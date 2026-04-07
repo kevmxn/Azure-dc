@@ -208,7 +208,7 @@ ROULETTE_CONFIGS = {
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 3   # Cambiado de 2 a 3
 BASE_BET  = 0.10   # USD
 VISIBLE   = 50
 
@@ -619,7 +619,7 @@ class RouletteEngine:
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
                 if self.attempts_left <= 0:
-                    # Pérdida definitiva del segundo intento → aumentar nivel y activar recuperación
+                    # Pérdida definitiva del último intento → aumentar nivel y activar recuperación
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
                         # Máximo nivel alcanzado: reset total
@@ -648,10 +648,16 @@ class RouletteEngine:
                     self._send_result(number, real, False, bet)
                     self._check_stats()
                 else:
-                    # Primer intento fallido → pasar al segundo sin cambios en nivel
+                    # Aún quedan intentos: enviar nueva señal de reintento
+                    # Primero eliminamos el mensaje anterior de la señal
+                    if self.signal_msg_id:
+                        tg_delete(self.chat_id, self.signal_msg_id)
+                        self.signal_msg_id = None
                     self.trigger_number = number
                     new_bet = self.bet_sys.current_bet()
-                    self._send_retry_signal(number, new_bet)
+                    # Calcular el número de intento actual
+                    attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
+                    self._send_retry_signal(number, new_bet, attempt_number)
 
         # ── Activate new signal ───────────────────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
@@ -696,11 +702,8 @@ class RouletteEngine:
         self.signal_msg_id = msg_id
         logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, recovery={self.recovery_active}")
 
-    # ── Telegram: send retry signal (segundo intento) ─────────────────────────
-    def _send_retry_signal(self, trigger: int, new_bet: float):
-        if self.signal_msg_id:
-            tg_delete(self.chat_id, self.signal_msg_id)
-            self.signal_msg_id = None
+    # ── Telegram: send retry signal (segundo o tercer intento) ─────────────────
+    def _send_retry_signal(self, trigger: int, new_bet: float, attempt_number: int):
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
@@ -714,13 +717,13 @@ class RouletteEngine:
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
-            f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
+            f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>"
         )
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
-        logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}")
+        logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}, attempt {attempt_number}/{MAX_ATTEMPTS}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float):
         bankroll = self.bet_sys.bankroll
