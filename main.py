@@ -633,7 +633,7 @@ class RouletteEngine:
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        sys_line = f"🉑 <i>D'Alembert paso {step} de 20</i>\n"
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
@@ -641,7 +641,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
-            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
+            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
         )
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
@@ -658,7 +658,7 @@ class RouletteEngine:
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        sys_line = f"🉑 <i>D'Alembert paso {step} de 20</i>\n"
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
@@ -666,7 +666,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
-            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n"
+            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento 2/{MAX_ATTEMPTS}</i>"
         )
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
