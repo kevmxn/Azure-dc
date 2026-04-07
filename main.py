@@ -761,7 +761,7 @@ class RouletteEngine:
 
         # ── Resolve active signal ─────────────────────────────────────────────
         if self.signal_active and time.time() > self.result_until:
-            is_win = (self.bet_color == "ROJO" and real == "ROJO") or                      (self.bet_color == "NEGRO" and real == "NEGRO")
+            is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
             if is_win:
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
@@ -892,35 +892,23 @@ class RouletteEngine:
             logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
         recovery_tag = " 🔄" if self.recovery_active else ""
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>
-"
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
 
         # Agregar info AMX si es señal AMX
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
-            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>
-"
+            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>"
 
         caption = (
-            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅
-
-"
-            f"🎰 <b>Juego: {self.name}</b>
-"
-            f"👉 <b>Después de: {trigger}</b>
-"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}
-
-"
-            f"💡 <i>Probabilidad de señal: {prob}%</i>
-"
+            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
+            f"🎰 <b>Juego: {self.name}</b>\n"
+            f"👉 <b>Después de: {trigger}</b>\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
+            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
-            f"{amx_line}"
-            f"📍 <i>Apuesta: {bet:.2f} usd</i>
-
-"
-            f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
+            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
+            f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
         )
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
@@ -933,27 +921,17 @@ class RouletteEngine:
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>
-"
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
         recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
         caption = (
-            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅
-
-"
-            f"🎰 <b>Juego: {self.name}</b>
-"
-            f"👉🏼 <b>Después de: {trigger}</b>
-"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}
-
-"
-            f"💡 <i>Probabilidad de señal: {prob}%</i>
-"
+            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
+            f"🎰 <b>Juego: {self.name}</b>\n"
+            f"👉🏼 <b>Después de: {trigger}</b>\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
+            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
-            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>
-
-"
-            f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>"
+            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
+            f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
         )
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
@@ -965,11 +943,9 @@ class RouletteEngine:
         bankroll = self.bet_sys.bankroll
         icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
         if won:
-            text = f"💎 <b>RESULTADO: {number}</b> {icon}
-💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
+            text = f"💎 <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>\n"
         else:
-            text = f"❌ <b>RESULTADO: {number}</b> {icon}
-💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
+            text = f"❌ <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>\n"
         self.result_until = time.time() + 7.0
         tg_send_text(self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] Result: {'WIN' if won else 'LOSS'} #{number}, bankroll={bankroll:.2f}")
@@ -982,20 +958,12 @@ class RouletteEngine:
         self.stats.mark_stats_sent(current_bankroll)
         w24, l24, t24, e24, bk24 = self.stats.stats_24h(current_bankroll)
         text = (
-            f"👉🏼 <b>ESTADÍSTICAS {t20} SEÑALES</b>
-"
-            f"🈯️ <b>W: {w20}</b> 🈲 <b>L: {l20}</b> 🈺 <b>T: {t20}</b> "
-            f"📈 <b>E: {e20}%</b>
-"
-            f"💰 <i>Bankroll acumulado: {batch_bankroll:.2f} usd</i>
-
-"
-            f"👉🏼 <b>ESTADÍSTICAS 24 HORAS</b>
-"
-            f"🈯️ <b>W: {w24}</b> 🈲 <b>L: {l24}</b> 🈺 <b>T: {t24}</b> "
-            f"📈 <b>E: {e24}%</b>
-"
-            f"💰 <i>Bankroll acumulado: {bk24:.2f} usd</i>"
+            f"👉🏼 <b>ESTADÍSTICAS {t20} SEÑALES</b>\n"
+            f"🈯️ <b>W: {w20}</b> 🈲 <b>L: {l20}</b> 🈺 <b>T: {t20}</b> 📈 <b>E: {e20}%</b>\n"
+            f"💰 <i>Bankroll acumulado: {batch_bankroll:.2f} usd</i>\n\n"
+            f"👉🏼 <b>ESTADÍSTICAS 24 HORAS</b>\n"
+            f"🈯️ <b>W: {w24}</b> 🈲 <b>L: {l24}</b> 🈺 <b>T: {t24}</b> 📈 <b>E: {e24}%</b>\n"
+            f"💰 <i>Bankroll acumulado: {bk24:.2f} usd</i>\n"
         )
         tg_send_text(self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] Stats sent: {t20} signals")
