@@ -33,7 +33,27 @@ logger = logging.getLogger("RouletteBot")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
+
+# Use a custom requests Session with automatic retries and connection pooling
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_session = requests.Session()
+_retry = Retry(
+    total=5,
+    backoff_factor=1.5,         # waits 0s, 1.5s, 3s, 6s, 12s between retries
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
+_session.mount("https://", _adapter)
+_session.mount("http://",  _adapter)
+
 bot = telebot.TeleBot(TOKEN, threaded=False)
+# Inject our resilient session into telebot's internal requester
+bot.session = _session
 
 # ─── ROULETTE COLOR MAPS ──────────────────────────────────────────────────────
 REAL_COLOR_MAP = {
@@ -388,38 +408,57 @@ def generate_chart(
 
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
+_TG_MAX_RETRIES = 5
+
+def _tg_call(fn, *args, **kwargs):
+    """Call any telebot function with automatic retry + exponential backoff."""
+    delay = 2.0
+    for attempt in range(1, _TG_MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            err = str(e)
+            # Flood-wait: Telegram tells us how long to wait
+            if "retry after" in err.lower():
+                try:
+                    wait = int(''.join(filter(str.isdigit, err))) + 1
+                except Exception:
+                    wait = 30
+                logger.warning(f"Telegram flood-wait {wait}s")
+                time.sleep(wait)
+                continue
+            logger.warning(f"Telegram error (attempt {attempt}/{_TG_MAX_RETRIES}): {e}")
+            if attempt < _TG_MAX_RETRIES:
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+            else:
+                logger.error(f"Telegram call failed after {_TG_MAX_RETRIES} attempts: {e}")
+                return None
+
 def tg_send_photo(chat_id: int, thread_id: int, photo_buf: io.BytesIO, caption: str) -> Optional[int]:
-    try:
-        msg = bot.send_photo(
-            chat_id=chat_id,
-            photo=photo_buf,
-            caption=caption,
-            parse_mode="HTML",
-            message_thread_id=thread_id
-        )
-        return msg.message_id
-    except Exception as e:
-        logger.error(f"send_photo error: {e}")
-        return None
+    photo_buf.seek(0)
+    msg = _tg_call(
+        bot.send_photo,
+        chat_id=chat_id,
+        photo=photo_buf,
+        caption=caption,
+        parse_mode="HTML",
+        message_thread_id=thread_id
+    )
+    return msg.message_id if msg else None
 
 def tg_send_text(chat_id: int, thread_id: int, text: str) -> Optional[int]:
-    try:
-        msg = bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-            message_thread_id=thread_id
-        )
-        return msg.message_id
-    except Exception as e:
-        logger.error(f"send_message error: {e}")
-        return None
+    msg = _tg_call(
+        bot.send_message,
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML",
+        message_thread_id=thread_id
+    )
+    return msg.message_id if msg else None
 
 def tg_delete(chat_id: int, msg_id: int):
-    try:
-        bot.delete_message(chat_id=chat_id, message_id=msg_id)
-    except Exception as e:
-        logger.error(f"delete_message error: {e}")
+    _tg_call(bot.delete_message, chat_id=chat_id, message_id=msg_id)
 
 
 # ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
