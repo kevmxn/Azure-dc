@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Roulette Telegram Signal Bot - Sistema 3 D'Alembert
+Roulette Telegram Signal Bot - Sistema 3 D'Alembert con recuperación +1 ficha
 Connects via WebSocket to Pragmatic Play roulettes, detects EMA 4/8/20 signals,
 manages D'Alembert bets and sends alerts to Telegram topics.
 """
@@ -456,8 +456,10 @@ class RouletteEngine:
         self.trigger_number:   Optional[int] = None
 
         self.result_until:     float = 0.0
-        self.consec_losses:    int = 0
-        self.loss_block_until: float = 0.0
+        self.consec_losses:    int = 0          # Nivel de pérdidas (0..9)
+        # Nuevas variables para la recuperación +1 ficha
+        self.recovery_active:  bool = False
+        self.recovery_target:  float = 0.0
 
         self.betting_system_name = cfg.get("betting_system", "dalembert")
         self.bet_sys = D_Alembert(BASE_BET)
@@ -513,8 +515,7 @@ class RouletteEngine:
             return "NEGRO"
 
     def should_activate(self) -> Optional[str]:
-        if time.time() < self.loss_block_until:
-            return None
+        # Ya no hay bloqueo temporal; solo se verifica el nivel de pérdidas
         losses = self.consec_losses
         min_spin = 22 + losses * 2
         if len(self.spin_history) < min_spin:
@@ -557,6 +558,14 @@ class RouletteEngine:
                 return "NEGRO"
         return None
 
+    def _check_recovery(self):
+        """Verifica si se ha alcanzado el objetivo de recuperación y resetea el nivel."""
+        if self.recovery_active and self.bet_sys.bankroll >= self.recovery_target:
+            logger.info(f"[{self.name}] Recuperación completada! Bankroll {self.bet_sys.bankroll:.2f} >= objetivo {self.recovery_target:.2f}. Reseteando nivel.")
+            self.consec_losses = 0
+            self.recovery_active = False
+            self.recovery_target = 0.0
+
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
         self.spin_history.append({"number": number, "real": real})
@@ -591,26 +600,33 @@ class RouletteEngine:
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
                 self.signal_active = False
-                self.consec_losses = 0
-                self.loss_block_until = 0.0
+                # Al ganar, se comprueba si se ha completado la recuperación
+                self._check_recovery()
                 self._send_result(number, real, True, bet)
                 self._check_stats()
             else:
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
                 if self.attempts_left <= 0:
+                    # Pérdida definitiva del segundo intento → aumentar nivel y activar recuperación
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
+                        # Máximo nivel alcanzado: reset total
                         self.consec_losses = 0
-                        self.loss_block_until = 0.0
-                        logger.info(f"[{self.name}] Max 10 losses → restrictions reset, bankroll kept at {self.bet_sys.bankroll:.2f}")
+                        self.recovery_active = False
+                        self.recovery_target = 0.0
+                        logger.info(f"[{self.name}] Max 10 losses → nivel reiniciado, bankroll {self.bet_sys.bankroll:.2f}")
                     else:
-                        self.loss_block_until = time.time() + min(3.0 * self.consec_losses, 30)
+                        # Activar modo recuperación con objetivo +1 ficha
+                        self.recovery_active = True
+                        self.recovery_target = self.bet_sys.bankroll + BASE_BET
+                        logger.info(f"[{self.name}] Pérdida nivel {self.consec_losses}. Modo recuperación activado. Objetivo: {self.recovery_target:.2f}")
                     self.stats.record(False, self.bet_sys.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
                     self._check_stats()
                 else:
+                    # Primer intento fallido → pasar al segundo sin cambios en nivel
                     self.trigger_number = number
                     new_bet = self.bet_sys.current_bet()
                     self._send_retry_signal(number, new_bet)
@@ -627,18 +643,19 @@ class RouletteEngine:
                 self.trigger_number = number
                 self._send_signal(number, 1)
 
-    # ── Telegram: send initial signal (con nuevo estilo) ──────────────────────
+    # ── Telegram: send initial signal ─────────────────────────────────────────
     def _send_signal(self, trigger: int, attempt: int):
         bet = self.bet_sys.current_bet()
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
         sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
+        recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Ingresar después del: {trigger}</b>\n"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}{recovery_note}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
@@ -648,7 +665,7 @@ class RouletteEngine:
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
-        logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, sys=D'Alembert step={step}")
+        logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, recovery={self.recovery_active}")
 
     # ── Telegram: send retry signal (segundo intento) ─────────────────────────
     def _send_retry_signal(self, trigger: int, new_bet: float):
@@ -659,11 +676,12 @@ class RouletteEngine:
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
         sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
+        recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Ingresar después del: {trigger}</b>\n"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}{recovery_note}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
@@ -805,7 +823,7 @@ async def main():
     engines = [RouletteEngine(name, cfg) for name, cfg in ROULETTE_CONFIGS.items()]
     tasks = [asyncio.create_task(e.run_ws()) for e in engines]
     tasks.append(asyncio.create_task(self_ping_loop()))
-    logger.info("All roulette engines started (Sistema 3: D'Alembert).")
+    logger.info("All roulette engines started (Sistema 3: D'Alembert con recuperación +1 ficha).")
     await asyncio.gather(*tasks)
 
 
