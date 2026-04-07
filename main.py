@@ -759,7 +759,7 @@ class RouletteEngine:
         # Extra info line depending on system
         if self.betting_system_name == "fibonacci":
             step = self.bet_sys.step + 1
-            sys_line = f"🌀 <i>Fibonacci paso {step} de 12 · ×{_FIB_SEQ[self.bet_sys.step]}</i>\n"
+            sys_line = f"🌀 <i>Fibonacci paso {step} de 12</i>\n"
         else:
             sys_line = f"💠 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
 
@@ -793,7 +793,7 @@ class RouletteEngine:
 
         if self.betting_system_name == "fibonacci":
             step = self.bet_sys.step + 1
-            sys_line = f"🌀 <i>Fibonacci paso {step} de 12 · ×{_FIB_SEQ[self.bet_sys.step]}</i>\n"
+            sys_line = f"🌀 <i>Fibonacci paso {step} de 12</i>\n"
         else:
             sys_line = f"💠 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
 
