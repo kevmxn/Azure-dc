@@ -770,7 +770,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
-            f"{sys_line}\n\n"
+            f"{sys_line}\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
         )
 
@@ -804,7 +804,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n"
-            f"{sys_line}\n\n"
+            f"{sys_line}\n"
             f"♻️ <i>Intento 2/{MAX_ATTEMPTS}</i>"
         )
 
