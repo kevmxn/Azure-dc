@@ -761,7 +761,7 @@ class RouletteEngine:
             step = self.bet_sys.step + 1
             sys_line = f"🌀 <i>Fibonacci paso {step}/12 · ×{_FIB_SEQ[self.bet_sys.step]}</i>\n"
         else:
-            sys_line = f"🔢 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
+            sys_line = f"💠 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
 
         caption = (
             f"✅ <b>SEÑAL CONFIRMADA</b> ✅\n\n"
@@ -770,7 +770,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
-            f"{sys_line}"
+            f"{sys_line}\n\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
         )
 
@@ -795,7 +795,7 @@ class RouletteEngine:
             step = self.bet_sys.step + 1
             sys_line = f"🌀 <i>Fibonacci paso {step}/12 · ×{_FIB_SEQ[self.bet_sys.step]}</i>\n"
         else:
-            sys_line = f"🔢 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
+            sys_line = f"💠 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
 
         caption = (
             f"✅ <b>SEÑAL CONFIRMADA</b> ✅\n\n"
@@ -804,7 +804,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n"
-            f"{sys_line}"
+            f"{sys_line}\n\n"
             f"♻️ <i>Intento 2/{MAX_ATTEMPTS}</i>"
         )
 
