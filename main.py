@@ -12,13 +12,11 @@ import logging
 import threading
 import time
 from collections import deque
-from datetime import datetime, timedelta
 from typing import Optional
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 import telebot
 import websockets
@@ -34,7 +32,6 @@ logger = logging.getLogger("RouletteBot")
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
 
-# Use a custom requests Session with automatic retries and connection pooling
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -42,7 +39,7 @@ from urllib3.util.retry import Retry
 _session = requests.Session()
 _retry = Retry(
     total=5,
-    backoff_factor=1.5,         # waits 0s, 1.5s, 3s, 6s, 12s between retries
+    backoff_factor=1.5,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"],
     raise_on_status=False,
@@ -52,7 +49,6 @@ _session.mount("https://", _adapter)
 _session.mount("http://",  _adapter)
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
-# Inject our resilient session into telebot's internal requester
 bot.session = _session
 
 # ─── ROULETTE COLOR MAPS ──────────────────────────────────────────────────────
@@ -186,7 +182,6 @@ COLOR_DATA_AZURE = [
 ]
 
 # ─── ROULETTE CONFIGS ─────────────────────────────────────────────────────────
-# Todas las ruletas usan SISTEMA 3: D'ALEMBERT
 ROULETTE_CONFIGS = {
     "Auto Roulette": {
         "ws_key": 225,
@@ -215,23 +210,15 @@ WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
 MAX_ATTEMPTS = 2
 BASE_BET  = 0.10   # USD
-VISIBLE   = 40     # last N spins for chart
+VISIBLE   = 40
 
 # ─── D'ALEMBERT (SISTEMA 3) ──────────────────────────────────────────────────
-class D Alembert:
-    """
-    Sistema D'Alembert:
-    - Apuesta base fija.
-    - Paso: 0..19 (máximo 20 escalones).
-    - Victoria: disminuye paso en 1 (mínimo 0).
-    - Derrota: aumenta paso en 1; si llega al máximo (19), se reinicia a 0.
-    - Apuesta = base * (paso + 1)
-    """
+class D_Alembert:
     def __init__(self, base: float):
         self.base      = base
-        self.step      = 0          # 0 = apuesta base * 1
+        self.step      = 0
         self.bankroll  = 0.0
-        self.max_step  = 20         # índices 0..19 (20 pasos)
+        self.max_step  = 20
 
     def current_bet(self) -> float:
         return round(self.base * (self.step + 1), 2)
@@ -247,7 +234,6 @@ class D Alembert:
         bet = self.current_bet()
         self.bankroll = round(self.bankroll - bet, 2)
         if self.step >= self.max_step - 1:
-            # Se alcanzó el límite → reiniciar paso (igual que Fibonacci)
             self.step = 0
         else:
             self.step += 1
@@ -256,7 +242,6 @@ class D Alembert:
 
 # ─── STATISTICS ───────────────────────────────────────────────────────────────
 class Stats:
-    """Tracks wins/losses in two windows: all-time batches of 20, and 24hr."""
     def __init__(self):
         self.total      = 0
         self.wins       = 0
@@ -315,56 +300,46 @@ class Stats:
         return w, l, t, e, bk24
 
 
-# ─── CHART GENERATION (sin cambios) ──────────────────────────────────────────
-def generate_chart(
-    levels: list,
-    spin_history: list,
-    bet_color: str,
-    visible: int = VISIBLE
-) -> io.BytesIO:
-    """
-    Chart of last `visible` cumulative levels with EMA 4/8/20.
-    Each point is drawn as a coloured dot: red=ROJO, dark=NEGRO, green=VERDE.
-    """
+# ─── CHART GENERATION ─────────────────────────────────────────────────────────
+def generate_chart(levels: list, spin_history: list, bet_color: str, visible: int = VISIBLE) -> io.BytesIO:
     arr = np.array(levels, dtype=float)
     n   = len(arr)
 
     def calc_ema(data, period):
         if len(data) < period:
             return np.full(len(data), np.nan)
-        mult  = 2 / (period + 1)
-        out   = np.full(len(data), np.nan)
+        mult = 2 / (period + 1)
+        out = np.full(len(data), np.nan)
         out[period - 1] = np.mean(data[:period])
         for i in range(period, len(data)):
             out[i] = (data[i] - out[i - 1]) * mult + out[i - 1]
         return out
 
-    ema4  = calc_ema(arr, 4)
-    ema8  = calc_ema(arr, 8)
+    ema4 = calc_ema(arr, 4)
+    ema8 = calc_ema(arr, 8)
     ema20 = calc_ema(arr, 20)
 
     start = max(0, n - visible)
-    sl    = slice(start, n)
-    x     = np.arange(len(arr[sl]))
+    sl = slice(start, n)
+    x = np.arange(len(arr[sl]))
     hist_sl = spin_history[start:]
 
     is_rojo = bet_color == "ROJO"
-
-    bg      = "#0b101f"
-    ax_bg   = "#0f1a2a"
-    grid_c  = "#1e2e48"
-    line_c  = "#e84040" if is_rojo else "#9090bb"
-    ema4_c  = "#ff9f43"
-    ema8_c  = "#48dbfb"
+    bg = "#0b101f"
+    ax_bg = "#0f1a2a"
+    grid_c = "#1e2e48"
+    line_c = "#e84040" if is_rojo else "#9090bb"
+    ema4_c = "#ff9f43"
+    ema8_c = "#48dbfb"
     ema20_c = "#1dd1a1"
     title_c = "#ff8080" if is_rojo else "#b0b8d0"
 
     fig, ax = plt.subplots(figsize=(8, 3.6), facecolor=bg)
     ax.set_facecolor(ax_bg)
 
-    y   = arr[sl]
-    e4  = ema4[sl]
-    e8  = ema8[sl]
+    y = arr[sl]
+    e4 = ema4[sl]
+    e8 = ema8[sl]
     e20 = ema20[sl]
 
     ax.fill_between(x, y, alpha=0.10, color=line_c)
@@ -373,19 +348,14 @@ def generate_chart(
     ax.plot(x, e8,  color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8",  zorder=4)
     ax.plot(x, e20, color=ema20_c, linewidth=1.0, label="EMA 20", zorder=4)
 
-    dot_colors = {
-        "ROJO":  "#e84040",
-        "NEGRO": "#aaaacc",
-        "VERDE": "#2ecc71",
-    }
+    dot_colors = {"ROJO": "#e84040", "NEGRO": "#aaaacc", "VERDE": "#2ecc71"}
     for i, spin in enumerate(hist_sl):
         c = dot_colors.get(spin["real"], "#ffffff")
-        ax.scatter(i, y[i], color=c, s=22, zorder=5,
-                   edgecolors="white", linewidths=0.3)
+        ax.scatter(i, y[i], color=c, s=22, zorder=5, edgecolors="white", linewidths=0.3)
 
     tick_step = max(1, len(x) // 8)
-    tick_x    = list(range(0, len(x), tick_step))
-    tick_lbs  = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
+    tick_x = list(range(0, len(x), tick_step))
+    tick_lbs = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
     ax.set_xticks(tick_x)
     ax.set_xticklabels(tick_lbs, color="#8899bb", fontsize=7)
     ax.tick_params(axis='y', colors="#8899bb", labelsize=7)
@@ -401,7 +371,7 @@ def generate_chart(
     ax.set_title(f"{emoji} Señal {'ROJO' if is_rojo else 'NEGRO'} — últimos {visible} giros · EMA 4/8/20",
                  color=title_c, fontsize=9, pad=6)
 
-    from matplotlib.lines  import Line2D
+    from matplotlib.lines import Line2D
     legend_els = [
         Line2D([0],[0], color=line_c,  linewidth=0.8, label="Nivel"),
         Line2D([0],[0], color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4"),
@@ -412,8 +382,7 @@ def generate_chart(
         Line2D([0],[0], marker='o', color='w', markerfacecolor='#2ecc71', markersize=5, label="Verde"),
     ]
     ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
-              facecolor="#0b101f", edgecolor=grid_c,
-              labelcolor="white", framealpha=0.8, ncol=2)
+              facecolor="#0b101f", edgecolor=grid_c, labelcolor="white", framealpha=0.8, ncol=2)
 
     plt.tight_layout(pad=0.8)
     buf = io.BytesIO()
@@ -423,7 +392,7 @@ def generate_chart(
     return buf
 
 
-# ─── TELEGRAM HELPERS (sin cambios) ──────────────────────────────────────────
+# ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 5
 
 def _tg_call(fn, *args, **kwargs):
@@ -451,31 +420,20 @@ def _tg_call(fn, *args, **kwargs):
 
 def tg_send_photo(chat_id: int, thread_id: int, photo_buf: io.BytesIO, caption: str) -> Optional[int]:
     photo_buf.seek(0)
-    msg = _tg_call(
-        bot.send_photo,
-        chat_id=chat_id,
-        photo=photo_buf,
-        caption=caption,
-        parse_mode="HTML",
-        message_thread_id=thread_id
-    )
+    msg = _tg_call(bot.send_photo, chat_id=chat_id, photo=photo_buf, caption=caption,
+                   parse_mode="HTML", message_thread_id=thread_id)
     return msg.message_id if msg else None
 
 def tg_send_text(chat_id: int, thread_id: int, text: str) -> Optional[int]:
-    msg = _tg_call(
-        bot.send_message,
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
-        message_thread_id=thread_id
-    )
+    msg = _tg_call(bot.send_message, chat_id=chat_id, text=text,
+                   parse_mode="HTML", message_thread_id=thread_id)
     return msg.message_id if msg else None
 
 def tg_delete(chat_id: int, msg_id: int):
     _tg_call(bot.delete_message, chat_id=chat_id, message_id=msg_id)
 
 
-# ─── ROULETTE ENGINE (modificado para D'Alembert) ────────────────────────────
+# ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
         self.name      = name
@@ -490,33 +448,31 @@ class RouletteEngine:
         self.last_nonzero_color: Optional[str] = None
         self.anti_block: set = set()
 
-        self.signal_active:    bool  = False
+        self.signal_active:    bool = False
         self.expected_color:   Optional[str] = None
         self.bet_color:        Optional[str] = None
-        self.attempts_left:    int   = 0
-        self.total_attempts:   int   = 0
+        self.attempts_left:    int = 0
+        self.total_attempts:   int = 0
         self.trigger_number:   Optional[int] = None
 
         self.result_until:     float = 0.0
-        self.consec_losses:    int   = 0
+        self.consec_losses:    int = 0
         self.loss_block_until: float = 0.0
 
-        # Sistema D'Alembert (Sistema 3)
         self.betting_system_name = cfg.get("betting_system", "dalembert")
-        self.bet_sys = D Alembert(BASE_BET)   # Nota: sin espacio en el nombre real
+        self.bet_sys = D_Alembert(BASE_BET)
 
         self.stats = Stats()
         self.signal_msg_id: Optional[int] = None
         self.ws = None
         self.running = True
 
-    # ── EMA ──────────────────────────────────────────────────────────────────
     @staticmethod
     def calculate_ema(data: list, period: int) -> list:
         if len(data) < period:
             return [None] * len(data)
         mult = 2 / (period + 1)
-        out  = [None] * (period - 1)
+        out = [None] * (period - 1)
         prev = sum(data[:period]) / period
         out.append(prev)
         for i in range(period, len(data)):
@@ -524,7 +480,6 @@ class RouletteEngine:
             out.append(prev)
         return out
 
-    # ── Color data helpers ────────────────────────────────────────────────────
     def get_entry(self, number: int) -> Optional[dict]:
         for e in self.color_data:
             if e["id"] == number:
@@ -541,7 +496,6 @@ class RouletteEngine:
             return 0.0
         return e["rojo"] if color == "ROJO" else e["negro"]
 
-    # ── Determine actual bet color (may differ from expected) ─────────────────
     def determine_bet_color(self, expected: str) -> str:
         if len(self.spin_history) < 20:
             return expected
@@ -558,30 +512,29 @@ class RouletteEngine:
                 return "ROJO" if last_sig == "ROJO" else "NEGRO"
             return "NEGRO"
 
-    # ── Signal activation (tendencia mode) ───────────────────────────────────
     def should_activate(self) -> Optional[str]:
         if time.time() < self.loss_block_until:
             return None
-        losses   = self.consec_losses
+        losses = self.consec_losses
         min_spin = 22 + losses * 2
         if len(self.spin_history) < min_spin:
             return None
 
         last_num = self.spin_history[-1]["number"]
-        entry    = self.get_entry(last_num)
+        entry = self.get_entry(last_num)
         if not entry or entry["senal"] == "NO APOSTAR":
             return None
         expected = entry["senal"]
 
-        ema4o  = self.calculate_ema(self.original_levels, 4)
-        ema8o  = self.calculate_ema(self.original_levels, 8)
+        ema4o = self.calculate_ema(self.original_levels, 4)
+        ema8o = self.calculate_ema(self.original_levels, 8)
         ema20o = self.calculate_ema(self.original_levels, 20)
-        ema4i  = self.calculate_ema(self.inverted_levels, 4)
-        ema8i  = self.calculate_ema(self.inverted_levels, 8)
+        ema4i = self.calculate_ema(self.inverted_levels, 4)
+        ema8i = self.calculate_ema(self.inverted_levels, 8)
         ema20i = self.calculate_ema(self.inverted_levels, 20)
 
         req = min(3 + losses, 13)
-        li  = len(self.original_levels) - 1
+        li = len(self.original_levels) - 1
 
         def check(levels, e20, e8, e4, idx):
             for off in range(req):
@@ -604,7 +557,6 @@ class RouletteEngine:
                 return "NEGRO"
         return None
 
-    # ── Process one roulette number ───────────────────────────────────────────
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
         self.spin_history.append({"number": number, "real": real})
@@ -638,8 +590,8 @@ class RouletteEngine:
             if is_win:
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
-                self.signal_active  = False
-                self.consec_losses  = 0
+                self.signal_active = False
+                self.consec_losses = 0
                 self.loss_block_until = 0.0
                 self._send_result(number, real, True, bet)
                 self._check_stats()
@@ -649,7 +601,7 @@ class RouletteEngine:
                 if self.attempts_left <= 0:
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
-                        self.consec_losses    = 0
+                        self.consec_losses = 0
                         self.loss_block_until = 0.0
                         logger.info(f"[{self.name}] Max 10 losses → restrictions reset, bankroll kept at {self.bet_sys.bankroll:.2f}")
                     else:
@@ -667,26 +619,23 @@ class RouletteEngine:
         if not self.signal_active and time.time() > self.result_until:
             expected = self.should_activate()
             if expected:
-                self.signal_active   = True
-                self.expected_color  = expected
-                self.bet_color       = self.determine_bet_color(expected)
-                self.attempts_left   = MAX_ATTEMPTS
-                self.total_attempts  = MAX_ATTEMPTS
-                self.trigger_number  = number
+                self.signal_active = True
+                self.expected_color = expected
+                self.bet_color = self.determine_bet_color(expected)
+                self.attempts_left = MAX_ATTEMPTS
+                self.total_attempts = MAX_ATTEMPTS
+                self.trigger_number = number
                 self._send_signal(number, 1)
 
-    # ── Telegram: send initial signal (con info de D'Alembert) ────────────────
+    # ── Telegram: send initial signal (con nuevo estilo) ──────────────────────
     def _send_signal(self, trigger: int, attempt: int):
-        bet        = self.bet_sys.current_bet()
-        prob       = int(self.get_prob(trigger, self.bet_color) * 100)
+        bet = self.bet_sys.current_bet()
+        prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
-
-        # Información específica para D'Alembert
         step = self.bet_sys.step + 1
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-
+        sys_line = f"🉑 <i>D'Alembert paso {step} de 20</i>\n"
         caption = (
-            f"✅ <b>SEÑAL CONFIRMADA</b> ✅\n\n"
+            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Ingresar después del: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
@@ -695,28 +644,23 @@ class RouletteEngine:
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
         )
-
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-        chart  = generate_chart(levels, self.spin_history[:], self.bet_color)
-
+        chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
         logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, sys=D'Alembert step={step}")
 
-    # ── Telegram: send retry signal (intento 2) ───────────────────────────────
+    # ── Telegram: send retry signal (segundo intento) ─────────────────────────
     def _send_retry_signal(self, trigger: int, new_bet: float):
         if self.signal_msg_id:
             tg_delete(self.chat_id, self.signal_msg_id)
             self.signal_msg_id = None
-
-        prob       = int(self.get_prob(trigger, self.bet_color) * 100)
+        prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
-
         step = self.bet_sys.step + 1
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-
+        sys_line = f"🉑 <i>D'Alembert paso {step} de 20</i>\n"
         caption = (
-            f"✅ <b>SEÑAL CONFIRMADA</b> ✅\n\n"
+            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Ingresar después del: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
@@ -725,29 +669,23 @@ class RouletteEngine:
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n"
             f"♻️ <i>Intento 2/{MAX_ATTEMPTS}</i>"
         )
-
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-        chart  = generate_chart(levels, self.spin_history[:], self.bet_color)
-
+        chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
         logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}")
 
-    # ── Telegram: send result ─────────────────────────────────────────────────
     def _send_result(self, number: int, real: str, won: bool, bet: float):
         bankroll = self.bet_sys.bankroll
+        icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
         if won:
-            icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
             text = f"✅ <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
         else:
-            icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
             text = f"❌ <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
-
         self.result_until = time.time() + 7.0
         tg_send_text(self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] Result: {'WIN' if won else 'LOSS'} #{number}, bankroll={bankroll:.2f}")
 
-    # ── Stats cada 20 señales ─────────────────────────────────────────────────
     def _check_stats(self):
         if not self.stats.should_send_stats():
             return
@@ -755,42 +693,33 @@ class RouletteEngine:
         w20, l20, t20, e20, batch_bankroll = self.stats.batch_stats(current_bankroll)
         self.stats.mark_stats_sent(current_bankroll)
         w24, l24, t24, e24, bk24 = self.stats.stats_24h(current_bankroll)
-
         text = (
             f"👉🏼 <b>ESTADÍSTICAS {t20} SEÑALES</b>\n"
             f"🈯️ <b>W: {w20}</b> 🈲 <b>L: {l20}</b> 🈺 <b>T: {t20}</b> "
             f"📈 <b>E: {e20}%</b>\n"
-            f"💰 <i>Bankroll acumulado: {batch_bankroll:.2f} usd</i>\n\n"
+            f"💰 <i>Bankroll acumulado en estas 20 señales: {batch_bankroll:.2f} usd</i>\n\n"
             f"👉🏼 <b>ESTADÍSTICAS 24 HORAS</b>\n"
             f"🈯️ <b>W: {w24}</b> 🈲 <b>L: {l24}</b> 🈺 <b>T: {t24}</b> "
             f"📈 <b>E: {e24}%</b>\n"
-            f"💰 <i>Bankroll acumulado: {bk24:.2f} usd</i>"
+            f"💰 <i>Bankroll acumulado últimas 24h: {bk24:.2f} usd</i>"
         )
         tg_send_text(self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] Stats sent: {t20} signals")
 
-    # ── WebSocket connection loop ──────────────────────────────────────────────
     async def run_ws(self):
         reconnect_delay = 5
         while self.running:
             try:
-                async with websockets.connect(
-                    WS_URL,
-                    ping_interval=30,
-                    ping_timeout=60,
-                    close_timeout=10
-                ) as ws:
+                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
                     self.ws = ws
                     reconnect_delay = 5
                     logger.info(f"[{self.name}] WS connected")
-
                     await ws.send(json.dumps({
                         "type": "subscribe",
                         "casinoId": CASINO_ID,
                         "currency": "USD",
                         "key": [self.ws_key]
                     }))
-
                     async for message in ws:
                         if not self.running:
                             break
@@ -798,7 +727,6 @@ class RouletteEngine:
                             data = json.loads(message)
                         except Exception:
                             continue
-
                         if "last20Results" in data and isinstance(data["last20Results"], list):
                             tmp = []
                             for r in data["last20Results"]:
@@ -816,7 +744,6 @@ class RouletteEngine:
                                         self.anti_block.add(gid)
                             for gid, n in reversed(tmp):
                                 self.process_number(n)
-
                         gid = data.get("gameId")
                         res = data.get("result")
                         if gid and res is not None:
@@ -829,14 +756,13 @@ class RouletteEngine:
                                     self.anti_block.clear()
                                 self.anti_block.add(gid)
                                 self.process_number(n)
-
             except Exception as e:
                 logger.warning(f"[{self.name}] WS error: {e}. Reconnecting in {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
 
-# ─── FLASK KEEPALIVE (sin cambios) ───────────────────────────────────────────
+# ─── FLASK KEEPALIVE ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
@@ -852,13 +778,13 @@ def health():
     return jsonify({"healthy": True})
 
 
-# ─── SELF-PING TASK (sin cambios) ────────────────────────────────────────────
+# ─── SELF-PING TASK ──────────────────────────────────────────────────────────
 import os
 import urllib.request
 
 async def self_ping_loop():
     port = int(os.environ.get("PORT", 10000))
-    url  = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
+    url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
     ping_url = f"{url}/ping"
     while True:
         await asyncio.sleep(300)
@@ -877,7 +803,7 @@ def run_flask():
 
 async def main():
     engines = [RouletteEngine(name, cfg) for name, cfg in ROULETTE_CONFIGS.items()]
-    tasks   = [asyncio.create_task(e.run_ws()) for e in engines]
+    tasks = [asyncio.create_task(e.run_ws()) for e in engines]
     tasks.append(asyncio.create_task(self_ping_loop()))
     logger.info("All roulette engines started (Sistema 3: D'Alembert).")
     await asyncio.gather(*tasks)
