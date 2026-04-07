@@ -679,7 +679,7 @@ class RouletteEngine:
             logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
         recovery_tag = " 🔄" if self.recovery_active else ""
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20{recovery_tag}</i>\n"
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
