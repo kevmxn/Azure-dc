@@ -208,9 +208,9 @@ ROULETTE_CONFIGS = {
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 3
 BASE_BET  = 0.10   # USD
-VISIBLE   = 40
+VISIBLE   = 50
 
 # ─── D'ALEMBERT (SISTEMA 3) ──────────────────────────────────────────────────
 class D_Alembert:
