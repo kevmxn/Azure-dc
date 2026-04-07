@@ -3,6 +3,7 @@
 Roulette Telegram Signal Bot - Sistema AMX V20 (Tendencia + Moderado)
 Integra la lógica de detección de señales 2.00x del AMX Genesis 20.0
 con las tablas predefinidas de cada ruleta para filtrado de probabilidad.
+VERSION CORREGIDA - Manejo de mensajes: eliminar intentos 1-2 si pierden, mantener si ganan o intento 3 pierde
 """
 
 import asyncio
@@ -287,13 +288,18 @@ class AMXSignalSystem:
         ema8 = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        if None in [ema4[-1], ema8[-1], ema20[-1]]:
+        # CORRECCIÓN: Verificar que tenemos suficientes valores calculados
+        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
+            return None
+        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
+            return None
+        if ema4[-2] is None or ema8[-2] is None:
             return None
 
         current_pos = positions[-1]
 
         # Condiciones Tendencia
-        cruce_alcista = ema4[-2] is not None and ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
+        cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
         sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
 
         entry = next((e for e in color_data if e["id"] == current_number), None)
@@ -331,10 +337,15 @@ class AMXSignalSystem:
         ema8 = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        if None in [ema4[-1], ema8[-1], ema20[-1]]:
+        # CORRECCIÓN: Verificar valores None
+        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
+            return None
+        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
+            return None
+        if ema8[-2] is None or ema20[-2] is None:
             return None
 
-        cruce_ema8 = ema8[-2] is not None and ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
+        cruce_ema8 = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
         sobre_emas = positions[-1] > ema4[-1] and positions[-1] > ema8[-1]
 
         # Patrón V
@@ -598,7 +609,8 @@ class RouletteEngine:
         self.bet_sys = D_Alembert(BASE_BET)
 
         self.stats = Stats()
-        self.signal_msg_id: Optional[int] = None
+        # CORRECCIÓN: Cambiar a lista para rastrear todos los message_ids de la señal actual
+        self.signal_msg_ids: list = []
         self.ws = None
         self.running = True
 
@@ -648,18 +660,25 @@ class RouletteEngine:
         ema20o = self.calculate_ema(self.original_levels, 20)
         ema20i = self.calculate_ema(self.inverted_levels, 20)
         li = len(self.original_levels) - 1
+        
+        # CORRECCIÓN: Verificar índice válido y valores None
+        if li < 0 or li >= len(ema20o) or li >= len(ema20i):
+            return expected
+        if ema20o[li] is None or ema20i[li] is None:
+            return expected
+            
         last_sig = self.get_signal(self.spin_history[-1]["number"])
         if expected == "ROJO":
-            if ema20o[li] is not None and self.original_levels[li] < ema20o[li]:
+            if self.original_levels[li] < ema20o[li]:
                 return "NEGRO" if last_sig == "NEGRO" else "ROJO"
             return "ROJO"
         else:
-            if ema20i[li] is not None and self.inverted_levels[li] < ema20i[li]:
+            if self.inverted_levels[li] < ema20i[li]:
                 return "ROJO" if last_sig == "ROJO" else "NEGRO"
             return "NEGRO"
 
     def should_activate(self) -> Optional[str]:
-        # Ya no hay bloqueo temporal; solo se verifica el nivel de pérdidas
+        """Versión corregida con verificación de límites de índices"""
         losses = self.consec_losses
         min_spin = 22 + losses * 2
         if len(self.spin_history) < min_spin:
@@ -670,6 +689,10 @@ class RouletteEngine:
         if not entry or entry["senal"] == "NO APOSTAR":
             return None
         expected = entry["senal"]
+
+        # CORRECCIÓN: Verificar que hay suficientes datos para calcular EMAs
+        if len(self.original_levels) < 20 or len(self.inverted_levels) < 20:
+            return None
 
         ema4o = self.calculate_ema(self.original_levels, 4)
         ema8o = self.calculate_ema(self.original_levels, 8)
@@ -686,12 +709,21 @@ class RouletteEngine:
                 i = idx - (req - 1) + off
                 if i < 0:
                     return False
+                # CORRECCIÓN: Verificar límites de índices
+                if i >= len(levels) or i >= len(e20):
+                    return False
                 if e20[i] is None or levels[i] <= e20[i]:
                     return False
-                if losses >= 2 and e8[i] is not None and levels[i] <= e8[i]:
-                    return False
-                if losses >= 4 and e4[i] is not None and levels[i] <= e4[i]:
-                    return False
+                if losses >= 2:
+                    if i >= len(e8) or e8[i] is None:
+                        return False
+                    if levels[i] <= e8[i]:
+                        return False
+                if losses >= 4:
+                    if i >= len(e4) or e4[i] is None:
+                        return False
+                    if levels[i] <= e4[i]:
+                        return False
             return True
 
         if expected == "ROJO":
@@ -751,10 +783,16 @@ class RouletteEngine:
             self.inverted_levels.append(last_i + (1 if real == "NEGRO" else -1))
             self.last_nonzero_color = real
 
+        # CORRECCIÓN: Mantener sincronización estricta con spin_history
         while len(self.original_levels) > len(self.spin_history):
             self.original_levels.pop(0)
         while len(self.inverted_levels) > len(self.spin_history):
             self.inverted_levels.pop(0)
+        
+        # Asegurar que las listas de niveles tengan el mismo tamaño
+        min_len = min(len(self.original_levels), len(self.inverted_levels))
+        self.original_levels = self.original_levels[-min_len:]
+        self.inverted_levels = self.inverted_levels[-min_len:]
 
         # Actualizar posiciones AMX
         self._update_amx_positions(real)
@@ -762,35 +800,49 @@ class RouletteEngine:
         # ── Resolve active signal ─────────────────────────────────────────────
         if self.signal_active and time.time() > self.result_until:
             is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
+            
+            # CORRECCIÓN: Calcular en qué intento estamos
+            current_attempt = MAX_ATTEMPTS - self.attempts_left + 1
+            
             if is_win:
+                # GANÓ: Mantener la señal del intento ganador, eliminar las anteriores
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
+                
+                # Eliminar señales de intentos anteriores (si hay más de una)
+                if len(self.signal_msg_ids) > 1:
+                    # Mantener solo la última señal (la ganadora)
+                    for msg_id in self.signal_msg_ids[:-1]:
+                        tg_delete(self.chat_id, msg_id)
+                    self.signal_msg_ids = [self.signal_msg_ids[-1]]
+                
                 self.signal_active = False
-                # Al ganar, se comprueba si se ha completado la recuperación
                 self._check_recovery()
                 self._send_result(number, real, True, bet)
                 self._check_stats()
+                
+                # Limpiar la lista de message_ids al finalizar la señal
+                self.signal_msg_ids = []
+                
             else:
+                # PERDIÓ
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
+                
                 if self.attempts_left <= 0:
-                    # Pérdida definitiva del último intento → aumentar nivel y activar recuperación
+                    # ÚLTIMO INTENTO (3) PERDIDO: Mantener todas las señales
+                    # No eliminar nada, mantener todas las señales de los intentos
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
-                        # Máximo nivel alcanzado: reset total
                         self.consec_losses = 0
                         self.recovery_active = False
                         self.recovery_target = 0.0
                         logger.info(f"[{self.name}] Max 10 losses → nivel reiniciado, bankroll {self.bet_sys.bankroll:.2f}")
                     else:
-                        # Activar modo recuperación
-                        # target = bankroll registrado en nivel 1 + 1 ficha positiva
-                        self.recovery_active  = True
+                        self.recovery_active = True
                         if self.signal_is_level1:
                             self.recovery_target = self.level1_bankroll + BASE_BET
                         else:
-                            # Si la señal no era nivel 1 pero hubo pérdida,
-                            # usar el último level1_bankroll conocido + 1 ficha
                             self.recovery_target = self.level1_bankroll + BASE_BET
                         logger.info(
                             f"[{self.name}] Pérdida nivel {self.consec_losses}. "
@@ -802,25 +854,31 @@ class RouletteEngine:
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
                     self._check_stats()
+                    
+                    # Limpiar la lista de message_ids al finalizar la señal
+                    self.signal_msg_ids = []
+                    
                 else:
-                    # Aún quedan intentos: enviar nueva señal de reintento
-                    # Primero eliminamos el mensaje anterior de la señal
-                    if self.signal_msg_id:
-                        tg_delete(self.chat_id, self.signal_msg_id)
-                        self.signal_msg_id = None
+                    # INTENTO 1 o 2 PERDIDO: Eliminar la señal de este intento
+                    if self.signal_msg_ids:
+                        # Eliminar la última señal enviada (la del intento perdido)
+                        last_msg_id = self.signal_msg_ids.pop()
+                        tg_delete(self.chat_id, last_msg_id)
+                    
+                    # Enviar nueva señal de reintento
                     self.trigger_number = number
                     new_bet = self.bet_sys.current_bet()
-                    # Calcular el número de intento actual
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
                     self._send_retry_signal(number, new_bet, attempt_number)
 
         # ── Activate new signal ───────────────────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
-            # Primero intentar con sistema AMX V20
+            # Limpiar message_ids al iniciar nueva señal
+            self.signal_msg_ids = []
+            
             signal = self._detect_amx_signal()
 
             if signal:
-                # Usar señal AMX
                 self.signal_active = True
                 self.expected_color = signal["expected_color"]
                 self.bet_color = signal["expected_color"]
@@ -829,7 +887,6 @@ class RouletteEngine:
                 self.trigger_number = signal["trigger_number"]
                 self._send_signal(signal["trigger_number"], 1, amx_signal=signal)
             else:
-                # Fallback al sistema original
                 expected = self.should_activate()
                 if expected:
                     self.signal_active = True
@@ -865,16 +922,20 @@ class RouletteEngine:
             return None
 
         # Detectar según modo
-        if self.amx_system.mode == "tendencia":
-            signal = self.amx_system.check_signal_tendencia(
-                self.amx_positions, self.color_data, current_number,
-                expected_color, self.min_prob_threshold
-            )
-        else:
-            signal = self.amx_system.check_signal_moderado(
-                self.amx_positions, self.color_data, current_number,
-                expected_color, self.min_prob_threshold
-            )
+        try:
+            if self.amx_system.mode == "tendencia":
+                signal = self.amx_system.check_signal_tendencia(
+                    self.amx_positions, self.color_data, current_number,
+                    expected_color, self.min_prob_threshold
+                )
+            else:
+                signal = self.amx_system.check_signal_moderado(
+                    self.amx_positions, self.color_data, current_number,
+                    expected_color, self.min_prob_threshold
+                )
+        except Exception as e:
+            logger.warning(f"[{self.name}] Error en detección AMX: {e}")
+            return None
 
         return signal
 
@@ -885,16 +946,13 @@ class RouletteEngine:
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
 
-        # Registrar bankroll cuando se activa en nivel 1 (step 0, sin recuperación)
         self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
         if self.signal_is_level1:
             self.level1_bankroll = self.bet_sys.bankroll
             logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
-        recovery_tag = " 🔄" if self.recovery_active else ""
         sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
 
-        # Agregar info AMX si es señal AMX
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
@@ -913,7 +971,11 @@ class RouletteEngine:
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
-        self.signal_msg_id = msg_id
+        
+        # CORRECCIÓN: Agregar el message_id a la lista
+        if msg_id:
+            self.signal_msg_ids.append(msg_id)
+        
         logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, recovery={self.recovery_active}")
 
     # ── Telegram: send retry signal (segundo o tercer intento) ─────────────────
@@ -936,7 +998,11 @@ class RouletteEngine:
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
-        self.signal_msg_id = msg_id
+        
+        # CORRECCIÓN: Agregar el message_id a la lista
+        if msg_id:
+            self.signal_msg_ids.append(msg_id)
+        
         logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}, attempt {attempt_number}/{MAX_ATTEMPTS}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float):
