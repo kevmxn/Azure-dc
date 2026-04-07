@@ -314,13 +314,13 @@ class Stats:
 # ─── CHART GENERATION ─────────────────────────────────────────────────────────
 def generate_chart(
     levels: list,
-    spin_numbers: list,
+    spin_history: list,      # list of {"number": int, "real": str}
     bet_color: str,
     visible: int = VISIBLE
 ) -> io.BytesIO:
     """
-    Generate a chart of the last `visible` cumulative levels with EMA 4/8/20.
-    Returns a PNG image as BytesIO.
+    Chart of last `visible` cumulative levels with EMA 4/8/20.
+    Each point is drawn as a coloured dot: red=ROJO, dark=NEGRO, green=VERDE.
     """
     arr = np.array(levels, dtype=float)
     n   = len(arr)
@@ -332,53 +332,60 @@ def generate_chart(
         out   = np.full(len(data), np.nan)
         out[period - 1] = np.mean(data[:period])
         for i in range(period, len(data)):
-            out[i] = (data[i] - out[i-1]) * mult + out[i-1]
+            out[i] = (data[i] - out[i - 1]) * mult + out[i - 1]
         return out
 
     ema4  = calc_ema(arr, 4)
     ema8  = calc_ema(arr, 8)
     ema20 = calc_ema(arr, 20)
 
-    # Slice to last `visible` points
-    sl   = slice(max(0, n - visible), n)
-    x    = np.arange(len(arr[sl]))
-    nums = spin_numbers[sl.start:] if sl.start < len(spin_numbers) else spin_numbers
+    start = max(0, n - visible)
+    sl    = slice(start, n)
+    x     = np.arange(len(arr[sl]))
+    hist_sl = spin_history[start:]      # matching spin history slice
 
     is_rojo = bet_color == "ROJO"
 
-    # Dark theme colours
-    bg       = "#0b101f"
-    ax_bg    = "#0f1a2a"
-    grid_c   = "#1e2e48"
-    line_c   = "#e84040" if is_rojo else "#aaaacc"
-    fill_c   = "#c0202030" if is_rojo else "#66668830"
-    ema4_c   = "#ff9f43"
-    ema8_c   = "#48dbfb"
-    ema20_c  = "#1dd1a1"
-    title_c  = "#ff8080" if is_rojo else "#b0b8d0"
+    # Theme
+    bg      = "#0b101f"
+    ax_bg   = "#0f1a2a"
+    grid_c  = "#1e2e48"
+    line_c  = "#e84040" if is_rojo else "#9090bb"
+    ema4_c  = "#ff9f43"
+    ema8_c  = "#48dbfb"
+    ema20_c = "#1dd1a1"
+    title_c = "#ff8080" if is_rojo else "#b0b8d0"
 
     fig, ax = plt.subplots(figsize=(8, 3.6), facecolor=bg)
     ax.set_facecolor(ax_bg)
 
-    y  = arr[sl]
-    e4 = ema4[sl]
-    e8 = ema8[sl]
-    e20= ema20[sl]
+    y   = arr[sl]
+    e4  = ema4[sl]
+    e8  = ema8[sl]
+    e20 = ema20[sl]
 
-    ax.fill_between(x, y, alpha=0.18, color=line_c)
-    ax.plot(x, y,   color=line_c,  linewidth=1.8, label="Nivel", zorder=4)
-    ax.plot(x, e4,  color=ema4_c,  linewidth=1.2, linestyle="--", label="EMA 4",  zorder=3)
-    ax.plot(x, e8,  color=ema8_c,  linewidth=1.2, linestyle="--", label="EMA 8",  zorder=3)
-    ax.plot(x, e20, color=ema20_c, linewidth=1.5, label="EMA 20", zorder=3)
+    # ── Main level line (thin) ────────────────────────────────────────────────
+    ax.fill_between(x, y, alpha=0.10, color=line_c)
+    ax.plot(x, y,   color=line_c,  linewidth=0.8, zorder=3)
+    ax.plot(x, e4,  color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4",  zorder=4)
+    ax.plot(x, e8,  color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8",  zorder=4)
+    ax.plot(x, e20, color=ema20_c, linewidth=1.0, label="EMA 20", zorder=4)
 
-    # Mark last point
-    if len(y) > 0:
-        ax.scatter([x[-1]], [y[-1]], color=line_c, s=55, zorder=5, edgecolors="white", linewidths=0.8)
+    # ── Coloured dots for each spin ───────────────────────────────────────────
+    dot_colors = {
+        "ROJO":  "#e84040",
+        "NEGRO": "#aaaacc",
+        "VERDE": "#2ecc71",
+    }
+    for i, spin in enumerate(hist_sl):
+        c = dot_colors.get(spin["real"], "#ffffff")
+        ax.scatter(i, y[i], color=c, s=22, zorder=5,
+                   edgecolors="white", linewidths=0.3)
 
-    # X-axis labels = roulette numbers
+    # ── X-axis: roulette numbers ──────────────────────────────────────────────
     tick_step = max(1, len(x) // 8)
-    tick_x    = x[::tick_step]
-    tick_lbs  = [str(nums[i]) if i < len(nums) else "" for i in range(0, len(x), tick_step)]
+    tick_x    = list(range(0, len(x), tick_step))
+    tick_lbs  = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
     ax.set_xticks(tick_x)
     ax.set_xticklabels(tick_lbs, color="#8899bb", fontsize=7)
     ax.tick_params(axis='y', colors="#8899bb", labelsize=7)
@@ -388,16 +395,27 @@ def generate_chart(
     ax.spines['left'].set_color(grid_c)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.grid(axis='y', color=grid_c, linewidth=0.5, alpha=0.6)
+    ax.grid(axis='y', color=grid_c, linewidth=0.4, alpha=0.5)
 
     emoji = "🔴" if is_rojo else "⚫️"
-    color_name = "ROJO" if is_rojo else "NEGRO"
-    ax.set_title(f"{emoji} Señal {color_name} — últimos {visible} giros · EMA 4/8/20",
+    ax.set_title(f"{emoji} Señal {'ROJO' if is_rojo else 'NEGRO'} — últimos {visible} giros · EMA 4/8/20",
                  color=title_c, fontsize=9, pad=6)
 
-    legend = ax.legend(loc="upper left", fontsize=7,
-                       facecolor="#0b101f", edgecolor=grid_c,
-                       labelcolor="white", framealpha=0.8)
+    # Custom legend with colour patches for dots
+    from matplotlib.lines  import Line2D
+    from matplotlib.patches import Patch
+    legend_els = [
+        Line2D([0],[0], color=line_c,  linewidth=0.8, label="Nivel"),
+        Line2D([0],[0], color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4"),
+        Line2D([0],[0], color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8"),
+        Line2D([0],[0], color=ema20_c, linewidth=1.0, label="EMA 20"),
+        Line2D([0],[0], marker='o', color='w', markerfacecolor='#e84040', markersize=5, label="Rojo"),
+        Line2D([0],[0], marker='o', color='w', markerfacecolor='#aaaacc', markersize=5, label="Negro"),
+        Line2D([0],[0], marker='o', color='w', markerfacecolor='#2ecc71', markersize=5, label="Verde"),
+    ]
+    ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
+              facecolor="#0b101f", edgecolor=grid_c,
+              labelcolor="white", framealpha=0.8, ncol=2)
 
     plt.tight_layout(pad=0.8)
     buf = io.BytesIO()
@@ -557,7 +575,7 @@ class RouletteEngine:
     def should_activate(self) -> Optional[str]:
         if time.time() < self.loss_block_until:
             return None
-        losses   = self.consec_losses
+        losses   = self.consec_losses          # 0–9
         min_spin = 22 + losses * 2
         if len(self.spin_history) < min_spin:
             return None
@@ -575,7 +593,8 @@ class RouletteEngine:
         ema8i  = self.calculate_ema(self.inverted_levels, 8)
         ema20i = self.calculate_ema(self.inverted_levels, 20)
 
-        req = min(3 + losses, 6)
+        # Required consecutive spins above EMA: grows +1 per loss level (max 13)
+        req = min(3 + losses, 13)
         li  = len(self.original_levels) - 1
 
         def check(levels, e20, e8, e4, idx):
@@ -583,11 +602,14 @@ class RouletteEngine:
                 i = idx - (req - 1) + off
                 if i < 0:
                     return False
+                # Level 0+: must be above EMA20
                 if e20[i] is None or levels[i] <= e20[i]:
                     return False
+                # Level 2+: must also be above EMA8
                 if losses >= 2 and e8[i] is not None and levels[i] <= e8[i]:
                     return False
-                if losses >= 3 and e4[i] is not None and levels[i] <= e4[i]:
+                # Level 4+: must also be above EMA4
+                if losses >= 4 and e4[i] is not None and levels[i] <= e4[i]:
                     return False
             return True
 
@@ -646,9 +668,15 @@ class RouletteEngine:
                 bet = self.lab.loss()
 
                 if self.attempts_left <= 0:
-                    # Final loss
-                    self.consec_losses = min(self.consec_losses + 1, 4)
-                    self.loss_block_until = time.time() + min(8000 * self.consec_losses / 1000, 30)
+                    # Final loss — increase restriction level
+                    self.consec_losses += 1
+                    if self.consec_losses >= 10:
+                        # Max 10 levels → reset restrictions, keep bankroll
+                        self.consec_losses    = 0
+                        self.loss_block_until = 0.0
+                        logger.info(f"[{self.name}] Max 10 losses → restrictions reset, bankroll kept at {self.lab.bankroll:.2f}")
+                    else:
+                        self.loss_block_until = time.time() + min(3.0 * self.consec_losses, 30)
                     self.stats.record(False, self.lab.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
@@ -691,8 +719,7 @@ class RouletteEngine:
 
         # Generate chart
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-        nums   = [s["number"] for s in self.spin_history]
-        chart  = generate_chart(levels, nums, self.bet_color)
+        chart  = generate_chart(levels, self.spin_history[:], self.bet_color)
 
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
@@ -719,8 +746,7 @@ class RouletteEngine:
         )
 
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-        nums   = [s["number"] for s in self.spin_history]
-        chart  = generate_chart(levels, nums, self.bet_color)
+        chart  = generate_chart(levels, self.spin_history[:], self.bet_color)
 
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
