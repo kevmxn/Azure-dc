@@ -714,7 +714,7 @@ class RouletteEngine:
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
-            f"♻️ <i>Intento 2/{MAX_ATTEMPTS}</i>"
+            f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
         )
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
