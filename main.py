@@ -192,18 +192,21 @@ ROULETTE_CONFIGS = {
         "chat_id": -1003835197023,
         "thread_id": 2,
         "color_data": COLOR_DATA_AUTO,
+        "betting_system": "fibonacci",   # Sistema 2
     },
     "Russian Roulette": {
         "ws_key": 221,
         "chat_id": -1003835197023,
         "thread_id": 7,
         "color_data": COLOR_DATA_RUSSIAN,
+        "betting_system": "fibonacci",   # Sistema 2
     },
     "Azure Roulette 1": {
         "ws_key": 227,
         "chat_id": -1003835197023,
         "thread_id": 6,
         "color_data": COLOR_DATA_AZURE,
+        "betting_system": "labouchere",  # Sistema 4
     },
 }
 
@@ -213,7 +216,6 @@ MAX_ATTEMPTS = 2
 LABOUCHERE_SEQ = [1, 2, 3, 2, 1]
 BASE_BET  = 0.10   # USD
 VISIBLE   = 40     # last N spins for chart
-
 
 # ─── LABOUCHÈRE ───────────────────────────────────────────────────────────────
 class Labouchere:
@@ -251,6 +253,38 @@ class Labouchere:
         return bet
 
 
+# ─── FIBONACCI ────────────────────────────────────────────────────────────────
+_FIB_SEQ = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+_FIB_MAX = len(_FIB_SEQ) - 1
+
+class Fibonacci:
+    def __init__(self, base: float):
+        self.base     = base
+        self.step     = 0
+        self.bankroll = 0.0
+
+    def current_bet(self) -> float:
+        return round(_FIB_SEQ[self.step] * self.base, 2)
+
+    def win(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll + bet, 2)
+        if self.step <= 1:
+            self.step = 0
+        else:
+            self.step = max(0, self.step - 2)
+        return bet
+
+    def loss(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll - bet, 2)
+        if self.step >= _FIB_MAX:
+            self.step = 0
+        else:
+            self.step += 1
+        return bet
+
+
 # ─── STATISTICS ───────────────────────────────────────────────────────────────
 class Stats:
     """Tracks wins/losses in two windows: all-time batches of 20, and 24hr."""
@@ -262,6 +296,9 @@ class Stats:
 
         # 24hr ring buffer: each entry = (timestamp, is_win, bankroll_at_time)
         self._h24: deque = deque()
+
+        # Batch bankroll tracking
+        self.batch_start_bankroll = None   # bankroll at start of current batch
 
     def record(self, is_win: bool, bankroll: float):
         self.total += 1
@@ -281,33 +318,43 @@ class Stats:
     def should_send_stats(self) -> bool:
         return (self.total - self.last_stats_at) >= 20
 
-    def mark_stats_sent(self):
+    def mark_stats_sent(self, bankroll: float):
+        """Call this when sending stats (resets batch counters)."""
         self.last_stats_at = self.total
-
-    def batch_stats(self):
-        """Stats for the last 20 signals (since last batch)."""
-        n = self.total - self.last_stats_at
-        w = self.wins_since_last = self._wins_in_last_n(n)
-        t = n
-        l = t - w
-        e = round(w / t * 100, 1) if t else 0.0
-        return w, l, t, e
-
-    def _wins_in_last_n(self, n):
-        # We don't store per-signal history for batch, approximate from total
-        return self.wins - getattr(self, '_wins_at_last_batch', 0)
-
-    def reset_batch_counters(self):
+        self.batch_start_bankroll = bankroll
         self._wins_at_last_batch = self.wins
 
-    def stats_24h(self, bankroll: float):
+    def batch_stats(self, current_bankroll: float):
+        """Stats for the last 20 signals (since last batch)."""
+        n = self.total - self.last_stats_at
+        w = self.wins - getattr(self, '_wins_at_last_batch', 0)
+        l = n - w
+        e = round(w / n * 100, 1) if n else 0.0
+        # Bankroll accumulated in this batch (net result)
+        if self.batch_start_bankroll is not None:
+            batch_bankroll = round(current_bankroll - self.batch_start_bankroll, 2)
+        else:
+            batch_bankroll = 0.0
+        return w, l, n, e, batch_bankroll
+
+    def stats_24h(self, current_bankroll: float):
         self._trim24()
         t = len(self._h24)
         w = sum(1 for _, iw, _ in self._h24 if iw)
         l = t - w
         e = round(w / t * 100, 1) if t else 0.0
-        # bankroll accumulated in last 24h
-        bk24 = bankroll  # we use total bankroll as approximation
+        # Bankroll accumulated in last 24h = last bankroll - first bankroll in window
+        if t >= 2:
+            first_bankroll = self._h24[0][2]
+            last_bankroll  = self._h24[-1][2]
+            bk24 = round(last_bankroll - first_bankroll, 2)
+        elif t == 1:
+            # Only one signal: bankroll change is that signal's delta
+            # We don't have prior bankroll, assume change is 0? Actually we can approximate
+            # But to be safe, use current - previous? Not possible. Set 0.
+            bk24 = 0.0
+        else:
+            bk24 = 0.0
         return w, l, t, e, bk24
 
 
@@ -510,8 +557,12 @@ class RouletteEngine:
         self.consec_losses:    int   = 0
         self.loss_block_until: float = 0.0
 
-        # Labouchère
-        self.lab = Labouchere(LABOUCHERE_SEQ, BASE_BET)
+        # Betting system — Fibonacci (Sistema 2) or Labouchère (Sistema 4)
+        self.betting_system_name = cfg.get("betting_system", "labouchere")
+        if self.betting_system_name == "fibonacci":
+            self.bet_sys = Fibonacci(BASE_BET)
+        else:
+            self.bet_sys = Labouchere(LABOUCHERE_SEQ, BASE_BET)
 
         # Stats
         self.stats = Stats()
@@ -656,8 +707,8 @@ class RouletteEngine:
             attempt_no = self.total_attempts - self.attempts_left + 1
 
             if is_win:
-                bet = self.lab.win()
-                self.stats.record(True, self.lab.bankroll)
+                bet = self.bet_sys.win()
+                self.stats.record(True, self.bet_sys.bankroll)
                 self.signal_active  = False
                 self.consec_losses  = 0
                 self.loss_block_until = 0.0
@@ -665,7 +716,7 @@ class RouletteEngine:
                 self._check_stats()
             else:
                 self.attempts_left -= 1
-                bet = self.lab.loss()
+                bet = self.bet_sys.loss()
 
                 if self.attempts_left <= 0:
                     # Final loss — increase restriction level
@@ -674,17 +725,17 @@ class RouletteEngine:
                         # Max 10 levels → reset restrictions, keep bankroll
                         self.consec_losses    = 0
                         self.loss_block_until = 0.0
-                        logger.info(f"[{self.name}] Max 10 losses → restrictions reset, bankroll kept at {self.lab.bankroll:.2f}")
+                        logger.info(f"[{self.name}] Max 10 losses → restrictions reset, bankroll kept at {self.bet_sys.bankroll:.2f}")
                     else:
                         self.loss_block_until = time.time() + min(3.0 * self.consec_losses, 30)
-                    self.stats.record(False, self.lab.bankroll)
+                    self.stats.record(False, self.bet_sys.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
                     self._check_stats()
                 else:
                     # Intento 2: delete old message, send new signal
                     self.trigger_number = number
-                    new_bet = self.lab.current_bet()
+                    new_bet = self.bet_sys.current_bet()
                     self._send_retry_signal(number, new_bet)
 
         # ── Activate new signal ───────────────────────────────────────────────
@@ -701,11 +752,16 @@ class RouletteEngine:
 
     # ── Telegram: send initial signal ─────────────────────────────────────────
     def _send_signal(self, trigger: int, attempt: int):
-        bet    = self.lab.current_bet()
-        entry  = self.get_entry(trigger)
-        prob   = int(self.get_prob(trigger, self.bet_color) * 100)
+        bet        = self.bet_sys.current_bet()
+        prob       = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
-        color_name = self.bet_color.capitalize()
+
+        # Extra info line depending on system
+        if self.betting_system_name == "fibonacci":
+            step = self.bet_sys.step + 1
+            sys_line = f"🌀 <i>Fibonacci paso {step}/12 · ×{_FIB_SEQ[self.bet_sys.step]}</i>\n"
+        else:
+            sys_line = f"🔢 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
 
         caption = (
             f"✅ <b>SEÑAL CONFIRMADA</b> ✅\n\n"
@@ -713,17 +769,17 @@ class RouletteEngine:
             f"👉 <b>Ingresar después del: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
-            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
+            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
+            f"{sys_line}"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>"
         )
 
-        # Generate chart
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart  = generate_chart(levels, self.spin_history[:], self.bet_color)
 
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         self.signal_msg_id = msg_id
-        logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}")
+        logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, sys={self.betting_system_name}")
 
     # ── Telegram: send retry signal (attempt 2) ───────────────────────────────
     def _send_retry_signal(self, trigger: int, new_bet: float):
@@ -735,13 +791,20 @@ class RouletteEngine:
         prob       = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
 
+        if self.betting_system_name == "fibonacci":
+            step = self.bet_sys.step + 1
+            sys_line = f"🌀 <i>Fibonacci paso {step}/12 · ×{_FIB_SEQ[self.bet_sys.step]}</i>\n"
+        else:
+            sys_line = f"🔢 <i>Labouchère [{','.join(str(v) for v in self.bet_sys.seq)}]</i>\n"
+
         caption = (
             f"✅ <b>SEÑAL CONFIRMADA</b> ✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Ingresar después del: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
-            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
+            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n"
+            f"{sys_line}"
             f"♻️ <i>Intento 2/{MAX_ATTEMPTS}</i>"
         )
 
@@ -754,7 +817,7 @@ class RouletteEngine:
 
     # ── Telegram: send result ─────────────────────────────────────────────────
     def _send_result(self, number: int, real: str, won: bool, bet: float):
-        bankroll = self.lab.bankroll
+        bankroll = self.bet_sys.bankroll
         if won:
             icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
             text = (
@@ -776,21 +839,20 @@ class RouletteEngine:
     def _check_stats(self):
         if not self.stats.should_send_stats():
             return
-        w20, l20, t20, e20 = self.stats.batch_stats()
-        self.stats.reset_batch_counters()
-        self.stats.mark_stats_sent()
-        bk = self.lab.bankroll
-        w24, l24, t24, e24, _ = self.stats.stats_24h(bk)
+        current_bankroll = self.bet_sys.bankroll
+        w20, l20, t20, e20, batch_bankroll = self.stats.batch_stats(current_bankroll)
+        self.stats.mark_stats_sent(current_bankroll)
+        w24, l24, t24, e24, bk24 = self.stats.stats_24h(current_bankroll)
 
         text = (
             f"👉🏼 <b>ESTADÍSTICAS {t20} SEÑALES</b>\n"
             f"🈯️ <b>W: {w20}</b> 🈲 <b>L: {l20}</b> 🈺 <b>T: {t20}</b> "
             f"📈 <b>E: {e20}%</b>\n"
-            f"💰 <i>Bankroll acumulado: {bk:.2f} usd</i>\n\n"
+            f"💰 <i>Bankroll acumulado en estas 20 señales: {batch_bankroll:.2f} usd</i>\n\n"
             f"👉🏼 <b>ESTADÍSTICAS 24 HORAS</b>\n"
             f"🈯️ <b>W: {w24}</b> 🈲 <b>L: {l24}</b> 🈺 <b>T: {t24}</b> "
             f"📈 <b>E: {e24}%</b>\n"
-            f"💰 <i>Bankroll acumulado: {bk:.2f} usd</i>"
+            f"💰 <i>Bankroll acumulado últimas 24h: {bk24:.2f} usd</i>"
         )
         tg_send_text(self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] Stats sent: {t20} signals")
