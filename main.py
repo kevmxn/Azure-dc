@@ -458,8 +458,12 @@ class RouletteEngine:
         self.result_until:     float = 0.0
         self.consec_losses:    int = 0          # Nivel de pérdidas (0..9)
         # Nuevas variables para la recuperación +1 ficha
-        self.recovery_active:  bool = False
+        self.recovery_active:  bool  = False
         self.recovery_target:  float = 0.0
+        # Bankroll al inicio de cada señal de nivel 1
+        self.level1_bankroll:  float = 0.0
+        # ¿La señal activa fue disparada en nivel 1?
+        self.signal_is_level1: bool  = False
 
         self.betting_system_name = cfg.get("betting_system", "dalembert")
         self.bet_sys = D_Alembert(BASE_BET)
@@ -559,12 +563,19 @@ class RouletteEngine:
         return None
 
     def _check_recovery(self):
-        """Verifica si se ha alcanzado el objetivo de recuperación y resetea el nivel."""
-        if self.recovery_active and self.bet_sys.bankroll >= self.recovery_target:
-            logger.info(f"[{self.name}] Recuperación completada! Bankroll {self.bet_sys.bankroll:.2f} >= objetivo {self.recovery_target:.2f}. Reseteando nivel.")
-            self.consec_losses = 0
-            self.recovery_active = False
-            self.recovery_target = 0.0
+        """Verifica si se alcanzó recovery_target y resetea a nivel 1."""
+        if not self.recovery_active:
+            return
+        if self.bet_sys.bankroll >= self.recovery_target:
+            logger.info(
+                f"[{self.name}] Recuperación completada! "
+                f"bankroll={self.bet_sys.bankroll:.2f} >= objetivo={self.recovery_target:.2f}. "
+                f"Reseteando a nivel 1."
+            )
+            self.consec_losses    = 0
+            self.recovery_active  = False
+            self.recovery_target  = 0.0
+            self.bet_sys.step     = 0   # vuelve al nivel 1 de D'Alembert
 
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
@@ -617,10 +628,21 @@ class RouletteEngine:
                         self.recovery_target = 0.0
                         logger.info(f"[{self.name}] Max 10 losses → nivel reiniciado, bankroll {self.bet_sys.bankroll:.2f}")
                     else:
-                        # Activar modo recuperación con objetivo +1 ficha
-                        self.recovery_active = True
-                        self.recovery_target = self.bet_sys.bankroll + BASE_BET
-                        logger.info(f"[{self.name}] Pérdida nivel {self.consec_losses}. Modo recuperación activado. Objetivo: {self.recovery_target:.2f}")
+                        # Activar modo recuperación
+                        # target = bankroll registrado en nivel 1 + 1 ficha positiva
+                        self.recovery_active  = True
+                        if self.signal_is_level1:
+                            self.recovery_target = self.level1_bankroll + BASE_BET
+                        else:
+                            # Si la señal no era nivel 1 pero hubo pérdida,
+                            # usar el último level1_bankroll conocido + 1 ficha
+                            self.recovery_target = self.level1_bankroll + BASE_BET
+                        logger.info(
+                            f"[{self.name}] Pérdida nivel {self.consec_losses}. "
+                            f"Modo recuperación activado. "
+                            f"level1_bankroll={self.level1_bankroll:.2f} "
+                            f"objetivo={self.recovery_target:.2f}"
+                        )
                     self.stats.record(False, self.bet_sys.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
@@ -649,12 +671,19 @@ class RouletteEngine:
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-        recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
+
+        # Registrar bankroll cuando se activa en nivel 1 (step 0, sin recuperación)
+        self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
+        if self.signal_is_level1:
+            self.level1_bankroll = self.bet_sys.bankroll
+            logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
+
+        recovery_tag = " 🔄" if self.recovery_active else ""
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20{recovery_tag}</i>\n"
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
-            f"👉 <b>Ingresar después del: {trigger}</b>\n"
+            f"👉 <b>Después de: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
@@ -680,7 +709,7 @@ class RouletteEngine:
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
-            f"👉 <b>Ingresar después del: {trigger}</b>\n"
+            f"👉🏼 <b>Después de: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
@@ -697,7 +726,7 @@ class RouletteEngine:
         bankroll = self.bet_sys.bankroll
         icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
         if won:
-            text = f"✅ <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
+            text = f"💎 <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
         else:
             text = f"❌ <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
         self.result_until = time.time() + 7.0
@@ -715,11 +744,11 @@ class RouletteEngine:
             f"👉🏼 <b>ESTADÍSTICAS {t20} SEÑALES</b>\n"
             f"🈯️ <b>W: {w20}</b> 🈲 <b>L: {l20}</b> 🈺 <b>T: {t20}</b> "
             f"📈 <b>E: {e20}%</b>\n"
-            f"💰 <i>Bankroll acumulado en estas 20 señales: {batch_bankroll:.2f} usd</i>\n\n"
+            f"💰 <i>Bankroll acumulado: {batch_bankroll:.2f} usd</i>\n\n"
             f"👉🏼 <b>ESTADÍSTICAS 24 HORAS</b>\n"
             f"🈯️ <b>W: {w24}</b> 🈲 <b>L: {l24}</b> 🈺 <b>T: {t24}</b> "
             f"📈 <b>E: {e24}%</b>\n"
-            f"💰 <i>Bankroll acumulado últimas 24h: {bk24:.2f} usd</i>"
+            f"💰 <i>Bankroll acumulado: {bk24:.2f} usd</i>"
         )
         tg_send_text(self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] Stats sent: {t20} signals")
