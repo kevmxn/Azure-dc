@@ -191,13 +191,22 @@ ROULETTE_CONFIGS = {
         "thread_id": 2,
         "color_data": COLOR_DATA_AUTO,
         "betting_system": "dalembert",
+        "min_prob_threshold": 0.48,  # Umbral mínimo de probabilidad
+        "min_consecutive": 2,         # Mínimo colores consecutivos para señal
+        "min_spins_between_signals": 5,  # Spins mínimos entre señales
+        "require_ema_confirm": True,  # Requiere confirmación EMA
     },
     "Russian Roulette": {
         "ws_key": 221,
         "chat_id": -1003835197023,
         "thread_id": 7,
         "color_data": COLOR_DATA_RUSSIAN,
-        "betting_system": "dalembert",
+        "betting_system": "oscars_grind",  # MEJOR para efectividad 75%
+        "min_prob_threshold": 0.52,  # UMBRAL ALTO - solo señales fuertes
+        "min_consecutive": 3,         # STRICT: 3 colores consecutivos mínimo
+        "min_spins_between_signals": 8,  # Más tiempo entre señales
+        "require_ema_confirm": True,  # Siempre requiere confirmación EMA
+        "require_momentum": True,     # Requiere momentum de 3+
     },
     "Azure Roulette 1": {
         "ws_key": 227,
@@ -205,6 +214,10 @@ ROULETTE_CONFIGS = {
         "thread_id": 6,
         "color_data": COLOR_DATA_AZURE,
         "betting_system": "dalembert",
+        "min_prob_threshold": 0.48,
+        "min_consecutive": 2,
+        "min_spins_between_signals": 5,
+        "require_ema_confirm": True,
     },
 }
 
@@ -240,6 +253,134 @@ class D_Alembert:
         else:
             self.step += 1
         return bet
+
+
+# ─── PAROLI (SISTEMA 5) - Mejor para efectividad 75-80% ───────────────────────
+class Paroli:
+    """
+    Sistema Paroli: progresión positiva.
+    - Triplica tras ganancia
+    - Resetea tras pérdida o tras 3 ganancias consecutivas
+    - Ideal para efectividad 70-85% donde hay rachas
+    """
+    def __init__(self, base: float):
+        self.base = base
+        self.step = 0      # 0=base, 1=2x, 2=3x (máximo)
+        self.bankroll = 0.0
+        self.consecutive_wins = 0
+        self.max_consecutive = 3
+
+    def current_bet(self) -> float:
+        multiplier = [1, 2, 3][min(self.step, 2)]
+        return round(self.base * multiplier, 2)
+
+    def win(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll + bet, 2)
+        self.consecutive_wins += 1
+        if self.consecutive_wins >= self.max_consecutive:
+            self.step = 0
+            self.consecutive_wins = 0
+        else:
+            self.step = min(self.step + 1, 2)
+        return bet
+
+    def loss(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll - bet, 2)
+        self.step = 0
+        self.consecutive_wins = 0
+        return bet
+
+
+# ─── OSCAR'S GRIND (SISTEMA 6) - Optimizado para efectividad 75% ─────────────
+class OscarsGrind:
+    """
+    Oscar's Grind: diseñado para efectividad ~75%.
+    - Aumenta 1 unidad tras ganancia SI aún no ganó el objetivo del ciclo
+    - Nunca aumenta tras pérdida
+    - Objetivo: ganar 1 unidad por ciclo
+    - Máximo 4 unidades apostadas
+    """
+    def __init__(self, base: float):
+        self.base = base
+        self.step = 0      # 0=1u, 1=2u, 2=3u, 3=4u (máximo)
+        self.bankroll = 0.0
+        self.cycle_profit = 0.0
+        self.cycle_goal = base  # Ganar 1 unidad por ciclo
+        self.max_step = 4
+
+    def current_bet(self) -> float:
+        return round(self.base * (self.step + 1), 2)
+
+    def win(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll + bet, 2)
+        self.cycle_profit += bet
+
+        # Si alcanzamos el objetivo del ciclo, reseteamos
+        if self.cycle_profit >= self.cycle_goal:
+            self.step = 0
+            self.cycle_profit = 0.0
+        else:
+            # Aumentamos solo si no superamos el objetivo y no estamos en máximo
+            if self.step < self.max_step - 1:
+                self.step += 1
+        return bet
+
+    def loss(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll - bet, 2)
+        self.cycle_profit -= bet
+        # NO aumentamos la apuesta tras pérdida
+        # Si bajamos del objetivo, reseteamos ciclo
+        if self.cycle_profit < -self.cycle_goal:
+            self.step = 0
+            self.cycle_profit = 0.0
+        return bet
+
+
+# ─── FIBONACCI (SISTEMA 2) ────────────────────────────────────────────────────
+class Fibonacci:
+    """
+    Fibonacci: 1, 1, 2, 3, 5, 8, 13, 21...
+    - Avanza tras pérdida
+    - Retrocede 2 pasos tras ganancia
+    - Menos agresivo que Martingale
+    """
+    def __init__(self, base: float):
+        self.base = base
+        self.step = 0
+        self.bankroll = 0.0
+        self.fib_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34]
+
+    def current_bet(self) -> float:
+        idx = min(self.step, len(self.fib_sequence) - 1)
+        return round(self.base * self.fib_sequence[idx], 2)
+
+    def win(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll + bet, 2)
+        self.step = max(0, self.step - 2)
+        return bet
+
+    def loss(self) -> float:
+        bet = self.current_bet()
+        self.bankroll = round(self.bankroll - bet, 2)
+        if self.step < len(self.fib_sequence) - 1:
+            self.step += 1
+        return bet
+
+
+# ─── FACTORY: Crear sistema según nombre ─────────────────────────────────────
+def create_betting_system(name: str, base: float):
+    systems = {
+        "dalembert": D_Alembert,
+        "paroli": Paroli,
+        "oscars_grind": OscarsGrind,
+        "fibonacci": Fibonacci,
+    }
+    return systems.get(name, D_Alembert)(base)
 
 
 # ─── SISTEMA AMX V20 ──────────────────────────────────────────────────────────
@@ -606,7 +747,7 @@ class RouletteEngine:
         self.signal_is_level1: bool  = False
 
         self.betting_system_name = cfg.get("betting_system", "dalembert")
-        self.bet_sys = D_Alembert(BASE_BET)
+        self.bet_sys = create_betting_system(self.betting_system_name, BASE_BET)
 
         self.stats = Stats()
         # CORRECCIÓN: Cambiar a lista para rastrear todos los message_ids de la señal actual
@@ -618,6 +759,12 @@ class RouletteEngine:
         self.amx_system = AMXSignalSystem(mode="moderado")
         self.amx_positions: list = [0]  # Posiciones para AMX
         self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
+        # NUEVOS FILTROS PARA RUSSIAN ROULETTE
+        self.min_consecutive = cfg.get("min_consecutive", 2)  # Colores consecutivos mínimos
+        self.min_spins_between_signals = cfg.get("min_spins_between_signals", 5)  # Spins entre señales
+        self.require_ema_confirm = cfg.get("require_ema_confirm", True)
+        self.require_momentum = cfg.get("require_momentum", False)
+        self.last_signal_spin_count = 0  # Para rastrear spins entre señales
 
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
         """Cambia el modo AMX V20"""
@@ -885,6 +1032,7 @@ class RouletteEngine:
                 self.attempts_left = MAX_ATTEMPTS
                 self.total_attempts = MAX_ATTEMPTS
                 self.trigger_number = signal["trigger_number"]
+                self.last_signal_spin_count = len(self.spin_history)  # Registrar spin de señal
                 self._send_signal(signal["trigger_number"], 1, amx_signal=signal)
             else:
                 expected = self.should_activate()
@@ -895,10 +1043,11 @@ class RouletteEngine:
                     self.attempts_left = MAX_ATTEMPTS
                     self.total_attempts = MAX_ATTEMPTS
                     self.trigger_number = number
+                    self.last_signal_spin_count = len(self.spin_history)  # Registrar spin de señal
                     self._send_signal(number, 1)
 
     def _detect_amx_signal(self) -> Optional[dict]:
-        """Detecta señal usando sistema AMX V20"""
+        """Detecta señal usando sistema AMX V20 con filtros estrictos"""
         if len(self.amx_positions) < 20:
             return None
 
@@ -909,8 +1058,8 @@ class RouletteEngine:
 
         expected_color = entry["senal"]
 
-        # Verificar momentum consecutivo (2 del mismo color)
-        recent_colors = [s["real"] for s in self.spin_history[-5:]]
+        # ─── FILTRO 1: Verificar colores consecutivos mínimos ───────────────────
+        recent_colors = [s["real"] for s in self.spin_history[-8:]]  # Más histórico
         momentum_count = 0
         for c in reversed(recent_colors):
             if c == expected_color:
@@ -918,8 +1067,34 @@ class RouletteEngine:
             elif c != "VERDE":
                 break
 
-        if momentum_count < 2:
+        if momentum_count < self.min_consecutive:
+            logger.debug(f"[{self.name}] Filtrado: momentum {momentum_count} < {self.min_consecutive}")
             return None
+
+        # ─── FILTRO 2: Verificar spins entre señales ────────────────────────────
+        spins_since_last_signal = len(self.spin_history) - self.last_signal_spin_count
+        if spins_since_last_signal < self.min_spins_between_signals:
+            logger.debug(f"[{self.name}] Filtrado: spins {spins_since_last_signal} < {self.min_spins_between_signals}")
+            return None
+
+        # ─── FILTRO 3: Verificar probabilidad mínima ────────────────────────────
+        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
+        if prob < self.min_prob_threshold:
+            logger.debug(f"[{self.name}] Filtrado: prob {prob} < {self.min_prob_threshold}")
+            return None
+
+        # ─── FILTRO 4: Requiere momentum extendido (Russian Roulette) ───────────
+        if self.require_momentum and momentum_count < 3:
+            logger.debug(f"[{self.name}] Filtrado: momentum extendido {momentum_count} < 3")
+            return None
+
+        # ─── FILTRO 5: Confirmación EMA si se requiere ────────────────────────
+        if self.require_ema_confirm:
+            # Verificar que EMA20 está por debajo del precio actual
+            ema20 = self.calculate_ema(self.amx_positions, 20)
+            if ema20 and ema20[-1] is not None and self.amx_positions[-1] <= ema20[-1]:
+                logger.debug(f"[{self.name}] Filtrado: EMA20 no confirma tendencia")
+                return None
 
         # Detectar según modo
         try:
@@ -951,7 +1126,15 @@ class RouletteEngine:
             self.level1_bankroll = self.bet_sys.bankroll
             logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
+        # Nombre del sistema de apuestas
+        system_names = {
+            "dalembert": f"D'Alembert paso {step} de 20",
+            "paroli": f"Paroli paso {step} de 3 (x{self.bet_sys.consecutive_wins + 1})",
+            "oscars_grind": f"Oscar's Grind ciclo {step} de 4",
+            "fibonacci": f"Fibonacci paso {step}",
+        }
+        sys_name = system_names.get(self.betting_system_name, f"Sistema paso {step}")
+        sys_line = f"🌀 <i>{sys_name}</i>\n"
 
         amx_line = ""
         if amx_signal:
@@ -983,7 +1166,14 @@ class RouletteEngine:
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
+        system_names = {
+            "dalembert": f"D'Alembert paso {step} de 20",
+            "paroli": f"Paroli paso {step} de 3 (x{getattr(self.bet_sys, 'consecutive_wins', 0) + 1})",
+            "oscars_grind": f"Oscar's Grind ciclo {step} de 4",
+            "fibonacci": f"Fibonacci paso {step}",
+        }
+        sys_name = system_names.get(self.betting_system_name, f"Sistema paso {step}")
+        sys_line = f"🌀 <i>{sys_name}</i>\n"
         recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
@@ -1226,3 +1416,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped.")
+
