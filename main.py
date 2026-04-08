@@ -1126,14 +1126,17 @@ class RouletteEngine:
             self.level1_bankroll = self.bet_sys.bankroll
             logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
-        # Nombre del sistema de apuestas
-        system_names = {
-            "dalembert": f"D'Alembert paso {step} de 20",
-            "paroli": f"Paroli paso {step} de 3 (x{self.bet_sys.consecutive_wins + 1})",
-            "oscars_grind": f"Oscar's Grind ciclo {step} de 4",
-            "fibonacci": f"Fibonacci paso {step}",
-        }
-        sys_name = system_names.get(self.betting_system_name, f"Sistema paso {step}")
+        # CORRECCIÓN: Generar sys_name de forma segura según el sistema activo
+        if self.betting_system_name == "paroli":
+            sys_name = f"Paroli paso {step} de 3 (x{self.bet_sys.consecutive_wins + 1})"
+        elif self.betting_system_name == "dalembert":
+            sys_name = f"D'Alembert paso {step} de 20"
+        elif self.betting_system_name == "oscars_grind":
+            sys_name = f"Oscar's Grind ciclo {step} de 4"
+        elif self.betting_system_name == "fibonacci":
+            sys_name = f"Fibonacci paso {step}"
+        else:
+            sys_name = f"Sistema paso {step}"
         sys_line = f"🌀 <i>{sys_name}</i>\n"
 
         amx_line = ""
@@ -1166,13 +1169,18 @@ class RouletteEngine:
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        system_names = {
-            "dalembert": f"D'Alembert paso {step} de 20",
-            "paroli": f"Paroli paso {step} de 3 (x{getattr(self.bet_sys, 'consecutive_wins', 0) + 1})",
-            "oscars_grind": f"Oscar's Grind ciclo {step} de 4",
-            "fibonacci": f"Fibonacci paso {step}",
-        }
-        sys_name = system_names.get(self.betting_system_name, f"Sistema paso {step}")
+
+        # CORRECCIÓN: Generar sys_name de forma segura según el sistema activo
+        if self.betting_system_name == "paroli":
+            sys_name = f"Paroli paso {step} de 3 (x{self.bet_sys.consecutive_wins + 1})"
+        elif self.betting_system_name == "dalembert":
+            sys_name = f"D'Alembert paso {step} de 20"
+        elif self.betting_system_name == "oscars_grind":
+            sys_name = f"Oscar's Grind ciclo {step} de 4"
+        elif self.betting_system_name == "fibonacci":
+            sys_name = f"Fibonacci paso {step}"
+        else:
+            sys_name = f"Sistema paso {step}"
         sys_line = f"🌀 <i>{sys_name}</i>\n"
         recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
         caption = (
