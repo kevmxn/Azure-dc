@@ -64,7 +64,7 @@ REAL_COLOR_MAP = {
 }
 
 COLOR_DATA_AZURE = [
-    {"id":0,"rojo":0.52,"negro":0.44,"senal":"NO APOSTAR"},
+    {"id":0,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
     {"id":1,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
     {"id":2,"rojo":0.60,"negro":0.40,"senal":"ROJO"},
     {"id":3,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
@@ -111,7 +111,7 @@ ROULETTE_CONFIGS = {
         "thread_id": 6,
         "color_data": COLOR_DATA_AZURE,
         "betting_system": "dalembert",
-        "min_prob_threshold": 0.49,   # umbral mínimo de probabilidad para emitir señal
+        "min_prob_threshold": 0.49,   # Umbral mínimo de probabilidad (ajustado)
     },
 }
 
@@ -538,7 +538,7 @@ class RouletteEngine:
         self.running = True
 
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.49)
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
 
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
         self.amx_system = AMXSignalSystem(mode=mode)
@@ -845,6 +845,7 @@ class RouletteEngine:
 
         sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
 
+        # Inicializar amx_line como cadena vacía por defecto (corregido)
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
@@ -883,7 +884,6 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
-            f"{amx_line}"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
         )
