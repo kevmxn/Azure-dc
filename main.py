@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Roulette Telegram Signal Bot - Modo Dual (Color AMX V20 / Docenas Tabla+EMA)
+Roulette Telegram Signal Bot - Sistema AMX V20 (Tendencia + Moderado)
+Integra la lógica de detección de señales 2.00x del AMX Genesis 20.0
+con las tablas predefinidas de cada ruleta para filtrado de probabilidad.
+VERSION CORREGIDA - Manejo de mensajes: eliminar intentos 1-2 si pierden, mantener si ganan o intento 3 pierde
 """
 
 import asyncio
@@ -26,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s %(message)s'
 )
-logger = logging.getLogger("RouletteBotDual")
+logger = logging.getLogger("RouletteBotAMX")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
@@ -50,7 +53,7 @@ _session.mount("http://",  _adapter)
 bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
-# ─── ROULETTE COLOR MAPS (solo para mostrar el color real) ────────────────────
+# ─── ROULETTE COLOR MAPS ──────────────────────────────────────────────────────
 REAL_COLOR_MAP = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
     7:"ROJO",8:"NEGRO",9:"ROJO",10:"NEGRO",11:"NEGRO",12:"ROJO",13:"NEGRO",
@@ -60,160 +63,67 @@ REAL_COLOR_MAP = {
     35:"NEGRO",36:"ROJO"
 }
 
+COLOR_DATA_AZURE = [
+    {"id":0,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":1,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
+    {"id":2,"rojo":0.60,"negro":0.40,"senal":"ROJO"},
+    {"id":3,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
+    {"id":4,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
+    {"id":5,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
+    {"id":6,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
+    {"id":7,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":8,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":9,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":10,"rojo":0.48,"negro":0.48,"senal":"NO APOSTAR"},
+    {"id":11,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":12,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
+    {"id":13,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
+    {"id":14,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":15,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
+    {"id":16,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":17,"rojo":0.60,"negro":0.36,"senal":"ROJO"},
+    {"id":18,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
+    {"id":19,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
+    {"id":20,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":21,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
+    {"id":22,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
+    {"id":23,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
+    {"id":24,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":25,"rojo":0.36,"negro":0.60,"senal":"NEGRO"},
+    {"id":26,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
+    {"id":27,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
+    {"id":28,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":29,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":30,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":31,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":32,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
+    {"id":33,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
+    {"id":34,"rojo":0.40,"negro":0.60,"senal":"NEGRO"},
+    {"id":35,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
+    {"id":36,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
+]
+
 # ─── ROULETTE CONFIGS ─────────────────────────────────────────────────────────
 ROULETTE_CONFIGS = {
-    "Auto Roulette": {
-        "ws_key": 225,
-        "chat_id": -1003835197023,
-        "thread_id": 2,
-        "betting_system": "dalembert",
-    },
-    "Russian Roulette": {
-        "ws_key": 221,
-        "chat_id": -1003835197023,
-        "thread_id": 7,
-        "betting_system": "dalembert",
-    },
     "Azure Roulette 1": {
         "ws_key": 227,
         "chat_id": -1003835197023,
         "thread_id": 6,
+        "color_data": COLOR_DATA_AZURE,
         "betting_system": "dalembert",
     },
 }
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 2
-BASE_BET  = 0.10   # USD
+MAX_ATTEMPTS = 3
+BASE_BET  = 0.10
 VISIBLE   = 50
 
-# ─── TABLAS DE DOCENAS (37 elementos por ruleta) ──────────────────────────────
-DOZEN_TABLES = {
-    "Auto Roulette": [
-        {"id": 0, "docena1": 32, "docena2": 44, "docena3": 24, "probability": 76, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 1, "docena1": 36, "docena2": 40, "docena3": 20, "probability": 76, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 2, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 3, "docena1": 32, "docena2": 36, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 4, "docena1": 36, "docena2": 32, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 5, "docena1": 36, "docena2": 32, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 6, "docena1": 28, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 7, "docena1": 40, "docena2": 20, "docena3": 36, "probability": 76, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 8, "docena1": 28, "docena2": 36, "docena3": 32, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 9, "docena1": 44, "docena2": 24, "docena3": 28, "probability": 76, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 10, "docena1": 24, "docena2": 36, "docena3": 36, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 11, "docena1": 32, "docena2": 36, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 12, "docena1": 28, "docena2": 36, "docena3": 32, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 13, "docena1": 36, "docena2": 28, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 14, "docena1": 36, "docena2": 40, "docena3": 20, "probability": 76, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 15, "docena1": 44, "docena2": 32, "docena3": 24, "probability": 76, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 16, "docena1": 36, "docena2": 32, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 17, "docena1": 36, "docena2": 32, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 18, "docena1": 36, "docena2": 32, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 19, "docena1": 36, "docena2": 28, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 20, "docena1": 32, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 21, "docena1": 28, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 22, "docena1": 28, "docena2": 36, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 23, "docena1": 24, "docena2": 36, "docena3": 40, "probability": 76, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 24, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 25, "docena1": 24, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 26, "docena1": 28, "docena2": 36, "docena3": 32, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 27, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 28, "docena1": 36, "docena2": 32, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 29, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 30, "docena1": 28, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 31, "docena1": 40, "docena2": 24, "docena3": 32, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 32, "docena1": 24, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 33, "docena1": 28, "docena2": 36, "docena3": 36, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 34, "docena1": 32, "docena2": 24, "docena3": 36, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 35, "docena1": 32, "docena2": 40, "docena3": 24, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 36, "docena1": 36, "docena2": 36, "docena3": 24, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-    ],
-    "Russian Roulette": [
-        {"id": 0, "docena1": 32, "docena2": 32, "docena3": 32, "probability": 32, "senal": "NO APOSTAR"},
-        {"id": 1, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 2, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 3, "docena1": 24, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 4, "docena1": 32, "docena2": 40, "docena3": 24, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 5, "docena1": 40, "docena2": 24, "docena3": 36, "probability": 76, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 6, "docena1": 32, "docena2": 24, "docena3": 40, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 7, "docena1": 36, "docena2": 24, "docena3": 40, "probability": 76, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 8, "docena1": 32, "docena2": 36, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 9, "docena1": 28, "docena2": 36, "docena3": 32, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 10, "docena1": 40, "docena2": 32, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 11, "docena1": 36, "docena2": 24, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 12, "docena1": 32, "docena2": 28, "docena3": 36, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 13, "docena1": 32, "docena2": 28, "docena3": 36, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 14, "docena1": 16, "docena2": 48, "docena3": 32, "probability": 80, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 15, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 16, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 17, "docena1": 20, "docena2": 44, "docena3": 32, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 18, "docena1": 32, "docena2": 28, "docena3": 36, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 19, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 20, "docena1": 36, "docena2": 36, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 21, "docena1": 24, "docena2": 44, "docena3": 28, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 22, "docena1": 36, "docena2": 36, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 23, "docena1": 24, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 24, "docena1": 44, "docena2": 32, "docena3": 24, "probability": 76, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 25, "docena1": 36, "docena2": 24, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 26, "docena1": 40, "docena2": 28, "docena3": 32, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 27, "docena1": 32, "docena2": 28, "docena3": 36, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 28, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 29, "docena1": 32, "docena2": 24, "docena3": 40, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 30, "docena1": 36, "docena2": 36, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 31, "docena1": 32, "docena2": 36, "docena3": 24, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 32, "docena1": 32, "docena2": 36, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 33, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 34, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 35, "docena1": 36, "docena2": 32, "docena3": 24, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 36, "docena1": 28, "docena2": 36, "docena3": 32, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-    ],
-    "Azure Roulette 1": [
-        {"id": 0, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 1, "docena1": 24, "docena2": 36, "docena3": 40, "probability": 76, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 2, "docena1": 36, "docena2": 36, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 3, "docena1": 32, "docena2": 36, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 4, "docena1": 36, "docena2": 24, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 5, "docena1": 28, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 6, "docena1": 32, "docena2": 32, "docena3": 32, "probability": 32, "senal": "NO APOSTAR"},
-        {"id": 7, "docena1": 36, "docena2": 24, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 8, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 9, "docena1": 24, "docena2": 28, "docena3": 44, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 10, "docena1": 32, "docena2": 40, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 11, "docena1": 40, "docena2": 28, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 12, "docena1": 24, "docena2": 36, "docena3": 40, "probability": 76, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 13, "docena1": 32, "docena2": 36, "docena3": 28, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 14, "docena1": 28, "docena2": 28, "docena3": 40, "probability": 40, "senal": "NO APOSTAR"},
-        {"id": 15, "docena1": 32, "docena2": 36, "docena3": 32, "probability": 32, "senal": "NO APOSTAR"},
-        {"id": 16, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 17, "docena1": 36, "docena2": 36, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 18, "docena1": 24, "docena2": 40, "docena3": 36, "probability": 76, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 19, "docena1": 28, "docena2": 36, "docena3": 32, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 20, "docena1": 40, "docena2": 32, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 21, "docena1": 28, "docena2": 32, "docena3": 36, "probability": 68, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 22, "docena1": 40, "docena2": 40, "docena3": 20, "probability": 80, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 23, "docena1": 32, "docena2": 36, "docena3": 32, "probability": 32, "senal": "NO APOSTAR"},
-        {"id": 24, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 25, "docena1": 32, "docena2": 32, "docena3": 32, "probability": 32, "senal": "NO APOSTAR"},
-        {"id": 26, "docena1": 32, "docena2": 36, "docena3": 32, "probability": 36, "senal": "NO APOSTAR"},
-        {"id": 27, "docena1": 36, "docena2": 24, "docena3": 36, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 28, "docena1": 28, "docena2": 44, "docena3": 24, "probability": 72, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 29, "docena1": 44, "docena2": 24, "docena3": 28, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 30, "docena1": 24, "docena2": 36, "docena3": 36, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 31, "docena1": 36, "docena2": 32, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 32, "docena1": 36, "docena2": 28, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 33, "docena1": 36, "docena2": 36, "docena3": 32, "probability": 68, "senal": "DOCENA 1 y DOCENA 2"},
-        {"id": 34, "docena1": 28, "docena2": 32, "docena3": 40, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-        {"id": 35, "docena1": 40, "docena2": 24, "docena3": 32, "probability": 72, "senal": "DOCENA 1 y DOCENA 3"},
-        {"id": 36, "docena1": 28, "docena2": 36, "docena3": 36, "probability": 72, "senal": "DOCENA 2 y DOCENA 3"},
-    ],
-}
-
-# ─── D'ALEMBERT (SOPORTA ODDS VARIABLES) ──────────────────────────────────────
+# ─── D'ALEMBERT (SISTEMA 3) ──────────────────────────────────────────────────
 class D_Alembert:
-    def __init__(self, base: float, odds: float = 2.0):
+    def __init__(self, base: float):
         self.base      = base
-        self.odds      = odds
         self.step      = 0
         self.bankroll  = 0.0
         self.max_step  = 20
@@ -223,8 +133,7 @@ class D_Alembert:
 
     def win(self) -> float:
         bet = self.current_bet()
-        profit = bet * (self.odds - 1)   # Ganancia neta
-        self.bankroll = round(self.bankroll + profit, 2)
+        self.bankroll = round(self.bankroll + bet, 2)
         if self.step > 0:
             self.step -= 1
         return bet
@@ -238,13 +147,18 @@ class D_Alembert:
             self.step += 1
         return bet
 
-# ─── SISTEMA AMX V20 (COLOR) ──────────────────────────────────────────────────
+
+# ─── SISTEMA AMX V20 ──────────────────────────────────────────────────────────
 class AMXSignalSystem:
     def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
         self.mode = mode
         self.last_signal_time: float = 0
         self.cooldown_seconds: int = 8
         self.so_cooldown: Optional[float] = None
+        self.momentum_consecutivo: int = 0
+        self.direccion_momentum: int = 0
+        self.prev_ema4_above_ema8: bool = True
+        self.ultimos_puntos: list = []
 
     def calculate_ema(self, data: list, period: int) -> list:
         if len(data) < period:
@@ -258,38 +172,12 @@ class AMXSignalSystem:
             ema.append(prev)
         return ema
 
-    def check_signal_tendencia(self, positions: list) -> Optional[dict]:
+    def check_signal_tendencia(self, positions: list, color_data: list, 
+                               current_number: int, expected_color: str,
+                               prob_threshold: float) -> Optional[dict]:
         if len(positions) < 20:
             return None
-        ahora = time.time()
-        if ahora - self.last_signal_time < self.cooldown_seconds:
-            return None
-        if self.so_cooldown and ahora - self.so_cooldown < 8:
-            return None
 
-        ema4 = self.calculate_ema(positions, 4)
-        ema20 = self.calculate_ema(positions, 20)
-        if len(ema4) < 2 or len(ema20) < 1 or ema4[-1] is None or ema20[-1] is None or ema4[-2] is None or ema20[-2] is None:
-            return None
-
-        current_pos = positions[-1]
-        cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
-        sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema20[-1]
-
-        if cruce_alcista or sobre_tres_emas:
-            expected_color = "ROJO" if current_pos > ema20[-1] else "NEGRO"
-            return {
-                "type": "SKRILL_2.0",
-                "mode": "tendencia",
-                "expected_color": expected_color,
-                "trigger_number": None,
-                "strength": "strong" if cruce_alcista else "moderate"
-            }
-        return None
-
-    def check_signal_moderado(self, positions: list) -> Optional[dict]:
-        if len(positions) < 20:
-            return None
         ahora = time.time()
         if ahora - self.last_signal_time < self.cooldown_seconds:
             return None
@@ -299,7 +187,59 @@ class AMXSignalSystem:
         ema4 = self.calculate_ema(positions, 4)
         ema8 = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
-        if len(ema8) < 2 or len(ema20) < 1 or ema8[-1] is None or ema20[-1] is None or ema8[-2] is None or ema20[-2] is None:
+
+        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
+            return None
+        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
+            return None
+        if ema4[-2] is None or ema8[-2] is None:
+            return None
+
+        current_pos = positions[-1]
+
+        cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
+        sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
+
+        entry = next((e for e in color_data if e["id"] == current_number), None)
+        if not entry or entry["senal"] == "NO APOSTAR":
+            return None
+
+        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
+        if entry["senal"] != expected_color or prob < prob_threshold:
+            return None
+
+        if (cruce_alcista or sobre_tres_emas):
+            return {
+                "type": "SKRILL_2.0",
+                "mode": "tendencia",
+                "expected_color": expected_color,
+                "probability": prob,
+                "trigger_number": current_number,
+                "strength": "strong" if cruce_alcista else "moderate"
+            }
+        return None
+
+    def check_signal_moderado(self, positions: list, color_data: list,
+                             current_number: int, expected_color: str,
+                             prob_threshold: float) -> Optional[dict]:
+        if len(positions) < 20:
+            return None
+
+        ahora = time.time()
+        if ahora - self.last_signal_time < self.cooldown_seconds:
+            return None
+        if self.so_cooldown and ahora - self.so_cooldown < 8:
+            return None
+
+        ema4 = self.calculate_ema(positions, 4)
+        ema8 = self.calculate_ema(positions, 8)
+        ema20 = self.calculate_ema(positions, 20)
+
+        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
+            return None
+        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
+            return None
+        if ema8[-2] is None or ema20[-2] is None:
             return None
 
         cruce_ema8 = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
@@ -310,13 +250,21 @@ class AMXSignalSystem:
             a, b, c = positions[-3], positions[-2], positions[-1]
             patron_v = b < a and b < c and abs(a - c) <= 1 and c > a
 
+        entry = next((e for e in color_data if e["id"] == current_number), None)
+        if not entry or entry["senal"] == "NO APOSTAR":
+            return None
+
+        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
+        if entry["senal"] != expected_color or prob < prob_threshold:
+            return None
+
         if (cruce_ema8 or patron_v) and sobre_emas:
-            expected_color = "ROJO" if positions[-1] > ema20[-1] else "NEGRO"
             return {
                 "type": "ALERTA_2.0",
                 "mode": "moderado",
                 "expected_color": expected_color,
-                "trigger_number": None,
+                "probability": prob,
+                "trigger_number": current_number,
                 "pattern": "V" if patron_v else "EMA_CROSS"
             }
         return None
@@ -327,130 +275,6 @@ class AMXSignalSystem:
     def register_so_failed(self):
         self.so_cooldown = time.time()
 
-# ─── SISTEMA DE DOCENAS (TABLA + TENDENCIA EMA) ───────────────────────────────
-class DozenSignalSystem:
-    def __init__(self, table: list):
-        self.table = {entry["id"]: entry for entry in table}
-        self.levels: list = [0]
-        self.last_dozen: Optional[int] = None
-        self.last_d2_number: Optional[int] = None
-        self.cooldown_seconds = 8
-        self.last_signal_time: float = 0
-
-    @staticmethod
-    def get_dozen(number: int) -> int:
-        if number == 0:
-            return 0
-        elif 1 <= number <= 12:
-            return 1
-        elif 13 <= number <= 24:
-            return 2
-        else:
-            return 3
-
-    def update_level(self, number: int):
-        dozen = self.get_dozen(number)
-        last_level = self.levels[-1] if self.levels else 0
-
-        if dozen == 0:
-            if self.last_dozen == 1:
-                change = 1
-            elif self.last_dozen == 2:
-                change = 1 if (self.last_d2_number and self.last_d2_number <= 18) else -1
-            elif self.last_dozen == 3:
-                change = -1
-            else:
-                change = 0
-        else:
-            if dozen == 1:
-                change = 1
-            elif dozen == 2:
-                change = 1 if number <= 18 else -1
-            else:
-                change = -1
-
-        new_level = last_level + change
-        self.levels.append(new_level)
-        if len(self.levels) > 300:
-            self.levels = self.levels[-200:]
-
-        if dozen != 0:
-            self.last_dozen = dozen
-            if dozen == 2:
-                self.last_d2_number = number
-
-    def calculate_ema(self, data: list, period: int) -> list:
-        if len(data) < period:
-            return [None] * len(data)
-        mult = 2 / (period + 1)
-        ema = [None] * (period - 1)
-        prev = sum(data[:period]) / period
-        ema.append(prev)
-        for i in range(period, len(data)):
-            prev = (data[i] * mult) + (prev * (1 - mult))
-            ema.append(prev)
-        return ema
-
-    def get_trend(self) -> str:
-        if len(self.levels) < 20:
-            return 'neutral'
-        ema4 = self.calculate_ema(self.levels, 4)
-        ema8 = self.calculate_ema(self.levels, 8)
-        ema20 = self.calculate_ema(self.levels, 20)
-
-        cur = self.levels[-1]
-        e4 = ema4[-1]
-        e8 = ema8[-1]
-        e20 = ema20[-1]
-        if None in (e4, e8, e20):
-            return 'neutral'
-
-        if cur > e4 > e8 > e20:
-            return 'bullish'
-        elif cur < e4 < e8 < e20:
-            return 'bearish'
-        else:
-            return 'neutral'
-
-    def get_trend_dozens(self) -> tuple:
-        trend = self.get_trend()
-        if trend == 'bullish':
-            return (1, 2)
-        elif trend == 'bearish':
-            return (2, 3)
-        else:
-            return (1, 3)
-
-    def check_signal(self, trigger_number: int) -> Optional[dict]:
-        ahora = time.time()
-        if ahora - self.last_signal_time < self.cooldown_seconds:
-            return None
-
-        entry = self.table.get(trigger_number)
-        if not entry:
-            return None
-
-        senal = entry["senal"]
-        dozens = []
-        if "DOCENA 1" in senal and "DOCENA 2" in senal:
-            dozens = [1, 2]
-        elif "DOCENA 1" in senal and "DOCENA 3" in senal:
-            dozens = [1, 3]
-        elif "DOCENA 2" in senal and "DOCENA 3" in senal:
-            dozens = [2, 3]
-        else:
-            return None
-
-        trend_dozens = self.get_trend_dozens()
-        if set(dozens) == set(trend_dozens):
-            self.last_signal_time = ahora
-            return {
-                "type": "DOZEN",
-                "dozens": dozens,
-                "probability": entry["probability"],
-                "trend": self.get_trend()
-            }
-        return None
 
 # ─── STATISTICS ───────────────────────────────────────────────────────────────
 class Stats:
@@ -511,7 +335,8 @@ class Stats:
             bk24 = 0.0
         return w, l, t, e, bk24
 
-# ─── CHART GENERATION (COLOR) ─────────────────────────────────────────────────
+
+# ─── CHART GENERATION ─────────────────────────────────────────────────────────
 def generate_chart(levels: list, spin_history: list, bet_color: str, visible: int = VISIBLE) -> io.BytesIO:
     arr = np.array(levels, dtype=float)
     n   = len(arr)
@@ -602,104 +427,6 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
     buf.seek(0)
     return buf
 
-# ─── CHART GENERATION (DOCENAS) ───────────────────────────────────────────────
-def generate_dozen_chart(levels: list, spin_history: list, bet_dozens: list, visible: int = VISIBLE) -> io.BytesIO:
-    arr = np.array(levels, dtype=float)
-    n = len(arr)
-
-    def calc_ema(data, period):
-        if len(data) < period:
-            return np.full(len(data), np.nan)
-        mult = 2 / (period + 1)
-        out = np.full(len(data), np.nan)
-        out[period - 1] = np.mean(data[:period])
-        for i in range(period, len(data)):
-            out[i] = (data[i] - out[i - 1]) * mult + out[i - 1]
-        return out
-
-    ema4 = calc_ema(arr, 4)
-    ema8 = calc_ema(arr, 8)
-    ema20 = calc_ema(arr, 20)
-
-    start = max(0, n - visible)
-    sl = slice(start, n)
-    x = np.arange(len(arr[sl]))
-    hist_sl = spin_history[start:]
-
-    color_map = {1: "#5bc8fa", 2: "#f0c040", 3: "#c0392b", 0: "#2ecc71"}
-    if set(bet_dozens) == {1,2}:
-        main_color = "#5bc8fa"
-    elif set(bet_dozens) == {2,3}:
-        main_color = "#c0392b"
-    else:
-        main_color = "#f39c12"
-
-    bg = "#0b101f"
-    ax_bg = "#0f1a2a"
-    grid_c = "#1e2e48"
-    ema4_c = "#ffd700"
-    ema8_c = "#ff922b"
-    ema20_c = "#ff4d4d"
-    title_c = main_color
-
-    fig, ax = plt.subplots(figsize=(8, 3.6), facecolor=bg)
-    ax.set_facecolor(ax_bg)
-
-    y = arr[sl]
-    e4 = ema4[sl]
-    e8 = ema8[sl]
-    e20 = ema20[sl]
-
-    ax.fill_between(x, y, alpha=0.10, color=main_color)
-    ax.plot(x, y, color=main_color, linewidth=0.8, zorder=3)
-    ax.plot(x, e4, color=ema4_c, linewidth=0.7, linestyle="--", label="EMA 4", zorder=4)
-    ax.plot(x, e8, color=ema8_c, linewidth=0.7, linestyle="--", label="EMA 8", zorder=4)
-    ax.plot(x, e20, color=ema20_c, linewidth=1.0, label="EMA 20", zorder=4)
-
-    for i, spin in enumerate(hist_sl):
-        num = spin["number"]
-        dozen = DozenSignalSystem.get_dozen(num)
-        c = color_map.get(dozen, "#ffffff")
-        ax.scatter(i, y[i], color=c, s=22, zorder=5, edgecolors="white", linewidths=0.3)
-
-    tick_step = max(1, len(x) // 8)
-    tick_x = list(range(0, len(x), tick_step))
-    tick_lbs = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
-    ax.set_xticks(tick_x)
-    ax.set_xticklabels(tick_lbs, color="#8899bb", fontsize=7)
-    ax.tick_params(axis='y', colors="#8899bb", labelsize=7)
-    ax.tick_params(axis='x', colors="#8899bb", labelsize=7)
-
-    ax.spines['bottom'].set_color(grid_c)
-    ax.spines['left'].set_color(grid_c)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.grid(axis='y', color=grid_c, linewidth=0.4, alpha=0.5)
-
-    dozen_str = " + ".join(f"D{d}" for d in bet_dozens)
-    ax.set_title(f"🎯 Señal Docenas: {dozen_str} — últimos {visible} giros · EMA 4/8/20",
-                 color=title_c, fontsize=9, pad=6)
-
-    from matplotlib.lines import Line2D
-    legend_els = [
-        Line2D([0],[0], color=main_color, linewidth=0.8, label="Nivel"),
-        Line2D([0],[0], color=ema4_c, linewidth=0.7, linestyle="--", label="EMA 4"),
-        Line2D([0],[0], color=ema8_c, linewidth=0.7, linestyle="--", label="EMA 8"),
-        Line2D([0],[0], color=ema20_c, linewidth=1.0, label="EMA 20"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor=color_map[1], markersize=5, label="D1 (1-12)"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor=color_map[2], markersize=5, label="D2 (13-24)"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor=color_map[3], markersize=5, label="D3 (25-36)"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor=color_map[0], markersize=5, label="0"),
-    ]
-    ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
-              facecolor="#0b101f", edgecolor=grid_c, labelcolor="white", framealpha=0.8, ncol=2)
-
-    plt.tight_layout(pad=0.8)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, facecolor=bg)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 5
@@ -741,13 +468,15 @@ def tg_send_text(chat_id: int, thread_id: int, text: str) -> Optional[int]:
 def tg_delete(chat_id: int, msg_id: int):
     _tg_call(bot.delete_message, chat_id=chat_id, message_id=msg_id)
 
-# ─── ROULETTE ENGINE (DUAL MODE) ──────────────────────────────────────────────
+
+# ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
         self.name      = name
         self.ws_key    = cfg["ws_key"]
         self.chat_id   = cfg["chat_id"]
         self.thread_id = cfg["thread_id"]
+        self.color_data: list = cfg["color_data"]
 
         self.spin_history:     list = []
         self.original_levels:  list = []
@@ -758,7 +487,6 @@ class RouletteEngine:
         self.signal_active:    bool = False
         self.expected_color:   Optional[str] = None
         self.bet_color:        Optional[str] = None
-        self.bet_dozens:       Optional[list] = None
         self.attempts_left:    int = 0
         self.total_attempts:   int = 0
         self.trigger_number:   Optional[int] = None
@@ -771,26 +499,140 @@ class RouletteEngine:
         self.signal_is_level1: bool  = False
 
         self.betting_system_name = cfg.get("betting_system", "dalembert")
-        self.mode: Literal["color", "dozen"] = "color"
-        self.bet_sys = D_Alembert(BASE_BET, odds=2.0)
+        self.bet_sys = D_Alembert(BASE_BET)
 
         self.stats = Stats()
         self.signal_msg_ids: list = []
         self.ws = None
         self.running = True
 
-        # Sistemas de señal
         self.amx_system = AMXSignalSystem(mode="moderado")
         self.amx_positions: list = [0]
-        self.dozen_system = DozenSignalSystem(DOZEN_TABLES[name])
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
 
-    def set_mode(self, mode: Literal["color", "dozen"]):
-        self.mode = mode
-        if mode == "color":
-            self.bet_sys = D_Alembert(BASE_BET, odds=2.0)
+    def set_mode(self, mode: Literal["tendencia", "moderado"]):
+        self.amx_system = AMXSignalSystem(mode=mode)
+        logger.info(f"[{self.name}] Modo AMX V20 cambiado a: {mode}")
+        return mode
+
+    @staticmethod
+    def calculate_ema(data: list, period: int) -> list:
+        if len(data) < period:
+            return [None] * len(data)
+        mult = 2 / (period + 1)
+        out = [None] * (period - 1)
+        prev = sum(data[:period]) / period
+        out.append(prev)
+        for i in range(period, len(data)):
+            prev = (data[i] - prev) * mult + prev
+            out.append(prev)
+        return out
+
+    def get_entry(self, number: int) -> Optional[dict]:
+        for e in self.color_data:
+            if e["id"] == number:
+                return e
+        return None
+
+    def get_signal(self, number: int) -> Optional[str]:
+        e = self.get_entry(number)
+        return e["senal"] if e else None
+
+    def get_prob(self, number: int, color: str) -> float:
+        e = self.get_entry(number)
+        if not e:
+            return 0.0
+        return e["rojo"] if color == "ROJO" else e["negro"]
+
+    def determine_bet_color(self, expected: str) -> str:
+        if len(self.spin_history) < 20:
+            return expected
+        ema20o = self.calculate_ema(self.original_levels, 20)
+        ema20i = self.calculate_ema(self.inverted_levels, 20)
+        li = len(self.original_levels) - 1
+        
+        if li < 0 or li >= len(ema20o) or li >= len(ema20i):
+            return expected
+        if ema20o[li] is None or ema20i[li] is None:
+            return expected
+            
+        last_sig = self.get_signal(self.spin_history[-1]["number"])
+        if expected == "ROJO":
+            if self.original_levels[li] < ema20o[li]:
+                return "NEGRO" if last_sig == "NEGRO" else "ROJO"
+            return "ROJO"
         else:
-            self.bet_sys = D_Alembert(BASE_BET, odds=1.5)
-        logger.info(f"[{self.name}] Modo cambiado a: {mode}, odds={self.bet_sys.odds}")
+            if self.inverted_levels[li] < ema20i[li]:
+                return "ROJO" if last_sig == "ROJO" else "NEGRO"
+            return "NEGRO"
+
+    def should_activate(self) -> Optional[str]:
+        losses = self.consec_losses
+        min_spin = 22 + losses * 2
+        if len(self.spin_history) < min_spin:
+            return None
+
+        last_num = self.spin_history[-1]["number"]
+        entry = self.get_entry(last_num)
+        if not entry or entry["senal"] == "NO APOSTAR":
+            return None
+        expected = entry["senal"]
+
+        if len(self.original_levels) < 20 or len(self.inverted_levels) < 20:
+            return None
+
+        ema4o = self.calculate_ema(self.original_levels, 4)
+        ema8o = self.calculate_ema(self.original_levels, 8)
+        ema20o = self.calculate_ema(self.original_levels, 20)
+        ema4i = self.calculate_ema(self.inverted_levels, 4)
+        ema8i = self.calculate_ema(self.inverted_levels, 8)
+        ema20i = self.calculate_ema(self.inverted_levels, 20)
+
+        req = min(3 + losses, 13)
+        li = len(self.original_levels) - 1
+
+        def check(levels, e20, e8, e4, idx):
+            for off in range(req):
+                i = idx - (req - 1) + off
+                if i < 0:
+                    return False
+                if i >= len(levels) or i >= len(e20):
+                    return False
+                if e20[i] is None or levels[i] <= e20[i]:
+                    return False
+                if losses >= 2:
+                    if i >= len(e8) or e8[i] is None:
+                        return False
+                    if levels[i] <= e8[i]:
+                        return False
+                if losses >= 4:
+                    if i >= len(e4) or e4[i] is None:
+                        return False
+                    if levels[i] <= e4[i]:
+                        return False
+            return True
+
+        if expected == "ROJO":
+            if check(self.original_levels, ema20o, ema8o, ema4o, li):
+                return "ROJO"
+        elif expected == "NEGRO":
+            if check(self.inverted_levels, ema20i, ema8i, ema4i, li):
+                return "NEGRO"
+        return None
+
+    def _check_recovery(self):
+        if not self.recovery_active:
+            return
+        if self.bet_sys.bankroll >= self.recovery_target:
+            logger.info(
+                f"[{self.name}] Recuperación completada! "
+                f"bankroll={self.bet_sys.bankroll:.2f} >= objetivo={self.recovery_target:.2f}. "
+                f"Reseteando a nivel 1."
+            )
+            self.consec_losses    = 0
+            self.recovery_active  = False
+            self.recovery_target  = 0.0
+            self.bet_sys.step     = 0
 
     def _update_amx_positions(self, color: str):
         last_pos = self.amx_positions[-1] if self.amx_positions else 0
@@ -829,38 +671,35 @@ class RouletteEngine:
             self.original_levels.pop(0)
         while len(self.inverted_levels) > len(self.spin_history):
             self.inverted_levels.pop(0)
+        
         min_len = min(len(self.original_levels), len(self.inverted_levels))
         self.original_levels = self.original_levels[-min_len:]
         self.inverted_levels = self.inverted_levels[-min_len:]
 
         self._update_amx_positions(real)
-        self.dozen_system.update_level(number)
 
-        # ── Resolver señal activa ─────────────────────────────────────────────
         if self.signal_active and time.time() > self.result_until:
-            if self.mode == "color":
-                is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
-            else:
-                dozen = self.dozen_system.get_dozen(number)
-                is_win = dozen in self.bet_dozens
-
-            current_attempt = MAX_ATTEMPTS - self.attempts_left + 1
-
+            is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
+            
             if is_win:
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
+                
                 if len(self.signal_msg_ids) > 1:
                     for msg_id in self.signal_msg_ids[:-1]:
                         tg_delete(self.chat_id, msg_id)
                     self.signal_msg_ids = [self.signal_msg_ids[-1]]
+                
                 self.signal_active = False
                 self._check_recovery()
                 self._send_result(number, real, True, bet)
                 self._check_stats()
                 self.signal_msg_ids = []
+                
             else:
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
+                
                 if self.attempts_left <= 0:
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
@@ -874,160 +713,152 @@ class RouletteEngine:
                             self.recovery_target = self.level1_bankroll + BASE_BET
                         else:
                             self.recovery_target = self.level1_bankroll + BASE_BET
-                        logger.info(f"[{self.name}] Pérdida nivel {self.consec_losses}. Recuperación activada, objetivo={self.recovery_target:.2f}")
+                        logger.info(
+                            f"[{self.name}] Pérdida nivel {self.consec_losses}. "
+                            f"Modo recuperación activado. "
+                            f"level1_bankroll={self.level1_bankroll:.2f} "
+                            f"objetivo={self.recovery_target:.2f}"
+                        )
                     self.stats.record(False, self.bet_sys.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
                     self._check_stats()
                     self.signal_msg_ids = []
+                    
                 else:
                     if self.signal_msg_ids:
                         last_msg_id = self.signal_msg_ids.pop()
                         tg_delete(self.chat_id, last_msg_id)
+                    
                     self.trigger_number = number
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
                     self._send_retry_signal(number, new_bet, attempt_number)
 
-        # ── Activar nueva señal ─────────────────────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
             self.signal_msg_ids = []
-            signal = None
-            if self.mode == "color":
-                signal = self._detect_amx_signal()
-                if signal:
-                    self.bet_color = signal["expected_color"]
-                    self.expected_color = signal["expected_color"]
-            else:
-                signal = self._detect_dozen_signal()
-                if signal:
-                    self.bet_dozens = signal["dozens"]
+            
+            signal = self._detect_amx_signal()
 
             if signal:
                 self.signal_active = True
+                self.expected_color = signal["expected_color"]
+                self.bet_color = signal["expected_color"]
                 self.attempts_left = MAX_ATTEMPTS
                 self.total_attempts = MAX_ATTEMPTS
-                self.trigger_number = self.spin_history[-1]["number"]
-                self._send_signal(self.trigger_number, 1, amx_signal=signal)
+                self.trigger_number = signal["trigger_number"]
+                self._send_signal(signal["trigger_number"], 1, amx_signal=signal)
+            else:
+                expected = self.should_activate()
+                if expected:
+                    self.signal_active = True
+                    self.expected_color = expected
+                    self.bet_color = self.determine_bet_color(expected)
+                    self.attempts_left = MAX_ATTEMPTS
+                    self.total_attempts = MAX_ATTEMPTS
+                    self.trigger_number = number
+                    self._send_signal(number, 1)
 
     def _detect_amx_signal(self) -> Optional[dict]:
         if len(self.amx_positions) < 20:
             return None
-        recent_colors = [s["real"] for s in self.spin_history[-5:] if s["real"] != "VERDE"]
-        if len(recent_colors) < 2 or recent_colors[-1] != recent_colors[-2]:
+
+        current_number = self.spin_history[-1]["number"] if self.spin_history else 0
+        entry = self.get_entry(current_number)
+        if not entry or entry["senal"] == "NO APOSTAR":
             return None
-        momentum_color = recent_colors[-1]
+
+        expected_color = entry["senal"]
+
+        recent_colors = [s["real"] for s in self.spin_history[-5:]]
+        momentum_count = 0
+        for c in reversed(recent_colors):
+            if c == expected_color:
+                momentum_count += 1
+            elif c != "VERDE":
+                break
+
+        if momentum_count < 2:
+            return None
+
         try:
             if self.amx_system.mode == "tendencia":
-                signal = self.amx_system.check_signal_tendencia(self.amx_positions)
+                signal = self.amx_system.check_signal_tendencia(
+                    self.amx_positions, self.color_data, current_number,
+                    expected_color, self.min_prob_threshold
+                )
             else:
-                signal = self.amx_system.check_signal_moderado(self.amx_positions)
+                signal = self.amx_system.check_signal_moderado(
+                    self.amx_positions, self.color_data, current_number,
+                    expected_color, self.min_prob_threshold
+                )
         except Exception as e:
             logger.warning(f"[{self.name}] Error en detección AMX: {e}")
             return None
-        if signal and signal["expected_color"] == momentum_color:
-            return signal
-        return None
 
-    def _detect_dozen_signal(self) -> Optional[dict]:
-        if len(self.spin_history) < 21:
-            return None
-        trigger = self.spin_history[-1]["number"]
-        return self.dozen_system.check_signal(trigger)
-
-    def _check_recovery(self):
-        if not self.recovery_active:
-            return
-        if self.bet_sys.bankroll >= self.recovery_target:
-            logger.info(f"[{self.name}] Recuperación completada! bankroll={self.bet_sys.bankroll:.2f} >= objetivo={self.recovery_target:.2f}. Reseteando a nivel 1.")
-            self.consec_losses    = 0
-            self.recovery_active  = False
-            self.recovery_target  = 0.0
-            self.bet_sys.step     = 0
+        return signal
 
     def _send_signal(self, trigger: int, attempt: int, amx_signal: Optional[dict] = None):
-        bet_total = self.bet_sys.current_bet()
-        if self.mode == "color":
-            color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
-            step = self.bet_sys.step + 1
-            self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
-            if self.signal_is_level1:
-                self.level1_bankroll = self.bet_sys.bankroll
-            sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-            amx_line = ""
-            if amx_signal:
-                mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
-                amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>\n"
-            caption = (
-                f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
-                f"🎰 <b>Juego: {self.name}</b>\n"
-                f"👉 <b>Después de: {trigger}</b>\n"
-                f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
-                f"{amx_line}"
-                f"{sys_line}"
-                f"📍 <i>Apuesta: {bet_total:.2f} usd</i>\n\n"
-                f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
-            )
-            levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-            chart = generate_chart(levels, self.spin_history[:], self.bet_color)
-        else:
-            bet_per_dozen = bet_total / 2
-            dozens_str = " + ".join(f"D{d}" for d in self.bet_dozens)
-            trend = amx_signal.get("trend", "neutral") if amx_signal else "neutral"
-            trend_emoji = {"bullish": "📈", "bearish": "📉", "neutral": "📊"}.get(trend, "")
-            prob = amx_signal.get("probability", 0) if amx_signal else 0
-            caption = (
-                f"✅☑️ <b>SEÑAL DOCENAS CONFIRMADA</b> ☑️✅\n\n"
-                f"🎰 <b>Juego: {self.name}</b>\n"
-                f"👉 <b>Después de: {trigger}</b>\n"
-                f"🎯 <b>Apostar a: {dozens_str}</b>\n\n"
-                f"{trend_emoji} Tendencia EMA: {trend.upper()}\n"
-                f"📊 Probabilidad tabla: {prob}%\n\n"
-                f"💰 Apuesta total: ${bet_total:.2f}\n"
-                f"   (${bet_per_dozen:.2f} por docena)\n\n"
-                f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
-            )
-            chart = generate_dozen_chart(self.dozen_system.levels, self.spin_history, self.bet_dozens)
+        bet = self.bet_sys.current_bet()
+        prob = int(self.get_prob(trigger, self.bet_color) * 100)
+        color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
+        step = self.bet_sys.step + 1
 
+        self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
+        if self.signal_is_level1:
+            self.level1_bankroll = self.bet_sys.bankroll
+            logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
+
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
+
+        amx_line = ""
+        if amx_signal:
+            mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
+            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>"
+
+        caption = (
+            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
+            f"🎰 <b>Juego: {self.name}</b>\n"
+            f"👉 <b>Después de: {trigger}</b>\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
+            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
+            f"{sys_line}"
+            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
+            f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
+        )
+        levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
+        chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
+        
         if msg_id:
             self.signal_msg_ids.append(msg_id)
-        logger.info(f"[{self.name}] Signal sent: {self.mode} after {trigger}")
+        
+        logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, recovery={self.recovery_active}")
 
     def _send_retry_signal(self, trigger: int, new_bet: float, attempt_number: int):
-        if self.mode == "color":
-            color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
-            step = self.bet_sys.step + 1
-            sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-            caption = (
-                f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
-                f"🎰 <b>Juego: {self.name}</b>\n"
-                f"👉🏼 <b>Después de: {trigger}</b>\n"
-                f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
-                f"{sys_line}"
-                f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
-                f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
-            )
-            levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-            chart = generate_chart(levels, self.spin_history[:], self.bet_color)
-        else:
-            bet_per_dozen = new_bet / 2
-            dozens_str = " + ".join(f"D{d}" for d in self.bet_dozens)
-            caption = (
-                f"✅☑️ <b>SEÑAL DOCENAS CONFIRMADA</b> ☑️✅\n\n"
-                f"🎰 <b>Juego: {self.name}</b>\n"
-                f"👉🏼 <b>Después de: {trigger}</b>\n"
-                f"🎯 <b>Apostar a: {dozens_str}</b>\n\n"
-                f"💰 Apuesta total: ${new_bet:.2f}\n"
-                f"   (${bet_per_dozen:.2f} por docena)\n\n"
-                f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
-            )
-            chart = generate_dozen_chart(self.dozen_system.levels, self.spin_history, self.bet_dozens)
-
+        prob = int(self.get_prob(trigger, self.bet_color) * 100)
+        color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
+        step = self.bet_sys.step + 1
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
+        recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
+        caption = (
+            f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
+            f"🎰 <b>Juego: {self.name}</b>\n"
+            f"👉🏼 <b>Después de: {trigger}</b>\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
+            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
+            f"{sys_line}"
+            f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
+            f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
+        )
+        levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
+        chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
+        
         if msg_id:
             self.signal_msg_ids.append(msg_id)
-        logger.info(f"[{self.name}] Retry signal sent: {self.mode} after {trigger}")
+        
+        logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}, attempt {attempt_number}/{MAX_ATTEMPTS}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float):
         bankroll = self.bet_sys.bankroll
@@ -1113,12 +944,13 @@ class RouletteEngine:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
+
 # ─── FLASK KEEPALIVE ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "bot": "Roulette Signal Bot Dual Mode", "ts": time.time()})
+    return jsonify({"status": "ok", "bot": "Roulette Signal Bot AMX V20", "ts": time.time()})
 
 @app.route("/ping")
 def ping():
@@ -1127,6 +959,7 @@ def ping():
 @app.route("/health")
 def health():
     return jsonify({"healthy": True})
+
 
 # ─── SELF-PING TASK ──────────────────────────────────────────────────────────
 import os
@@ -1144,68 +977,68 @@ async def self_ping_loop():
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
 
+
 # ─── COMANDOS TELEGRAM ───────────────────────────────────────────────────────
 engines: dict[str, RouletteEngine] = {}
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     help_text = """
-<b>🎰 Roulette Bot - Modo Dual</b>
+<b>🎰 Roulette Bot - Sistema AMX V20</b>
 
 Comandos disponibles:
-/color - Activa modo COLOR (AMX V20)
-/docena - Activa modo DOCENAS (tabla + tendencia EMA)
-/modo <ruleta> <color|dozen> - Cambia modo de una ruleta específica
+/moderado - Activa modo MODERADO (EMA8/EMA20 + patrón V)
+/tendencia - Activa modo TENDENCIA (EMA4/EMA20 + momentum)
 /status - Muestra estado de todas las ruletas
 /reset - Resetea estadísticas
 /help - Muestra esta ayuda
 
-El bot envía señales con gráficos. Solo una señal activa a la vez.
+Sistema AMX V20 integrado con detección de señales 2.00x
     """
     bot.reply_to(message, help_text, parse_mode="HTML")
 
-@bot.message_handler(commands=['color'])
-def cmd_color(message):
-    for engine in engines.values():
-        engine.set_mode("color")
-    bot.reply_to(message, "✅ <b>Modo COLOR activado en todas las ruletas</b>", parse_mode="HTML")
 
-@bot.message_handler(commands=['docena'])
-def cmd_docena(message):
-    for engine in engines.values():
-        engine.set_mode("dozen")
-    bot.reply_to(message, "✅ <b>Modo DOCENAS activado en todas las ruletas</b>", parse_mode="HTML")
+@bot.message_handler(commands=['moderado'])
+def cmd_moderado(message):
+    changed = []
+    for name, engine in engines.items():
+        old_mode = engine.amx_system.mode
+        engine.set_mode("moderado")
+        if old_mode != "moderado":
+            changed.append(name)
 
-@bot.message_handler(commands=['modo'])
-def cmd_modo(message):
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            raise ValueError
-        _, ruleta, nuevo_modo = parts
-    except:
-        bot.reply_to(message, "Uso: /modo <ruleta> <color|dozen>")
-        return
+    if changed:
+        text = f"✅ <b>Modo MODERADO activado</b>\n\nRuletas: {', '.join(changed)}"
+    else:
+        text = "📊 <b>Todas las ruletas en modo MODERADO</b>"
+    bot.reply_to(message, text, parse_mode="HTML")
 
-    engine = engines.get(ruleta)
-    if not engine:
-        bot.reply_to(message, f"Ruleta no encontrada. Disponibles: {', '.join(engines.keys())}")
-        return
-    if nuevo_modo not in ("color", "dozen"):
-        bot.reply_to(message, "Modo debe ser 'color' o 'dozen'")
-        return
 
-    engine.set_mode(nuevo_modo)
-    bot.reply_to(message, f"✅ {ruleta} ahora en modo {nuevo_modo}")
+@bot.message_handler(commands=['tendencia'])
+def cmd_tendencia(message):
+    changed = []
+    for name, engine in engines.items():
+        old_mode = engine.amx_system.mode
+        engine.set_mode("tendencia")
+        if old_mode != "tendencia":
+            changed.append(name)
+
+    if changed:
+        text = f"📈 <b>Modo TENDENCIA activado</b>\n\nRuletas: {', '.join(changed)}"
+    else:
+        text = "📈 <b>Todas las ruletas en modo TENDENCIA</b>"
+    bot.reply_to(message, text, parse_mode="HTML")
+
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
     lines = ["<b>📊 ESTADO</b>\n"]
     for name, engine in engines.items():
-        mode_icon = "🎨" if engine.mode == "color" else "📊"
+        mode_icon = "📈" if engine.amx_system.mode == "tendencia" else "📊"
         signal_status = "🟢" if engine.signal_active else "⚪"
-        lines.append(f"<b>{name}</b>: {mode_icon} {engine.mode} {signal_status}")
+        lines.append(f"<b>{name}</b>: {mode_icon} {engine.amx_system.mode} {signal_status}")
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(message):
@@ -1213,14 +1046,17 @@ def cmd_reset(message):
         engine.stats = Stats()
     bot.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
 
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+
 async def main():
     global engines
     engines = {name: RouletteEngine(name, cfg) for name, cfg in ROULETTE_CONFIGS.items()}
+
     tasks = [asyncio.create_task(e.run_ws()) for e in engines.values()]
     tasks.append(asyncio.create_task(self_ping_loop()))
 
@@ -1231,10 +1067,11 @@ async def main():
     tg_thread = threading.Thread(target=telegram_polling, daemon=True)
     tg_thread.start()
 
-    logger.info("🎰 Roulette Bot Dual Mode iniciado (Color AMX V20 / Docenas Tabla+EMA)")
-    logger.info("Comandos: /color, /docena, /modo, /status, /reset, /help")
+    logger.info("🎰 Roulette Bot AMX V20 iniciado")
+    logger.info("Comandos: /moderado, /tendencia, /status, /reset, /help")
 
     await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
