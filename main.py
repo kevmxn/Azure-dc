@@ -64,7 +64,7 @@ REAL_COLOR_MAP = {
 }
 
 COLOR_DATA_AZURE = [
-    {"id":0,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
+    {"id":0,"rojo":0.52,"negro":0.44,"senal":"NO APOSTAR"},
     {"id":1,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
     {"id":2,"rojo":0.60,"negro":0.40,"senal":"ROJO"},
     {"id":3,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
@@ -111,6 +111,7 @@ ROULETTE_CONFIGS = {
         "thread_id": 6,
         "color_data": COLOR_DATA_AZURE,
         "betting_system": "dalembert",
+        "min_prob_threshold": 0.49,   # umbral mínimo de probabilidad para emitir señal
     },
 }
 
@@ -159,6 +160,15 @@ class AMXSignalSystem:
         self.direccion_momentum: int = 0
         self.prev_ema4_above_ema8: bool = True
         self.ultimos_puntos: list = []
+        # Nuevos atributos para rachas (simulan dos valores consecutivos >=2.00)
+        self.last_two_expected = deque(maxlen=2)   # almacena si el giro fue del color esperado
+        self.last_two_colors = deque(maxlen=2)     # colores reales de los dos últimos giros
+
+    def update_streak(self, real_color: str, expected_color: Optional[str]):
+        """Actualiza las rachas de aciertos del color esperado."""
+        if expected_color:
+            self.last_two_expected.append(real_color == expected_color)
+        self.last_two_colors.append(real_color)
 
     def calculate_ema(self, data: list, period: int) -> list:
         if len(data) < period:
@@ -172,7 +182,7 @@ class AMXSignalSystem:
             ema.append(prev)
         return ema
 
-    def check_signal_tendencia(self, positions: list, color_data: list, 
+    def check_signal_tendencia(self, positions: list, color_data: list,
                                current_number: int, expected_color: str,
                                prob_threshold: float) -> Optional[dict]:
         if len(positions) < 20:
@@ -192,13 +202,28 @@ class AMXSignalSystem:
             return None
         if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
             return None
-        if ema4[-2] is None or ema8[-2] is None:
+        if ema4[-2] is None or ema8[-2] is None or ema20[-2] is None:
             return None
 
         current_pos = positions[-1]
 
+        # Condiciones del sistema original
         cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
         sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
+
+        # Nuevas condiciones para emular 2.00x alcista
+        cruce_ema8 = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
+        cerca_ema4 = abs(current_pos - ema4[-1]) <= 0.5
+        dos_ultimos_esperados = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
+
+        # Combinaciones que generan señal
+        cond1 = cruce_alcista or sobre_tres_emas
+        cond2 = cruce_ema8
+        cond3 = sobre_tres_emas and dos_ultimos_esperados
+        cond4 = sobre_tres_emas and cerca_ema4
+
+        if not (cond1 or cond2 or cond3 or cond4):
+            return None
 
         entry = next((e for e in color_data if e["id"] == current_number), None)
         if not entry or entry["senal"] == "NO APOSTAR":
@@ -208,16 +233,16 @@ class AMXSignalSystem:
         if entry["senal"] != expected_color or prob < prob_threshold:
             return None
 
-        if (cruce_alcista or sobre_tres_emas):
-            return {
-                "type": "SKRILL_2.0",
-                "mode": "tendencia",
-                "expected_color": expected_color,
-                "probability": prob,
-                "trigger_number": current_number,
-                "strength": "strong" if cruce_alcista else "moderate"
-            }
-        return None
+        # Determinar fuerza de la señal
+        strength = "strong" if (cruce_alcista or cruce_ema8) else "moderate"
+        return {
+            "type": "SKRILL_2.0",
+            "mode": "tendencia",
+            "expected_color": expected_color,
+            "probability": prob,
+            "trigger_number": current_number,
+            "strength": strength
+        }
 
     def check_signal_moderado(self, positions: list, color_data: list,
                              current_number: int, expected_color: str,
@@ -250,6 +275,14 @@ class AMXSignalSystem:
             a, b, c = positions[-3], positions[-2], positions[-1]
             patron_v = b < a and b < c and abs(a - c) <= 1 and c > a
 
+        # Nueva condición: dos valores consecutivos esperados + EMAs en orden alcista
+        dos_ultimos_esperados = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
+        emas_alcistas = ema4[-1] > ema8[-1] > ema20[-1]
+        cond_racha_alcista = dos_ultimos_esperados and emas_alcistas and sobre_emas
+
+        if not (cruce_ema8 or patron_v or cond_racha_alcista):
+            return None
+
         entry = next((e for e in color_data if e["id"] == current_number), None)
         if not entry or entry["senal"] == "NO APOSTAR":
             return None
@@ -258,16 +291,14 @@ class AMXSignalSystem:
         if entry["senal"] != expected_color or prob < prob_threshold:
             return None
 
-        if (cruce_ema8 or patron_v) and sobre_emas:
-            return {
-                "type": "ALERTA_2.0",
-                "mode": "moderado",
-                "expected_color": expected_color,
-                "probability": prob,
-                "trigger_number": current_number,
-                "pattern": "V" if patron_v else "EMA_CROSS"
-            }
-        return None
+        return {
+            "type": "ALERTA_2.0",
+            "mode": "moderado",
+            "expected_color": expected_color,
+            "probability": prob,
+            "trigger_number": current_number,
+            "pattern": "V" if patron_v else "EMA_CROSS"
+        }
 
     def register_signal_sent(self):
         self.last_signal_time = time.time()
@@ -507,8 +538,7 @@ class RouletteEngine:
         self.running = True
 
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.amx_positions: list = [0]
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.49)
 
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
         self.amx_system = AMXSignalSystem(mode=mode)
@@ -635,16 +665,16 @@ class RouletteEngine:
             self.bet_sys.step     = 0
 
     def _update_amx_positions(self, color: str):
-        last_pos = self.amx_positions[-1] if self.amx_positions else 0
+        last_pos = self.amx_system.ultimos_puntos[-1] if self.amx_system.ultimos_puntos else 0
         if color == "ROJO":
             new_pos = last_pos + 1
         elif color == "NEGRO":
             new_pos = last_pos - 1
         else:
             new_pos = last_pos
-        self.amx_positions.append(new_pos)
-        if len(self.amx_positions) > 300:
-            self.amx_positions = self.amx_positions[-200:]
+        self.amx_system.ultimos_puntos.append(new_pos)
+        if len(self.amx_system.ultimos_puntos) > 300:
+            self.amx_system.ultimos_puntos = self.amx_system.ultimos_puntos[-200:]
 
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
@@ -676,7 +706,10 @@ class RouletteEngine:
         self.original_levels = self.original_levels[-min_len:]
         self.inverted_levels = self.inverted_levels[-min_len:]
 
+        # Actualizar posiciones AMX y rachas de color esperado
         self._update_amx_positions(real)
+        expected_signal = self.get_signal(number)
+        self.amx_system.update_streak(real, expected_signal)
 
         if self.signal_active and time.time() > self.result_until:
             is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
@@ -760,7 +793,7 @@ class RouletteEngine:
                     self._send_signal(number, 1)
 
     def _detect_amx_signal(self) -> Optional[dict]:
-        if len(self.amx_positions) < 20:
+        if len(self.amx_system.ultimos_puntos) < 20:
             return None
 
         current_number = self.spin_history[-1]["number"] if self.spin_history else 0
@@ -770,6 +803,7 @@ class RouletteEngine:
 
         expected_color = entry["senal"]
 
+        # Verificar momentum: al menos 2 giros consecutivos del color esperado
         recent_colors = [s["real"] for s in self.spin_history[-5:]]
         momentum_count = 0
         for c in reversed(recent_colors):
@@ -784,12 +818,12 @@ class RouletteEngine:
         try:
             if self.amx_system.mode == "tendencia":
                 signal = self.amx_system.check_signal_tendencia(
-                    self.amx_positions, self.color_data, current_number,
+                    self.amx_system.ultimos_puntos, self.color_data, current_number,
                     expected_color, self.min_prob_threshold
                 )
             else:
                 signal = self.amx_system.check_signal_moderado(
-                    self.amx_positions, self.color_data, current_number,
+                    self.amx_system.ultimos_puntos, self.color_data, current_number,
                     expected_color, self.min_prob_threshold
                 )
         except Exception as e:
@@ -814,7 +848,7 @@ class RouletteEngine:
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
-            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>"
+            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>\n"
 
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
@@ -823,6 +857,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
+            f"{amx_line}"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
         )
@@ -848,6 +883,7 @@ class RouletteEngine:
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
             f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
+            f"{amx_line}"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
         )
@@ -993,7 +1029,7 @@ Comandos disponibles:
 /reset - Resetea estadísticas
 /help - Muestra esta ayuda
 
-Sistema AMX V20 integrado con detección de señales 2.00x
+Sistema AMX V20 integrado con detección de señales 2.00x para ROJO y NEGRO
     """
     bot.reply_to(message, help_text, parse_mode="HTML")
 
