@@ -2,8 +2,7 @@
 """
 Roulette Telegram Signal Bot - Sistema AMX V20 (Tendencia + Moderado)
 Integra la lógica de detección de señales 2.00x del AMX Genesis 20.0
-con las tablas predefinidas de cada ruleta para filtrado de probabilidad.
-VERSION CORREGIDA - Manejo de mensajes: eliminar intentos 1-2 si pierden, mantener si ganan o intento 3 pierde
+basada únicamente en EMAs y momentum, sin tablas predefinidas.
 """
 
 import asyncio
@@ -53,7 +52,7 @@ _session.mount("http://",  _adapter)
 bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
-# ─── ROULETTE COLOR MAPS ──────────────────────────────────────────────────────
+# ─── ROULETTE COLOR MAPS (solo para mostrar el color real) ────────────────────
 REAL_COLOR_MAP = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
     7:"ROJO",8:"NEGRO",9:"ROJO",10:"NEGRO",11:"NEGRO",12:"ROJO",13:"NEGRO",
@@ -63,167 +62,31 @@ REAL_COLOR_MAP = {
     35:"NEGRO",36:"ROJO"
 }
 
-COLOR_DATA_AUTO = [
-    {"id":0,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-    {"id":1,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":2,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":3,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":4,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":5,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":6,"rojo":0.40,"negro":0.60,"senal":"NEGRO"},
-    {"id":7,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":8,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":9,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":10,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":11,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":12,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":13,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-    {"id":14,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":15,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-    {"id":16,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":17,"rojo":0.36,"negro":0.60,"senal":"NEGRO"},
-    {"id":18,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":19,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":20,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":21,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":22,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":23,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":24,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":25,"rojo":0.60,"negro":0.40,"senal":"ROJO"},
-    {"id":26,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":27,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":28,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":29,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":30,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":31,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":32,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":33,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":34,"rojo":0.60,"negro":0.36,"senal":"ROJO"},
-    {"id":35,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":36,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-]
-
-COLOR_DATA_RUSSIAN = [
-    {"id":0,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":1,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":2,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":3,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":4,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":5,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":6,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":7,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":8,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":9,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":10,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":11,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":12,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":13,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":14,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":15,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":16,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":17,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":18,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":19,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":20,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":21,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":22,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":23,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":24,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":25,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-    {"id":26,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":27,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":28,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":29,"rojo":0.48,"negro":0.49,"senal":"NEGRO"},
-    {"id":30,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-    {"id":31,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":32,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":33,"rojo":0.48,"negro":0.49,"senal":"ROJO"},
-    {"id":34,"rojo":0.48,"negro":0.56,"senal":"NEGRO"},
-    {"id":35,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":36,"rojo":0.49,"negro":0.48,"senal":"ROJO"},
-]
-
-COLOR_DATA_AZURE = [
-    {"id":0,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":1,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":2,"rojo":0.60,"negro":0.40,"senal":"ROJO"},
-    {"id":3,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":4,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":5,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":6,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":7,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":8,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":9,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":10,"rojo":0.48,"negro":0.48,"senal":"NO APOSTAR"},
-    {"id":11,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":12,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":13,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":14,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":15,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":16,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":17,"rojo":0.60,"negro":0.36,"senal":"ROJO"},
-    {"id":18,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":19,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":20,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":21,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":22,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":23,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":24,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":25,"rojo":0.36,"negro":0.60,"senal":"NEGRO"},
-    {"id":26,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-    {"id":27,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":28,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":29,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":30,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":31,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":32,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":33,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":34,"rojo":0.40,"negro":0.60,"senal":"NEGRO"},
-    {"id":35,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":36,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-]
-
-# ─── ROULETTE CONFIGS ─────────────────────────────────────────────────────────
+# ─── ROULETTE CONFIGS (sin tablas de probabilidad) ────────────────────────────
 ROULETTE_CONFIGS = {
     "Auto Roulette": {
         "ws_key": 225,
         "chat_id": -1003835197023,
         "thread_id": 2,
-        "color_data": COLOR_DATA_AUTO,
         "betting_system": "dalembert",
-        "min_prob_threshold": 0.48,  # Umbral mínimo de probabilidad
-        "min_consecutive": 2,         # Mínimo colores consecutivos para señal
-        "min_spins_between_signals": 5,  # Spins mínimos entre señales
-        "require_ema_confirm": True,  # Requiere confirmación EMA
     },
     "Russian Roulette": {
         "ws_key": 221,
         "chat_id": -1003835197023,
         "thread_id": 7,
-        "color_data": COLOR_DATA_RUSSIAN,
-        "betting_system": "oscars_grind",  # MEJOR para efectividad 75%
-        "min_prob_threshold": 0.52,  # UMBRAL ALTO - solo señales fuertes
-        "min_consecutive": 3,         # STRICT: 3 colores consecutivos mínimo
-        "min_spins_between_signals": 8,  # Más tiempo entre señales
-        "require_ema_confirm": True,  # Siempre requiere confirmación EMA
-        "require_momentum": True,     # Requiere momentum de 3+
+        "betting_system": "dalembert",
     },
     "Azure Roulette 1": {
         "ws_key": 227,
         "chat_id": -1003835197023,
         "thread_id": 6,
-        "color_data": COLOR_DATA_AZURE,
         "betting_system": "dalembert",
-        "min_prob_threshold": 0.48,
-        "min_consecutive": 2,
-        "min_spins_between_signals": 5,
-        "require_ema_confirm": True,
     },
 }
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 3   # Cambiado de 2 a 3
+MAX_ATTEMPTS = 2
 BASE_BET  = 0.10   # USD
 VISIBLE   = 50
 
@@ -254,141 +117,13 @@ class D_Alembert:
             self.step += 1
         return bet
 
-
-# ─── PAROLI (SISTEMA 5) - Mejor para efectividad 75-80% ───────────────────────
-class Paroli:
-    """
-    Sistema Paroli: progresión positiva.
-    - Triplica tras ganancia
-    - Resetea tras pérdida o tras 3 ganancias consecutivas
-    - Ideal para efectividad 70-85% donde hay rachas
-    """
-    def __init__(self, base: float):
-        self.base = base
-        self.step = 0      # 0=base, 1=2x, 2=3x (máximo)
-        self.bankroll = 0.0
-        self.consecutive_wins = 0
-        self.max_consecutive = 3
-
-    def current_bet(self) -> float:
-        multiplier = [1, 2, 3][min(self.step, 2)]
-        return round(self.base * multiplier, 2)
-
-    def win(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll + bet, 2)
-        self.consecutive_wins += 1
-        if self.consecutive_wins >= self.max_consecutive:
-            self.step = 0
-            self.consecutive_wins = 0
-        else:
-            self.step = min(self.step + 1, 2)
-        return bet
-
-    def loss(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll - bet, 2)
-        self.step = 0
-        self.consecutive_wins = 0
-        return bet
-
-
-# ─── OSCAR'S GRIND (SISTEMA 6) - Optimizado para efectividad 75% ─────────────
-class OscarsGrind:
-    """
-    Oscar's Grind: diseñado para efectividad ~75%.
-    - Aumenta 1 unidad tras ganancia SI aún no ganó el objetivo del ciclo
-    - Nunca aumenta tras pérdida
-    - Objetivo: ganar 1 unidad por ciclo
-    - Máximo 4 unidades apostadas
-    """
-    def __init__(self, base: float):
-        self.base = base
-        self.step = 0      # 0=1u, 1=2u, 2=3u, 3=4u (máximo)
-        self.bankroll = 0.0
-        self.cycle_profit = 0.0
-        self.cycle_goal = base  # Ganar 1 unidad por ciclo
-        self.max_step = 4
-
-    def current_bet(self) -> float:
-        return round(self.base * (self.step + 1), 2)
-
-    def win(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll + bet, 2)
-        self.cycle_profit += bet
-
-        # Si alcanzamos el objetivo del ciclo, reseteamos
-        if self.cycle_profit >= self.cycle_goal:
-            self.step = 0
-            self.cycle_profit = 0.0
-        else:
-            # Aumentamos solo si no superamos el objetivo y no estamos en máximo
-            if self.step < self.max_step - 1:
-                self.step += 1
-        return bet
-
-    def loss(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll - bet, 2)
-        self.cycle_profit -= bet
-        # NO aumentamos la apuesta tras pérdida
-        # Si bajamos del objetivo, reseteamos ciclo
-        if self.cycle_profit < -self.cycle_goal:
-            self.step = 0
-            self.cycle_profit = 0.0
-        return bet
-
-
-# ─── FIBONACCI (SISTEMA 2) ────────────────────────────────────────────────────
-class Fibonacci:
-    """
-    Fibonacci: 1, 1, 2, 3, 5, 8, 13, 21...
-    - Avanza tras pérdida
-    - Retrocede 2 pasos tras ganancia
-    - Menos agresivo que Martingale
-    """
-    def __init__(self, base: float):
-        self.base = base
-        self.step = 0
-        self.bankroll = 0.0
-        self.fib_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34]
-
-    def current_bet(self) -> float:
-        idx = min(self.step, len(self.fib_sequence) - 1)
-        return round(self.base * self.fib_sequence[idx], 2)
-
-    def win(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll + bet, 2)
-        self.step = max(0, self.step - 2)
-        return bet
-
-    def loss(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll - bet, 2)
-        if self.step < len(self.fib_sequence) - 1:
-            self.step += 1
-        return bet
-
-
-# ─── FACTORY: Crear sistema según nombre ─────────────────────────────────────
-def create_betting_system(name: str, base: float):
-    systems = {
-        "dalembert": D_Alembert,
-        "paroli": Paroli,
-        "oscars_grind": OscarsGrind,
-        "fibonacci": Fibonacci,
-    }
-    return systems.get(name, D_Alembert)(base)
-
-
-# ─── SISTEMA AMX V20 ──────────────────────────────────────────────────────────
+# ─── SISTEMA AMX V20 (sin tablas) ────────────────────────────────────────────
 class AMXSignalSystem:
     """
     Sistema de señales AMX V20 adaptado para ruleta.
     Modo Tendencia: EMA4/EMA20 + momentum
     Modo Moderado: EMA8/EMA20 + patrón V
+    La dirección de la señal se determina por la tendencia de las EMAs.
     """
 
     def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
@@ -396,10 +131,6 @@ class AMXSignalSystem:
         self.last_signal_time: float = 0
         self.cooldown_seconds: int = 8
         self.so_cooldown: Optional[float] = None
-        self.momentum_consecutivo: int = 0
-        self.direccion_momentum: int = 0
-        self.prev_ema4_above_ema8: bool = True
-        self.ultimos_puntos: list = []
 
     def calculate_ema(self, data: list, period: int) -> list:
         if len(data) < period:
@@ -413,9 +144,8 @@ class AMXSignalSystem:
             ema.append(prev)
         return ema
 
-    def check_signal_tendencia(self, positions: list, color_data: list, 
-                               current_number: int, expected_color: str,
-                               prob_threshold: float) -> Optional[dict]:
+    def check_signal_tendencia(self, positions: list) -> Optional[dict]:
+        """Detecta señal en modo tendencia (EMA4/EMA20 + momentum)"""
         if len(positions) < 20:
             return None
 
@@ -426,45 +156,36 @@ class AMXSignalSystem:
             return None
 
         ema4 = self.calculate_ema(positions, 4)
-        ema8 = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        # CORRECCIÓN: Verificar que tenemos suficientes valores calculados
-        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
+        if len(ema4) < 2 or len(ema20) < 1:
             return None
-        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
+        if ema4[-1] is None or ema20[-1] is None:
             return None
-        if ema4[-2] is None or ema8[-2] is None:
+        if ema4[-2] is None or ema20[-2] is None:
             return None
 
         current_pos = positions[-1]
 
-        # Condiciones Tendencia
+        # Cruce alcista de EMA4 sobre EMA20
         cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
-        sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
+        # Precio por encima de todas las EMAs
+        sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema20[-1]
 
-        entry = next((e for e in color_data if e["id"] == current_number), None)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-
-        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
-        if entry["senal"] != expected_color or prob < prob_threshold:
-            return None
-
-        if (cruce_alcista or sobre_tres_emas):
+        if cruce_alcista or sobre_tres_emas:
+            # Determinar dirección: si la tendencia es alcista -> ROJO, bajista -> NEGRO
+            expected_color = "ROJO" if current_pos > ema20[-1] else "NEGRO"
             return {
                 "type": "SKRILL_2.0",
                 "mode": "tendencia",
                 "expected_color": expected_color,
-                "probability": prob,
-                "trigger_number": current_number,
+                "trigger_number": None,  # ya no se usa
                 "strength": "strong" if cruce_alcista else "moderate"
             }
         return None
 
-    def check_signal_moderado(self, positions: list, color_data: list,
-                             current_number: int, expected_color: str,
-                             prob_threshold: float) -> Optional[dict]:
+    def check_signal_moderado(self, positions: list) -> Optional[dict]:
+        """Detecta señal en modo moderado (EMA8/EMA20 + patrón V)"""
         if len(positions) < 20:
             return None
 
@@ -478,10 +199,9 @@ class AMXSignalSystem:
         ema8 = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        # CORRECCIÓN: Verificar valores None
-        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
+        if len(ema8) < 2 or len(ema20) < 1:
             return None
-        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
+        if ema8[-1] is None or ema20[-1] is None:
             return None
         if ema8[-2] is None or ema20[-2] is None:
             return None
@@ -495,21 +215,13 @@ class AMXSignalSystem:
             a, b, c = positions[-3], positions[-2], positions[-1]
             patron_v = b < a and b < c and abs(a - c) <= 1 and c > a
 
-        entry = next((e for e in color_data if e["id"] == current_number), None)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-
-        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
-        if entry["senal"] != expected_color or prob < prob_threshold:
-            return None
-
         if (cruce_ema8 or patron_v) and sobre_emas:
+            expected_color = "ROJO" if positions[-1] > ema20[-1] else "NEGRO"
             return {
                 "type": "ALERTA_2.0",
                 "mode": "moderado",
                 "expected_color": expected_color,
-                "probability": prob,
-                "trigger_number": current_number,
+                "trigger_number": None,
                 "pattern": "V" if patron_v else "EMA_CROSS"
             }
         return None
@@ -519,7 +231,6 @@ class AMXSignalSystem:
 
     def register_so_failed(self):
         self.so_cooldown = time.time()
-
 
 # ─── STATISTICS ───────────────────────────────────────────────────────────────
 class Stats:
@@ -579,7 +290,6 @@ class Stats:
         else:
             bk24 = 0.0
         return w, l, t, e, bk24
-
 
 # ─── CHART GENERATION ─────────────────────────────────────────────────────────
 def generate_chart(levels: list, spin_history: list, bet_color: str, visible: int = VISIBLE) -> io.BytesIO:
@@ -672,7 +382,6 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
     buf.seek(0)
     return buf
 
-
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 5
 
@@ -713,15 +422,13 @@ def tg_send_text(chat_id: int, thread_id: int, text: str) -> Optional[int]:
 def tg_delete(chat_id: int, msg_id: int):
     _tg_call(bot.delete_message, chat_id=chat_id, message_id=msg_id)
 
-
-# ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
+# ─── ROULETTE ENGINE (sin tablas predefinidas) ────────────────────────────────
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
         self.name      = name
         self.ws_key    = cfg["ws_key"]
         self.chat_id   = cfg["chat_id"]
         self.thread_id = cfg["thread_id"]
-        self.color_data: list = cfg["color_data"]
 
         self.spin_history:     list = []
         self.original_levels:  list = []
@@ -737,167 +444,30 @@ class RouletteEngine:
         self.trigger_number:   Optional[int] = None
 
         self.result_until:     float = 0.0
-        self.consec_losses:    int = 0          # Nivel de pérdidas (0..9)
-        # Nuevas variables para la recuperación +1 ficha
+        self.consec_losses:    int = 0
         self.recovery_active:  bool  = False
         self.recovery_target:  float = 0.0
-        # Bankroll al inicio de cada señal de nivel 1
         self.level1_bankroll:  float = 0.0
-        # ¿La señal activa fue disparada en nivel 1?
         self.signal_is_level1: bool  = False
 
         self.betting_system_name = cfg.get("betting_system", "dalembert")
-        self.bet_sys = create_betting_system(self.betting_system_name, BASE_BET)
+        self.bet_sys = D_Alembert(BASE_BET)
 
         self.stats = Stats()
-        # CORRECCIÓN: Cambiar a lista para rastrear todos los message_ids de la señal actual
         self.signal_msg_ids: list = []
         self.ws = None
         self.running = True
 
-        # ─── SISTEMA AMX V20 ──────────────────────────────────────────────────
+        # Sistema AMX V20
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.amx_positions: list = [0]  # Posiciones para AMX
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
-        # NUEVOS FILTROS PARA RUSSIAN ROULETTE
-        self.min_consecutive = cfg.get("min_consecutive", 2)  # Colores consecutivos mínimos
-        self.min_spins_between_signals = cfg.get("min_spins_between_signals", 5)  # Spins entre señales
-        self.require_ema_confirm = cfg.get("require_ema_confirm", True)
-        self.require_momentum = cfg.get("require_momentum", False)
-        self.last_signal_spin_count = 0  # Para rastrear spins entre señales
+        self.amx_positions: list = [0]
 
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
-        """Cambia el modo AMX V20"""
         self.amx_system = AMXSignalSystem(mode=mode)
         logger.info(f"[{self.name}] Modo AMX V20 cambiado a: {mode}")
         return mode
 
-    @staticmethod
-    def calculate_ema(data: list, period: int) -> list:
-        if len(data) < period:
-            return [None] * len(data)
-        mult = 2 / (period + 1)
-        out = [None] * (period - 1)
-        prev = sum(data[:period]) / period
-        out.append(prev)
-        for i in range(period, len(data)):
-            prev = (data[i] - prev) * mult + prev
-            out.append(prev)
-        return out
-
-    def get_entry(self, number: int) -> Optional[dict]:
-        for e in self.color_data:
-            if e["id"] == number:
-                return e
-        return None
-
-    def get_signal(self, number: int) -> Optional[str]:
-        e = self.get_entry(number)
-        return e["senal"] if e else None
-
-    def get_prob(self, number: int, color: str) -> float:
-        e = self.get_entry(number)
-        if not e:
-            return 0.0
-        return e["rojo"] if color == "ROJO" else e["negro"]
-
-    def determine_bet_color(self, expected: str) -> str:
-        if len(self.spin_history) < 20:
-            return expected
-        ema20o = self.calculate_ema(self.original_levels, 20)
-        ema20i = self.calculate_ema(self.inverted_levels, 20)
-        li = len(self.original_levels) - 1
-        
-        # CORRECCIÓN: Verificar índice válido y valores None
-        if li < 0 or li >= len(ema20o) or li >= len(ema20i):
-            return expected
-        if ema20o[li] is None or ema20i[li] is None:
-            return expected
-            
-        last_sig = self.get_signal(self.spin_history[-1]["number"])
-        if expected == "ROJO":
-            if self.original_levels[li] < ema20o[li]:
-                return "NEGRO" if last_sig == "NEGRO" else "ROJO"
-            return "ROJO"
-        else:
-            if self.inverted_levels[li] < ema20i[li]:
-                return "ROJO" if last_sig == "ROJO" else "NEGRO"
-            return "NEGRO"
-
-    def should_activate(self) -> Optional[str]:
-        """Versión corregida con verificación de límites de índices"""
-        losses = self.consec_losses
-        min_spin = 22 + losses * 2
-        if len(self.spin_history) < min_spin:
-            return None
-
-        last_num = self.spin_history[-1]["number"]
-        entry = self.get_entry(last_num)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-        expected = entry["senal"]
-
-        # CORRECCIÓN: Verificar que hay suficientes datos para calcular EMAs
-        if len(self.original_levels) < 20 or len(self.inverted_levels) < 20:
-            return None
-
-        ema4o = self.calculate_ema(self.original_levels, 4)
-        ema8o = self.calculate_ema(self.original_levels, 8)
-        ema20o = self.calculate_ema(self.original_levels, 20)
-        ema4i = self.calculate_ema(self.inverted_levels, 4)
-        ema8i = self.calculate_ema(self.inverted_levels, 8)
-        ema20i = self.calculate_ema(self.inverted_levels, 20)
-
-        req = min(3 + losses, 13)
-        li = len(self.original_levels) - 1
-
-        def check(levels, e20, e8, e4, idx):
-            for off in range(req):
-                i = idx - (req - 1) + off
-                if i < 0:
-                    return False
-                # CORRECCIÓN: Verificar límites de índices
-                if i >= len(levels) or i >= len(e20):
-                    return False
-                if e20[i] is None or levels[i] <= e20[i]:
-                    return False
-                if losses >= 2:
-                    if i >= len(e8) or e8[i] is None:
-                        return False
-                    if levels[i] <= e8[i]:
-                        return False
-                if losses >= 4:
-                    if i >= len(e4) or e4[i] is None:
-                        return False
-                    if levels[i] <= e4[i]:
-                        return False
-            return True
-
-        if expected == "ROJO":
-            if check(self.original_levels, ema20o, ema8o, ema4o, li):
-                return "ROJO"
-        elif expected == "NEGRO":
-            if check(self.inverted_levels, ema20i, ema8i, ema4i, li):
-                return "NEGRO"
-        return None
-
-    def _check_recovery(self):
-        """Verifica si se alcanzó recovery_target y resetea a nivel 1."""
-        if not self.recovery_active:
-            return
-        if self.bet_sys.bankroll >= self.recovery_target:
-            logger.info(
-                f"[{self.name}] Recuperación completada! "
-                f"bankroll={self.bet_sys.bankroll:.2f} >= objetivo={self.recovery_target:.2f}. "
-                f"Reseteando a nivel 1."
-            )
-            self.consec_losses    = 0
-            self.recovery_active  = False
-            self.recovery_target  = 0.0
-            self.bet_sys.step     = 0   # vuelve al nivel 1 de D'Alembert
-
     def _update_amx_positions(self, color: str):
-        """Actualiza posiciones para sistema AMX"""
         last_pos = self.amx_positions[-1] if self.amx_positions else 0
         if color == "ROJO":
             new_pos = last_pos + 1
@@ -930,55 +500,39 @@ class RouletteEngine:
             self.inverted_levels.append(last_i + (1 if real == "NEGRO" else -1))
             self.last_nonzero_color = real
 
-        # CORRECCIÓN: Mantener sincronización estricta con spin_history
+        # Sincronizar longitudes
         while len(self.original_levels) > len(self.spin_history):
             self.original_levels.pop(0)
         while len(self.inverted_levels) > len(self.spin_history):
             self.inverted_levels.pop(0)
-        
-        # Asegurar que las listas de niveles tengan el mismo tamaño
         min_len = min(len(self.original_levels), len(self.inverted_levels))
         self.original_levels = self.original_levels[-min_len:]
         self.inverted_levels = self.inverted_levels[-min_len:]
 
-        # Actualizar posiciones AMX
         self._update_amx_positions(real)
 
-        # ── Resolve active signal ─────────────────────────────────────────────
+        # ── Resolver señal activa ─────────────────────────────────────────────
         if self.signal_active and time.time() > self.result_until:
             is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
-            
-            # CORRECCIÓN: Calcular en qué intento estamos
             current_attempt = MAX_ATTEMPTS - self.attempts_left + 1
-            
+
             if is_win:
-                # GANÓ: Mantener la señal del intento ganador, eliminar las anteriores
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
-                
-                # Eliminar señales de intentos anteriores (si hay más de una)
                 if len(self.signal_msg_ids) > 1:
-                    # Mantener solo la última señal (la ganadora)
                     for msg_id in self.signal_msg_ids[:-1]:
                         tg_delete(self.chat_id, msg_id)
                     self.signal_msg_ids = [self.signal_msg_ids[-1]]
-                
                 self.signal_active = False
                 self._check_recovery()
                 self._send_result(number, real, True, bet)
                 self._check_stats()
-                
-                # Limpiar la lista de message_ids al finalizar la señal
                 self.signal_msg_ids = []
-                
             else:
-                # PERDIÓ
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
-                
                 if self.attempts_left <= 0:
-                    # ÚLTIMO INTENTO (3) PERDIDO: Mantener todas las señales
-                    # No eliminar nada, mantener todas las señales de los intentos
+                    # Último intento perdido: mantener todas las señales
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
                         self.consec_losses = 0
@@ -991,133 +545,77 @@ class RouletteEngine:
                             self.recovery_target = self.level1_bankroll + BASE_BET
                         else:
                             self.recovery_target = self.level1_bankroll + BASE_BET
-                        logger.info(
-                            f"[{self.name}] Pérdida nivel {self.consec_losses}. "
-                            f"Modo recuperación activado. "
-                            f"level1_bankroll={self.level1_bankroll:.2f} "
-                            f"objetivo={self.recovery_target:.2f}"
-                        )
+                        logger.info(f"[{self.name}] Pérdida nivel {self.consec_losses}. Recuperación activada, objetivo={self.recovery_target:.2f}")
                     self.stats.record(False, self.bet_sys.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
                     self._check_stats()
-                    
-                    # Limpiar la lista de message_ids al finalizar la señal
                     self.signal_msg_ids = []
-                    
                 else:
-                    # INTENTO 1 o 2 PERDIDO: Eliminar la señal de este intento
+                    # Intento 1 o 2 perdido: eliminar la última señal
                     if self.signal_msg_ids:
-                        # Eliminar la última señal enviada (la del intento perdido)
                         last_msg_id = self.signal_msg_ids.pop()
                         tg_delete(self.chat_id, last_msg_id)
-                    
-                    # Enviar nueva señal de reintento
                     self.trigger_number = number
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
                     self._send_retry_signal(number, new_bet, attempt_number)
 
-        # ── Activate new signal ───────────────────────────────────────────────
+        # ── Activar nueva señal (solo con AMX) ─────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
-            # Limpiar message_ids al iniciar nueva señal
             self.signal_msg_ids = []
-            
             signal = self._detect_amx_signal()
-
             if signal:
                 self.signal_active = True
                 self.expected_color = signal["expected_color"]
                 self.bet_color = signal["expected_color"]
                 self.attempts_left = MAX_ATTEMPTS
                 self.total_attempts = MAX_ATTEMPTS
-                self.trigger_number = signal["trigger_number"]
-                self.last_signal_spin_count = len(self.spin_history)  # Registrar spin de señal
-                self._send_signal(signal["trigger_number"], 1, amx_signal=signal)
-            else:
-                expected = self.should_activate()
-                if expected:
-                    self.signal_active = True
-                    self.expected_color = expected
-                    self.bet_color = self.determine_bet_color(expected)
-                    self.attempts_left = MAX_ATTEMPTS
-                    self.total_attempts = MAX_ATTEMPTS
-                    self.trigger_number = number
-                    self.last_signal_spin_count = len(self.spin_history)  # Registrar spin de señal
-                    self._send_signal(number, 1)
+                self.trigger_number = self.spin_history[-1]["number"] if self.spin_history else 0
+                self._send_signal(self.trigger_number, 1, amx_signal=signal)
 
     def _detect_amx_signal(self) -> Optional[dict]:
-        """Detecta señal usando sistema AMX V20 con filtros estrictos"""
         if len(self.amx_positions) < 20:
             return None
 
-        current_number = self.spin_history[-1]["number"] if self.spin_history else 0
-        entry = self.get_entry(current_number)
-        if not entry or entry["senal"] == "NO APOSTAR":
+        # Verificar momentum: dos del mismo color seguidos (excluyendo verde)
+        recent_colors = [s["real"] for s in self.spin_history[-5:] if s["real"] != "VERDE"]
+        if len(recent_colors) < 2:
             return None
-
-        expected_color = entry["senal"]
-
-        # ─── FILTRO 1: Verificar colores consecutivos mínimos ───────────────────
-        recent_colors = [s["real"] for s in self.spin_history[-8:]]  # Más histórico
-        momentum_count = 0
-        for c in reversed(recent_colors):
-            if c == expected_color:
-                momentum_count += 1
-            elif c != "VERDE":
-                break
-
-        if momentum_count < self.min_consecutive:
-            logger.debug(f"[{self.name}] Filtrado: momentum {momentum_count} < {self.min_consecutive}")
+        if recent_colors[-1] != recent_colors[-2]:
             return None
+        momentum_color = recent_colors[-1]  # ROJO o NEGRO
 
-        # ─── FILTRO 2: Verificar spins entre señales ────────────────────────────
-        spins_since_last_signal = len(self.spin_history) - self.last_signal_spin_count
-        if spins_since_last_signal < self.min_spins_between_signals:
-            logger.debug(f"[{self.name}] Filtrado: spins {spins_since_last_signal} < {self.min_spins_between_signals}")
-            return None
-
-        # ─── FILTRO 3: Verificar probabilidad mínima ────────────────────────────
-        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
-        if prob < self.min_prob_threshold:
-            logger.debug(f"[{self.name}] Filtrado: prob {prob} < {self.min_prob_threshold}")
-            return None
-
-        # ─── FILTRO 4: Requiere momentum extendido (Russian Roulette) ───────────
-        if self.require_momentum and momentum_count < 3:
-            logger.debug(f"[{self.name}] Filtrado: momentum extendido {momentum_count} < 3")
-            return None
-
-        # ─── FILTRO 5: Confirmación EMA si se requiere ────────────────────────
-        if self.require_ema_confirm:
-            # Verificar que EMA20 está por debajo del precio actual
-            ema20 = self.calculate_ema(self.amx_positions, 20)
-            if ema20 and ema20[-1] is not None and self.amx_positions[-1] <= ema20[-1]:
-                logger.debug(f"[{self.name}] Filtrado: EMA20 no confirma tendencia")
-                return None
-
-        # Detectar según modo
+        # Detectar según modo AMX
         try:
             if self.amx_system.mode == "tendencia":
-                signal = self.amx_system.check_signal_tendencia(
-                    self.amx_positions, self.color_data, current_number,
-                    expected_color, self.min_prob_threshold
-                )
+                signal = self.amx_system.check_signal_tendencia(self.amx_positions)
             else:
-                signal = self.amx_system.check_signal_moderado(
-                    self.amx_positions, self.color_data, current_number,
-                    expected_color, self.min_prob_threshold
-                )
+                signal = self.amx_system.check_signal_moderado(self.amx_positions)
         except Exception as e:
             logger.warning(f"[{self.name}] Error en detección AMX: {e}")
             return None
 
-        return signal
+        if signal:
+            # Asegurar que la dirección de la señal coincida con el momentum
+            if signal["expected_color"] != momentum_color:
+                return None
+            return signal
+        return None
 
-    # ── Telegram: send initial signal ─────────────────────────────────────────
+    def _check_recovery(self):
+        if not self.recovery_active:
+            return
+        if self.bet_sys.bankroll >= self.recovery_target:
+            logger.info(f"[{self.name}] Recuperación completada! bankroll={self.bet_sys.bankroll:.2f} >= objetivo={self.recovery_target:.2f}. Reseteando a nivel 1.")
+            self.consec_losses    = 0
+            self.recovery_active  = False
+            self.recovery_target  = 0.0
+            self.bet_sys.step     = 0
+
+    # ── Telegram: enviar señal inicial ─────────────────────────────────────────
     def _send_signal(self, trigger: int, attempt: int, amx_signal: Optional[dict] = None):
         bet = self.bet_sys.current_bet()
-        prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
 
@@ -1126,30 +624,18 @@ class RouletteEngine:
             self.level1_bankroll = self.bet_sys.bankroll
             logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
-        # CORRECCIÓN: Generar sys_name de forma segura según el sistema activo
-        if self.betting_system_name == "paroli":
-            sys_name = f"Paroli paso {step} de 3 (x{self.bet_sys.consecutive_wins + 1})"
-        elif self.betting_system_name == "dalembert":
-            sys_name = f"D'Alembert paso {step} de 20"
-        elif self.betting_system_name == "oscars_grind":
-            sys_name = f"Oscar's Grind ciclo {step} de 4"
-        elif self.betting_system_name == "fibonacci":
-            sys_name = f"Fibonacci paso {step}"
-        else:
-            sys_name = f"Sistema paso {step}"
-        sys_line = f"🌀 <i>{sys_name}</i>\n"
-
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
-            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>"
+            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>\n"
 
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Después de: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
-            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
+            f"{amx_line}"
             f"{sys_line}"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
@@ -1157,38 +643,20 @@ class RouletteEngine:
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
-        
-        # CORRECCIÓN: Agregar el message_id a la lista
         if msg_id:
             self.signal_msg_ids.append(msg_id)
-        
         logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, recovery={self.recovery_active}")
 
-    # ── Telegram: send retry signal (segundo o tercer intento) ─────────────────
     def _send_retry_signal(self, trigger: int, new_bet: float, attempt_number: int):
-        prob = int(self.get_prob(trigger, self.bet_color) * 100)
         color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-
-        # CORRECCIÓN: Generar sys_name de forma segura según el sistema activo
-        if self.betting_system_name == "paroli":
-            sys_name = f"Paroli paso {step} de 3 (x{self.bet_sys.consecutive_wins + 1})"
-        elif self.betting_system_name == "dalembert":
-            sys_name = f"D'Alembert paso {step} de 20"
-        elif self.betting_system_name == "oscars_grind":
-            sys_name = f"Oscar's Grind ciclo {step} de 4"
-        elif self.betting_system_name == "fibonacci":
-            sys_name = f"Fibonacci paso {step}"
-        else:
-            sys_name = f"Sistema paso {step}"
-        sys_line = f"🌀 <i>{sys_name}</i>\n"
+        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
         recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉🏼 <b>Después de: {trigger}</b>\n"
             f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
-            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
             f"{sys_line}"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
@@ -1196,11 +664,8 @@ class RouletteEngine:
         levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
         chart = generate_chart(levels, self.spin_history[:], self.bet_color)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
-        
-        # CORRECCIÓN: Agregar el message_id a la lista
         if msg_id:
             self.signal_msg_ids.append(msg_id)
-        
         logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}, attempt {attempt_number}/{MAX_ATTEMPTS}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float):
@@ -1287,7 +752,6 @@ class RouletteEngine:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
-
 # ─── FLASK KEEPALIVE ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -1302,7 +766,6 @@ def ping():
 @app.route("/health")
 def health():
     return jsonify({"healthy": True})
-
 
 # ─── SELF-PING TASK ──────────────────────────────────────────────────────────
 import os
@@ -1320,7 +783,6 @@ async def self_ping_loop():
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
 
-
 # ─── COMANDOS TELEGRAM ───────────────────────────────────────────────────────
 engines: dict[str, RouletteEngine] = {}
 
@@ -1336,10 +798,9 @@ Comandos disponibles:
 /reset - Resetea estadísticas
 /help - Muestra esta ayuda
 
-Sistema AMX V20 integrado con detección de señales 2.00x
+Sistema AMX V20 sin tablas predefinidas. La dirección de la señal se determina por la tendencia de las EMAs.
     """
     bot.reply_to(message, help_text, parse_mode="HTML")
-
 
 @bot.message_handler(commands=['moderado'])
 def cmd_moderado(message):
@@ -1349,13 +810,11 @@ def cmd_moderado(message):
         engine.set_mode("moderado")
         if old_mode != "moderado":
             changed.append(name)
-
     if changed:
         text = f"✅ <b>Modo MODERADO activado</b>\n\nRuletas: {', '.join(changed)}"
     else:
         text = "📊 <b>Todas las ruletas en modo MODERADO</b>"
     bot.reply_to(message, text, parse_mode="HTML")
-
 
 @bot.message_handler(commands=['tendencia'])
 def cmd_tendencia(message):
@@ -1365,13 +824,11 @@ def cmd_tendencia(message):
         engine.set_mode("tendencia")
         if old_mode != "tendencia":
             changed.append(name)
-
     if changed:
         text = f"📈 <b>Modo TENDENCIA activado</b>\n\nRuletas: {', '.join(changed)}"
     else:
         text = "📈 <b>Todas las ruletas en modo TENDENCIA</b>"
     bot.reply_to(message, text, parse_mode="HTML")
-
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
@@ -1382,24 +839,20 @@ def cmd_status(message):
         lines.append(f"<b>{name}</b>: {mode_icon} {engine.amx_system.mode} {signal_status}")
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
-
 @bot.message_handler(commands=['reset'])
 def cmd_reset(message):
     for engine in engines.values():
         engine.stats = Stats()
     bot.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
 
-
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-
 async def main():
     global engines
     engines = {name: RouletteEngine(name, cfg) for name, cfg in ROULETTE_CONFIGS.items()}
-
     tasks = [asyncio.create_task(e.run_ws()) for e in engines.values()]
     tasks.append(asyncio.create_task(self_ping_loop()))
 
@@ -1410,11 +863,10 @@ async def main():
     tg_thread = threading.Thread(target=telegram_polling, daemon=True)
     tg_thread.start()
 
-    logger.info("🎰 Roulette Bot AMX V20 iniciado")
+    logger.info("🎰 Roulette Bot AMX V20 iniciado (sin tablas predefinidas)")
     logger.info("Comandos: /moderado, /tendencia, /status, /reset, /help")
 
     await asyncio.gather(*tasks)
-
 
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
