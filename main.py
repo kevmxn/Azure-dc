@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX V20 + ML + Markov Chain
-AGREGADO:
-  - MarkovChain (orden 2): predice color siguiente con probabilidad estadística
-  - OnlineLogisticRegression (SGD): filtra señales en tiempo real, se entrena con resultados
-  - MLSignalFilter: integra ambos modelos, extrae features y decide si emitir señal
 """
 
 import asyncio
@@ -21,7 +17,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.util import escape_html
 import websockets
 from flask import Flask, jsonify
 
@@ -124,26 +120,15 @@ VISIBLE   = 50
 # ─── MARKOV CHAIN (ORDEN 2) ────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 class MarkovChain:
-    """
-    Cadena de Markov de orden configurable (default 2).
-    Estado = últimos `order` colores no-verde.
-    Aprende en línea con cada nuevo resultado y predice la probabilidad
-    del siguiente color.
-
-    Usa suavizado de Laplace para evitar probabilidades 0 con pocos datos.
-    """
     COLORS = ("ROJO", "NEGRO")
 
     def __init__(self, order: int = 2, laplace_alpha: float = 1.0):
         self.order = order
-        self.alpha = laplace_alpha          # suavizado Laplace
-        # {state_tuple: {color: count}}
+        self.alpha = laplace_alpha
         self.transitions: dict = {}
-        self._history: deque = deque(maxlen=500)  # historial interno
+        self._history: deque = deque(maxlen=500)
 
-    # ── Actualización online ────────────────────────────────────────────────
     def update(self, color: str):
-        """Llamar con cada color nuevo (ROJO/NEGRO; VERDE se ignora)."""
         if color not in self.COLORS:
             return
         self._history.append(color)
@@ -156,12 +141,7 @@ class MarkovChain:
             self.transitions[state] = {c: 0 for c in self.COLORS}
         self.transitions[state][next_c] += 1
 
-    # ── Predicción ─────────────────────────────────────────────────────────
     def predict(self) -> dict:
-        """
-        Retorna {ROJO: prob, NEGRO: prob} dado el historial actual.
-        Usa suavizado de Laplace si el estado tiene pocas observaciones.
-        """
         if len(self._history) < self.order:
             return {c: 0.5 for c in self.COLORS}
         state = tuple(list(self._history)[-self.order:])
@@ -169,12 +149,7 @@ class MarkovChain:
         total = sum(counts.values()) + self.alpha * len(self.COLORS)
         return {c: (counts.get(c, 0) + self.alpha) / total for c in self.COLORS}
 
-    # ── Confianza del modelo ────────────────────────────────────────────────
     def confidence(self) -> float:
-        """
-        Retorna cuántas observaciones ha visto el estado actual.
-        Más observaciones → más confianza.
-        """
         if len(self._history) < self.order:
             return 0.0
         state = tuple(list(self._history)[-self.order:])
@@ -183,7 +158,6 @@ class MarkovChain:
         return float(sum(self.transitions[state].values()))
 
     def state_info(self) -> str:
-        """Debug: estado actual y su distribución."""
         if len(self._history) < self.order:
             return "Sin datos suficientes"
         state = tuple(list(self._history)[-self.order:])
@@ -198,27 +172,19 @@ class MarkovChain:
 # ─── ONLINE LOGISTIC REGRESSION (SGD) ────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 class OnlineLogisticRegression:
-    """
-    Regresión logística entrenada en línea con descenso de gradiente estocástico.
-    - 12 features normalizados (ver `MLSignalFilter.extract_features`)
-    - Se actualiza con cada resultado (win=1, loss=0)
-    - Warm-up: los primeros `min_samples` resultados solo entrenan, no filtran
-    """
     N_FEATURES = 12
 
     def __init__(self, lr: float = 0.05, reg: float = 0.005, min_samples: int = 30):
         self.weights = np.zeros(self.N_FEATURES)
         self.bias    = 0.0
         self.lr      = lr
-        self.reg     = reg                  # L2 regularización
+        self.reg     = reg
         self.min_samples = min_samples
         self.n_samples   = 0
-        # Estadísticas acumuladas para normalización online (media/var)
         self._feat_mean = np.zeros(self.N_FEATURES)
         self._feat_var  = np.ones(self.N_FEATURES)
         self._feat_n    = 0
 
-    # ── Normalización online (Welford) ─────────────────────────────────────
     def _update_stats(self, x: np.ndarray):
         self._feat_n += 1
         delta = x - self._feat_mean
@@ -233,23 +199,15 @@ class OnlineLogisticRegression:
         std = np.where(std < 1e-8, 1.0, std)
         return (x - self._feat_mean) / std
 
-    # ── Sigmoid ────────────────────────────────────────────────────────────
     @staticmethod
     def _sigmoid(z: float) -> float:
         return 1.0 / (1.0 + np.exp(-np.clip(z, -15, 15)))
 
-    # ── Inferencia ─────────────────────────────────────────────────────────
     def predict_proba(self, raw_features: np.ndarray) -> float:
-        """Probabilidad de win [0, 1]."""
         x = self._normalize(raw_features)
         return self._sigmoid(float(np.dot(self.weights, x)) + self.bias)
 
-    # ── Entrenamiento online ────────────────────────────────────────────────
     def update(self, raw_features: np.ndarray, label: int):
-        """
-        label: 1 = ganó la apuesta, 0 = perdió.
-        Actualiza pesos via SGD + L2.
-        """
         self._update_stats(raw_features)
         x = self._normalize(raw_features)
         pred  = self._sigmoid(float(np.dot(self.weights, x)) + self.bias)
@@ -260,7 +218,6 @@ class OnlineLogisticRegression:
 
     @property
     def ready(self) -> bool:
-        """True cuando tiene suficientes muestras para filtrar."""
         return self.n_samples >= self.min_samples
 
     def summary(self) -> str:
@@ -271,30 +228,6 @@ class OnlineLogisticRegression:
 # ─── ML SIGNAL FILTER  (integra Markov + LR) ─────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 class MLSignalFilter:
-    """
-    Orquesta Markov Chain + Logistic Regression para filtrar señales.
-
-    Umbrales:
-      - `markov_threshold`: probabilidad mínima de Markov para el color apostado
-      - `ml_threshold`:     probabilidad mínima del modelo LR para emitir señal
-      - `ml_threshold_retry`: umbral más suave para intento 2 (ya hubo pérdida)
-
-    Cuando el modelo no está listo (warm-up), solo se usa Markov.
-    """
-    # Features (12 en total):
-    # 0  tabla_prob        – probabilidad de la tabla de colores
-    # 1  markov_prob       – probabilidad Markov para bet_color
-    # 2  markov_conf_norm  – confianza Markov (saturada a 50 obs)
-    # 3  ema4_above_ema20  – EMA4 > EMA20
-    # 4  ema8_above_ema20  – EMA8 > EMA20
-    # 5  ema4_above_ema8   – EMA4 > EMA8
-    # 6  momentum_norm     – racha del color correcto (÷5)
-    # 7  positions_above5  – últimas 5 posiciones sobre EMA20 (÷5)
-    # 8  consec_losses_n   – pérdidas consecutivas (÷10)
-    # 9  bet_step_norm     – paso D'Alembert (÷20)
-    # 10 streak_match      – últimos 2 resultados coincidieron con señal (0/0.5/1)
-    # 11 recovery_flag     – 1 si está en modo recuperación
-
     N_FEATURES = 12
 
     def __init__(
@@ -310,11 +243,8 @@ class MLSignalFilter:
         self.markov_threshold   = markov_threshold
         self.ml_threshold       = ml_threshold
         self.ml_threshold_retry = ml_threshold_retry
-
-        # Features del último análisis (para pasarlas al update después)
         self._last_features: Optional[np.ndarray] = None
 
-    # ── Extracción de features ─────────────────────────────────────────────
     def extract_features(
         self,
         bet_color: str,
@@ -340,7 +270,6 @@ class MLSignalFilter:
         f4 = float(ema8[li] > ema20[li]) if safe else 0.5
         f5 = float(ema4[li] > ema8[li])  if safe else 0.5
 
-        # últimas 5 posiciones por encima de EMA20
         above5 = 0.0
         if safe and len(positions) >= 5:
             cutoff = max(0, len(positions) - 5)
@@ -367,53 +296,37 @@ class MLSignalFilter:
         self._last_features = feats
         return feats
 
-    # ── Filtro principal ────────────────────────────────────────────────────
     def should_emit_signal(
         self,
         features: np.ndarray,
         bet_color: str,
         is_retry: bool = False,
     ) -> tuple[bool, float, float, str]:
-        """
-        Retorna (emit, markov_prob, ml_prob, reason).
-        `reason` explica por qué se bloqueó o aprobó la señal.
-        """
         markov_prob = self.markov.predict().get(bet_color, 0.5)
-
-        # Filtro Markov: siempre activo
         if markov_prob < self.markov_threshold:
             return False, markov_prob, 0.0, (
                 f"Markov bloqueó: {markov_prob:.2f} < {self.markov_threshold:.2f}"
             )
-
-        # Si el modelo no está listo, solo Markov decide
         if not self.model.ready:
             return True, markov_prob, 0.0, (
                 f"Markov OK ({markov_prob:.2f}), ML en warm-up "
                 f"({self.model.n_samples}/{self.model.min_samples})"
             )
-
         ml_prob  = self.model.predict_proba(features)
         threshold = self.ml_threshold_retry if is_retry else self.ml_threshold
-
         if ml_prob < threshold:
             return False, markov_prob, ml_prob, (
                 f"ML bloqueó: {ml_prob:.2f} < {threshold:.2f}"
             )
-
         return True, markov_prob, ml_prob, (
             f"Aprobado — Markov={markov_prob:.2f} ML={ml_prob:.2f}"
         )
 
-    # ── Update post-resultado ──────────────────────────────────────────────
     def update_result(self, won: bool):
-        """Llamar después de cada resultado con señal activa."""
         if self._last_features is not None:
             self.model.update(self._last_features, int(won))
 
-    # ── Update Markov con cada giro ────────────────────────────────────────
     def observe_color(self, color: str):
-        """Llamar con cada color real (verde se ignora internamente)."""
         self.markov.update(color)
 
     def info(self) -> str:
@@ -694,7 +607,6 @@ def generate_chart(levels: list, spin_history: list, bet_color: str,
         ax.scatter(i, y[i], color=c, s=22, zorder=5,
                    edgecolors="white", linewidths=0.3)
 
-    # Soporte / resistencia
     sr = find_support_resistance(levels, lookback=30)
     res_color = "#e84040" if is_rojo else "#888888"
     sup_color = "#888888" if is_rojo else "#e84040"
@@ -709,7 +621,6 @@ def generate_chart(levels: list, spin_history: list, bet_color: str,
         ax.text(x[-1], sr['resistance'], f' R {sr["resistance"]:.1f}',
                 color=res_color, fontsize=8, va='top', ha='right')
 
-    # Etiqueta ML / Markov en el gráfico
     if ml_prob > 0 or markov_prob > 0:
         label_txt = (f"Markov {markov_prob*100:.0f}%"
                      + (f"  |  ML {ml_prob*100:.0f}%" if ml_prob > 0 else ""))
@@ -839,7 +750,6 @@ class RouletteEngine:
         self.amx_system = AMXSignalSystem(mode="moderado")
         self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
 
-        # ── ML / Markov ────────────────────────────────────────────────────
         self.ml_filter = MLSignalFilter(
             markov_order=2,
             markov_threshold=0.52,
@@ -847,10 +757,10 @@ class RouletteEngine:
             ml_threshold_retry=0.48,
             ml_min_samples=30,
         )
-        # Almacena las features del último intento para actualizar en resultado
         self._pending_features: Optional[np.ndarray] = None
         self._last_markov_prob: float = 0.0
         self._last_ml_prob:     float = 0.0
+        self.signal_sequence_colors: list = []  # Colores reales durante la señal activa
 
     # ── Modo AMX ───────────────────────────────────────────────────────────
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
@@ -997,41 +907,32 @@ class RouletteEngine:
         self.original_levels = self.original_levels[-min_len:]
         self.inverted_levels = self.inverted_levels[-min_len:]
 
-        # Actualizar Markov con cada giro (VERDE se ignora internamente)
         self.ml_filter.observe_color(real)
-
         self._update_amx_positions(real)
         expected_signal = self.get_signal(number)
         self.amx_system.update_streak(real, expected_signal)
+
+        # Registrar color si hay señal activa
+        if self.signal_active:
+            self.signal_sequence_colors.append(real)
 
         # ── Evaluación de resultado de señal activa ───────────────────────
         if self.signal_active and time.time() > self.result_until:
             is_win = ((self.bet_color == "ROJO"  and real == "ROJO") or
                       (self.bet_color == "NEGRO" and real == "NEGRO"))
 
-            # Actualizar modelo ML con el resultado
             self.ml_filter.update_result(is_win)
             logger.info(f"[{self.name}] ML update: won={is_win} | {self.ml_filter.info()}")
 
             if is_win:
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
-                # Limpiar mensajes anteriores (mantener solo el último)
-                for mid in self.signal_msg_ids[:-1]:
-                    tg_delete(self.chat_id, mid)
-                self.signal_msg_ids = [self.signal_msg_ids[-1]] if self.signal_msg_ids else []
-                self.signal_active = False
-                self._check_recovery()
-                self._send_result(number, real, True, bet)
-                self._check_stats()
-                self.signal_msg_ids = []
-
+                self._finalize_signal(won=True, number=number, real=real, bet=bet)
             else:
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
 
                 if self.attempts_left <= 0:
-                    # Señal agotada → pérdida confirmada
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
                         self.consec_losses   = 0
@@ -1041,13 +942,9 @@ class RouletteEngine:
                         self.recovery_active = True
                         self.recovery_target = self.level1_bankroll + BASE_BET
                     self.stats.record(False, self.bet_sys.bankroll)
-                    self.signal_active = False
-                    self._send_result(number, real, False, bet)
-                    self._check_stats()
-                    self.signal_msg_ids = []
-
+                    self._finalize_signal(won=False, number=number, real=real, bet=bet)
                 else:
-                    # Retry: borrar último mensaje y emitir nuevo con filtro ML
+                    # Reintento
                     if self.signal_msg_ids:
                         tg_delete(self.chat_id, self.signal_msg_ids.pop())
 
@@ -1055,7 +952,6 @@ class RouletteEngine:
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
 
-                    # ── Filtro ML para reintento ──────────────────────────
                     feats = self._build_features(self.bet_color)
                     emit, mp, mlp, reason = self.ml_filter.should_emit_signal(
                         feats, self.bet_color, is_retry=True
@@ -1066,28 +962,20 @@ class RouletteEngine:
                         self._last_ml_prob     = mlp
                         self._send_retry_signal(number, new_bet, attempt_number)
                     else:
-                        # ML bloquea el reintento → cancelar señal
                         logger.info(f"[{self.name}] Retry bloqueado por ML/Markov: {reason}")
-                        tg_send_text(
-                            self.chat_id, self.thread_id,
-                            f"🚫 <b>Reintento cancelado por filtro ML</b>\n"
-                            f"<i>{reason}</i>"
-                        )
                         self.stats.record(False, self.bet_sys.bankroll)
-                        self.signal_active = False
-                        self.signal_msg_ids = []
+                        self._finalize_signal(won=False, number=number, real=real, bet=bet)
 
         # ── Búsqueda de nueva señal ───────────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
-            self.signal_msg_ids = []
+            self.signal_msg_ids.clear()
+            self.signal_sequence_colors.clear()
 
             signal = self._detect_amx_signal()
-
             if signal:
                 bet_color  = signal["expected_color"]
                 tabla_prob = signal["probability"]
 
-                # ── Filtro ML intento 1 ───────────────────────────────────
                 feats = self._build_features(bet_color, tabla_prob=tabla_prob)
                 emit, mp, mlp, reason = self.ml_filter.should_emit_signal(
                     feats, bet_color, is_retry=False
@@ -1113,7 +1001,6 @@ class RouletteEngine:
                 if expected:
                     bet_color = self.determine_bet_color(expected)
 
-                    # ── Filtro ML intento 1 (clásico) ─────────────────────
                     feats = self._build_features(bet_color)
                     emit, mp, mlp, reason = self.ml_filter.should_emit_signal(
                         feats, bet_color, is_retry=False
@@ -1136,7 +1023,6 @@ class RouletteEngine:
 
     # ── Feature builder ─────────────────────────────────────────────────────
     def _build_features(self, bet_color: str, tabla_prob: Optional[float] = None) -> np.ndarray:
-        """Extrae el vector de 12 features para el filtro ML."""
         if tabla_prob is None:
             last_num = self.spin_history[-1]["number"] if self.spin_history else 0
             tabla_prob = self.get_prob(last_num, bet_color)
@@ -1147,7 +1033,6 @@ class RouletteEngine:
         ema8  = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        # Momentum: cuántos giros recientes coinciden con bet_color
         recent = [s["real"] for s in self.spin_history[-5:]]
         momentum = sum(1 for c in reversed(recent)
                        if c == bet_color) if recent else 0
@@ -1197,92 +1082,113 @@ class RouletteEngine:
             logger.warning(f"[{self.name}] Error AMX: {e}")
             return None
 
-    # ── Send signal ─────────────────────────────────────────────────────────
+    # ── Envío de señal (primer intento) ─────────────────────────────────────
     def _send_signal(self, trigger: int, attempt: int, amx_signal: Optional[dict] = None):
         bet  = self.bet_sys.current_bet()
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
+        mk   = self._last_markov_prob * 100
 
         self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
         if self.signal_is_level1:
             self.level1_bankroll = self.bet_sys.bankroll
 
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-        amx_line = ""
-        if amx_signal:
-            mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
-            amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>\n"
-
-        # Líneas ML / Markov
-        mk = self._last_markov_prob
-        ml = self._last_ml_prob
-        ml_line = (f"🧠 <i>Markov: {mk*100:.0f}%"
-                   + (f"  |  ML: {ml*100:.0f}%" if ml > 0 else "")
-                   + "</i>\n")
+        safe_name = escape_html(self.name)
+        safe_trigger = escape_html(str(trigger))
+        safe_bet_color = escape_html(self.bet_color)
 
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
-            f"🎰 <b>Juego: {self.name}</b>\n"
-            f"👉 <b>Después de: {trigger}</b>\n"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {icon}\n\n"
+            f"🎰 <b>Juego: {safe_name}</b>\n"
+            f"👉🏼 <b>Después de: {safe_trigger}</b>\n"
+            f"🎯 <b>Apostar a: {safe_bet_color}</b> {icon}\n\n"
             f"💡 <i>Probabilidad tabla: {prob}%</i>\n"
-            f"{ml_line}"
-            f"{sys_line}"
-            f"{amx_line}"
+            f"💠 <i>Probabilidad Markov: {mk:.0f}%</i>\n"
+            f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
         )
+
         levels = (self.original_levels[:] if self.bet_color == "ROJO"
                   else self.inverted_levels[:])
         chart  = generate_chart(levels, self.spin_history[:], self.bet_color,
-                                markov_prob=mk, ml_prob=ml)
+                                markov_prob=mk/100, ml_prob=0)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         if msg_id:
             self.signal_msg_ids.append(msg_id)
         logger.info(f"[{self.name}] Signal: {self.bet_color} after {trigger}, "
-                    f"bet={bet:.2f}, step={step}, Markov={mk:.2f}, ML={ml:.2f}")
+                    f"bet={bet:.2f}, step={step}, Markov={mk:.0f}%")
 
+    # ── Envío de reintento ──────────────────────────────────────────────────
     def _send_retry_signal(self, trigger: int, new_bet: float, attempt_number: int):
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
         icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        mk, ml = self._last_markov_prob, self._last_ml_prob
-        ml_line = (f"🧠 <i>Markov: {mk*100:.0f}%"
-                   + (f"  |  ML: {ml*100:.0f}%" if ml > 0 else "")
-                   + "</i>\n")
+        mk   = self._last_markov_prob * 100
+
+        safe_name = escape_html(self.name)
+        safe_trigger = escape_html(str(trigger))
+        safe_bet_color = escape_html(self.bet_color)
+
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
-            f"🎰 <b>Juego: {self.name}</b>\n"
-            f"👉🏼 <b>Después de: {trigger}</b>\n"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {icon}\n\n"
+            f"🎰 <b>Juego: {safe_name}</b>\n"
+            f"👉🏼 <b>Después de: {safe_trigger}</b>\n"
+            f"🎯 <b>Apostar a: {safe_bet_color}</b> {icon}\n\n"
             f"💡 <i>Probabilidad tabla: {prob}%</i>\n"
-            f"{ml_line}"
+            f"💠 <i>Probabilidad Markov: {mk:.0f}%</i>\n"
             f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
         )
+
         levels = (self.original_levels[:] if self.bet_color == "ROJO"
                   else self.inverted_levels[:])
         chart  = generate_chart(levels, self.spin_history[:], self.bet_color,
-                                markov_prob=mk, ml_prob=ml)
+                                markov_prob=mk/100, ml_prob=0)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
         if msg_id:
             self.signal_msg_ids.append(msg_id)
         logger.info(f"[{self.name}] Retry #{attempt_number}: {self.bet_color}, bet={new_bet:.2f}")
 
-    def _send_result(self, number: int, real: str, won: bool, bet: float):
+    # ── Finalizar señal y enviar resultado con gráfico ──────────────────────
+    def _finalize_signal(self, won: bool, number: int, real: str, bet: float):
+        # Eliminar todos los mensajes de señal previos
+        for msg_id in self.signal_msg_ids:
+            tg_delete(self.chat_id, msg_id)
+        self.signal_msg_ids.clear()
+
+        # Construir secuencia de emojis
+        emoji_map = {"ROJO": "🔴", "NEGRO": "⚫️", "VERDE": "🟢"}
+        seq_str = " -> ".join(emoji_map.get(c, "⚪") for c in self.signal_sequence_colors)
+
         bankroll = self.bet_sys.bankroll
-        icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
-        prefix = "💎" if won else "❌"
-        text = (f"{prefix} <b>RESULTADO: {number}</b> {icon}\n"
-                f"💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>\n"
-                f"📊 <i>{self.ml_filter.info()}</i>\n")
-        self.result_until = time.time() + 7.0
-        tg_send_text(self.chat_id, self.thread_id, text)
-        logger.info(f"[{self.name}] Result: {'WIN' if won else 'LOSS'} #{number}, "
+        icon = emoji_map.get(real, "⚪")
+        prefix = "✅" if won else "❌"
+        caption = (
+            f"🆔 <i>Secuencia:</i> {seq_str}\n\n"
+            f"{prefix} <i>Resultado: {number} {real}</i>\n"
+            f"💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>"
+        )
+
+        levels = (self.original_levels[:] if self.bet_color == "ROJO"
+                  else self.inverted_levels[:])
+        chart = generate_chart(levels, self.spin_history[:], self.bet_color,
+                               markov_prob=0.0, ml_prob=0.0)
+
+        tg_send_photo(self.chat_id, self.thread_id, chart, caption)
+
+        self.signal_active = False
+        self.signal_sequence_colors.clear()
+        self._check_recovery()
+        self._check_stats()
+        self.result_until = time.time() + 7.0  # cooldown para próximo resultado
+
+        logger.info(f"[{self.name}] Signal finalized: {'WIN' if won else 'LOSS'} #{number}, "
                     f"bankroll={bankroll:.2f}")
 
+    # ── Estadísticas periódicas ─────────────────────────────────────────────
     def _check_stats(self):
         if not self.stats.should_send_stats():
             return
@@ -1424,9 +1330,6 @@ def cmd_mlreset(message):
 
 @bot.message_handler(commands=['moderado'])
 def cmd_moderado(message):
-    changed = [n for n, e in engines.items()
-               if e.amx_system.mode != "moderado" and not e.set_mode("moderado")]
-    # set_mode returns the mode string (truthy), so we need all that changed
     for n, e in engines.items():
         e.set_mode("moderado")
     bot.reply_to(message, "📊 <b>Modo MODERADO activado</b>", parse_mode="HTML")
