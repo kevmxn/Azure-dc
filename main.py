@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Roulette Telegram Signal Bot - Sistema AMX V20 (Tendencia + Moderado)
-Integra la lógica de detección de señales 2.00x del AMX Genesis 20.0
-con las tablas predefinidas de cada ruleta para filtrado de probabilidad.
-VERSION CORREGIDA - Manejo de mensajes: eliminar intentos 1-2 si pierden, mantener si ganan o intento 3 pierde
-AGREGADO: Líneas de soporte (gris) y resistencia (rojo/gris según color de apuesta)
+Roulette Telegram Signal Bot - Sistema AMX V20 + ML + Markov Chain
+AGREGADO:
+  - MarkovChain (orden 2): predice color siguiente con probabilidad estadística
+  - OnlineLogisticRegression (SGD): filtra señales en tiempo real, se entrena con resultados
+  - MLSignalFilter: integra ambos modelos, extrae features y decide si emitir señal
 """
 
 import asyncio
@@ -41,11 +41,9 @@ from urllib3.util.retry import Retry
 
 _session = requests.Session()
 _retry = Retry(
-    total=5,
-    backoff_factor=1.5,
+    total=5, backoff_factor=1.5,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-    raise_on_status=False,
+    allowed_methods=["GET", "POST"], raise_on_status=False,
 )
 _adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
 _session.mount("https://", _adapter)
@@ -122,13 +120,314 @@ MAX_ATTEMPTS = 3
 BASE_BET  = 0.10
 VISIBLE   = 50
 
-# ─── D'ALEMBERT (SISTEMA 3) ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── MARKOV CHAIN (ORDEN 2) ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+class MarkovChain:
+    """
+    Cadena de Markov de orden configurable (default 2).
+    Estado = últimos `order` colores no-verde.
+    Aprende en línea con cada nuevo resultado y predice la probabilidad
+    del siguiente color.
+
+    Usa suavizado de Laplace para evitar probabilidades 0 con pocos datos.
+    """
+    COLORS = ("ROJO", "NEGRO")
+
+    def __init__(self, order: int = 2, laplace_alpha: float = 1.0):
+        self.order = order
+        self.alpha = laplace_alpha          # suavizado Laplace
+        # {state_tuple: {color: count}}
+        self.transitions: dict = {}
+        self._history: deque = deque(maxlen=500)  # historial interno
+
+    # ── Actualización online ────────────────────────────────────────────────
+    def update(self, color: str):
+        """Llamar con cada color nuevo (ROJO/NEGRO; VERDE se ignora)."""
+        if color not in self.COLORS:
+            return
+        self._history.append(color)
+        if len(self._history) < self.order + 1:
+            return
+        recent = list(self._history)
+        state = tuple(recent[-(self.order + 1):-1])
+        next_c = recent[-1]
+        if state not in self.transitions:
+            self.transitions[state] = {c: 0 for c in self.COLORS}
+        self.transitions[state][next_c] += 1
+
+    # ── Predicción ─────────────────────────────────────────────────────────
+    def predict(self) -> dict:
+        """
+        Retorna {ROJO: prob, NEGRO: prob} dado el historial actual.
+        Usa suavizado de Laplace si el estado tiene pocas observaciones.
+        """
+        if len(self._history) < self.order:
+            return {c: 0.5 for c in self.COLORS}
+        state = tuple(list(self._history)[-self.order:])
+        counts = self.transitions.get(state, {c: 0 for c in self.COLORS})
+        total = sum(counts.values()) + self.alpha * len(self.COLORS)
+        return {c: (counts.get(c, 0) + self.alpha) / total for c in self.COLORS}
+
+    # ── Confianza del modelo ────────────────────────────────────────────────
+    def confidence(self) -> float:
+        """
+        Retorna cuántas observaciones ha visto el estado actual.
+        Más observaciones → más confianza.
+        """
+        if len(self._history) < self.order:
+            return 0.0
+        state = tuple(list(self._history)[-self.order:])
+        if state not in self.transitions:
+            return 0.0
+        return float(sum(self.transitions[state].values()))
+
+    def state_info(self) -> str:
+        """Debug: estado actual y su distribución."""
+        if len(self._history) < self.order:
+            return "Sin datos suficientes"
+        state = tuple(list(self._history)[-self.order:])
+        probs = self.predict()
+        conf = self.confidence()
+        return (f"Estado: {state} | "
+                f"R={probs['ROJO']:.2f} N={probs['NEGRO']:.2f} | "
+                f"Obs={conf:.0f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ONLINE LOGISTIC REGRESSION (SGD) ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+class OnlineLogisticRegression:
+    """
+    Regresión logística entrenada en línea con descenso de gradiente estocástico.
+    - 12 features normalizados (ver `MLSignalFilter.extract_features`)
+    - Se actualiza con cada resultado (win=1, loss=0)
+    - Warm-up: los primeros `min_samples` resultados solo entrenan, no filtran
+    """
+    N_FEATURES = 12
+
+    def __init__(self, lr: float = 0.05, reg: float = 0.005, min_samples: int = 30):
+        self.weights = np.zeros(self.N_FEATURES)
+        self.bias    = 0.0
+        self.lr      = lr
+        self.reg     = reg                  # L2 regularización
+        self.min_samples = min_samples
+        self.n_samples   = 0
+        # Estadísticas acumuladas para normalización online (media/var)
+        self._feat_mean = np.zeros(self.N_FEATURES)
+        self._feat_var  = np.ones(self.N_FEATURES)
+        self._feat_n    = 0
+
+    # ── Normalización online (Welford) ─────────────────────────────────────
+    def _update_stats(self, x: np.ndarray):
+        self._feat_n += 1
+        delta = x - self._feat_mean
+        self._feat_mean += delta / self._feat_n
+        delta2 = x - self._feat_mean
+        self._feat_var += delta * delta2
+
+    def _normalize(self, x: np.ndarray) -> np.ndarray:
+        if self._feat_n < 2:
+            return x
+        std = np.sqrt(self._feat_var / max(self._feat_n - 1, 1))
+        std = np.where(std < 1e-8, 1.0, std)
+        return (x - self._feat_mean) / std
+
+    # ── Sigmoid ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _sigmoid(z: float) -> float:
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -15, 15)))
+
+    # ── Inferencia ─────────────────────────────────────────────────────────
+    def predict_proba(self, raw_features: np.ndarray) -> float:
+        """Probabilidad de win [0, 1]."""
+        x = self._normalize(raw_features)
+        return self._sigmoid(float(np.dot(self.weights, x)) + self.bias)
+
+    # ── Entrenamiento online ────────────────────────────────────────────────
+    def update(self, raw_features: np.ndarray, label: int):
+        """
+        label: 1 = ganó la apuesta, 0 = perdió.
+        Actualiza pesos via SGD + L2.
+        """
+        self._update_stats(raw_features)
+        x = self._normalize(raw_features)
+        pred  = self._sigmoid(float(np.dot(self.weights, x)) + self.bias)
+        error = label - pred
+        self.weights += self.lr * (error * x - self.reg * self.weights)
+        self.bias    += self.lr * error
+        self.n_samples += 1
+
+    @property
+    def ready(self) -> bool:
+        """True cuando tiene suficientes muestras para filtrar."""
+        return self.n_samples >= self.min_samples
+
+    def summary(self) -> str:
+        return f"LR={self.lr} | n={self.n_samples} | ready={self.ready}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ML SIGNAL FILTER  (integra Markov + LR) ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+class MLSignalFilter:
+    """
+    Orquesta Markov Chain + Logistic Regression para filtrar señales.
+
+    Umbrales:
+      - `markov_threshold`: probabilidad mínima de Markov para el color apostado
+      - `ml_threshold`:     probabilidad mínima del modelo LR para emitir señal
+      - `ml_threshold_retry`: umbral más suave para intento 2 (ya hubo pérdida)
+
+    Cuando el modelo no está listo (warm-up), solo se usa Markov.
+    """
+    # Features (12 en total):
+    # 0  tabla_prob        – probabilidad de la tabla de colores
+    # 1  markov_prob       – probabilidad Markov para bet_color
+    # 2  markov_conf_norm  – confianza Markov (saturada a 50 obs)
+    # 3  ema4_above_ema20  – EMA4 > EMA20
+    # 4  ema8_above_ema20  – EMA8 > EMA20
+    # 5  ema4_above_ema8   – EMA4 > EMA8
+    # 6  momentum_norm     – racha del color correcto (÷5)
+    # 7  positions_above5  – últimas 5 posiciones sobre EMA20 (÷5)
+    # 8  consec_losses_n   – pérdidas consecutivas (÷10)
+    # 9  bet_step_norm     – paso D'Alembert (÷20)
+    # 10 streak_match      – últimos 2 resultados coincidieron con señal (0/0.5/1)
+    # 11 recovery_flag     – 1 si está en modo recuperación
+
+    N_FEATURES = 12
+
+    def __init__(
+        self,
+        markov_order: int = 2,
+        markov_threshold: float = 0.52,
+        ml_threshold: float = 0.55,
+        ml_threshold_retry: float = 0.48,
+        ml_min_samples: int = 30,
+    ):
+        self.markov = MarkovChain(order=markov_order)
+        self.model  = OnlineLogisticRegression(min_samples=ml_min_samples)
+        self.markov_threshold   = markov_threshold
+        self.ml_threshold       = ml_threshold
+        self.ml_threshold_retry = ml_threshold_retry
+
+        # Features del último análisis (para pasarlas al update después)
+        self._last_features: Optional[np.ndarray] = None
+
+    # ── Extracción de features ─────────────────────────────────────────────
+    def extract_features(
+        self,
+        bet_color: str,
+        tabla_prob: float,
+        ema4: list, ema8: list, ema20: list,
+        positions: list,
+        momentum_count: int,
+        consec_losses: int,
+        bet_step: int,
+        last_two_expected: deque,
+        recovery_active: bool,
+    ) -> np.ndarray:
+        li = len(ema4) - 1
+        safe = (li >= 0
+                and ema4[li] is not None
+                and ema8[li] is not None
+                and ema20[li] is not None)
+
+        f0 = tabla_prob
+        f1 = self.markov.predict().get(bet_color, 0.5)
+        f2 = min(self.markov.confidence(), 50.0) / 50.0
+        f3 = float(ema4[li] > ema20[li]) if safe else 0.5
+        f4 = float(ema8[li] > ema20[li]) if safe else 0.5
+        f5 = float(ema4[li] > ema8[li])  if safe else 0.5
+
+        # últimas 5 posiciones por encima de EMA20
+        above5 = 0.0
+        if safe and len(positions) >= 5:
+            cutoff = max(0, len(positions) - 5)
+            e20_cut = max(0, li - 4)
+            for k in range(5):
+                pi = cutoff + k
+                ei = e20_cut + k
+                if (pi < len(positions)
+                        and ei < len(ema20)
+                        and ema20[ei] is not None
+                        and positions[pi] > ema20[ei]):
+                    above5 += 1.0
+        f7 = above5 / 5.0
+
+        f6  = min(momentum_count, 5) / 5.0
+        f8  = min(consec_losses, 10) / 10.0
+        f9  = min(bet_step, 20) / 20.0
+        f10 = (sum(1 for v in last_two_expected if v) / max(len(last_two_expected), 1)
+               if last_two_expected else 0.5)
+        f11 = float(recovery_active)
+
+        feats = np.array([f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11],
+                         dtype=np.float32)
+        self._last_features = feats
+        return feats
+
+    # ── Filtro principal ────────────────────────────────────────────────────
+    def should_emit_signal(
+        self,
+        features: np.ndarray,
+        bet_color: str,
+        is_retry: bool = False,
+    ) -> tuple[bool, float, float, str]:
+        """
+        Retorna (emit, markov_prob, ml_prob, reason).
+        `reason` explica por qué se bloqueó o aprobó la señal.
+        """
+        markov_prob = self.markov.predict().get(bet_color, 0.5)
+
+        # Filtro Markov: siempre activo
+        if markov_prob < self.markov_threshold:
+            return False, markov_prob, 0.0, (
+                f"Markov bloqueó: {markov_prob:.2f} < {self.markov_threshold:.2f}"
+            )
+
+        # Si el modelo no está listo, solo Markov decide
+        if not self.model.ready:
+            return True, markov_prob, 0.0, (
+                f"Markov OK ({markov_prob:.2f}), ML en warm-up "
+                f"({self.model.n_samples}/{self.model.min_samples})"
+            )
+
+        ml_prob  = self.model.predict_proba(features)
+        threshold = self.ml_threshold_retry if is_retry else self.ml_threshold
+
+        if ml_prob < threshold:
+            return False, markov_prob, ml_prob, (
+                f"ML bloqueó: {ml_prob:.2f} < {threshold:.2f}"
+            )
+
+        return True, markov_prob, ml_prob, (
+            f"Aprobado — Markov={markov_prob:.2f} ML={ml_prob:.2f}"
+        )
+
+    # ── Update post-resultado ──────────────────────────────────────────────
+    def update_result(self, won: bool):
+        """Llamar después de cada resultado con señal activa."""
+        if self._last_features is not None:
+            self.model.update(self._last_features, int(won))
+
+    # ── Update Markov con cada giro ────────────────────────────────────────
+    def observe_color(self, color: str):
+        """Llamar con cada color real (verde se ignora internamente)."""
+        self.markov.update(color)
+
+    def info(self) -> str:
+        return (f"Markov: {self.markov.state_info()} | "
+                f"ML: {self.model.summary()}")
+
+
+# ─── D'ALEMBERT ──────────────────────────────────────────────────────────────
 class D_Alembert:
     def __init__(self, base: float):
-        self.base      = base
-        self.step      = 0
-        self.bankroll  = 0.0
-        self.max_step  = 20
+        self.base     = base
+        self.step     = 0
+        self.bankroll = 0.0
+        self.max_step = 20
 
     def current_bet(self) -> float:
         return round(self.base * (self.step + 1), 2)
@@ -149,6 +448,7 @@ class D_Alembert:
             self.step += 1
         return bet
 
+
 # ─── SISTEMA AMX V20 ──────────────────────────────────────────────────────────
 class AMXSignalSystem:
     def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
@@ -160,8 +460,8 @@ class AMXSignalSystem:
         self.direccion_momentum: int = 0
         self.prev_ema4_above_ema8: bool = True
         self.ultimos_puntos: list = []
-        self.last_two_expected = deque(maxlen=2)
-        self.last_two_colors = deque(maxlen=2)
+        self.last_two_expected: deque = deque(maxlen=2)
+        self.last_two_colors: deque = deque(maxlen=2)
 
     def update_streak(self, real_color: str, expected_color: Optional[str]):
         if expected_color:
@@ -180,84 +480,64 @@ class AMXSignalSystem:
             ema.append(prev)
         return ema
 
-    def check_signal_tendencia(self, positions: list, color_data: list,
-                               current_number: int, expected_color: str,
-                               prob_threshold: float) -> Optional[dict]:
+    def check_signal_tendencia(self, positions, color_data, current_number,
+                               expected_color, prob_threshold):
         if len(positions) < 20:
             return None
-
         ahora = time.time()
         if ahora - self.last_signal_time < self.cooldown_seconds:
             return None
         if self.so_cooldown and ahora - self.so_cooldown < 8:
             return None
 
-        ema4 = self.calculate_ema(positions, 4)
-        ema8 = self.calculate_ema(positions, 8)
+        ema4  = self.calculate_ema(positions, 4)
+        ema8  = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
-            return None
-        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
-            return None
-        if ema4[-2] is None or ema8[-2] is None or ema20[-2] is None:
+        if (ema4[-1] is None or ema8[-1] is None or ema20[-1] is None or
+                ema4[-2] is None or ema8[-2] is None or ema20[-2] is None):
             return None
 
         current_pos = positions[-1]
-
-        cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
-        sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
+        cruce_alcista  = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
+        sobre_tres_emas = (current_pos > ema4[-1] and current_pos > ema8[-1] and
+                           current_pos > ema20[-1])
         cruce_ema8 = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
         cerca_ema4 = abs(current_pos - ema4[-1]) <= 0.5
-        dos_ultimos_esperados = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
+        dos_ultimos = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
 
-        cond1 = cruce_alcista or sobre_tres_emas
-        cond2 = cruce_ema8
-        cond3 = sobre_tres_emas and dos_ultimos_esperados
-        cond4 = sobre_tres_emas and cerca_ema4
-
-        if not (cond1 or cond2 or cond3 or cond4):
+        if not (cruce_alcista or sobre_tres_emas or cruce_ema8 or
+                (sobre_tres_emas and dos_ultimos) or (sobre_tres_emas and cerca_ema4)):
             return None
 
         entry = next((e for e in color_data if e["id"] == current_number), None)
         if not entry or entry["senal"] == "NO APOSTAR":
             return None
-
         prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
         if entry["senal"] != expected_color or prob < prob_threshold:
             return None
 
         strength = "strong" if (cruce_alcista or cruce_ema8) else "moderate"
-        return {
-            "type": "SKRILL_2.0",
-            "mode": "tendencia",
-            "expected_color": expected_color,
-            "probability": prob,
-            "trigger_number": current_number,
-            "strength": strength
-        }
+        return {"type": "SKRILL_2.0", "mode": "tendencia",
+                "expected_color": expected_color, "probability": prob,
+                "trigger_number": current_number, "strength": strength}
 
-    def check_signal_moderado(self, positions: list, color_data: list,
-                             current_number: int, expected_color: str,
-                             prob_threshold: float) -> Optional[dict]:
+    def check_signal_moderado(self, positions, color_data, current_number,
+                              expected_color, prob_threshold):
         if len(positions) < 20:
             return None
-
         ahora = time.time()
         if ahora - self.last_signal_time < self.cooldown_seconds:
             return None
         if self.so_cooldown and ahora - self.so_cooldown < 8:
             return None
 
-        ema4 = self.calculate_ema(positions, 4)
-        ema8 = self.calculate_ema(positions, 8)
+        ema4  = self.calculate_ema(positions, 4)
+        ema8  = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
 
-        if len(ema4) < 2 or len(ema8) < 2 or len(ema20) < 1:
-            return None
-        if ema4[-1] is None or ema8[-1] is None or ema20[-1] is None:
-            return None
-        if ema8[-2] is None or ema20[-2] is None:
+        if (ema4[-1] is None or ema8[-1] is None or ema20[-1] is None or
+                ema8[-2] is None or ema20[-2] is None):
             return None
 
         cruce_ema8 = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
@@ -268,29 +548,24 @@ class AMXSignalSystem:
             a, b, c = positions[-3], positions[-2], positions[-1]
             patron_v = b < a and b < c and abs(a - c) <= 1 and c > a
 
-        dos_ultimos_esperados = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
+        dos_ultimos = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
         emas_alcistas = ema4[-1] > ema8[-1] > ema20[-1]
-        cond_racha_alcista = dos_ultimos_esperados and emas_alcistas and sobre_emas
+        cond_racha = dos_ultimos and emas_alcistas and sobre_emas
 
-        if not (cruce_ema8 or patron_v or cond_racha_alcista):
+        if not (cruce_ema8 or patron_v or cond_racha):
             return None
 
         entry = next((e for e in color_data if e["id"] == current_number), None)
         if not entry or entry["senal"] == "NO APOSTAR":
             return None
-
         prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
         if entry["senal"] != expected_color or prob < prob_threshold:
             return None
 
-        return {
-            "type": "ALERTA_2.0",
-            "mode": "moderado",
-            "expected_color": expected_color,
-            "probability": prob,
-            "trigger_number": current_number,
-            "pattern": "V" if patron_v else "EMA_CROSS"
-        }
+        return {"type": "ALERTA_2.0", "mode": "moderado",
+                "expected_color": expected_color, "probability": prob,
+                "trigger_number": current_number,
+                "pattern": "V" if patron_v else "EMA_CROSS"}
 
     def register_signal_sent(self):
         self.last_signal_time = time.time()
@@ -298,25 +573,23 @@ class AMXSignalSystem:
     def register_so_failed(self):
         self.so_cooldown = time.time()
 
+
 # ─── STATISTICS ───────────────────────────────────────────────────────────────
 class Stats:
     def __init__(self):
-        self.total      = 0
-        self.wins       = 0
-        self.losses     = 0
+        self.total   = 0
+        self.wins    = 0
+        self.losses  = 0
         self.last_stats_at = 0
         self._h24: deque = deque()
         self.batch_start_bankroll = None
-        self._wins_at_last_batch = 0
+        self._wins_at_last_batch  = 0
 
     def record(self, is_win: bool, bankroll: float):
         self.total += 1
-        if is_win:
-            self.wins += 1
-        else:
-            self.losses += 1
-        now = time.time()
-        self._h24.append((now, is_win, bankroll))
+        if is_win: self.wins += 1
+        else:       self.losses += 1
+        self._h24.append((time.time(), is_win, bankroll))
         self._trim24()
 
     def _trim24(self):
@@ -328,20 +601,17 @@ class Stats:
         return (self.total - self.last_stats_at) >= 20
 
     def mark_stats_sent(self, bankroll: float):
-        self.last_stats_at = self.total
+        self.last_stats_at        = self.total
         self.batch_start_bankroll = bankroll
-        self._wins_at_last_batch = self.wins
+        self._wins_at_last_batch  = self.wins
 
     def batch_stats(self, current_bankroll: float):
         n = self.total - self.last_stats_at
-        w = self.wins - self._wins_at_last_batch
+        w = self.wins  - self._wins_at_last_batch
         l = n - w
         e = round(w / n * 100, 1) if n else 0.0
-        if self.batch_start_bankroll is not None:
-            batch_bankroll = round(current_bankroll - self.batch_start_bankroll, 2)
-        else:
-            batch_bankroll = 0.0
-        return w, l, n, e, batch_bankroll
+        bk = round(current_bankroll - (self.batch_start_bankroll or 0), 2)
+        return w, l, n, e, bk
 
     def stats_24h(self, current_bankroll: float):
         self._trim24()
@@ -349,47 +619,32 @@ class Stats:
         w = sum(1 for _, iw, _ in self._h24 if iw)
         l = t - w
         e = round(w / t * 100, 1) if t else 0.0
-        if t >= 2:
-            first_bankroll = self._h24[0][2]
-            last_bankroll  = self._h24[-1][2]
-            bk24 = round(last_bankroll - first_bankroll, 2)
-        else:
-            bk24 = 0.0
+        bk24 = (round(self._h24[-1][2] - self._h24[0][2], 2)
+                if t >= 2 else 0.0)
         return w, l, t, e, bk24
 
-# ─── FUNCIONES PARA SOPORTES Y RESISTENCIAS ──────────────────────────────────
+
+# ─── SOPORTE / RESISTENCIA ────────────────────────────────────────────────────
 def find_support_resistance(levels: list, lookback: int = 30) -> dict:
-    """
-    Detecta niveles de soporte y resistencia basados en mínimos/máximos locales.
-    Retorna dict con keys 'support' (nivel) y 'resistance' (nivel) o None.
-    """
     if len(levels) < lookback:
         return {'support': None, 'resistance': None}
-    
     recent = levels[-lookback:]
-    # Detectar mínimos locales (soporte)
-    support_candidates = []
-    for i in range(2, len(recent)-2):
-        if recent[i] < recent[i-1] and recent[i] < recent[i-2] and recent[i] < recent[i+1] and recent[i] < recent[i+2]:
-            support_candidates.append(recent[i])
-    # Detectar máximos locales (resistencia)
-    resistance_candidates = []
-    for i in range(2, len(recent)-2):
-        if recent[i] > recent[i-1] and recent[i] > recent[i-2] and recent[i] > recent[i+1] and recent[i] > recent[i+2]:
-            resistance_candidates.append(recent[i])
-    
-    # Usar el nivel más reciente (o el más cercano al precio actual)
-    support = support_candidates[-1] if support_candidates else None
-    resistance = resistance_candidates[-1] if resistance_candidates else None
-    return {'support': support, 'resistance': resistance}
+    support_c, resistance_c = [], []
+    for i in range(2, len(recent) - 2):
+        if all(recent[i] < recent[j] for j in (i-1, i-2, i+1, i+2)):
+            support_c.append(recent[i])
+        if all(recent[i] > recent[j] for j in (i-1, i-2, i+1, i+2)):
+            resistance_c.append(recent[i])
+    return {
+        'support':    support_c[-1]    if support_c    else None,
+        'resistance': resistance_c[-1] if resistance_c else None,
+    }
 
-# ─── CHART GENERATION CON SOPORTE/RESISTENCIA ─────────────────────────────────
-def generate_chart(levels: list, spin_history: list, bet_color: str, visible: int = VISIBLE) -> io.BytesIO:
-    """
-    Genera gráfico con línea de nivel, EMAs, puntos de giros y líneas de soporte/resistencia.
-    Para bet_color = "ROJO": resistencia roja, soporte gris.
-    Para bet_color = "NEGRO": resistencia gris, soporte rojo.
-    """
+
+# ─── CHART GENERATION ────────────────────────────────────────────────────────
+def generate_chart(levels: list, spin_history: list, bet_color: str,
+                   markov_prob: float = 0.0, ml_prob: float = 0.0,
+                   visible: int = VISIBLE) -> io.BytesIO:
     arr = np.array(levels, dtype=float)
     n   = len(arr)
 
@@ -397,91 +652,80 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
         if len(data) < period:
             return np.full(len(data), np.nan)
         mult = 2 / (period + 1)
-        out = np.full(len(data), np.nan)
+        out  = np.full(len(data), np.nan)
         out[period - 1] = np.mean(data[:period])
         for i in range(period, len(data)):
-            out[i] = (data[i] - out[i - 1]) * mult + out[i - 1]
+            out[i] = (data[i] - out[i-1]) * mult + out[i-1]
         return out
 
-    ema4 = calc_ema(arr, 4)
-    ema8 = calc_ema(arr, 8)
+    ema4  = calc_ema(arr, 4)
+    ema8  = calc_ema(arr, 8)
     ema20 = calc_ema(arr, 20)
 
     start = max(0, n - visible)
-    sl = slice(start, n)
-    x = np.arange(len(arr[sl]))
+    sl    = slice(start, n)
+    x     = np.arange(len(arr[sl]))
     hist_sl = spin_history[start:]
 
-    is_rojo = bet_color == "ROJO"
-    bg = "#0b101f"
-    ax_bg = "#0f1a2a"
-    grid_c = "#1e2e48"
-    line_c = "#e84040" if is_rojo else "#9090bb"
-    ema4_c = "#ff9f43"
-    ema8_c = "#48dbfb"
-    ema20_c = "#1dd1a1"
-    title_c = "#ff8080" if is_rojo else "#b0b8d0"
+    is_rojo  = bet_color == "ROJO"
+    bg       = "#0b101f"
+    ax_bg    = "#0f1a2a"
+    grid_c   = "#1e2e48"
+    line_c   = "#e84040" if is_rojo else "#9090bb"
+    ema4_c   = "#ff9f43"
+    ema8_c   = "#48dbfb"
+    ema20_c  = "#1dd1a1"
+    title_c  = "#ff8080" if is_rojo else "#b0b8d0"
 
     fig, ax = plt.subplots(figsize=(8, 3.6), facecolor=bg)
     ax.set_facecolor(ax_bg)
 
-    y = arr[sl]
-    e4 = ema4[sl]
-    e8 = ema8[sl]
-    e20 = ema20[sl]
+    y, e4, e8, e20 = arr[sl], ema4[sl], ema8[sl], ema20[sl]
 
-    # Línea de nivel
     ax.fill_between(x, y, alpha=0.10, color=line_c)
     ax.plot(x, y,   color=line_c,  linewidth=0.8, zorder=3)
-    # EMAs
     ax.plot(x, e4,  color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4",  zorder=4)
     ax.plot(x, e8,  color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8",  zorder=4)
     ax.plot(x, e20, color=ema20_c, linewidth=1.0, label="EMA 20", zorder=4)
 
-    # Puntos de giros
     dot_colors = {"ROJO": "#e84040", "NEGRO": "#aaaacc", "VERDE": "#2ecc71"}
     for i, spin in enumerate(hist_sl):
         c = dot_colors.get(spin["real"], "#ffffff")
-        ax.scatter(i, y[i], color=c, s=22, zorder=5, edgecolors="white", linewidths=0.3)
+        ax.scatter(i, y[i], color=c, s=22, zorder=5,
+                   edgecolors="white", linewidths=0.3)
 
-    # ─── SOPORTE Y RESISTENCIA ────────────────────────────────────────────────
-    # Calcular niveles usando la serie de niveles (levels)
+    # Soporte / resistencia
     sr = find_support_resistance(levels, lookback=30)
-    support_val = sr['support']
-    resistance_val = sr['resistance']
+    res_color = "#e84040" if is_rojo else "#888888"
+    sup_color = "#888888" if is_rojo else "#e84040"
+    if sr['support'] is not None:
+        ax.axhline(y=sr['support'], color=sup_color, linestyle='--',
+                   linewidth=1.5, alpha=0.7, label='Soporte')
+        ax.text(x[-1], sr['support'], f' S {sr["support"]:.1f}',
+                color=sup_color, fontsize=8, va='bottom', ha='right')
+    if sr['resistance'] is not None:
+        ax.axhline(y=sr['resistance'], color=res_color, linestyle='--',
+                   linewidth=1.5, alpha=0.7, label='Resistencia')
+        ax.text(x[-1], sr['resistance'], f' R {sr["resistance"]:.1f}',
+                color=res_color, fontsize=8, va='top', ha='right')
 
-    # Definir colores según bet_color
-    if is_rojo:
-        resistance_color = "#e84040"   # rojo
-        support_color    = "#888888"   # gris
-    else:
-        resistance_color = "#888888"   # gris
-        support_color    = "#e84040"   # rojo
+    # Etiqueta ML / Markov en el gráfico
+    if ml_prob > 0 or markov_prob > 0:
+        label_txt = (f"Markov {markov_prob*100:.0f}%"
+                     + (f"  |  ML {ml_prob*100:.0f}%" if ml_prob > 0 else ""))
+        ax.text(0.01, 0.97, label_txt, transform=ax.transAxes,
+                color="#f0e040", fontsize=7.5, va='top', ha='left',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='#0b101f', alpha=0.7))
 
-    # Convertir valores a coordenadas y (si existen)
-    y_min, y_max = ax.get_ylim()
-    # Nota: los valores de levels están en el mismo rango que arr, usar la transformación de datos a coordenadas
-    if support_val is not None:
-        ax.axhline(y=support_val, color=support_color, linestyle='--', linewidth=1.5, alpha=0.7, label='Soporte')
-        # Añadir texto
-        ax.text(x[-1], support_val, f' Soporte {support_val:.1f}', color=support_color, fontsize=8,
-                verticalalignment='bottom', horizontalalignment='right')
-    if resistance_val is not None:
-        ax.axhline(y=resistance_val, color=resistance_color, linestyle='--', linewidth=1.5, alpha=0.7, label='Resistencia')
-        ax.text(x[-1], resistance_val, f' Resistencia {resistance_val:.1f}', color=resistance_color, fontsize=8,
-                verticalalignment='top', horizontalalignment='right')
-
-    # Configuración de ejes
     tick_step = max(1, len(x) // 8)
-    tick_x = list(range(0, len(x), tick_step))
+    tick_x  = list(range(0, len(x), tick_step))
     tick_lbs = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
     ax.set_xticks(tick_x)
     ax.set_xticklabels(tick_lbs, color="#8899bb", fontsize=7)
     ax.tick_params(axis='y', colors="#8899bb", labelsize=7)
     ax.tick_params(axis='x', colors="#8899bb", labelsize=7)
-
-    ax.spines['bottom'].set_color(grid_c)
-    ax.spines['left'].set_color(grid_c)
+    for spine in ('bottom', 'left'):
+        ax.spines[spine].set_color(grid_c)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.grid(axis='y', color=grid_c, linewidth=0.4, alpha=0.5)
@@ -500,20 +744,19 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
         Line2D([0],[0], marker='o', color='w', markerfacecolor='#aaaacc', markersize=5, label="Negro"),
         Line2D([0],[0], marker='o', color='w', markerfacecolor='#2ecc71', markersize=5, label="Verde"),
     ]
-    if support_val is not None:
-        legend_els.append(Line2D([0],[0], color=support_color, linestyle='--', linewidth=1.5, label='Soporte'))
-    if resistance_val is not None:
-        legend_els.append(Line2D([0],[0], color=resistance_color, linestyle='--', linewidth=1.5, label='Resistencia'))
+    if sr['support']    is not None: legend_els.append(Line2D([0],[0], color=sup_color, linestyle='--', linewidth=1.5, label='Soporte'))
+    if sr['resistance'] is not None: legend_els.append(Line2D([0],[0], color=res_color, linestyle='--', linewidth=1.5, label='Resistencia'))
 
     ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
-              facecolor="#0b101f", edgecolor=grid_c, labelcolor="white", framealpha=0.8, ncol=2)
-
+              facecolor="#0b101f", edgecolor=grid_c, labelcolor="white",
+              framealpha=0.8, ncol=2)
     plt.tight_layout(pad=0.8)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=120, facecolor=bg)
     plt.close(fig)
     buf.seek(0)
     return buf
+
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 5
@@ -526,36 +769,37 @@ def _tg_call(fn, *args, **kwargs):
         except Exception as e:
             err = str(e)
             if "retry after" in err.lower():
-                try:
-                    wait = int(''.join(filter(str.isdigit, err))) + 1
-                except Exception:
-                    wait = 30
+                try:    wait = int(''.join(filter(str.isdigit, err))) + 1
+                except: wait = 30
                 logger.warning(f"Telegram flood-wait {wait}s")
                 time.sleep(wait)
                 continue
-            logger.warning(f"Telegram error (attempt {attempt}/{_TG_MAX_RETRIES}): {e}")
+            logger.warning(f"Telegram error ({attempt}/{_TG_MAX_RETRIES}): {e}")
             if attempt < _TG_MAX_RETRIES:
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
             else:
-                logger.error(f"Telegram call failed after {_TG_MAX_RETRIES} attempts: {e}")
+                logger.error(f"Telegram failed after {_TG_MAX_RETRIES} attempts: {e}")
                 return None
 
-def tg_send_photo(chat_id: int, thread_id: int, photo_buf: io.BytesIO, caption: str) -> Optional[int]:
+def tg_send_photo(chat_id, thread_id, photo_buf, caption) -> Optional[int]:
     photo_buf.seek(0)
-    msg = _tg_call(bot.send_photo, chat_id=chat_id, photo=photo_buf, caption=caption,
-                   parse_mode="HTML", message_thread_id=thread_id)
+    msg = _tg_call(bot.send_photo, chat_id=chat_id, photo=photo_buf,
+                   caption=caption, parse_mode="HTML", message_thread_id=thread_id)
     return msg.message_id if msg else None
 
-def tg_send_text(chat_id: int, thread_id: int, text: str) -> Optional[int]:
+def tg_send_text(chat_id, thread_id, text) -> Optional[int]:
     msg = _tg_call(bot.send_message, chat_id=chat_id, text=text,
                    parse_mode="HTML", message_thread_id=thread_id)
     return msg.message_id if msg else None
 
-def tg_delete(chat_id: int, msg_id: int):
+def tg_delete(chat_id, msg_id):
     _tg_call(bot.delete_message, chat_id=chat_id, message_id=msg_id)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
         self.name      = name
@@ -564,25 +808,25 @@ class RouletteEngine:
         self.thread_id = cfg["thread_id"]
         self.color_data: list = cfg["color_data"]
 
-        self.spin_history:     list = []
-        self.original_levels:  list = []
-        self.inverted_levels:  list = []
+        self.spin_history:    list = []
+        self.original_levels: list = []
+        self.inverted_levels: list = []
         self.last_nonzero_color: Optional[str] = None
         self.anti_block: set = set()
 
-        self.signal_active:    bool = False
-        self.expected_color:   Optional[str] = None
-        self.bet_color:        Optional[str] = None
-        self.attempts_left:    int = 0
-        self.total_attempts:   int = 0
-        self.trigger_number:   Optional[int] = None
+        self.signal_active:  bool = False
+        self.expected_color: Optional[str] = None
+        self.bet_color:      Optional[str] = None
+        self.attempts_left:  int = 0
+        self.total_attempts: int = 0
+        self.trigger_number: Optional[int] = None
 
-        self.result_until:     float = 0.0
-        self.consec_losses:    int = 0
-        self.recovery_active:  bool  = False
-        self.recovery_target:  float = 0.0
-        self.level1_bankroll:  float = 0.0
-        self.signal_is_level1: bool  = False
+        self.result_until:    float = 0.0
+        self.consec_losses:   int   = 0
+        self.recovery_active: bool  = False
+        self.recovery_target: float = 0.0
+        self.level1_bankroll: float = 0.0
+        self.signal_is_level1: bool = False
 
         self.betting_system_name = cfg.get("betting_system", "dalembert")
         self.bet_sys = D_Alembert(BASE_BET)
@@ -595,17 +839,32 @@ class RouletteEngine:
         self.amx_system = AMXSignalSystem(mode="moderado")
         self.min_prob_threshold = cfg.get("min_prob_threshold", 0.48)
 
+        # ── ML / Markov ────────────────────────────────────────────────────
+        self.ml_filter = MLSignalFilter(
+            markov_order=2,
+            markov_threshold=0.52,
+            ml_threshold=0.55,
+            ml_threshold_retry=0.48,
+            ml_min_samples=30,
+        )
+        # Almacena las features del último intento para actualizar en resultado
+        self._pending_features: Optional[np.ndarray] = None
+        self._last_markov_prob: float = 0.0
+        self._last_ml_prob:     float = 0.0
+
+    # ── Modo AMX ───────────────────────────────────────────────────────────
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
         self.amx_system = AMXSignalSystem(mode=mode)
-        logger.info(f"[{self.name}] Modo AMX V20 cambiado a: {mode}")
+        logger.info(f"[{self.name}] Modo AMX V20: {mode}")
         return mode
 
+    # ── EMA helper ─────────────────────────────────────────────────────────
     @staticmethod
     def calculate_ema(data: list, period: int) -> list:
         if len(data) < period:
             return [None] * len(data)
         mult = 2 / (period + 1)
-        out = [None] * (period - 1)
+        out  = [None] * (period - 1)
         prev = sum(data[:period]) / period
         out.append(prev)
         for i in range(period, len(data)):
@@ -613,11 +872,9 @@ class RouletteEngine:
             out.append(prev)
         return out
 
+    # ── Color data helpers ─────────────────────────────────────────────────
     def get_entry(self, number: int) -> Optional[dict]:
-        for e in self.color_data:
-            if e["id"] == number:
-                return e
-        return None
+        return next((e for e in self.color_data if e["id"] == number), None)
 
     def get_signal(self, number: int) -> Optional[str]:
         e = self.get_entry(number)
@@ -625,32 +882,29 @@ class RouletteEngine:
 
     def get_prob(self, number: int, color: str) -> float:
         e = self.get_entry(number)
-        if not e:
-            return 0.0
+        if not e: return 0.0
         return e["rojo"] if color == "ROJO" else e["negro"]
 
+    # ── Bet color por EMA doble ────────────────────────────────────────────
     def determine_bet_color(self, expected: str) -> str:
         if len(self.spin_history) < 20:
             return expected
         ema20o = self.calculate_ema(self.original_levels, 20)
         ema20i = self.calculate_ema(self.inverted_levels, 20)
         li = len(self.original_levels) - 1
-        
         if li < 0 or li >= len(ema20o) or li >= len(ema20i):
             return expected
         if ema20o[li] is None or ema20i[li] is None:
             return expected
-            
         last_sig = self.get_signal(self.spin_history[-1]["number"])
         if expected == "ROJO":
-            if self.original_levels[li] < ema20o[li]:
-                return "NEGRO" if last_sig == "NEGRO" else "ROJO"
-            return "ROJO"
+            return ("NEGRO" if self.original_levels[li] < ema20o[li]
+                             and last_sig == "NEGRO" else "ROJO")
         else:
-            if self.inverted_levels[li] < ema20i[li]:
-                return "ROJO" if last_sig == "ROJO" else "NEGRO"
-            return "NEGRO"
+            return ("ROJO" if self.inverted_levels[li] < ema20i[li]
+                            and last_sig == "ROJO" else "NEGRO")
 
+    # ── Activación clásica ─────────────────────────────────────────────────
     def should_activate(self) -> Optional[str]:
         losses = self.consec_losses
         min_spin = 22 + losses * 2
@@ -666,71 +920,60 @@ class RouletteEngine:
         if len(self.original_levels) < 20 or len(self.inverted_levels) < 20:
             return None
 
-        ema4o = self.calculate_ema(self.original_levels, 4)
-        ema8o = self.calculate_ema(self.original_levels, 8)
+        ema4o  = self.calculate_ema(self.original_levels, 4)
+        ema8o  = self.calculate_ema(self.original_levels, 8)
         ema20o = self.calculate_ema(self.original_levels, 20)
-        ema4i = self.calculate_ema(self.inverted_levels, 4)
-        ema8i = self.calculate_ema(self.inverted_levels, 8)
+        ema4i  = self.calculate_ema(self.inverted_levels, 4)
+        ema8i  = self.calculate_ema(self.inverted_levels, 8)
         ema20i = self.calculate_ema(self.inverted_levels, 20)
 
         req = min(3 + losses, 13)
-        li = len(self.original_levels) - 1
+        li  = len(self.original_levels) - 1
 
         def check(levels, e20, e8, e4, idx):
             for off in range(req):
                 i = idx - (req - 1) + off
-                if i < 0:
-                    return False
-                if i >= len(levels) or i >= len(e20):
+                if i < 0 or i >= len(levels) or i >= len(e20):
                     return False
                 if e20[i] is None or levels[i] <= e20[i]:
                     return False
                 if losses >= 2:
-                    if i >= len(e8) or e8[i] is None:
-                        return False
-                    if levels[i] <= e8[i]:
+                    if i >= len(e8) or e8[i] is None or levels[i] <= e8[i]:
                         return False
                 if losses >= 4:
-                    if i >= len(e4) or e4[i] is None:
-                        return False
-                    if levels[i] <= e4[i]:
+                    if i >= len(e4) or e4[i] is None or levels[i] <= e4[i]:
                         return False
             return True
 
-        if expected == "ROJO":
-            if check(self.original_levels, ema20o, ema8o, ema4o, li):
-                return "ROJO"
-        elif expected == "NEGRO":
-            if check(self.inverted_levels, ema20i, ema8i, ema4i, li):
-                return "NEGRO"
+        if expected == "ROJO" and check(self.original_levels, ema20o, ema8o, ema4o, li):
+            return "ROJO"
+        if expected == "NEGRO" and check(self.inverted_levels, ema20i, ema8i, ema4i, li):
+            return "NEGRO"
         return None
 
+    # ── Recovery check ─────────────────────────────────────────────────────
     def _check_recovery(self):
         if not self.recovery_active:
             return
         if self.bet_sys.bankroll >= self.recovery_target:
-            logger.info(
-                f"[{self.name}] Recuperación completada! "
-                f"bankroll={self.bet_sys.bankroll:.2f} >= objetivo={self.recovery_target:.2f}. "
-                f"Reseteando a nivel 1."
-            )
-            self.consec_losses    = 0
-            self.recovery_active  = False
-            self.recovery_target  = 0.0
-            self.bet_sys.step     = 0
+            logger.info(f"[{self.name}] Recuperación completada — "
+                        f"bankroll={self.bet_sys.bankroll:.2f}")
+            self.consec_losses   = 0
+            self.recovery_active = False
+            self.recovery_target = 0.0
+            self.bet_sys.step    = 0
 
+    # ── AMX positions update ───────────────────────────────────────────────
     def _update_amx_positions(self, color: str):
-        last_pos = self.amx_system.ultimos_puntos[-1] if self.amx_system.ultimos_puntos else 0
-        if color == "ROJO":
-            new_pos = last_pos + 1
-        elif color == "NEGRO":
-            new_pos = last_pos - 1
-        else:
-            new_pos = last_pos
-        self.amx_system.ultimos_puntos.append(new_pos)
+        last = self.amx_system.ultimos_puntos[-1] if self.amx_system.ultimos_puntos else 0
+        delta = 1 if color == "ROJO" else (-1 if color == "NEGRO" else 0)
+        self.amx_system.ultimos_puntos.append(last + delta)
         if len(self.amx_system.ultimos_puntos) > 300:
             self.amx_system.ultimos_puntos = self.amx_system.ultimos_puntos[-200:]
 
+    # ══════════════════════════════════════════════════════════════════════
+    # ─── PROCESS NUMBER (núcleo del motor) ────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
         self.spin_history.append({"number": number, "real": real})
@@ -741,256 +984,335 @@ class RouletteEngine:
         last_i = self.inverted_levels[-1] if self.inverted_levels else 0
 
         if number == 0:
-            if self.last_nonzero_color:
-                self.original_levels.append(last_o + (1 if self.last_nonzero_color == "ROJO" else -1))
-                self.inverted_levels.append(last_i + (1 if self.last_nonzero_color == "NEGRO" else -1))
-            else:
-                self.original_levels.append(last_o)
-                self.inverted_levels.append(last_i)
+            ref = self.last_nonzero_color
+            self.original_levels.append(last_o + (1 if ref == "ROJO"  else (-1 if ref else 0)))
+            self.inverted_levels.append(last_i + (1 if ref == "NEGRO" else (-1 if ref else 0)))
         else:
-            self.original_levels.append(last_o + (1 if real == "ROJO" else -1))
+            self.original_levels.append(last_o + (1 if real == "ROJO"  else -1))
             self.inverted_levels.append(last_i + (1 if real == "NEGRO" else -1))
             self.last_nonzero_color = real
 
-        while len(self.original_levels) > len(self.spin_history):
-            self.original_levels.pop(0)
-        while len(self.inverted_levels) > len(self.spin_history):
-            self.inverted_levels.pop(0)
-        
-        min_len = min(len(self.original_levels), len(self.inverted_levels))
+        min_len = min(len(self.original_levels), len(self.inverted_levels),
+                      len(self.spin_history))
         self.original_levels = self.original_levels[-min_len:]
         self.inverted_levels = self.inverted_levels[-min_len:]
+
+        # Actualizar Markov con cada giro (VERDE se ignora internamente)
+        self.ml_filter.observe_color(real)
 
         self._update_amx_positions(real)
         expected_signal = self.get_signal(number)
         self.amx_system.update_streak(real, expected_signal)
 
+        # ── Evaluación de resultado de señal activa ───────────────────────
         if self.signal_active and time.time() > self.result_until:
-            is_win = (self.bet_color == "ROJO" and real == "ROJO") or (self.bet_color == "NEGRO" and real == "NEGRO")
-            
+            is_win = ((self.bet_color == "ROJO"  and real == "ROJO") or
+                      (self.bet_color == "NEGRO" and real == "NEGRO"))
+
+            # Actualizar modelo ML con el resultado
+            self.ml_filter.update_result(is_win)
+            logger.info(f"[{self.name}] ML update: won={is_win} | {self.ml_filter.info()}")
+
             if is_win:
                 bet = self.bet_sys.win()
                 self.stats.record(True, self.bet_sys.bankroll)
-                
-                if len(self.signal_msg_ids) > 1:
-                    for msg_id in self.signal_msg_ids[:-1]:
-                        tg_delete(self.chat_id, msg_id)
-                    self.signal_msg_ids = [self.signal_msg_ids[-1]]
-                
+                # Limpiar mensajes anteriores (mantener solo el último)
+                for mid in self.signal_msg_ids[:-1]:
+                    tg_delete(self.chat_id, mid)
+                self.signal_msg_ids = [self.signal_msg_ids[-1]] if self.signal_msg_ids else []
                 self.signal_active = False
                 self._check_recovery()
                 self._send_result(number, real, True, bet)
                 self._check_stats()
                 self.signal_msg_ids = []
-                
+
             else:
                 self.attempts_left -= 1
                 bet = self.bet_sys.loss()
-                
+
                 if self.attempts_left <= 0:
+                    # Señal agotada → pérdida confirmada
                     self.consec_losses += 1
                     if self.consec_losses >= 10:
-                        self.consec_losses = 0
+                        self.consec_losses   = 0
                         self.recovery_active = False
                         self.recovery_target = 0.0
-                        logger.info(f"[{self.name}] Max 10 losses → nivel reiniciado, bankroll {self.bet_sys.bankroll:.2f}")
                     else:
                         self.recovery_active = True
-                        if self.signal_is_level1:
-                            self.recovery_target = self.level1_bankroll + BASE_BET
-                        else:
-                            self.recovery_target = self.level1_bankroll + BASE_BET
-                        logger.info(
-                            f"[{self.name}] Pérdida nivel {self.consec_losses}. "
-                            f"Modo recuperación activado. "
-                            f"level1_bankroll={self.level1_bankroll:.2f} "
-                            f"objetivo={self.recovery_target:.2f}"
-                        )
+                        self.recovery_target = self.level1_bankroll + BASE_BET
                     self.stats.record(False, self.bet_sys.bankroll)
                     self.signal_active = False
                     self._send_result(number, real, False, bet)
                     self._check_stats()
                     self.signal_msg_ids = []
-                    
+
                 else:
+                    # Retry: borrar último mensaje y emitir nuevo con filtro ML
                     if self.signal_msg_ids:
-                        last_msg_id = self.signal_msg_ids.pop()
-                        tg_delete(self.chat_id, last_msg_id)
-                    
+                        tg_delete(self.chat_id, self.signal_msg_ids.pop())
+
                     self.trigger_number = number
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
-                    self._send_retry_signal(number, new_bet, attempt_number)
 
+                    # ── Filtro ML para reintento ──────────────────────────
+                    feats = self._build_features(self.bet_color)
+                    emit, mp, mlp, reason = self.ml_filter.should_emit_signal(
+                        feats, self.bet_color, is_retry=True
+                    )
+                    logger.info(f"[{self.name}] Retry ML check: {reason}")
+                    if emit:
+                        self._last_markov_prob = mp
+                        self._last_ml_prob     = mlp
+                        self._send_retry_signal(number, new_bet, attempt_number)
+                    else:
+                        # ML bloquea el reintento → cancelar señal
+                        logger.info(f"[{self.name}] Retry bloqueado por ML/Markov: {reason}")
+                        tg_send_text(
+                            self.chat_id, self.thread_id,
+                            f"🚫 <b>Reintento cancelado por filtro ML</b>\n"
+                            f"<i>{reason}</i>"
+                        )
+                        self.stats.record(False, self.bet_sys.bankroll)
+                        self.signal_active = False
+                        self.signal_msg_ids = []
+
+        # ── Búsqueda de nueva señal ───────────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
             self.signal_msg_ids = []
-            
+
             signal = self._detect_amx_signal()
 
             if signal:
-                self.signal_active = True
-                self.expected_color = signal["expected_color"]
-                self.bet_color = signal["expected_color"]
-                self.attempts_left = MAX_ATTEMPTS
-                self.total_attempts = MAX_ATTEMPTS
-                self.trigger_number = signal["trigger_number"]
-                self._send_signal(signal["trigger_number"], 1, amx_signal=signal)
+                bet_color  = signal["expected_color"]
+                tabla_prob = signal["probability"]
+
+                # ── Filtro ML intento 1 ───────────────────────────────────
+                feats = self._build_features(bet_color, tabla_prob=tabla_prob)
+                emit, mp, mlp, reason = self.ml_filter.should_emit_signal(
+                    feats, bet_color, is_retry=False
+                )
+                logger.info(f"[{self.name}] AMX signal ML check: {reason}")
+
+                if emit:
+                    self._last_markov_prob = mp
+                    self._last_ml_prob     = mlp
+                    self._pending_features = feats
+                    self.signal_active   = True
+                    self.expected_color  = bet_color
+                    self.bet_color       = bet_color
+                    self.attempts_left   = MAX_ATTEMPTS
+                    self.total_attempts  = MAX_ATTEMPTS
+                    self.trigger_number  = signal["trigger_number"]
+                    self._send_signal(signal["trigger_number"], 1, amx_signal=signal)
+                else:
+                    logger.info(f"[{self.name}] Señal AMX bloqueada: {reason}")
+
             else:
                 expected = self.should_activate()
                 if expected:
-                    self.signal_active = True
-                    self.expected_color = expected
-                    self.bet_color = self.determine_bet_color(expected)
-                    self.attempts_left = MAX_ATTEMPTS
-                    self.total_attempts = MAX_ATTEMPTS
-                    self.trigger_number = number
-                    self._send_signal(number, 1)
+                    bet_color = self.determine_bet_color(expected)
 
+                    # ── Filtro ML intento 1 (clásico) ─────────────────────
+                    feats = self._build_features(bet_color)
+                    emit, mp, mlp, reason = self.ml_filter.should_emit_signal(
+                        feats, bet_color, is_retry=False
+                    )
+                    logger.info(f"[{self.name}] Classic signal ML check: {reason}")
+
+                    if emit:
+                        self._last_markov_prob = mp
+                        self._last_ml_prob     = mlp
+                        self._pending_features = feats
+                        self.signal_active   = True
+                        self.expected_color  = expected
+                        self.bet_color       = bet_color
+                        self.attempts_left   = MAX_ATTEMPTS
+                        self.total_attempts  = MAX_ATTEMPTS
+                        self.trigger_number  = number
+                        self._send_signal(number, 1)
+                    else:
+                        logger.info(f"[{self.name}] Señal clásica bloqueada: {reason}")
+
+    # ── Feature builder ─────────────────────────────────────────────────────
+    def _build_features(self, bet_color: str, tabla_prob: Optional[float] = None) -> np.ndarray:
+        """Extrae el vector de 12 features para el filtro ML."""
+        if tabla_prob is None:
+            last_num = self.spin_history[-1]["number"] if self.spin_history else 0
+            tabla_prob = self.get_prob(last_num, bet_color)
+
+        positions = (self.original_levels if bet_color == "ROJO"
+                     else self.inverted_levels)
+        ema4  = self.calculate_ema(positions, 4)
+        ema8  = self.calculate_ema(positions, 8)
+        ema20 = self.calculate_ema(positions, 20)
+
+        # Momentum: cuántos giros recientes coinciden con bet_color
+        recent = [s["real"] for s in self.spin_history[-5:]]
+        momentum = sum(1 for c in reversed(recent)
+                       if c == bet_color) if recent else 0
+
+        return self.ml_filter.extract_features(
+            bet_color       = bet_color,
+            tabla_prob      = tabla_prob,
+            ema4            = ema4,
+            ema8            = ema8,
+            ema20           = ema20,
+            positions       = positions,
+            momentum_count  = momentum,
+            consec_losses   = self.consec_losses,
+            bet_step        = self.bet_sys.step,
+            last_two_expected = self.amx_system.last_two_expected,
+            recovery_active = self.recovery_active,
+        )
+
+    # ── AMX signal detection ────────────────────────────────────────────────
     def _detect_amx_signal(self) -> Optional[dict]:
         if len(self.amx_system.ultimos_puntos) < 20:
             return None
-
         current_number = self.spin_history[-1]["number"] if self.spin_history else 0
         entry = self.get_entry(current_number)
         if not entry or entry["senal"] == "NO APOSTAR":
             return None
-
         expected_color = entry["senal"]
 
         recent_colors = [s["real"] for s in self.spin_history[-5:]]
-        momentum_count = 0
+        momentum = 0
         for c in reversed(recent_colors):
-            if c == expected_color:
-                momentum_count += 1
-            elif c != "VERDE":
-                break
-
-        if momentum_count < 2:
+            if c == expected_color: momentum += 1
+            elif c != "VERDE":      break
+        if momentum < 2:
             return None
 
         try:
             if self.amx_system.mode == "tendencia":
-                signal = self.amx_system.check_signal_tendencia(
-                    self.amx_system.ultimos_puntos, self.color_data, current_number,
-                    expected_color, self.min_prob_threshold
-                )
+                return self.amx_system.check_signal_tendencia(
+                    self.amx_system.ultimos_puntos, self.color_data,
+                    current_number, expected_color, self.min_prob_threshold)
             else:
-                signal = self.amx_system.check_signal_moderado(
-                    self.amx_system.ultimos_puntos, self.color_data, current_number,
-                    expected_color, self.min_prob_threshold
-                )
+                return self.amx_system.check_signal_moderado(
+                    self.amx_system.ultimos_puntos, self.color_data,
+                    current_number, expected_color, self.min_prob_threshold)
         except Exception as e:
-            logger.warning(f"[{self.name}] Error en detección AMX: {e}")
+            logger.warning(f"[{self.name}] Error AMX: {e}")
             return None
 
-        return signal
-
+    # ── Send signal ─────────────────────────────────────────────────────────
     def _send_signal(self, trigger: int, attempt: int, amx_signal: Optional[dict] = None):
-        bet = self.bet_sys.current_bet()
+        bet  = self.bet_sys.current_bet()
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
-        color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
+        icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
 
         self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
         if self.signal_is_level1:
             self.level1_bankroll = self.bet_sys.bankroll
-            logger.info(f"[{self.name}] Señal nivel 1 — bankroll registrado: {self.level1_bankroll:.2f}")
 
         sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-
-        # --- CORRECCIÓN: inicializar amx_line fuera del bloque condicional ---
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
             amx_line = f"{mode_icon} <i>AMX V20 • {amx_signal['mode'].upper()}</i>\n"
 
+        # Líneas ML / Markov
+        mk = self._last_markov_prob
+        ml = self._last_ml_prob
+        ml_line = (f"🧠 <i>Markov: {mk*100:.0f}%"
+                   + (f"  |  ML: {ml*100:.0f}%" if ml > 0 else "")
+                   + "</i>\n")
+
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉 <b>Después de: {trigger}</b>\n"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
-            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {icon}\n\n"
+            f"💡 <i>Probabilidad tabla: {prob}%</i>\n"
+            f"{ml_line}"
             f"{sys_line}"
             f"{amx_line}"
             f"📍 <i>Apuesta: {bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt}/{MAX_ATTEMPTS}</i>\n"
         )
-        levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-        chart = generate_chart(levels, self.spin_history[:], self.bet_color)
+        levels = (self.original_levels[:] if self.bet_color == "ROJO"
+                  else self.inverted_levels[:])
+        chart  = generate_chart(levels, self.spin_history[:], self.bet_color,
+                                markov_prob=mk, ml_prob=ml)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
-        
         if msg_id:
             self.signal_msg_ids.append(msg_id)
-        
-        logger.info(f"[{self.name}] Signal sent: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, recovery={self.recovery_active}")
+        logger.info(f"[{self.name}] Signal: {self.bet_color} after {trigger}, "
+                    f"bet={bet:.2f}, step={step}, Markov={mk:.2f}, ML={ml:.2f}")
 
     def _send_retry_signal(self, trigger: int, new_bet: float, attempt_number: int):
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
-        color_icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
+        icon = "🔴" if self.bet_color == "ROJO" else "⚫️"
         step = self.bet_sys.step + 1
-        sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
-        recovery_note = " 🔄 (modo recuperación)" if self.recovery_active else ""
+        mk, ml = self._last_markov_prob, self._last_ml_prob
+        ml_line = (f"🧠 <i>Markov: {mk*100:.0f}%"
+                   + (f"  |  ML: {ml*100:.0f}%" if ml > 0 else "")
+                   + "</i>\n")
         caption = (
             f"✅☑️ <b>SEÑAL CONFIRMADA</b> ☑️✅\n\n"
             f"🎰 <b>Juego: {self.name}</b>\n"
             f"👉🏼 <b>Después de: {trigger}</b>\n"
-            f"🎯 <b>Apostar a: {self.bet_color}</b> {color_icon}\n\n"
-            f"💡 <i>Probabilidad de señal: {prob}%</i>\n"
-            f"{sys_line}"
+            f"🎯 <b>Apostar a: {self.bet_color}</b> {icon}\n\n"
+            f"💡 <i>Probabilidad tabla: {prob}%</i>\n"
+            f"{ml_line}"
+            f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
             f"📍 <i>Apuesta: {new_bet:.2f} usd</i>\n\n"
             f"♻️ <i>Intento {attempt_number}/{MAX_ATTEMPTS}</i>\n"
         )
-        levels = self.original_levels[:] if self.bet_color == "ROJO" else self.inverted_levels[:]
-        chart = generate_chart(levels, self.spin_history[:], self.bet_color)
+        levels = (self.original_levels[:] if self.bet_color == "ROJO"
+                  else self.inverted_levels[:])
+        chart  = generate_chart(levels, self.spin_history[:], self.bet_color,
+                                markov_prob=mk, ml_prob=ml)
         msg_id = tg_send_photo(self.chat_id, self.thread_id, chart, caption)
-        
         if msg_id:
             self.signal_msg_ids.append(msg_id)
-        
-        logger.info(f"[{self.name}] Retry signal sent: {self.bet_color} after {trigger}, bet={new_bet:.2f}, attempt {attempt_number}/{MAX_ATTEMPTS}")
+        logger.info(f"[{self.name}] Retry #{attempt_number}: {self.bet_color}, bet={new_bet:.2f}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float):
         bankroll = self.bet_sys.bankroll
         icon = "🔴" if real == "ROJO" else ("⚫️" if real == "NEGRO" else "🟢")
-        if won:
-            text = f"💎 <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>\n"
-        else:
-            text = f"❌ <b>RESULTADO: {number}</b> {icon}\n💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>\n"
+        prefix = "💎" if won else "❌"
+        text = (f"{prefix} <b>RESULTADO: {number}</b> {icon}\n"
+                f"💰 <i>Bankroll Actual: {bankroll:.2f} usd</i>\n"
+                f"📊 <i>{self.ml_filter.info()}</i>\n")
         self.result_until = time.time() + 7.0
         tg_send_text(self.chat_id, self.thread_id, text)
-        logger.info(f"[{self.name}] Result: {'WIN' if won else 'LOSS'} #{number}, bankroll={bankroll:.2f}")
+        logger.info(f"[{self.name}] Result: {'WIN' if won else 'LOSS'} #{number}, "
+                    f"bankroll={bankroll:.2f}")
 
     def _check_stats(self):
         if not self.stats.should_send_stats():
             return
-        current_bankroll = self.bet_sys.bankroll
-        w20, l20, t20, e20, batch_bankroll = self.stats.batch_stats(current_bankroll)
-        self.stats.mark_stats_sent(current_bankroll)
-        w24, l24, t24, e24, bk24 = self.stats.stats_24h(current_bankroll)
+        bk = self.bet_sys.bankroll
+        w20, l20, t20, e20, bk20 = self.stats.batch_stats(bk)
+        self.stats.mark_stats_sent(bk)
+        w24, l24, t24, e24, bk24 = self.stats.stats_24h(bk)
         text = (
             f"👉🏼 <b>ESTADÍSTICAS {t20} SEÑALES</b>\n"
             f"🈯️ <b>W: {w20}</b> 🈲 <b>L: {l20}</b> 🈺 <b>T: {t20}</b> 📈 <b>E: {e20}%</b>\n"
-            f"💰 <i>Bankroll acumulado: {batch_bankroll:.2f} usd</i>\n\n"
+            f"💰 <i>Bankroll acumulado: {bk20:.2f} usd</i>\n\n"
             f"👉🏼 <b>ESTADÍSTICAS 24 HORAS</b>\n"
             f"🈯️ <b>W: {w24}</b> 🈲 <b>L: {l24}</b> 🈺 <b>T: {t24}</b> 📈 <b>E: {e24}%</b>\n"
             f"💰 <i>Bankroll acumulado: {bk24:.2f} usd</i>\n"
         )
         tg_send_text(self.chat_id, self.thread_id, text)
-        logger.info(f"[{self.name}] Stats sent: {t20} signals")
 
+    # ── WebSocket ───────────────────────────────────────────────────────────
     async def run_ws(self):
         reconnect_delay = 5
         while self.running:
             try:
-                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
+                async with websockets.connect(WS_URL, ping_interval=30,
+                                              ping_timeout=60, close_timeout=10) as ws:
                     self.ws = ws
                     reconnect_delay = 5
                     logger.info(f"[{self.name}] WS connected")
                     await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "casinoId": CASINO_ID,
-                        "currency": "USD",
-                        "key": [self.ws_key]
+                        "type": "subscribe", "casinoId": CASINO_ID,
+                        "currency": "USD", "key": [self.ws_key]
                     }))
                     async for message in ws:
                         if not self.running:
@@ -1005,40 +1327,37 @@ class RouletteEngine:
                                 gid = r.get("gameId")
                                 num = r.get("result")
                                 if gid and num is not None:
-                                    try:
-                                        n = int(num)
-                                    except Exception:
-                                        continue
+                                    try: n = int(num)
+                                    except: continue
                                     if 0 <= n <= 36 and gid not in self.anti_block:
                                         tmp.append((gid, n))
+                                        self.anti_block.add(gid)
                                         if len(self.anti_block) > 1000:
                                             self.anti_block.clear()
-                                        self.anti_block.add(gid)
                             for gid, n in reversed(tmp):
                                 self.process_number(n)
                         gid = data.get("gameId")
                         res = data.get("result")
                         if gid and res is not None:
-                            try:
-                                n = int(res)
-                            except Exception:
-                                continue
+                            try: n = int(res)
+                            except: continue
                             if 0 <= n <= 36 and gid not in self.anti_block:
+                                self.anti_block.add(gid)
                                 if len(self.anti_block) > 1000:
                                     self.anti_block.clear()
-                                self.anti_block.add(gid)
                                 self.process_number(n)
             except Exception as e:
-                logger.warning(f"[{self.name}] WS error: {e}. Reconnecting in {reconnect_delay}s")
+                logger.warning(f"[{self.name}] WS error: {e}. Retry in {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
+
 
 # ─── FLASK KEEPALIVE ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "bot": "Roulette Signal Bot AMX V20", "ts": time.time()})
+    return jsonify({"status": "ok", "bot": "Roulette Signal Bot AMX V20+ML", "ts": time.time()})
 
 @app.route("/ping")
 def ping():
@@ -1048,85 +1367,91 @@ def ping():
 def health():
     return jsonify({"healthy": True})
 
-# ─── SELF-PING TASK ──────────────────────────────────────────────────────────
-import os
-import urllib.request
+# ─── SELF-PING ────────────────────────────────────────────────────────────────
+import os, urllib.request
 
 async def self_ping_loop():
     port = int(os.environ.get("PORT", 10000))
-    url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
-    ping_url = f"{url}/ping"
+    url  = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
     while True:
         await asyncio.sleep(300)
         try:
-            with urllib.request.urlopen(ping_url, timeout=10) as r:
+            with urllib.request.urlopen(f"{url}/ping", timeout=10) as r:
                 logger.info(f"Self-ping OK: {r.status}")
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
 
-# ─── COMANDOS TELEGRAM ───────────────────────────────────────────────────────
+
+# ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
 engines: dict[str, RouletteEngine] = {}
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
-    help_text = """
-<b>🎰 Roulette Bot - Sistema AMX V20</b>
+    bot.reply_to(message, """
+<b>🎰 Roulette Bot - Sistema AMX V20 + ML + Markov</b>
 
-Comandos disponibles:
-/moderado - Activa modo MODERADO (EMA8/EMA20 + patrón V)
-/tendencia - Activa modo TENDENCIA (EMA4/EMA20 + momentum)
-/status - Muestra estado de todas las ruletas
-/reset - Resetea estadísticas
-/help - Muestra esta ayuda
+/moderado  — Modo MODERADO (EMA8/EMA20 + patrón V)
+/tendencia — Modo TENDENCIA (EMA4/EMA20 + momentum)
+/mlstatus  — Estado del modelo ML y Markov Chain
+/mlreset   — Resetea modelo ML (mantiene Markov)
+/status    — Estado de ruletas
+/reset     — Resetea estadísticas
+/help      — Esta ayuda
+""", parse_mode="HTML")
 
-Sistema AMX V20 integrado con detección de señales 2.00x para ROJO y NEGRO
-    """
-    bot.reply_to(message, help_text, parse_mode="HTML")
+@bot.message_handler(commands=['mlstatus'])
+def cmd_mlstatus(message):
+    lines = ["<b>🧠 ESTADO ML / MARKOV</b>\n"]
+    for name, engine in engines.items():
+        ml   = engine.ml_filter.model
+        mk   = engine.ml_filter.markov
+        info = (
+            f"<b>{name}</b>\n"
+            f"  Markov: {mk.state_info()}\n"
+            f"  ML ready: {ml.ready} | muestras: {ml.n_samples}/{ml.min_samples}\n"
+            f"  Umbral señal: {engine.ml_filter.ml_threshold:.2f} | "
+            f"retry: {engine.ml_filter.ml_threshold_retry:.2f}\n"
+        )
+        lines.append(info)
+    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
+@bot.message_handler(commands=['mlreset'])
+def cmd_mlreset(message):
+    for engine in engines.values():
+        engine.ml_filter.model = OnlineLogisticRegression(min_samples=30)
+    bot.reply_to(message, "🔄 <b>Modelos ML reseteados</b> (Markov conservado)",
+                 parse_mode="HTML")
 
 @bot.message_handler(commands=['moderado'])
 def cmd_moderado(message):
-    changed = []
-    for name, engine in engines.items():
-        old_mode = engine.amx_system.mode
-        engine.set_mode("moderado")
-        if old_mode != "moderado":
-            changed.append(name)
-
-    if changed:
-        text = f"✅ <b>Modo MODERADO activado</b>\n\nRuletas: {', '.join(changed)}"
-    else:
-        text = "📊 <b>Todas las ruletas en modo MODERADO</b>"
-    bot.reply_to(message, text, parse_mode="HTML")
+    changed = [n for n, e in engines.items()
+               if e.amx_system.mode != "moderado" and not e.set_mode("moderado")]
+    # set_mode returns the mode string (truthy), so we need all that changed
+    for n, e in engines.items():
+        e.set_mode("moderado")
+    bot.reply_to(message, "📊 <b>Modo MODERADO activado</b>", parse_mode="HTML")
 
 @bot.message_handler(commands=['tendencia'])
 def cmd_tendencia(message):
-    changed = []
-    for name, engine in engines.items():
-        old_mode = engine.amx_system.mode
-        engine.set_mode("tendencia")
-        if old_mode != "tendencia":
-            changed.append(name)
-
-    if changed:
-        text = f"📈 <b>Modo TENDENCIA activado</b>\n\nRuletas: {', '.join(changed)}"
-    else:
-        text = "📈 <b>Todas las ruletas en modo TENDENCIA</b>"
-    bot.reply_to(message, text, parse_mode="HTML")
+    for n, e in engines.items():
+        e.set_mode("tendencia")
+    bot.reply_to(message, "📈 <b>Modo TENDENCIA activado</b>", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
     lines = ["<b>📊 ESTADO</b>\n"]
     for name, engine in engines.items():
-        mode_icon = "📈" if engine.amx_system.mode == "tendencia" else "📊"
-        signal_status = "🟢" if engine.signal_active else "⚪"
-        lines.append(f"<b>{name}</b>: {mode_icon} {engine.amx_system.mode} {signal_status}")
+        icon = "📈" if engine.amx_system.mode == "tendencia" else "📊"
+        sig  = "🟢" if engine.signal_active else "⚪"
+        lines.append(f"<b>{name}</b>: {icon} {engine.amx_system.mode} {sig}")
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(message):
-    for engine in engines.values():
-        engine.stats = Stats()
+    for e in engines.values():
+        e.stats = Stats()
     bot.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
+
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def run_flask():
@@ -1136,26 +1461,20 @@ def run_flask():
 async def main():
     global engines
     engines = {name: RouletteEngine(name, cfg) for name, cfg in ROULETTE_CONFIGS.items()}
-
     tasks = [asyncio.create_task(e.run_ws()) for e in engines.values()]
     tasks.append(asyncio.create_task(self_ping_loop()))
 
     def telegram_polling():
-        logger.info("Iniciando polling de Telegram...")
+        logger.info("Iniciando polling Telegram...")
         bot.polling(none_stop=True, interval=1, timeout=30)
 
-    tg_thread = threading.Thread(target=telegram_polling, daemon=True)
-    tg_thread.start()
-
-    logger.info("🎰 Roulette Bot AMX V20 iniciado")
-    logger.info("Comandos: /moderado, /tendencia, /status, /reset, /help")
-
+    threading.Thread(target=telegram_polling, daemon=True).start()
+    logger.info("🎰 Roulette Bot AMX V20 + ML + Markov iniciado")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started.")
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info("Flask started.")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
