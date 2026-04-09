@@ -1,25 +1,30 @@
 # ── Roulette Signal Bot — Dockerfile ──────────────────────────────────────────
-FROM python:3.10-slim
+FROM python:3.13-slim
 
-# System dependencies for matplotlib
+# Evita escritura de .pyc y asegura salida sin buffer
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Dependencias del sistema para matplotlib
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfreetype6-dev \
     libpng-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Directorio de trabajo
 WORKDIR /app
 
-# Install Python dependencies
+# Instala dependencias de Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
+# Copia el código principal
 COPY main.py .
 
-# Render injects $PORT automatically
+# Render asigna automáticamente la variable $PORT
 ENV PORT=10000
 EXPOSE 10000
 
-# Start the bot (Flask + asyncio WebSockets)
+# Comando de inicio
 CMD ["python", "main.py"]
