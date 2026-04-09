@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX V20 + ML + Markov Chain
-Corrección de espera para reintentos.
+Incluye re‑evaluación de inversión en cada intento (2 y 3).
 """
 
 import asyncio
@@ -723,7 +723,7 @@ def tg_delete(chat_id, msg_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── ROULETTE ENGINE (CORREGIDO) ──────────────────────────────────────────────
+# ─── ROULETTE ENGINE (CON RE‑EVALUACIÓN DE INVERSIÓN POR INTENTO) ────────────
 # ══════════════════════════════════════════════════════════════════════════════
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
@@ -740,8 +740,8 @@ class RouletteEngine:
         self.anti_block: set = set()
 
         self.signal_active:  bool = False
-        self.expected_color: Optional[str] = None
-        self.bet_color:      Optional[str] = None
+        self.expected_color: Optional[str] = None   # color base original de la señal
+        self.bet_color:      Optional[str] = None   # color real de apuesta para el intento actual
         self.attempts_left:  int = 0
         self.total_attempts: int = 0
         self.trigger_number: Optional[int] = None
@@ -894,6 +894,9 @@ class RouletteEngine:
         if len(self.amx_system.ultimos_puntos) > 300:
             self.amx_system.ultimos_puntos = self.amx_system.ultimos_puntos[-200:]
 
+    # --------------------------------------------------------------------------
+    # EVALUACIÓN DE INVERSIÓN (SE PUEDE LLAMAR EN CADA INTENTO)
+    # --------------------------------------------------------------------------
     def _evaluate_inversion(self, expected_color: str, trigger_number: int) -> tuple[str, float, str]:
         opposite = "NEGRO" if expected_color == "ROJO" else "ROJO"
 
@@ -956,7 +959,7 @@ class RouletteEngine:
         logger.info(f"[{self.name}] Enviado mensaje de espera para intento {attempt_number}.")
 
     # --------------------------------------------------------------------------
-    # PROCESAMIENTO DE NÚMEROS (CORREGIDO)
+    # PROCESAMIENTO DE NÚMEROS (CON RE‑EVALUACIÓN DE COLOR EN CADA INTENTO)
     # --------------------------------------------------------------------------
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
@@ -991,7 +994,6 @@ class RouletteEngine:
 
         # ─── PRIORIDAD: ESPERA DE REINTENTO ───────────────────────────────────
         if self.waiting_for_retry and self.signal_active:
-            # Se espera un nuevo número para evaluar condiciones de reintento
             self.waiting_spins_remaining -= 1
             if self.waiting_spins_remaining <= 0:
                 logger.info(f"[{self.name}] Tiempo de espera agotado para reintento. Finalizando señal como pérdida.")
@@ -1003,10 +1005,15 @@ class RouletteEngine:
                 self._finalize_signal(won=False, number=number, real=real, bet=0)
                 return
             else:
+                # Re‑evaluar color para este reintento
+                new_color, _, inv_reason = self._evaluate_inversion(self.expected_color, number)
+                if new_color != self.bet_color:
+                    logger.info(f"[{self.name}] Reintento en espera: cambia color de {self.bet_color} a {new_color}. Razón: {inv_reason}")
+                    self.bet_color = new_color
                 feats = self._build_features(self.bet_color)
                 emit, mp, mlp, reason = self.ml_filter.should_emit_signal(feats, self.bet_color, is_retry=True)
                 if emit:
-                    logger.info(f"[{self.name}] Condiciones cumplidas para reintento tras espera, enviando intento {MAX_ATTEMPTS - self.attempts_left + 1}")
+                    logger.info(f"[{self.name}] Condiciones cumplidas para reintento tras espera, enviando intento {MAX_ATTEMPTS - self.attempts_left + 1} (color {self.bet_color})")
                     self.waiting_for_retry = False
                     if self.waiting_message_id:
                         tg_delete(self.chat_id, self.waiting_message_id)
@@ -1014,10 +1021,9 @@ class RouletteEngine:
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
                     self._send_retry_signal(number, new_bet, attempt_number)
-                    self.result_until = time.time() + 5
+                    self.result_until = time.time() + 30
                 else:
                     logger.info(f"[{self.name}] Aún no se cumplen condiciones para reintento. Giros restantes: {self.waiting_spins_remaining}")
-                # No procesar más este número (ni resultado ni nueva señal)
                 return
 
         # ─── RESULTADO DE APUESTA ACTIVA ──────────────────────────────────────
@@ -1052,7 +1058,7 @@ class RouletteEngine:
                     self.stats.record(False, self.bet_sys.bankroll)
                     self._finalize_signal(won=False, number=number, real=real, bet=bet)
                 else:
-                    # Intentar reintento inmediato
+                    # Reintento inmediato: re‑evaluar color primero
                     if self.signal_msg_ids:
                         tg_delete(self.chat_id, self.signal_msg_ids.pop())
 
@@ -1060,27 +1066,30 @@ class RouletteEngine:
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
 
+                    # Re‑evaluar inversión para este nuevo intento
+                    new_color, _, inv_reason = self._evaluate_inversion(self.expected_color, number)
+                    if new_color != self.bet_color:
+                        logger.info(f"[{self.name}] Reintento inmediato: cambia color de {self.bet_color} a {new_color}. Razón: {inv_reason}")
+                        self.bet_color = new_color
+
                     feats = self._build_features(self.bet_color)
                     emit, mp, mlp, reason = self.ml_filter.should_emit_signal(feats, self.bet_color, is_retry=True)
-                    logger.info(f"[{self.name}] Reintento inmediato ML check: {reason}")
+                    logger.info(f"[{self.name}] Reintento inmediato ML check: {reason} (color {self.bet_color})")
                     if emit:
                         self._last_markov_prob = mp
                         self._last_ml_prob     = mlp
                         self._send_retry_signal(number, new_bet, attempt_number)
-                        self.result_until = time.time() + 5
+                        self.result_until = time.time() + 30
                     else:
-                        # Entrar en espera
                         logger.info(f"[{self.name}] Reintento bloqueado, entrando en espera para intento {attempt_number}")
                         self.waiting_for_retry = True
                         self.waiting_attempt_number = attempt_number
                         self.waiting_spins_remaining = MAX_WAIT_SPINS
                         self._send_waiting_message(number, attempt_number)
-                        # No se finaliza la señal, se mantiene activa esperando
-                        # Pero debemos evitar que este mismo número se procese como nueva señal
-                        self.result_until = time.time() + 1000  # desactivar resultado hasta que envíe reintento
-            return  # Importante: no buscar nueva señal después de procesar resultado
+                        self.result_until = time.time() + 1000  # desactivar resultado
+            return
 
-        # ─── NUEVA SEÑAL (si no hay señal activa) ─────────────────────────────
+        # ─── NUEVA SEÑAL ──────────────────────────────────────────────────────
         if not self.signal_active and time.time() > self.result_until:
             self.signal_msg_ids.clear()
             self.signal_sequence_colors.clear()
@@ -1221,7 +1230,7 @@ class RouletteEngine:
         if msg_id:
             self.signal_msg_ids.append(msg_id)
         logger.info(f"[{self.name}] Signal: {self.bet_color} after {trigger}, bet={bet:.2f}, step={step}, Markov={mk:.0f}%")
-        self.result_until = time.time() + 30  # tiempo para esperar el resultado
+        self.result_until = time.time() + 30
 
     def _send_retry_signal(self, trigger: int, new_bet: float, attempt_number: int):
         prob = int(self.get_prob(trigger, self.bet_color) * 100)
