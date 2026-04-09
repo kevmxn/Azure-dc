@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX V20 + ML + Markov Chain
-Incluye re‑evaluación de inversión en cada intento (2 y 3).
+Versión final con secuencia de intentos correcta y reintentos robustos.
 """
 
 import asyncio
@@ -18,12 +18,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import telebot
+from telebot import apihelper
 import websockets
 from flask import Flask, jsonify
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from telebot import apihelper
 
 # ─── FUNCIÓN DE ESCAPE HTML PERSONALIZADA ────────────────────────────────────
 def escape_html(text: str) -> str:
@@ -58,7 +58,6 @@ _session.mount("http://",  _adapter)
 bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
-import telebot.apihelper as apihelper
 apihelper.CONNECT_TIMEOUT = 10
 apihelper.READ_TIMEOUT = 60
 
@@ -724,7 +723,7 @@ def tg_delete(chat_id, msg_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── ROULETTE ENGINE (CON RE‑EVALUACIÓN DE INVERSIÓN POR INTENTO) ────────────
+# ─── ROULETTE ENGINE (VERSIÓN FINAL) ─────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
@@ -960,7 +959,7 @@ class RouletteEngine:
         logger.info(f"[{self.name}] Enviado mensaje de espera para intento {attempt_number}.")
 
     # --------------------------------------------------------------------------
-    # PROCESAMIENTO DE NÚMEROS (CON RE‑EVALUACIÓN DE COLOR EN CADA INTENTO)
+    # PROCESAMIENTO DE NÚMEROS
     # --------------------------------------------------------------------------
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
@@ -989,9 +988,6 @@ class RouletteEngine:
         self._update_amx_positions(real)
         expected_signal = self.get_signal(number)
         self.amx_system.update_streak(real, expected_signal)
-
-        if self.signal_active:
-            self.signal_sequence_colors.append(real)
 
         # ─── PRIORIDAD: ESPERA DE REINTENTO ───────────────────────────────────
         if self.waiting_for_retry and self.signal_active:
@@ -1032,6 +1028,9 @@ class RouletteEngine:
             is_win = ((self.bet_color == "ROJO"  and real == "ROJO") or
                       (self.bet_color == "NEGRO" and real == "NEGRO"))
 
+            # Registrar el resultado de ESTE intento en la secuencia
+            self.signal_sequence_colors.append(real)
+
             self.signal_history.append({"expected": self.expected_color, "won": is_win})
             if len(self.signal_history) > 50:
                 self.signal_history.pop(0)
@@ -1067,7 +1066,6 @@ class RouletteEngine:
                     new_bet = self.bet_sys.current_bet()
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
 
-                    # Re‑evaluar inversión para este nuevo intento
                     new_color, _, inv_reason = self._evaluate_inversion(self.expected_color, number)
                     if new_color != self.bet_color:
                         logger.info(f"[{self.name}] Reintento inmediato: cambia color de {self.bet_color} a {new_color}. Razón: {inv_reason}")
@@ -1087,7 +1085,7 @@ class RouletteEngine:
                         self.waiting_attempt_number = attempt_number
                         self.waiting_spins_remaining = MAX_WAIT_SPINS
                         self._send_waiting_message(number, attempt_number)
-                        self.result_until = time.time() + 1000  # desactivar resultado
+                        self.result_until = time.time() + 1000
             return
 
         # ─── NUEVA SEÑAL ──────────────────────────────────────────────────────
@@ -1505,3 +1503,11 @@ async def main():
     threading.Thread(target=telegram_polling, daemon=True).start()
     logger.info("🎰 Roulette Bot AMX V20 + ML + Markov iniciado")
     await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info("Flask started.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped.")
