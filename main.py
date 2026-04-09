@@ -4,6 +4,7 @@ Roulette Telegram Signal Bot - Sistema AMX V20 (Tendencia + Moderado)
 Integra la lógica de detección de señales 2.00x del AMX Genesis 20.0
 con las tablas predefinidas de cada ruleta para filtrado de probabilidad.
 VERSION CORREGIDA - Manejo de mensajes: eliminar intentos 1-2 si pierden, mantener si ganan o intento 3 pierde
+AGREGADO: Líneas de soporte (gris) y resistencia (rojo/gris según color de apuesta)
 """
 
 import asyncio
@@ -111,7 +112,7 @@ ROULETTE_CONFIGS = {
         "thread_id": 6,
         "color_data": COLOR_DATA_AZURE,
         "betting_system": "dalembert",
-        "min_prob_threshold": 0.49,   # Umbral mínimo de probabilidad (ajustado)
+        "min_prob_threshold": 0.49,
     },
 }
 
@@ -148,7 +149,6 @@ class D_Alembert:
             self.step += 1
         return bet
 
-
 # ─── SISTEMA AMX V20 ──────────────────────────────────────────────────────────
 class AMXSignalSystem:
     def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
@@ -160,12 +160,10 @@ class AMXSignalSystem:
         self.direccion_momentum: int = 0
         self.prev_ema4_above_ema8: bool = True
         self.ultimos_puntos: list = []
-        # Nuevos atributos para rachas (simulan dos valores consecutivos >=2.00)
-        self.last_two_expected = deque(maxlen=2)   # almacena si el giro fue del color esperado
-        self.last_two_colors = deque(maxlen=2)     # colores reales de los dos últimos giros
+        self.last_two_expected = deque(maxlen=2)
+        self.last_two_colors = deque(maxlen=2)
 
     def update_streak(self, real_color: str, expected_color: Optional[str]):
-        """Actualiza las rachas de aciertos del color esperado."""
         if expected_color:
             self.last_two_expected.append(real_color == expected_color)
         self.last_two_colors.append(real_color)
@@ -207,16 +205,12 @@ class AMXSignalSystem:
 
         current_pos = positions[-1]
 
-        # Condiciones del sistema original
         cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
         sobre_tres_emas = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
-
-        # Nuevas condiciones para emular 2.00x alcista
         cruce_ema8 = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
         cerca_ema4 = abs(current_pos - ema4[-1]) <= 0.5
         dos_ultimos_esperados = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
 
-        # Combinaciones que generan señal
         cond1 = cruce_alcista or sobre_tres_emas
         cond2 = cruce_ema8
         cond3 = sobre_tres_emas and dos_ultimos_esperados
@@ -233,7 +227,6 @@ class AMXSignalSystem:
         if entry["senal"] != expected_color or prob < prob_threshold:
             return None
 
-        # Determinar fuerza de la señal
         strength = "strong" if (cruce_alcista or cruce_ema8) else "moderate"
         return {
             "type": "SKRILL_2.0",
@@ -275,7 +268,6 @@ class AMXSignalSystem:
             a, b, c = positions[-3], positions[-2], positions[-1]
             patron_v = b < a and b < c and abs(a - c) <= 1 and c > a
 
-        # Nueva condición: dos valores consecutivos esperados + EMAs en orden alcista
         dos_ultimos_esperados = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
         emas_alcistas = ema4[-1] > ema8[-1] > ema20[-1]
         cond_racha_alcista = dos_ultimos_esperados and emas_alcistas and sobre_emas
@@ -305,7 +297,6 @@ class AMXSignalSystem:
 
     def register_so_failed(self):
         self.so_cooldown = time.time()
-
 
 # ─── STATISTICS ───────────────────────────────────────────────────────────────
 class Stats:
@@ -366,9 +357,39 @@ class Stats:
             bk24 = 0.0
         return w, l, t, e, bk24
 
+# ─── FUNCIONES PARA SOPORTES Y RESISTENCIAS ──────────────────────────────────
+def find_support_resistance(levels: list, lookback: int = 30) -> dict:
+    """
+    Detecta niveles de soporte y resistencia basados en mínimos/máximos locales.
+    Retorna dict con keys 'support' (nivel) y 'resistance' (nivel) o None.
+    """
+    if len(levels) < lookback:
+        return {'support': None, 'resistance': None}
+    
+    recent = levels[-lookback:]
+    # Detectar mínimos locales (soporte)
+    support_candidates = []
+    for i in range(2, len(recent)-2):
+        if recent[i] < recent[i-1] and recent[i] < recent[i-2] and recent[i] < recent[i+1] and recent[i] < recent[i+2]:
+            support_candidates.append(recent[i])
+    # Detectar máximos locales (resistencia)
+    resistance_candidates = []
+    for i in range(2, len(recent)-2):
+        if recent[i] > recent[i-1] and recent[i] > recent[i-2] and recent[i] > recent[i+1] and recent[i] > recent[i+2]:
+            resistance_candidates.append(recent[i])
+    
+    # Usar el nivel más reciente (o el más cercano al precio actual)
+    support = support_candidates[-1] if support_candidates else None
+    resistance = resistance_candidates[-1] if resistance_candidates else None
+    return {'support': support, 'resistance': resistance}
 
-# ─── CHART GENERATION ─────────────────────────────────────────────────────────
+# ─── CHART GENERATION CON SOPORTE/RESISTENCIA ─────────────────────────────────
 def generate_chart(levels: list, spin_history: list, bet_color: str, visible: int = VISIBLE) -> io.BytesIO:
+    """
+    Genera gráfico con línea de nivel, EMAs, puntos de giros y líneas de soporte/resistencia.
+    Para bet_color = "ROJO": resistencia roja, soporte gris.
+    Para bet_color = "NEGRO": resistencia gris, soporte rojo.
+    """
     arr = np.array(levels, dtype=float)
     n   = len(arr)
 
@@ -409,17 +430,48 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
     e8 = ema8[sl]
     e20 = ema20[sl]
 
+    # Línea de nivel
     ax.fill_between(x, y, alpha=0.10, color=line_c)
     ax.plot(x, y,   color=line_c,  linewidth=0.8, zorder=3)
+    # EMAs
     ax.plot(x, e4,  color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4",  zorder=4)
     ax.plot(x, e8,  color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8",  zorder=4)
     ax.plot(x, e20, color=ema20_c, linewidth=1.0, label="EMA 20", zorder=4)
 
+    # Puntos de giros
     dot_colors = {"ROJO": "#e84040", "NEGRO": "#aaaacc", "VERDE": "#2ecc71"}
     for i, spin in enumerate(hist_sl):
         c = dot_colors.get(spin["real"], "#ffffff")
         ax.scatter(i, y[i], color=c, s=22, zorder=5, edgecolors="white", linewidths=0.3)
 
+    # ─── SOPORTE Y RESISTENCIA ────────────────────────────────────────────────
+    # Calcular niveles usando la serie de niveles (levels)
+    sr = find_support_resistance(levels, lookback=30)
+    support_val = sr['support']
+    resistance_val = sr['resistance']
+
+    # Definir colores según bet_color
+    if is_rojo:
+        resistance_color = "#e84040"   # rojo
+        support_color    = "#888888"   # gris
+    else:
+        resistance_color = "#888888"   # gris
+        support_color    = "#e84040"   # rojo
+
+    # Convertir valores a coordenadas y (si existen)
+    y_min, y_max = ax.get_ylim()
+    # Nota: los valores de levels están en el mismo rango que arr, usar la transformación de datos a coordenadas
+    if support_val is not None:
+        ax.axhline(y=support_val, color=support_color, linestyle='--', linewidth=1.5, alpha=0.7, label='Soporte')
+        # Añadir texto
+        ax.text(x[-1], support_val, f' Soporte {support_val:.1f}', color=support_color, fontsize=8,
+                verticalalignment='bottom', horizontalalignment='right')
+    if resistance_val is not None:
+        ax.axhline(y=resistance_val, color=resistance_color, linestyle='--', linewidth=1.5, alpha=0.7, label='Resistencia')
+        ax.text(x[-1], resistance_val, f' Resistencia {resistance_val:.1f}', color=resistance_color, fontsize=8,
+                verticalalignment='top', horizontalalignment='right')
+
+    # Configuración de ejes
     tick_step = max(1, len(x) // 8)
     tick_x = list(range(0, len(x), tick_step))
     tick_lbs = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
@@ -448,6 +500,11 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
         Line2D([0],[0], marker='o', color='w', markerfacecolor='#aaaacc', markersize=5, label="Negro"),
         Line2D([0],[0], marker='o', color='w', markerfacecolor='#2ecc71', markersize=5, label="Verde"),
     ]
+    if support_val is not None:
+        legend_els.append(Line2D([0],[0], color=support_color, linestyle='--', linewidth=1.5, label='Soporte'))
+    if resistance_val is not None:
+        legend_els.append(Line2D([0],[0], color=resistance_color, linestyle='--', linewidth=1.5, label='Resistencia'))
+
     ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
               facecolor="#0b101f", edgecolor=grid_c, labelcolor="white", framealpha=0.8, ncol=2)
 
@@ -457,7 +514,6 @@ def generate_chart(levels: list, spin_history: list, bet_color: str, visible: in
     plt.close(fig)
     buf.seek(0)
     return buf
-
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 5
@@ -498,7 +554,6 @@ def tg_send_text(chat_id: int, thread_id: int, text: str) -> Optional[int]:
 
 def tg_delete(chat_id: int, msg_id: int):
     _tg_call(bot.delete_message, chat_id=chat_id, message_id=msg_id)
-
 
 # ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
 class RouletteEngine:
@@ -706,7 +761,6 @@ class RouletteEngine:
         self.original_levels = self.original_levels[-min_len:]
         self.inverted_levels = self.inverted_levels[-min_len:]
 
-        # Actualizar posiciones AMX y rachas de color esperado
         self._update_amx_positions(real)
         expected_signal = self.get_signal(number)
         self.amx_system.update_streak(real, expected_signal)
@@ -803,7 +857,6 @@ class RouletteEngine:
 
         expected_color = entry["senal"]
 
-        # Verificar momentum: al menos 2 giros consecutivos del color esperado
         recent_colors = [s["real"] for s in self.spin_history[-5:]]
         momentum_count = 0
         for c in reversed(recent_colors):
@@ -845,7 +898,7 @@ class RouletteEngine:
 
         sys_line = f"🌀 <i>D'Alembert paso {step} de 20</i>\n"
 
-        # Inicializar amx_line como cadena vacía por defecto (corregido)
+        # --- CORRECCIÓN: inicializar amx_line fuera del bloque condicional ---
         amx_line = ""
         if amx_signal:
             mode_icon = "📈" if amx_signal["mode"] == "tendencia" else "📊"
@@ -980,7 +1033,6 @@ class RouletteEngine:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
-
 # ─── FLASK KEEPALIVE ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -995,7 +1047,6 @@ def ping():
 @app.route("/health")
 def health():
     return jsonify({"healthy": True})
-
 
 # ─── SELF-PING TASK ──────────────────────────────────────────────────────────
 import os
@@ -1012,7 +1063,6 @@ async def self_ping_loop():
                 logger.info(f"Self-ping OK: {r.status}")
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
-
 
 # ─── COMANDOS TELEGRAM ───────────────────────────────────────────────────────
 engines: dict[str, RouletteEngine] = {}
@@ -1033,7 +1083,6 @@ Sistema AMX V20 integrado con detección de señales 2.00x para ROJO y NEGRO
     """
     bot.reply_to(message, help_text, parse_mode="HTML")
 
-
 @bot.message_handler(commands=['moderado'])
 def cmd_moderado(message):
     changed = []
@@ -1048,7 +1097,6 @@ def cmd_moderado(message):
     else:
         text = "📊 <b>Todas las ruletas en modo MODERADO</b>"
     bot.reply_to(message, text, parse_mode="HTML")
-
 
 @bot.message_handler(commands=['tendencia'])
 def cmd_tendencia(message):
@@ -1065,7 +1113,6 @@ def cmd_tendencia(message):
         text = "📈 <b>Todas las ruletas en modo TENDENCIA</b>"
     bot.reply_to(message, text, parse_mode="HTML")
 
-
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
     lines = ["<b>📊 ESTADO</b>\n"]
@@ -1075,19 +1122,16 @@ def cmd_status(message):
         lines.append(f"<b>{name}</b>: {mode_icon} {engine.amx_system.mode} {signal_status}")
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
-
 @bot.message_handler(commands=['reset'])
 def cmd_reset(message):
     for engine in engines.values():
         engine.stats = Stats()
     bot.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
 
-
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
 
 async def main():
     global engines
@@ -1107,7 +1151,6 @@ async def main():
     logger.info("Comandos: /moderado, /tendencia, /status, /reset, /help")
 
     await asyncio.gather(*tasks)
-
 
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
