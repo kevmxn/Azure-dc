@@ -23,6 +23,7 @@ from flask import Flask, jsonify
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from telebot import apihelper
 
 # ─── FUNCIÓN DE ESCAPE HTML PERSONALIZADA ────────────────────────────────────
 def escape_html(text: str) -> str:
@@ -1485,6 +1486,18 @@ async def main():
             except requests.exceptions.ReadTimeout:
                 logger.warning("Telegram read timeout. Reiniciando polling en 5 segundos...")
                 time.sleep(5)
+            except telebot.apihelper.ApiTelegramException as e:
+                err_str = str(e)
+                if "retry after" in err_str.lower():
+                    try:
+                        wait = int(''.join(filter(str.isdigit, err_str))) + 1
+                    except:
+                        wait = 30
+                    logger.warning(f"Telegram API flood-wait {wait}s")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"ApiTelegramException: {e}. Reiniciando en 15 segundos...")
+                    time.sleep(15)
             except Exception as e:
                 logger.error(f"Error crítico en polling de Telegram: {e}. Reiniciando en 15 segundos...")
                 time.sleep(15)
@@ -1492,11 +1505,3 @@ async def main():
     threading.Thread(target=telegram_polling, daemon=True).start()
     logger.info("🎰 Roulette Bot AMX V20 + ML + Markov iniciado")
     await asyncio.gather(*tasks)
-
-if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    logger.info("Flask started.")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped.")
