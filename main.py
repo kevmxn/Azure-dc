@@ -17,7 +17,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import telebot
-from telebot.util import escape_html
+from telebot.formattin import escape_html
 import websockets
 from flask import Flask, jsonify
 
