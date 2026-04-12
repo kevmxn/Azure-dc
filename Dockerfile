@@ -22,6 +22,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia el código principal
 COPY main.py .
 
+# Copia la base de datos de pre-entrenamiento (15k giros)
+COPY russian-azure.db .
+
 # Render asigna automáticamente la variable $PORT
 ENV PORT=10000
 EXPOSE 10000
