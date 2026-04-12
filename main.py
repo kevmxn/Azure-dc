@@ -119,7 +119,7 @@ COLOR_DATA = [
 ]
 
 ROULETTE_CONFIGS = {
-    "Azure Roulette": {
+    "Azure Roulette - Pragmatic Play": {
         "ws_key": 227, "chat_id": -1003835197023, "thread_id": 6,
         "color_data": COLOR_DATA, "betting_system": "dalembert",
         "min_prob_threshold": 0.49, "signal_quality_threshold": 0.54,
@@ -134,9 +134,9 @@ VISIBLE  = 50
 
 # --- Parámetros V23.3 (blend óptimo V23.1 + V23.2) ---
 #                      V23.1   V23.3   V23.2
-RETRY_THRESHOLD  = {1: 0.54, 2: 0.55, 3: 0.58}  # V23.1={0.54,0.57,0.61} V23.2={0.54,0.54,0.57}
-MIN_SAMPLES      = {1: 10,   2: 7,    3: 6}      # V23.1={10,6,5} V23.2={10,9,8}
-RETRY_MIN_RECENT_ACC = 0.535  # promedio entre V23.1(0.55) y V23.2(0.525)
+RETRY_THRESHOLD  = {1: 0.54, 2: 0.55, 3: 0.56}  # V23.1={0.54,0.57,0.61} V23.2={0.54,0.54,0.57}
+MIN_SAMPLES      = {1: 10,   2: 8,    3: 7}      # V23.1={10,6,5} V23.2={10,9,8}
+RETRY_MIN_RECENT_ACC = 0.525  # promedio entre V23.1(0.55) y V23.2(0.525)
 ANTI_BOUNCE_N    = 3          # sin cambio
 MOMENTUM_REQ     = {2: 1, 3: 1}   # igual V23.2 (más reactivo que V23.1's I3=2)
 CROSS_CATEGORY_PENALTY = 0.04  # ligeramente menor que V23.2(0.05), permite más cross-cat
