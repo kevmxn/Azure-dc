@@ -139,7 +139,7 @@ MIN_SAMPLES      = {1: 10,   2: 10,    3: 10}      # V23.1={10,6,5} V23.2={10,9,
 RETRY_MIN_RECENT_ACC = 0.525  # promedio entre V23.1(0.55) y V23.2(0.525)
 ANTI_BOUNCE_N    = 3          # sin cambio
 MOMENTUM_REQ     = {2: 1, 3: 1}   # igual V23.2 (más reactivo que V23.1's I3=2)
-CROSS_CATEGORY_PENALTY = 0.04  # ligeramente menor que V23.2(0.05), permite más cross-cat
+CROSS_CATEGORY_PENALTY = 0.00  # ligeramente menor que V23.2(0.05), permite más cross-cat
 COOLDOWN_SECONDS = 0          # sin cooldown entre señales
 
 # ─── COLORES DEL GRÁFICO POR VALOR ────────────────────────────────────────────
