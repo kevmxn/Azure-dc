@@ -134,7 +134,7 @@ VISIBLE  = 50
 
 # --- Parámetros V23.3 (blend óptimo V23.1 + V23.2) ---
 #                      V23.1   V23.3   V23.2
-RETRY_THRESHOLD  = {1: 0.55, 2: 0.60, 3: 0.65}  # V23.1={0.54,0.57,0.61} V23.2={0.54,0.54,0.57}
+RETRY_THRESHOLD  = {1: 0.55, 2: 0.575, 3: 0.60}  # V23.1={0.54,0.57,0.61} V23.2={0.54,0.54,0.57}
 MIN_SAMPLES      = {1: 10,   2: 10,    3: 10}      # V23.1={10,6,5} V23.2={10,9,8}
 RETRY_MIN_RECENT_ACC = 0.525  # promedio entre V23.1(0.55) y V23.2(0.525)
 ANTI_BOUNCE_N    = 3          # sin cambio
