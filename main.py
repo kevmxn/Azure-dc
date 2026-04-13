@@ -428,14 +428,15 @@ class TransformerTimeSeries:
         self.d_model = d_model
         self.n_heads = n_heads
         self.sequence_length = sequence_length
-        self.d_k = d_model // n_heads
+        self.d_k = d_model // n_heads  # 8 si d_model=16 y n_heads=2
         
-        # Pesos de atención multi-cabeza
-        self.W_q = [np.random.randn(d_model, d_model) * 0.1 for _ in range(n_heads)]
-        self.W_k = [np.random.randn(d_model, d_model) * 0.1 for _ in range(n_heads)]
-        self.W_v = [np.random.randn(d_model, d_model) * 0.1 for _ in range(n_heads)]
+        # Pesos de atención multi-cabeza: (d_model, d_k) para cada cabeza
+        self.W_q = [np.random.randn(d_model, self.d_k) * 0.1 for _ in range(n_heads)]
+        self.W_k = [np.random.randn(d_model, self.d_k) * 0.1 for _ in range(n_heads)]
+        self.W_v = [np.random.randn(d_model, self.d_k) * 0.1 for _ in range(n_heads)]
         
-        # Proyección de salida
+        # Proyección de salida: (d_model, d_model)
+        # La concatenación de n_heads cabezas da (seq_len, n_heads * d_k) = (seq_len, d_model)
         self.W_o = np.random.randn(d_model, d_model) * 0.1
         
         # Embedding posicional simplificado
@@ -465,28 +466,32 @@ class TransformerTimeSeries:
         attention_weights = []
         
         for h in range(self.n_heads):
-            # Proyecciones
+            # Proyecciones: X (seq_len, d_model) @ W (d_model, d_k) -> (seq_len, d_k)
             Q = X @ self.W_q[h]
             K = X @ self.W_k[h]
             V = X @ self.W_v[h]
             
             # Scaled dot-product attention
+            # Q @ K.T: (seq_len, d_k) @ (d_k, seq_len) -> (seq_len, seq_len)
             scores = (Q @ K.T) / np.sqrt(self.d_k)
             attn = self._softmax(scores)
             attention_weights.append(attn)
             
+            # attn @ V: (seq_len, seq_len) @ (seq_len, d_k) -> (seq_len, d_k)
             head_output = attn @ V
             heads_output.append(head_output)
         
-        # Concatenar cabezas
+        # Concatenar cabezas: n_heads * d_k = d_model
+        # Cada cabeza es (seq_len, d_k), concatenadas -> (seq_len, n_heads * d_k) = (seq_len, d_model)
         multi_head = np.concatenate(heads_output, axis=1)
+        
+        # Proyección final: (seq_len, d_model) @ (d_model, d_model) -> (seq_len, d_model)
         output = multi_head @ self.W_o
         
         return output, attention_weights
     
     def _feed_forward(self, x: np.ndarray) -> np.ndarray:
         """Red feed-forward simplificada"""
-        # Capa densa simplificada
         W1 = np.random.randn(self.d_model, self.d_model * 2) * 0.1
         b1 = np.zeros(self.d_model * 2)
         W2 = np.random.randn(self.d_model * 2, self.d_model) * 0.1
@@ -503,12 +508,11 @@ class TransformerTimeSeries:
     
     def _forward_and_update(self):
         """Forward pass y actualización online"""
-        # Preparar input
         seq = np.array(list(self.history)[-self.sequence_length:])
         
         # Embedding: valor + posición
         X = np.zeros((self.sequence_length, self.d_model))
-        X[:, 0] = seq  # El valor en primera dimensión
+        X[:, 0] = seq
         X += self.pos_encoding[:self.sequence_length]
         
         # Self-attention
@@ -522,15 +526,14 @@ class TransformerTimeSeries:
         ff_output = self._feed_forward(X)
         X = X + ff_output
         
-        # Guardar attention map para visualización/debug
-        self.attention_maps.append(attn_weights[0])  # Primera cabeza
+        # Guardar attention map
+        self.attention_maps.append(attn_weights[0])
         
-        # Actualización online (simplificada)
+        # Actualización online
         self._online_update(X)
     
     def _online_update(self, final_output: np.ndarray):
         """Actualización de pesos con gradiente simplificado"""
-        # Predicción actual vs target
         pred = self._sigmoid(np.mean(final_output[-1]))
         actual = list(self.history)[-1]
         target = 1.0 if actual > 0.5 else 0.0
@@ -538,17 +541,16 @@ class TransformerTimeSeries:
         error = pred - target
         lr = 0.0001
         
-        # Ajuste simple
         self.W_o -= lr * error * np.random.randn(*self.W_o.shape) * 0.01
     
-    def _sigmoid(self, x): return 1 / (1 + np.exp(-np.clip(x, -10, 10)))
+    def _sigmoid(self, x): 
+        return 1 / (1 + np.exp(-np.clip(x, -10, 10)))
     
     def predict(self) -> Optional[Dict]:
         """Predicción del transformer"""
         if len(self.history) < self.sequence_length:
             return None
         
-        # Forward pass
         seq = np.array(list(self.history)[-self.sequence_length:])
         
         X = np.zeros((self.sequence_length, self.d_model))
@@ -566,7 +568,7 @@ class TransformerTimeSeries:
         temperature = 0.8
         prob_rojo = 1 / (1 + np.exp(-(prob_rojo - 0.5) / temperature + 0.5))
         
-        # Confianza basada en atención del último token
+        # Confianza basada en atención
         last_attn = attn_weights[0][-1] if len(attn_weights) > 0 else np.ones(self.sequence_length) / self.sequence_length
         confidence = np.max(last_attn)
         
@@ -577,7 +579,6 @@ class TransformerTimeSeries:
             "attention_pattern": "global" if confidence < 0.3 else "focused",
             "model": "Transformer"
         }
-
 
 class DynamicEnsemble:
     """
