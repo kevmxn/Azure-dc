@@ -2237,4 +2237,64 @@ def cmd_start(message):
 """, parse_mode="HTML")
 
 @bot.message_handler(commands=['retrain'])
-def cmd_retrain
+def cmd_retrain(message):
+    """Forzar re-entrenamiento de los modelos desde la base de datos"""
+    for e in engines.values():
+        if hasattr(e, 'ensemble_ml'):
+            e.ensemble_ml.train_from_database(force_retrain=True)
+    bot.reply_to(message,"🔄 <b>Re-entrenamiento completado</b>\n\nLos modelos han sido re-entrenados con los datos más recientes de la base de datos.", parse_mode="HTML")
+
+@bot.message_handler(commands=['moderado'])
+def cmd_moderado(message):
+    for e in engines.values(): e.set_mode("moderado")
+    bot.reply_to(message,"✅ <b>Modo MODERADO activado</b>",parse_mode="HTML")
+
+@bot.message_handler(commands=['tendencia'])
+def cmd_tendencia(message):
+    for e in engines.values(): e.set_mode("tendencia")
+    bot.reply_to(message,"📈 <b>Modo TENDENCIA activado</b>",parse_mode="HTML")
+
+@bot.message_handler(commands=['status'])
+def cmd_status(message):
+    lines=["<b>📊 ESTADO AMX V24.1</b>\n"]
+    for name,engine in engines.items():
+        mi="📈" if engine.amx_system.mode=="tendencia" else "📊"
+        if engine.learning_phase:
+            st=f"📚 Aprendiendo ({engine.learning_spin_count}/{engine.max_learning_spins})"
+        elif engine.signal_active:
+            v=engine.bet_value or "?"; ic=CATEGORY_ICONS.get(v,"")
+            st=f"🟢 [{engine.active_category}] {v}{ic} int={engine.current_attempt_number}/{MAX_ATTEMPTS}"
+        elif engine.waiting_for_attempt:
+            st=f"⏳ Esperando int.{engine.waiting_attempt_number}/{MAX_ATTEMPTS}"
+        else: st="⚪ Idle"
+        w=engine.ensemble_ml.weights if hasattr(engine, 'ensemble_ml') else {}
+        w_str = f"TCN:{w.get('tcn',0):.2f} LSTM:{w.get('lstm_att',0):.2f} TRF:{w.get('transformer',0):.2f}" if w else "N/A"
+        lines.append(f"<b>{name}</b>: {mi} — {st}\n🧠 {w_str}")
+    bot.reply_to(message,"\n".join(lines),parse_mode="HTML")
+
+@bot.message_handler(commands=['reset'])
+def cmd_reset(message):
+    for e in engines.values(): 
+        e.stats=DetailedStats()
+        if hasattr(e, 'ensemble_ml'):
+            for name in e.ensemble_ml.performance_history:
+                e.ensemble_ml.performance_history[name].clear()
+    bot.reply_to(message,"🔄 <b>Estadísticas y pesos del ensemble reseteados</b>",parse_mode="HTML")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def run_flask():
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)),debug=False,use_reloader=False)
+
+async def main():
+    global engines
+    engines={name:RouletteEngine(name,cfg) for name,cfg in ROULETTE_CONFIGS.items()}
+    tasks=[asyncio.create_task(e.run_ws()) for e in engines.values()]
+    tasks.append(asyncio.create_task(self_ping_loop()))
+    threading.Thread(target=lambda:bot.polling(none_stop=True,interval=1,timeout=30),daemon=True).start()
+    logger.info("🎰 AMX V24.1 iniciado con Ensemble ML Avanzado (Entrenamiento DB)")
+    await asyncio.gather(*tasks)
+
+if __name__=="__main__":
+    threading.Thread(target=run_flask,daemon=True).start()
+    try: asyncio.run(main())
+    except KeyboardInterrupt: logger.info("Bot stopped.")
