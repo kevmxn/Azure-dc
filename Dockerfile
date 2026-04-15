@@ -27,4 +27,4 @@ ENV PORT=10000
 EXPOSE 10000
 
 # Comando de inicio
-CMD ["python", "main.py"]
+CMD ["python", "ppc.py"]
