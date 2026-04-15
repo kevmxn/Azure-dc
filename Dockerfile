@@ -19,11 +19,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia el código principal
-COPY main.py .
-
-# Copia la base de datos de pre-entrenamiento (15k giros)
-COPY russian-azure.db .
+# Copia TODO el contenido del repositorio al contenedor
+COPY . .
 
 # Render asigna automáticamente la variable $PORT
 ENV PORT=10000
