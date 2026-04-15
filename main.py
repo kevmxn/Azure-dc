@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
   - Dos ruletas en un solo proceso: Russian Roulette + Azure Roulette
