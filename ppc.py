@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
   - Dos ruletas en un solo proceso: Russian Roulette + Azure Roulette
@@ -209,32 +208,74 @@ BASE_BET  = 0.10
 VISIBLE   = 50
 WARMUP_SPINS = 21   # giros WS mínimos antes de emitir señales
 
-# ─── D'ALEMBERT ───────────────────────────────────────────────────────────────
-class D_Alembert:
-    def __init__(self, base: float):
-        self.base     = base
-        self.step     = 0
-        self.bankroll = 0.0
-        self.max_step = 20
+# ─── LABOUCHÈRE ───────────────────────────────────────────────────────────────
+LABOUCHERE_SEQUENCE: list[int] = [1, 2, 1]   # secuencia global por defecto
+
+class Labouchere:
+    """
+    Sistema de cancelación Labouchère.
+    - Apuesta = primer + último elemento de la secuencia.
+    - Si solo queda un elemento, apuesta = ese elemento.
+    - Victoria → elimina primero y último.
+    - Derrota  → añade la apuesta al final.
+    - Secuencia vacía → ciclo completado, reiniciar.
+    Los valores de la secuencia son multiplicadores de `base`.
+    """
+    def __init__(self, sequence: list[int], base: float):
+        self.base            = base
+        self.original_seq    = list(sequence)
+        self.sequence        = list(sequence)
+        self.bankroll        = 0.0
+
+    # ── acceso de compatibilidad ──────────────────────────────────────────────
+    @property
+    def step(self) -> int:
+        """Número de elementos añadidos respecto a la secuencia original."""
+        return max(0, len(self.sequence) - len(self.original_seq))
+
+    def is_fresh(self) -> bool:
+        """True si la secuencia está en su estado inicial (sin pérdidas pendientes)."""
+        return self.sequence == self.original_seq
+
+    def reset(self):
+        self.sequence = list(self.original_seq)
+
+    def set_sequence(self, new_seq: list[int]):
+        """Cambia la secuencia base (toma efecto en el próximo ciclo si hay señal activa)."""
+        self.original_seq = list(new_seq)
+        self.sequence     = list(new_seq)
 
     def current_bet(self) -> float:
-        return round(self.base * (self.step + 1), 2)
+        if not self.sequence:
+            self.reset()
+        if len(self.sequence) == 1:
+            val = self.sequence[0]
+        else:
+            val = self.sequence[0] + self.sequence[-1]
+        return round(self.base * val, 2)
 
     def win(self) -> float:
         bet = self.current_bet()
         self.bankroll = round(self.bankroll + bet, 2)
-        if self.step > 0:
-            self.step -= 1
+        if len(self.sequence) >= 2:
+            self.sequence.pop(0)
+            self.sequence.pop(-1)
+        elif len(self.sequence) == 1:
+            self.sequence.pop(0)
+        if not self.sequence:
+            self.reset()          # ciclo completo → reiniciar
         return bet
 
     def loss(self) -> float:
         bet = self.current_bet()
         self.bankroll = round(self.bankroll - bet, 2)
-        if self.step >= self.max_step - 1:
-            self.step = 0
-        else:
-            self.step += 1
+        # Añade el valor apostado (en unidades base) al final
+        units = round(bet / self.base)
+        self.sequence.append(units if units > 0 else 1)
         return bet
+
+    def sequence_display(self) -> str:
+        return " - ".join(str(v) for v in self.sequence)
 
 # ─── MARKOV CHAIN (ventana 60 giros) ─────────────────────────────────────────
 class MarkovChainPredictor:
@@ -1107,7 +1148,7 @@ class RouletteEngine:
         self.result_sequence: deque = deque(maxlen=10)
 
         # ── D'Alembert ────────────────────────────────────────
-        self.bet_sys = D_Alembert(BASE_BET)
+        self.bet_sys = Labouchere(LABOUCHERE_SEQUENCE, BASE_BET)
 
         # ── Recuperación ──────────────────────────────────────
         self.consec_losses:   int   = 0
@@ -1503,7 +1544,7 @@ class RouletteEngine:
             self.consec_losses = 0
             self.recovery_active = False
             self.recovery_target = 0.0
-            self.bet_sys.step = 0
+            self.bet_sys.reset()
 
     # ─── AMX POSITIONS ────────────────────────────────────────────────────────
     def _update_amx_positions(self, color: str):
@@ -1562,7 +1603,6 @@ class RouletteEngine:
     def _build_caption(self, attempt: int, unified_prob: Optional[dict]) -> str:
         """Construye el caption de señal para cualquier categoría."""
         bet       = self.bet_sys.current_bet()
-        step      = self.bet_sys.step + 1
         prob_pct  = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
         val_icon  = self._category_icon(self.bet_value)
         cat_icon  = {"COLOR": "🎨", "PARIDAD": "🟣🟡", "RANGO": "🟤🔵"}.get(self.active_category, "🎯")
@@ -1574,7 +1614,7 @@ class RouletteEngine:
             f"👉 Después de: {trig_disp}\n"
             f"🎯 Apostar a: <b>{self.bet_value}</b> {val_icon}\n"
             f"🤖 Probabilidad Unificada: {prob_pct}%\n"
-            f"🌀 D'Alembert paso {step} de 20\n"
+            f"🎲 Labouchère: [{self.bet_sys.sequence_display()}]\n"
             f"📍 Apuesta: {bet:.2f} usd\n\n"
             f"♻️ Intento {attempt}/{MAX_ATTEMPTS}"
         )
@@ -1586,7 +1626,7 @@ class RouletteEngine:
         return "ROJO"  # default para paridad/rango
 
     def _send_signal(self, attempt: int, unified_prob: Optional[dict] = None):
-        self.signal_is_level1 = (self.bet_sys.step == 0 and not self.recovery_active)
+        self.signal_is_level1 = (self.bet_sys.is_fresh() and not self.recovery_active)
         if self.signal_is_level1:
             self.level1_bankroll = self.bet_sys.bankroll
         caption = self._build_caption(attempt, unified_prob)
@@ -1972,13 +2012,15 @@ def _register_handlers(b: telebot.TeleBot):
 
     @b.message_handler(commands=['start', 'help'])
     def cmd_start(message):
-        help_text = """
+        seq = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
+        help_text = f"""
 <b>🎰 Roulette Bot AMX UNIFIED</b>
 Dos ruletas en un proceso: Russian Roulette + Azure Roulette
 
 <b>Características:</b>
 • Sin cooldown entre señales
-• 5 intentos por señal (D'Alembert)
+• 5 intentos por señal (Labouchère)
+• Secuencia actual: <code>{seq}</code>
 • Calentamiento WS: 21 giros silenciosos
 • Gráficos por categoría: COLOR 🔴⚫️ | PARIDAD 🟣🟡 | RANGO 🟤🔵
 • Pre-entrenamiento con DB histórica (~16k giros/tabla)
@@ -1987,6 +2029,7 @@ Comandos:
 /moderado - Modo MODERADO
 /tendencia - Modo TENDENCIA
 /status - Estado de ruletas
+/secuencia 1 2 1 - Cambiar secuencia Labouchère
 /reset - Resetear estadísticas
 /help - Esta ayuda
         """
@@ -2021,6 +2064,40 @@ Comandos:
             w = engine.unified_prob_system.weights
             lines.append(f"<b>{name}</b>: {mode_icon} — {st} [M:{w['markov']:.2f} ML:{w['ml']:.2f}]")
         b.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
+    @b.message_handler(commands=['secuencia'])
+    def cmd_secuencia(message):
+        global LABOUCHERE_SEQUENCE
+        parts = message.text.strip().split()[1:]   # descarta "/secuencia"
+        if not parts:
+            seq_str = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
+            b.reply_to(message,
+                f"🎲 Secuencia actual: <code>{seq_str}</code>\n"
+                f"Uso: /secuencia 1 2 1",
+                parse_mode="HTML")
+            return
+        try:
+            new_seq = [int(x) for x in parts if int(x) > 0]
+            if not new_seq:
+                raise ValueError("secuencia vacía")
+        except ValueError:
+            b.reply_to(message,
+                "⚠️ Formato inválido. Usa números enteros positivos.\n"
+                "Ejemplo: <code>/secuencia 1 2 3 2 1</code>",
+                parse_mode="HTML")
+            return
+        LABOUCHERE_SEQUENCE = new_seq
+        for engine in engines.values():
+            engine.bet_sys.set_sequence(new_seq)
+        seq_str = " - ".join(str(v) for v in new_seq)
+        total_units = sum(new_seq)
+        b.reply_to(message,
+            f"✅ <b>Secuencia Labouchère actualizada</b>\n\n"
+            f"🎲 Nueva secuencia: <code>{seq_str}</code>\n"
+            f"💰 Apuesta inicial: {(new_seq[0]+new_seq[-1])*BASE_BET:.2f} usd "
+            f"({new_seq[0]+new_seq[-1]} unidades)\n"
+            f"📊 Total a recuperar: {total_units*BASE_BET:.2f} usd ({total_units} unidades)",
+            parse_mode="HTML")
 
     @b.message_handler(commands=['reset'])
     def cmd_reset(message):
