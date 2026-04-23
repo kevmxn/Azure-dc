@@ -1426,13 +1426,16 @@ class RouletteEngine:
         return CATEGORY_ICONS.get(value, "❓")
 
     def _trigger_display(self, number: int, category: str) -> str:
-        """Siempre muestra número + paridad — referencia visual común para cualquier categoría."""
+        """Muestra número + valor de la misma categoría que se apuesta."""
         if number == 0:
             return "0 VERDE 🟢"
-        par      = get_paridad(number)
-        par_str  = par if par else "VERDE"
-        par_icon = self._category_icon(par_str)
-        return f"{number} {par_str} {par_icon}"
+        if category == "COLOR":
+            val = REAL_COLOR_MAP.get(number, "VERDE")
+        elif category == "PARIDAD":
+            val = get_paridad(number) or "VERDE"
+        else:  # RANGO
+            val = get_rango(number) or "VERDE"
+        return f"{number} {val} {self._category_icon(val)}"
 
     def _is_win(self, number: int, real_color: str) -> Optional[bool]:
         """
@@ -1785,47 +1788,41 @@ class RouletteEngine:
         return "ROJO"  # default para paridad/rango
 
     def _send_signal(self, attempt: int, unified_prob: Optional[dict] = None):
+        """Solo registra internamente — no envía ningún mensaje al canal."""
         self.signal_is_level1 = (self.bet_sys.is_fresh() and not self.recovery_active)
         if self.signal_is_level1:
             self.level1_bankroll = self.bet_sys.bankroll
-        caption = self._build_caption(attempt, unified_prob)
-
-        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, caption)
-        logger.info(f"[{self.name}] Señal [{self.active_category}] {self.bet_value} "
-                    f"trig={self.trigger_number} prob={int((unified_prob['combined_prob'] if unified_prob else 0.5)*100)}%")
+        prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
+        logger.info(
+            f"[{self.name}] 🎯 [{self.active_category}] {self.bet_value} "
+            f"intento={attempt} trig={self.trigger_number} prob={prob_pct}%"
+        )
 
     def _send_waiting_message(self, attempt_number: int):
-        for msg_id in self.signal_msg_ids:
-            tg_delete(self.bot, self.chat_id, msg_id)
-        self.signal_msg_ids = []
-        if self.waiting_msg_id:
-            tg_delete(self.bot, self.chat_id, self.waiting_msg_id)
-            self.waiting_msg_id = None
-        ords = {2:"2°", 3:"3°", 4:"4°", 5:"5°"}
-        ord_str = ords.get(attempt_number, f"{attempt_number}°")
-        caption = (
-            f"⚠️ <b>Esperando condiciones para el {ord_str} intento</b>\n\n"
-            f"🎰 <b>{self.name}</b>\n"
-            f"🔍 <i>Analizando {self.active_category} en cada giro...</i>\n"
-        )
-        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, caption)
-        if msg_id:
-            self.waiting_msg_id = msg_id
+        """Solo registra internamente — no envía ningún mensaje al canal."""
+        logger.info(f"[{self.name}] ⏳ Esperando condiciones intento {attempt_number}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float,
                      attempt_won: int, delete_signals: bool = True):
+        """
+        Único mensaje visible al canal — formato simple.
+        Muestra el valor de la categoría apostada en el resultado.
+        """
         bankroll = self.bet_sys.bankroll
-        icon = {"ROJO": "🔴", "NEGRO": "⚫️", "VERDE": "🟢"}.get(real, "❓")
-        if delete_signals:
-            for msg_id in self.signal_msg_ids:
-                tg_delete(self.bot, self.chat_id, msg_id)
-            self.signal_msg_ids = []
-            if self.waiting_msg_id:
-                tg_delete(self.bot, self.chat_id, self.waiting_msg_id)
-                self.waiting_msg_id = None
-        result_text = f"{'✅' if won else '❌'} Resultado: {number} {icon} — {'Acierto!' if won else 'Fallo'}"
-        tg_send_text(self.bot, self.chat_id, self.thread_id, result_text)
-        logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} bankroll={bankroll:.2f}")
+        # Valor de la categoría activa para el número salido
+        cat = self.active_category or "COLOR"
+        if cat == "COLOR":
+            cat_val = real
+        elif cat == "PARIDAD":
+            cat_val = get_paridad(number) or "VERDE"
+        else:  # RANGO
+            cat_val = get_rango(number) or "VERDE"
+        cat_icon = self._category_icon(cat_val)
+        status   = "Acierto!" if won else "Fallo"
+        text = f"{'✅' if won else '❌'} Resultado: {number} {cat_val} {cat_icon} — {status}"
+        tg_send_text(self.bot, self.chat_id, self.thread_id, text)
+        logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
+                    f"cat_val={cat_val} intento={attempt_won} bankroll={bankroll:.2f}")
 
     def _check_stats(self):
         """Cada 20 señales envía: estadísticas del lote + estadísticas acumuladas del día (24h)."""
@@ -1990,8 +1987,6 @@ class RouletteEngine:
                     self._handle_full_loss(number, real)
                     return
                 attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
-                if self.signal_msg_ids:
-                    tg_delete(self.bot, self.chat_id, self.signal_msg_ids.pop())
                 self.signal_active = False
                 self.waiting_for_attempt = True
                 self.waiting_attempt_number = attempt_number
@@ -2022,8 +2017,6 @@ class RouletteEngine:
                     self._handle_full_loss(number, real, bet)
                 else:
                     attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
-                    if self.signal_msg_ids:
-                        tg_delete(self.bot, self.chat_id, self.signal_msg_ids.pop())
                     chosen = self._best_retry_value(number)
                     if chosen is not None:
                         self.bet_value      = chosen
@@ -2048,9 +2041,6 @@ class RouletteEngine:
             attempt_number = self.waiting_attempt_number
             chosen = self._best_retry_value(number)
             if chosen is not None:
-                if self.waiting_msg_id:
-                    tg_delete(self.bot, self.chat_id, self.waiting_msg_id)
-                    self.waiting_msg_id = None
                 self.bet_value          = chosen
                 self.trigger_number     = number
                 self.signal_active      = True
