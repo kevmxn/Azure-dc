@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 import urllib.request
@@ -66,7 +67,24 @@ bot_russian = _make_bot(TOKEN_RUSSIAN)
 bot_azure   = _make_bot(TOKEN_AZURE)
 
 # ─── DB CONFIG ────────────────────────────────────────────────────────────────
-DB_PATH = "russian-azure.db"   # único archivo, dos tablas
+DB_PATH       = "russian-azure.db"   # dump SQL histórico (lectura inicial)
+LIVE_DB_PATH  = "live_spins.db"      # SQLite persistente de giros en vivo
+
+def _get_live_db() -> "sqlite3.Connection":
+    """Abre (o crea) la DB SQLite de giros en vivo."""
+    import sqlite3 as _sq
+    conn = _sq.connect(LIVE_DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS live_spins (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT NOT NULL,
+            number    INTEGER NOT NULL,
+            ts        INTEGER NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_table ON live_spins(table_name, id)")
+    conn.commit()
+    return conn
 
 # ─── ROULETTE COLOR MAPS ──────────────────────────────────────────────────────
 REAL_COLOR_MAP = {
@@ -353,49 +371,61 @@ class MLPatternPredictor:
             "total": total,
         }
 
-# ─── COMBO ML PREDICTOR — 512 estados (COLOR × PARIDAD × RANGO) ──────────────
-class ComboMLPredictor:
+# ─── CATEGORY PREDICTOR — 16 combinaciones por categoría (2⁴) ───────────────
+class CategoryPredictor:
     """
-    Predictor ML que trabaja con los 512 estados compuestos.
-    Cada giro (no-verde) tiene un estado = "COLOR-PARIDAD-RANGO" → 8 posibles.
-    Patrón = últimos 3 estados → 8³ = 512 combinaciones posibles.
-    Predice la distribución del próximo estado y la desagrega por sub-categoría.
-    """
-    def __init__(self, pattern_length: int = 3):
-        self.pattern_length = pattern_length
-        self.combo_counts: dict = defaultdict(lambda: defaultdict(int))
-        self.combo_history: list[str] = []
+    Tres predictores independientes (COLOR, PARIDAD, RANGO), cada uno con
+    patrón de longitud 4 → 2⁴ = 16 combinaciones posibles por categoría.
 
-    @staticmethod
-    def _spin_to_combo(number: int, real_color: str) -> Optional[str]:
-        """Convierte un giro en estado compuesto. None si es VERDE."""
+    COLOR  : ROJO / NEGRO
+    PARIDAD: PAR  / IMPAR
+    RANGO  : ALTO / BAJO
+
+    Elige la categoría con mayor probabilidad en el próximo valor.
+    """
+    PATTERN_LEN = 10  # 2¹⁰ = 1024 patrones por categoría
+
+    def __init__(self):
+        # Historial de valores por categoría
+        self._hist: dict[str, list[str]] = {
+            "COLOR":   [],
+            "PARIDAD": [],
+            "RANGO":   [],
+        }
+        # Tabla de conteos: counts[cat][patron_tuple][siguiente_valor]
+        self._counts: dict[str, dict] = {
+            "COLOR":   defaultdict(lambda: defaultdict(int)),
+            "PARIDAD": defaultdict(lambda: defaultdict(int)),
+            "RANGO":   defaultdict(lambda: defaultdict(int)),
+        }
+
+    def add_spin(self, number: int, real_color: str):
+        """Registra un giro. Ignora el 0 (VERDE)."""
         if number == 0 or real_color == "VERDE":
-            return None
+            return
         par  = get_paridad(number)
         rang = get_rango(number)
         if not par or not rang:
-            return None
-        return f"{real_color}-{par}-{rang}"
-
-    def add_spin(self, number: int, real_color: str):
-        combo = self._spin_to_combo(number, real_color)
-        if combo is None:
             return
-        n = len(self.combo_history)
-        if n >= self.pattern_length:
-            pattern = tuple(self.combo_history[-self.pattern_length:])
-            self.combo_counts[pattern][combo] += 1
-        self.combo_history.append(combo)
+        new_vals = {"COLOR": real_color, "PARIDAD": par, "RANGO": rang}
+        for cat, val in new_vals.items():
+            hist = self._hist[cat]
+            if len(hist) >= self.PATTERN_LEN:
+                pattern = tuple(hist[-self.PATTERN_LEN:])
+                self._counts[cat][pattern][val] += 1
+            hist.append(val)
 
-    def predict(self) -> Optional[dict]:
+    def predict_category(self, category: str) -> Optional[dict]:
         """
-        Distribución del próximo estado compuesto.
-        {combo_str: prob, ..., "total": n}  o  None si no hay datos.
+        Distribución del próximo valor para la categoría dada.
+        Retorna {valor: prob, ..., "total": n} o None si no hay datos.
         """
-        if len(self.combo_history) < self.pattern_length:
+        hist   = self._hist[category]
+        counts = self._counts[category]
+        if len(hist) < self.PATTERN_LEN:
             return None
-        pattern = tuple(self.combo_history[-self.pattern_length:])
-        c = dict(self.combo_counts.get(pattern, {}))
+        pattern = tuple(hist[-self.PATTERN_LEN:])
+        c = dict(counts.get(pattern, {}))
         total = sum(c.values())
         if total < 5:
             return None
@@ -403,37 +433,9 @@ class ComboMLPredictor:
         result["total"] = total
         return result
 
-    def predict_category(self, category: str) -> Optional[dict]:
-        """
-        Desagrega la predicción del combo en una sub-categoría.
-        Retorna {value: prob, ..., "total": n} o None.
-        category ∈ {"COLOR", "PARIDAD", "RANGO"}
-        """
-        dist = self.predict()
-        if dist is None:
-            return None
-        idx_map = {"COLOR": 0, "PARIDAD": 1, "RANGO": 2}
-        idx = idx_map.get(category)
-        if idx is None:
-            return None
-        agg: dict = {}
-        total = dist.get("total", 0)
-        for combo_str, prob in dist.items():
-            if combo_str == "total":
-                continue
-            parts = combo_str.split("-")
-            if len(parts) != 3:
-                continue
-            val = parts[idx]
-            agg[val] = agg.get(val, 0.0) + prob
-        if not agg:
-            return None
-        agg["total"] = total
-        return agg
-
     def best_category(self, threshold: float = 0.49) -> Optional[dict]:
         """
-        Evalúa las 3 sub-categorías y retorna la de mayor probabilidad.
+        Evalúa las 3 categorías y retorna la de mayor probabilidad.
         Retorna {category, bet_value, probability} o None.
         """
         best = None
@@ -451,16 +453,14 @@ class ComboMLPredictor:
                     best = {"category": cat, "bet_value": top_val, "probability": top_prob}
         return best
 
-    # ── Compatibilidad con código de historial para gráficos ─────────────────
+    # ── Compatibilidad para gráficos ──────────────────────────────────────────
     @property
     def par_history(self) -> list:
-        """Lista de PAR/IMPAR extraída del historial combinado."""
-        return [c.split("-")[1] for c in self.combo_history]
+        return list(self._hist["PARIDAD"])
 
     @property
     def rang_history(self) -> list:
-        """Lista de BAJO/ALTO extraída del historial combinado."""
-        return [c.split("-")[2] for c in self.combo_history]
+        return list(self._hist["RANGO"])
 
 # ─── SISTEMA DE PROBABILIDAD CONJUNTA PONDERADA ────────────────────────────────
 class UnifiedProbabilitySystem:
@@ -1271,7 +1271,7 @@ class RouletteEngine:
         # ── Predictores ───────────────────────────────────────
         self.markov       = MarkovChainPredictor(window=60, order=2)
         self.ml_predictor = MLPatternPredictor(pattern_length=3)
-        self.category_ml  = ComboMLPredictor(pattern_length=3)
+        self.category_ml  = CategoryPredictor()
 
         # ── Estadísticas ──────────────────────────────────────
         self.stats = DetailedStats()
@@ -1279,13 +1279,17 @@ class RouletteEngine:
         self.ws      = None
         self.running = True
 
-        # ── Calentamiento WebSocket ────────────────────────────
-        # Bloquea señales hasta recibir WARMUP_SPINS giros reales del WS
-        self.ws_spins_count: int  = 0
-        self.warmup_done:    bool = False
+        # ── Persistencia live ──────────────────────────────────
+        self._live_conn = _get_live_db()   # conexión SQLite compartida
 
-        # ── Pre-entrenamiento ─────────────────────────────────
+        # ── Pre-entrenamiento: dump histórico + giros live guardados ──────────
         self._pretrain_from_db(DB_PATH, self.db_table)
+        live_loaded = self._load_live_history()
+
+        # ── Calentamiento WebSocket ────────────────────────────
+        # Si ya cargamos suficientes giros live, no necesitamos esperar
+        self.ws_spins_count: int  = live_loaded
+        self.warmup_done:    bool = live_loaded >= WARMUP_SPINS
 
     # ─── PRE-ENTRENAMIENTO DESDE DB ──────────────────────────────────────────
     def _pretrain_from_db(self, db_path: str, table_name: str):
@@ -1323,6 +1327,67 @@ class RouletteEngine:
             self.category_ml.add_spin(n, real)
 
         logger.info(f"[{self.name}] Pre-entrenado con {len(spins)} giros (tabla: {table_name})")
+
+    def _load_live_history(self) -> int:
+        """
+        Carga los giros en vivo guardados en SQLite desde el último reinicio.
+        Entrena todos los predictores con esos datos y devuelve la cantidad cargada.
+        Los giros más antiguos de 7 días se descartan automáticamente.
+        """
+        import time as _time
+        try:
+            cutoff = int(_time.time()) - 7 * 86400   # últimos 7 días
+            cur = self._live_conn.execute(
+                "SELECT number FROM live_spins WHERE table_name=? AND ts>=? ORDER BY id ASC",
+                (self.db_table, cutoff)
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.warning(f"[{self.name}] Error cargando live history: {e}")
+            return 0
+
+        if not rows:
+            return 0
+
+        temp_history = []
+        for (n,) in rows:
+            real = REAL_COLOR_MAP.get(n, "VERDE")
+            temp_history.append({"number": n, "real": real})
+            self.markov.update(temp_history)
+            self.ml_predictor.add_spin(temp_history)
+            self.category_ml.add_spin(n, real)
+            # Rellenar también spin_history para que el estado sea coherente
+            self.spin_history.append({"number": n, "real": real})
+            if len(self.spin_history) > 300:
+                self.spin_history.pop(0)
+
+        logger.info(f"[{self.name}] Live history cargada: {len(rows)} giros")
+        return len(rows)
+
+    def _persist_spin(self, number: int):
+        """Guarda el giro en la DB SQLite de persistencia."""
+        import time as _time
+        try:
+            self._live_conn.execute(
+                "INSERT INTO live_spins (table_name, number, ts) VALUES (?,?,?)",
+                (self.db_table, number, int(_time.time()))
+            )
+            self._live_conn.commit()
+        except Exception as e:
+            logger.debug(f"[{self.name}] Error persistiendo spin: {e}")
+
+    def _cleanup_old_live_spins(self):
+        """Limpia registros de más de 7 días para que la DB no crezca indefinidamente."""
+        import time as _time
+        try:
+            cutoff = int(_time.time()) - 7 * 86400
+            self._live_conn.execute(
+                "DELETE FROM live_spins WHERE table_name=? AND ts<?",
+                (self.db_table, cutoff)
+            )
+            self._live_conn.commit()
+        except Exception as e:
+            logger.debug(f"[{self.name}] Error limpiando live_db: {e}")
 
     # ─── HELPERS ─────────────────────────────────────────────────────────────
     def set_mode(self, mode: Literal["tendencia", "moderado"]):
@@ -1386,7 +1451,7 @@ class RouletteEngine:
 
     def _evaluate_ml_category(self, category: str) -> Optional[dict]:
         """
-        Evalúa COLOR, PARIDAD o RANGO desagregando el ComboMLPredictor.
+        Evalúa COLOR, PARIDAD o RANGO usando CategoryPredictor (16 combos).
         Retorna dict {category, bet_value, probability, trigger_number} o None.
         """
         pred = self.category_ml.predict_category(category)
@@ -1448,7 +1513,7 @@ class RouletteEngine:
 
     def _detect_best_category_signal(self) -> Optional[dict]:
         """
-        Evalúa las 3 categorías usando los 512 estados compuestos del ComboMLPredictor.
+        Evalúa las 3 categorías usando CategoryPredictor (16 combos por categoría).
         Selecciona la sub-categoría (COLOR / PARIDAD / RANGO) con mayor probabilidad.
         El candidato COLOR también debe pasar el filtro AMX/Markov para ser válido.
         """
@@ -1725,37 +1790,7 @@ class RouletteEngine:
             self.level1_bankroll = self.bet_sys.bankroll
         caption = self._build_caption(attempt, unified_prob)
 
-        # ── Gráfico según categoría activa ───────────────────────────────────
-        if self.active_category == "PARIDAD":
-            chart = generate_category_chart(
-                category="PARIDAD",
-                bet_value=self.bet_value,
-                cat_history=list(self.category_ml.par_history),
-                spin_history=self.spin_history[:],
-                unified_prob=unified_prob,
-            )
-            self.bet_color = "ROJO"   # valor neutro para compatibilidad
-        elif self.active_category == "RANGO":
-            chart = generate_category_chart(
-                category="RANGO",
-                bet_value=self.bet_value,
-                cat_history=list(self.category_ml.rang_history),
-                spin_history=self.spin_history[:],
-                unified_prob=unified_prob,
-            )
-            self.bet_color = "ROJO"
-        else:  # COLOR (comportamiento original)
-            chart_color = self._chart_color()
-            self.bet_color = chart_color
-            levels = self.original_levels[:] if chart_color == "ROJO" else self.inverted_levels[:]
-            mp  = self.markov.predict(self.spin_history)
-            ml  = self.ml_predictor.predict(self.spin_history)
-            chart = generate_chart(levels, self.spin_history[:], chart_color,
-                                   markov_pred=mp, ml_pred=ml, unified_prob=unified_prob)
-
-        msg_id = tg_send_photo(self.bot, self.chat_id, self.thread_id, chart, caption)
-        if msg_id:
-            self.signal_msg_ids.append(msg_id)
+        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, caption)
         logger.info(f"[{self.name}] Señal [{self.active_category}] {self.bet_value} "
                     f"trig={self.trigger_number} prob={int((unified_prob['combined_prob'] if unified_prob else 0.5)*100)}%")
 
@@ -1773,13 +1808,7 @@ class RouletteEngine:
             f"🎰 <b>{self.name}</b>\n"
             f"🔍 <i>Analizando {self.active_category} en cada giro...</i>\n"
         )
-        chart_color = self._chart_color()
-        levels = self.original_levels[:] if chart_color == "ROJO" else self.inverted_levels[:]
-        mp = self.markov.predict(self.spin_history)
-        ml = self.ml_predictor.predict(self.spin_history)
-        chart = generate_chart(levels, self.spin_history[:], chart_color,
-                               markov_pred=mp, ml_pred=ml)
-        msg_id = tg_send_photo(self.bot, self.chat_id, self.thread_id, chart, caption)
+        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, caption)
         if msg_id:
             self.waiting_msg_id = msg_id
 
@@ -1794,35 +1823,45 @@ class RouletteEngine:
             if self.waiting_msg_id:
                 tg_delete(self.bot, self.chat_id, self.waiting_msg_id)
                 self.waiting_msg_id = None
-        chart_color = self._chart_color()
-        levels = self.original_levels[:] if chart_color == "ROJO" else self.inverted_levels[:]
-        mp = self.markov.predict(self.spin_history)
-        ml = self.ml_predictor.predict(self.spin_history)
-        chart = generate_chart(levels, self.spin_history[:], chart_color,
-                               markov_pred=mp, ml_pred=ml)
         result_text = f"{'✅' if won else '❌'} Resultado: {number} {icon} — {'Acierto!' if won else 'Fallo'}"
-        tg_send_photo(self.bot, self.chat_id, self.thread_id, chart, result_text)
+        tg_send_text(self.bot, self.chat_id, self.thread_id, result_text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} bankroll={bankroll:.2f}")
 
     def _check_stats(self):
-        """Estadísticas por lote de 20 señales. Independiente del reporte diario."""
+        """Cada 20 señales envía: estadísticas del lote + estadísticas acumuladas del día (24h)."""
         if not self.stats.should_send_stats(): return
         current_bankroll = self.bet_sys.bankroll
         s20 = self.stats.get_batch_stats(current_bankroll)
+        s24 = self.stats.get_daily_stats(current_bankroll)
         self.stats.mark_stats_sent(current_bankroll)
-        if not s20: return
-        stats_text = (
-            f"👉🏼 <b>ESTADISTICAS {s20['total']} SENALES</b>\n"
-            f"🈯️ <b>T:</b> {s20['total']} 📈 <b>E:</b> {s20['efficiency']}%\n"
-            f"1️⃣ <b>W:</b> {s20['w1']} --> <b>E:</b> {s20['e_w1']}%\n"
-            f"2️⃣ <b>W:</b> {s20['w2']} --> <b>E:</b> {s20['e_w2']}%\n"
-            f"3️⃣ <b>W:</b> {s20['w3']} --> <b>E:</b> {s20['e_w3']}%\n"
-            f"4️⃣ <b>W:</b> {s20['w4']} --> <b>E:</b> {s20['e_w4']}%\n"
-            f"5️⃣ <b>W:</b> {s20['w5']} --> <b>E:</b> {s20['e_w5']}%\n"
-            f"🈲 <b>L:</b> {s20['losses']} --> <b>E:</b> {s20['e_loss']}%\n"
-            f"💰 <i>Bankroll: {s20['bankroll_delta']:.2f} usd</i>"
-        )
-        tg_send_text(self.bot, self.chat_id, self.thread_id, stats_text)
+        if not s20 and not s24: return
+        stats_text = ""
+        if s20:
+            stats_text += (
+                f"👉🏼 <b>ESTADISTICAS {s20['total']} SENALES</b>\n"
+                f"🈯️ <b>T:</b> {s20['total']} 📈 <b>E:</b> {s20['efficiency']}%\n"
+                f"1️⃣ <b>W:</b> {s20['w1']} --> <b>E:</b> {s20['e_w1']}%\n"
+                f"2️⃣ <b>W:</b> {s20['w2']} --> <b>E:</b> {s20['e_w2']}%\n"
+                f"3️⃣ <b>W:</b> {s20['w3']} --> <b>E:</b> {s20['e_w3']}%\n"
+                f"4️⃣ <b>W:</b> {s20['w4']} --> <b>E:</b> {s20['e_w4']}%\n"
+                f"5️⃣ <b>W:</b> {s20['w5']} --> <b>E:</b> {s20['e_w5']}%\n"
+                f"🈲 <b>L:</b> {s20['losses']} --> <b>E:</b> {s20['e_loss']}%\n"
+                f"💰 <i>Bankroll: {s20['bankroll_delta']:.2f} usd</i>\n\n"
+            )
+        if s24 and s24.get("total", 0) > 0:
+            stats_text += (
+                f"👉🏼 <b>ESTADISTICAS 24 HORAS</b>\n"
+                f"🈯️ <b>T:</b> {s24['total']} 📈 <b>E:</b> {s24['efficiency']}%\n"
+                f"1️⃣ <b>W:</b> {s24['w1']} --> <b>E:</b> {s24['e_w1']}%\n"
+                f"2️⃣ <b>W:</b> {s24['w2']} --> <b>E:</b> {s24['e_w2']}%\n"
+                f"3️⃣ <b>W:</b> {s24['w3']} --> <b>E:</b> {s24['e_w3']}%\n"
+                f"4️⃣ <b>W:</b> {s24['w4']} --> <b>E:</b> {s24['e_w4']}%\n"
+                f"5️⃣ <b>W:</b> {s24['w5']} --> <b>E:</b> {s24['e_w5']}%\n"
+                f"🈲 <b>L:</b> {s24['losses']} --> <b>E:</b> {s24['e_loss']}%\n"
+                f"💰 <i>Bankroll 24h: {s24['bankroll_delta']:.2f} usd</i>"
+            )
+        if stats_text:
+            tg_send_text(self.bot, self.chat_id, self.thread_id, stats_text)
 
     def _check_daily_report(self):
         """
@@ -1873,6 +1912,13 @@ class RouletteEngine:
     def process_number(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
 
+        # Persistir giro en SQLite (estado 24/7)
+        self._persist_spin(number)
+
+        # Limpieza semanal (cada ~5000 giros)
+        if len(self.spin_history) > 0 and len(self.spin_history) % 5000 == 0:
+            self._cleanup_old_live_spins()
+
         # Actualizar historial
         self.spin_history.append({"number": number, "real": real})
         if len(self.spin_history) > 300:
@@ -1922,11 +1968,11 @@ class RouletteEngine:
             if self.ws_spins_count < WARMUP_SPINS:
                 logger.info(f"[{self.name}] Calentamiento WS: {self.ws_spins_count}/{WARMUP_SPINS} giros")
                 return
-            # Giro 21 alcanzado → activar señales
+            # Umbral alcanzado → activar señales
             self.warmup_done = True
-            logger.info(f"[{self.name}] ✅ Calentamiento completado ({WARMUP_SPINS} giros). Iniciando señales.")
+            logger.info(f"[{self.name}] ✅ Calentamiento completado. Iniciando señales.")
             tg_send_text(self.bot, self.chat_id, self.thread_id,
-                         f"🟢 <b>{self.name}</b> — Sistema listo. Iniciando señales a partir del giro {WARMUP_SPINS}.")
+                         f"🟢 <b>{self.name}</b> — Sistema listo. Emitiendo señales.")
 
         # ══════════════════════════════════════════════════════════════════════
         #  MÁQUINA DE ESTADOS
