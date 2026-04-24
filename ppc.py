@@ -1787,11 +1787,54 @@ class RouletteEngine:
             return self.bet_value if self.bet_value in ("ROJO", "NEGRO") else "ROJO"
         return "ROJO"  # default para paridad/rango
 
+    def _cat_val(self, number: int, real: str) -> tuple[str, str]:
+        """Retorna (valor_categoría, icono) del número salido según categoría activa."""
+        cat = self.active_category or "COLOR"
+        if cat == "COLOR":
+            val = real
+        elif cat == "PARIDAD":
+            val = get_paridad(number) or "VERDE"
+        else:
+            val = get_rango(number) or "VERDE"
+        return val, self._category_icon(val)
+
+    def _build_signal_text(self, attempt: int, unified_prob: Optional[dict]) -> str:
+        """Texto del mensaje de señal activa (se reemplaza en cada intento)."""
+        bet      = self.bet_sys.current_bet()
+        prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
+        val_icon = self._category_icon(self.bet_value or "")
+        trig_disp = self._trigger_display(self.trigger_number, self.active_category)
+        return (
+            f"☑️☑️ <b>SEÑAL CONFIRMADA</b> ☑️☑️\n\n"
+            f"🎰 Juego: {self.name}\n\n"
+            f"👉 Después de: {trig_disp}\n"
+            f"🎯 Apostar a: <b>{self.bet_value}</b> {val_icon}\n"
+            f"🤖 Probabilidad Unificada: {prob_pct}%\n"
+            f"🎲 Labouchère: [{self.bet_sys.sequence_display()}]\n"
+            f"📍 Apuesta: {bet:.2f} usd\n\n"
+            f"♻️ Intento {attempt}/{MAX_ATTEMPTS}"
+        )
+
     def _send_signal(self, attempt: int, unified_prob: Optional[dict] = None):
-        """Solo registra internamente — no envía ningún mensaje al canal."""
+        """
+        Envía (o reemplaza) el mensaje de señal activa.
+        Borra el mensaje anterior del mismo ciclo antes de enviar el nuevo.
+        """
         self.signal_is_level1 = (self.bet_sys.is_fresh() and not self.recovery_active)
         if self.signal_is_level1:
             self.level1_bankroll = self.bet_sys.bankroll
+
+        # Borrar mensaje de señal anterior si existe
+        if self.signal_msg_ids:
+            for mid in self.signal_msg_ids:
+                tg_delete(self.bot, self.chat_id, mid)
+            self.signal_msg_ids = []
+
+        text   = self._build_signal_text(attempt, unified_prob)
+        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
+        if msg_id:
+            self.signal_msg_ids.append(msg_id)
+
         prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
         logger.info(
             f"[{self.name}] 🎯 [{self.active_category}] {self.bet_value} "
@@ -1799,27 +1842,37 @@ class RouletteEngine:
         )
 
     def _send_waiting_message(self, attempt_number: int):
-        """Solo registra internamente — no envía ningún mensaje al canal."""
+        """Borra señal anterior y envía mensaje de espera mientras analiza el próximo giro."""
+        if self.signal_msg_ids:
+            for mid in self.signal_msg_ids:
+                tg_delete(self.bot, self.chat_id, mid)
+            self.signal_msg_ids = []
         logger.info(f"[{self.name}] ⏳ Esperando condiciones intento {attempt_number}")
 
     def _send_result(self, number: int, real: str, won: bool, bet: float,
                      attempt_won: int, delete_signals: bool = True):
         """
-        Único mensaje visible al canal — formato simple.
-        Muestra el valor de la categoría apostada en el resultado.
+        Al resolver el ciclo:
+          - Borra el mensaje de señal activa.
+          - Envía el resultado final con el valor de la categoría apostada.
         """
-        bankroll = self.bet_sys.bankroll
-        # Valor de la categoría activa para el número salido
-        cat = self.active_category or "COLOR"
-        if cat == "COLOR":
-            cat_val = real
-        elif cat == "PARIDAD":
-            cat_val = get_paridad(number) or "VERDE"
-        else:  # RANGO
-            cat_val = get_rango(number) or "VERDE"
-        cat_icon = self._category_icon(cat_val)
-        status   = "Acierto!" if won else "Fallo"
-        text = f"{'✅' if won else '❌'} Resultado: {number} {cat_val} {cat_icon} — {status}"
+        # Borrar señal activa
+        if delete_signals and self.signal_msg_ids:
+            for mid in self.signal_msg_ids:
+                tg_delete(self.bot, self.chat_id, mid)
+            self.signal_msg_ids = []
+
+        bankroll         = self.bet_sys.bankroll
+        cat_val, cat_icon = self._cat_val(number, real)
+        bet_icon          = self._category_icon(self.bet_value or "")
+        status            = "✅ Acierto" if won else "❌ Fallo"
+
+        text = (
+            f"{status}\n\n"
+            f"🎯 Aposté a: <b>{self.bet_value}</b> {bet_icon}\n"
+            f"🔢 Salió: {number} <b>{cat_val}</b> {cat_icon}\n"
+            f"💰 Bankroll: {bankroll:.2f} usd"
+        )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
                     f"cat_val={cat_val} intento={attempt_won} bankroll={bankroll:.2f}")
