@@ -163,7 +163,7 @@ ROULETTE_CONFIGS = {
         "thread_id": 8344,
         "db_table":  "russian_roulette",
         "color_data": RUSSIAN_COLOR_DATA,
-        "min_prob_threshold": 0.49,
+        "min_prob_threshold": 0.60,
     },
 }
 
@@ -1211,7 +1211,7 @@ class RouletteEngine:
 
         # ── AMX V22 ───────────────────────────────────────────
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.49)
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)
 
         # ── Probabilidad Unificada ─────────────────────────────
         self.unified_prob_system = UnifiedProbabilitySystem()
@@ -2063,21 +2063,38 @@ class RouletteEngine:
                 self.skip_one_after_zero = False
                 return
             attempt_number = self.waiting_attempt_number
-            chosen = self._best_retry_value(number)
-            if chosen is not None:
-                self.bet_value          = chosen
-                self.trigger_number     = number
-                self.signal_active      = True
-                self.waiting_for_attempt = False
+            # Re-evaluar TODAS las categorías y elegir la de mayor probabilidad ≥ 60%
+            best = self._detect_best_category_signal()
+            if best and best["probability"] >= self.min_prob_threshold:
                 unified_prob = self._get_category_probability(
-                    self.active_category, chosen, number)
-                self._send_signal(attempt_number, unified_prob)
+                    best["category"], best["bet_value"], number)
+                # Verificar umbral 60% en probabilidad unificada
+                if unified_prob["combined_prob"] < self.min_prob_threshold:
+                    logger.debug(
+                        f"[{self.name}] Reintento descartado [{best['category']}] "
+                        f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
+                else:
+                    self.active_category    = best["category"]
+                    self.bet_value          = best["bet_value"]
+                    self.bet_color          = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
+                    self.trigger_number     = number
+                    self.signal_active      = True
+                    self.waiting_for_attempt = False
+                    self._send_signal(attempt_number, unified_prob)
 
         # ── ESTADO 3: Idle – buscar señal ────────────────────────────────
         else:
             self.signal_msg_ids = []
             best = self._detect_best_category_signal()
             if best:
+                unified_prob = self._get_category_probability(
+                    best["category"], best["bet_value"], best["trigger_number"])
+                # Verificar umbral 60% antes de emitir
+                if unified_prob["combined_prob"] < self.min_prob_threshold:
+                    logger.debug(
+                        f"[{self.name}] Señal descartada [{best['category']}] "
+                        f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
+                    return
                 self.signal_active   = True
                 self.active_category = best["category"]
                 self.bet_value       = best["bet_value"]
@@ -2085,8 +2102,6 @@ class RouletteEngine:
                 self.attempts_left   = MAX_ATTEMPTS
                 self.total_attempts  = MAX_ATTEMPTS
                 self.trigger_number  = best["trigger_number"]
-                unified_prob = self._get_category_probability(
-                    best["category"], best["bet_value"], best["trigger_number"])
                 self._send_signal(1, unified_prob)
                 self.amx_system.register_signal_sent()
 
