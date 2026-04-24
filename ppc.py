@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
-  - Dos ruletas en un solo proceso: Russian Roulette + Azure Roulette
-  - Pre-entrenamiento con russian-azure.db (~16k giros por tabla)
+  - Russian Roulette
+  - Pre-entrenamiento con russian-azure.db (tabla russian_roulette)
   - 5 intentos por señal (D'Alembert)
   - Calentamiento WS: 21 giros silenciosos antes de emitir señales
   - Gráficos por categoría: COLOR / PARIDAD 🟣🟡 / RANGO 🟤🔵
@@ -44,7 +44,6 @@ logger = logging.getLogger("RouletteBotAMX")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN_RUSSIAN = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
-TOKEN_AZURE   = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
 
 _session = requests.Session()
 _retry = Retry(
@@ -64,10 +63,9 @@ def _make_bot(token: str) -> telebot.TeleBot:
     return b
 
 bot_russian = _make_bot(TOKEN_RUSSIAN)
-bot_azure   = _make_bot(TOKEN_AZURE)
 
 # ─── DB CONFIG ────────────────────────────────────────────────────────────────
-DB_PATH       = "russian-azure.db"   # dump SQL histórico (lectura inicial)
+DB_PATH       = "russian-azure.db"   # dump SQL histórico
 LIVE_DB_PATH  = "live_spins.db"      # SQLite persistente de giros en vivo
 
 def _get_live_db() -> "sqlite3.Connection":
@@ -156,47 +154,6 @@ RUSSIAN_COLOR_DATA = [
     {"id": 36, "rojo": 0.40, "negro": 0.56, "senal": "NEGRO"},
 ]
 
-# ─── COLOR DATA — AZURE ROULETTE ──────────────────────────────────────────────
-AZURE_COLOR_DATA = [
-    {"id":0, "rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":1, "rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":2, "rojo":0.60,"negro":0.40,"senal":"ROJO"},
-    {"id":3, "rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":4, "rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":5, "rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":6, "rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":7, "rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":8, "rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":9, "rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":10,"rojo":0.48,"negro":0.48,"senal":"NO APOSTAR"},
-    {"id":11,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":12,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":13,"rojo":0.56,"negro":0.40,"senal":"ROJO"},
-    {"id":14,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":15,"rojo":0.56,"negro":0.44,"senal":"ROJO"},
-    {"id":16,"rojo":0.52,"negro":0.44,"senal":"ROJO"},
-    {"id":17,"rojo":0.60,"negro":0.36,"senal":"ROJO"},
-    {"id":18,"rojo":0.52,"negro":0.48,"senal":"ROJO"},
-    {"id":19,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":20,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":21,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":22,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":23,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":24,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":25,"rojo":0.36,"negro":0.60,"senal":"NEGRO"},
-    {"id":26,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-    {"id":27,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":28,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":29,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":30,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":31,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":32,"rojo":0.44,"negro":0.52,"senal":"NEGRO"},
-    {"id":33,"rojo":0.48,"negro":0.52,"senal":"NEGRO"},
-    {"id":34,"rojo":0.40,"negro":0.60,"senal":"NEGRO"},
-    {"id":35,"rojo":0.40,"negro":0.56,"senal":"NEGRO"},
-    {"id":36,"rojo":0.44,"negro":0.56,"senal":"NEGRO"},
-]
-
 # ─── ROULETTE CONFIGS ─────────────────────────────────────────────────────────
 ROULETTE_CONFIGS = {
     "Russian Roulette": {
@@ -206,15 +163,6 @@ ROULETTE_CONFIGS = {
         "thread_id": 8344,
         "db_table":  "russian_roulette",
         "color_data": RUSSIAN_COLOR_DATA,
-        "min_prob_threshold": 0.49,
-    },
-    "Azure Roulette": {
-        "bot":       bot_azure,
-        "ws_key":    227,
-        "chat_id":   -1003835197023,
-        "thread_id": 6,
-        "db_table":  "roulette_1",
-        "color_data": AZURE_COLOR_DATA,
         "min_prob_threshold": 0.49,
     },
 }
@@ -1179,7 +1127,7 @@ def generate_category_chart(
     return buf
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
-_TG_MAX_RETRIES = 5
+_TG_MAX_RETRIES = 12   # backoff hasta 60s
 
 def _tg_call(fn, *args, **kwargs):
     delay = 2.0
@@ -1361,11 +1309,14 @@ class RouletteEngine:
             if len(self.spin_history) > 300:
                 self.spin_history.pop(0)
 
-        logger.info(f"[{self.name}] Live history cargada: {len(rows)} giros")
+        logger.info(f"[{self.name}] ✅ Historial ML cargado: {len(rows)} giros")
         return len(rows)
 
     def _persist_spin(self, number: int):
-        """Guarda el giro en la DB SQLite de persistencia."""
+        """
+        Guarda el giro en SQLite — núcleo de la continuidad 24/7.
+        Si la conexión falla, la reabre automáticamente.
+        """
         import time as _time
         try:
             self._live_conn.execute(
@@ -1374,7 +1325,16 @@ class RouletteEngine:
             )
             self._live_conn.commit()
         except Exception as e:
-            logger.debug(f"[{self.name}] Error persistiendo spin: {e}")
+            logger.warning(f"[{self.name}] SQLite error, reconectando: {e}")
+            try:
+                self._live_conn = _get_live_db()
+                self._live_conn.execute(
+                    "INSERT INTO live_spins (table_name, number, ts) VALUES (?,?,?)",
+                    (self.db_table, number, int(_time.time()))
+                )
+                self._live_conn.commit()
+            except Exception as e2:
+                logger.error(f"[{self.name}] SQLite irrecuperable: {e2}")
 
     def _cleanup_old_live_spins(self):
         """Limpia registros de más de 7 días para que la DB no crezca indefinidamente."""
@@ -1386,6 +1346,7 @@ class RouletteEngine:
                 (self.db_table, cutoff)
             )
             self._live_conn.commit()
+            logger.info(f"[{self.name}] Limpieza SQLite: giros > 7 días eliminados")
         except Exception as e:
             logger.debug(f"[{self.name}] Error limpiando live_db: {e}")
 
@@ -1960,6 +1921,16 @@ class RouletteEngine:
 
     # ─── PROCESO PRINCIPAL DE CADA NÚMERO ────────────────────────────────────
     def process_number(self, number: int):
+        try:
+            self._process_number_inner(number)
+        except Exception as e:
+            logger.error(f"[{self.name}] ❌ Error en process_number({number}): {e}", exc_info=True)
+            if self.signal_active:
+                self.signal_active       = False
+                self.waiting_for_attempt = False
+                self.attempts_left       = MAX_ATTEMPTS
+
+    def _process_number_inner(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE")
 
         # Persistir giro en SQLite (estado 24/7)
@@ -2188,7 +2159,12 @@ class RouletteEngine:
                                 self.anti_block.add(gid)
                                 self.process_number(n)
             except Exception as e:
-                logger.warning(f"[{self.name}] WS error: {e}. Reconectando en {reconnect_delay}s")
+                logger.warning(f"[{self.name}] WS desconectado: {e}. Recon en {reconnect_delay}s")
+                try:
+                    tg_send_text(self.bot, self.chat_id, self.thread_id,
+                                 f"⚠️ <b>{self.name}</b> — Conexión perdida. Reconectando en {reconnect_delay}s...")
+                except Exception:
+                    pass
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
@@ -2231,7 +2207,7 @@ def _register_handlers(b: telebot.TeleBot):
         seq = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
         help_text = f"""
 <b>🎰 Roulette Bot AMX UNIFIED</b>
-Dos ruletas en un proceso: Russian Roulette + Azure Roulette
+Russian Roulette
 
 <b>Características:</b>
 • Sin cooldown entre señales
@@ -2334,16 +2310,14 @@ async def main():
 
     # Registrar handlers y lanzar polling independiente para cada bot
     _register_handlers(bot_russian)
-    _register_handlers(bot_azure)
 
     def _poll(b: telebot.TeleBot, label: str):
         logger.info(f"Iniciando polling Telegram — {label}")
         b.polling(none_stop=True, interval=1, timeout=30)
 
-    for b, lbl in [(bot_russian, "Russian"), (bot_azure, "Azure")]:
-        threading.Thread(target=_poll, args=(b, lbl), daemon=True).start()
+    threading.Thread(target=_poll, args=(bot_russian, "Russian"), daemon=True).start()
 
-    logger.info("🎰 Roulette Bot AMX UNIFIED iniciado (Russian Roulette + Azure Roulette)")
+    logger.info("🎰 Roulette Bot AMX UNIFIED iniciado (Russian Roulette)")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
