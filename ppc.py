@@ -1252,6 +1252,138 @@ def tg_delete(bot_inst, chat_id, msg_id):
     _tg_call(bot_inst.delete_message, chat_id=chat_id, message_id=msg_id)
 
 # ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
+
+# ─── DETAILED STATS ───────────────────────────────────────────────────────────
+class DetailedStats:
+    def __init__(self):
+        self.signal_history: deque = deque(maxlen=50)
+        self.wins_attempt_1: int = 0
+        self.wins_attempt_2: int = 0
+        self.wins_attempt_3: int = 0
+        self.wins_attempt_4: int = 0
+        self.wins_attempt_5: int = 0
+        self.losses:         int = 0
+        self.total_signals:  int = 0
+        self.last_stats_at:  int = 0
+        self.batch_start_bankroll: Optional[float] = None
+        self.batch_start_wins:  int = 0
+        self.batch_start_losses:int = 0
+        self.batch_start_w1: int = 0
+        self.batch_start_w2: int = 0
+        self.batch_start_w3: int = 0
+        self.batch_start_w4: int = 0
+        self.batch_start_w5: int = 0
+        # Diario
+        self.last_daily_date      = ""
+        self.daily_start_bankroll: Optional[float] = None
+        self.daily_signals:  int = 0
+        self.daily_wins:     int = 0
+        self.daily_losses:   int = 0
+        self.daily_w1: int = 0
+        self.daily_w2: int = 0
+        self.daily_w3: int = 0
+        self.daily_w4: int = 0
+        self.daily_w5: int = 0
+
+    def record_signal_result(self, attempt_won: int, final_result: bool,
+                             bet_amount: float, bankroll: float):
+        entry = {"attempt_won": attempt_won, "won": final_result,
+                 "bet": bet_amount, "bankroll": bankroll, "timestamp": time.time()}
+        self.signal_history.append(entry)
+        self.total_signals += 1
+        if final_result:
+            if   attempt_won == 1: self.wins_attempt_1 += 1
+            elif attempt_won == 2: self.wins_attempt_2 += 1
+            elif attempt_won == 3: self.wins_attempt_3 += 1
+            elif attempt_won == 4: self.wins_attempt_4 += 1
+            elif attempt_won == 5: self.wins_attempt_5 += 1
+        else:
+            self.losses += 1
+        # Diario
+        self.daily_signals += 1
+        if final_result:
+            self.daily_wins += 1
+            if   attempt_won == 1: self.daily_w1 += 1
+            elif attempt_won == 2: self.daily_w2 += 1
+            elif attempt_won == 3: self.daily_w3 += 1
+            elif attempt_won == 4: self.daily_w4 += 1
+            elif attempt_won == 5: self.daily_w5 += 1
+        else:
+            self.daily_losses += 1
+        if self.daily_start_bankroll is None:
+            self.daily_start_bankroll = bankroll
+
+    def should_send_stats(self) -> bool:
+        return (self.total_signals - self.last_stats_at) >= 20
+
+    def mark_stats_sent(self, bankroll: float):
+        self.last_stats_at        = self.total_signals
+        self.batch_start_bankroll = bankroll
+        self.batch_start_wins     = (self.wins_attempt_1 + self.wins_attempt_2 +
+                                     self.wins_attempt_3 + self.wins_attempt_4 +
+                                     self.wins_attempt_5)
+        self.batch_start_losses   = self.losses
+        self.batch_start_w1 = self.wins_attempt_1
+        self.batch_start_w2 = self.wins_attempt_2
+        self.batch_start_w3 = self.wins_attempt_3
+        self.batch_start_w4 = self.wins_attempt_4
+        self.batch_start_w5 = self.wins_attempt_5
+
+    def get_batch_stats(self, current_bankroll: float) -> dict:
+        n = self.total_signals - self.last_stats_at
+        if n == 0: return {}
+        w1 = self.wins_attempt_1 - self.batch_start_w1
+        w2 = self.wins_attempt_2 - self.batch_start_w2
+        w3 = self.wins_attempt_3 - self.batch_start_w3
+        w4 = self.wins_attempt_4 - self.batch_start_w4
+        w5 = self.wins_attempt_5 - self.batch_start_w5
+        l  = self.losses - self.batch_start_losses
+        w  = w1+w2+w3+w4+w5
+        bk = round(current_bankroll - self.batch_start_bankroll, 2)              if self.batch_start_bankroll is not None else 0.0
+        return {"total":n,"wins":w,"losses":l,"w1":w1,"w2":w2,"w3":w3,"w4":w4,"w5":w5,
+                "efficiency":round(w/n*100,1) if n else 0.0,
+                "e_w1":round(w1/n*100,2) if n else 0.0,
+                "e_w2":round(w2/n*100,2) if n else 0.0,
+                "e_w3":round(w3/n*100,2) if n else 0.0,
+                "e_w4":round(w4/n*100,2) if n else 0.0,
+                "e_w5":round(w5/n*100,2) if n else 0.0,
+                "e_loss":round(l/n*100,2) if n else 0.0,
+                "bankroll_delta":bk}
+
+    def get_daily_stats(self, current_bankroll: float) -> dict:
+        t  = self.daily_signals
+        w  = self.daily_wins
+        l  = self.daily_losses
+        bk = round(current_bankroll - self.daily_start_bankroll, 2)              if self.daily_start_bankroll is not None else 0.0
+        return {"total":t,"wins":w,"losses":l,
+                "w1":self.daily_w1,"w2":self.daily_w2,"w3":self.daily_w3,
+                "w4":self.daily_w4,"w5":self.daily_w5,
+                "efficiency":round(w/t*100,1) if t else 0.0,
+                "e_w1":round(self.daily_w1/t*100,2) if t else 0.0,
+                "e_w2":round(self.daily_w2/t*100,2) if t else 0.0,
+                "e_w3":round(self.daily_w3/t*100,2) if t else 0.0,
+                "e_w4":round(self.daily_w4/t*100,2) if t else 0.0,
+                "e_w5":round(self.daily_w5/t*100,2) if t else 0.0,
+                "e_loss":round(l/t*100,2) if t else 0.0,
+                "bankroll_delta":bk}
+
+    def reset_daily(self, date_str: str, current_bankroll: float):
+        self.last_daily_date      = date_str
+        self.daily_start_bankroll = current_bankroll
+        self.daily_signals  = 0
+        self.daily_wins     = 0
+        self.daily_losses   = 0
+        self.daily_w1 = self.daily_w2 = self.daily_w3 = 0
+        self.daily_w4 = self.daily_w5 = 0
+
+    def reset(self):
+        self.signal_history.clear()
+        self.wins_attempt_1 = self.wins_attempt_2 = self.wins_attempt_3 = 0
+        self.wins_attempt_4 = self.wins_attempt_5 = 0
+        self.losses = self.total_signals = self.last_stats_at = 0
+        self.batch_start_bankroll = None
+        self.reset_daily("", 0.0)
+
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
         self.name       = name
@@ -1398,7 +1530,26 @@ class RouletteEngine:
             self.markov.update(temp_history)
             self.ml_predictor.add_spin(temp_history)
             self.category_ml.add_spin(n, real)
-            # Rellenar también spin_history para que el estado sea coherente
+            # Niveles acumulados para las 3 categorías
+            last_o  = self.original_levels[-1] if self.original_levels else 0
+            last_i  = self.inverted_levels[-1]  if self.inverted_levels  else 0
+            last_p  = self.par_levels[-1]        if self.par_levels        else 0
+            last_ip = self.impar_levels[-1]      if self.impar_levels      else 0
+            last_a  = self.alto_levels[-1]        if self.alto_levels        else 0
+            last_b  = self.bajo_levels[-1]        if self.bajo_levels        else 0
+            if n == 0:
+                self.original_levels.append(last_o); self.inverted_levels.append(last_i)
+                self.par_levels.append(last_p);      self.impar_levels.append(last_ip)
+                self.alto_levels.append(last_a);     self.bajo_levels.append(last_b)
+            else:
+                par  = get_paridad(n)
+                rang = get_rango(n)
+                self.original_levels.append(last_o  + (1 if real == "ROJO"   else -1))
+                self.inverted_levels.append(last_i  + (1 if real == "NEGRO"  else -1))
+                self.par_levels.append(last_p       + (1 if par  == "PAR"    else -1))
+                self.impar_levels.append(last_ip    + (1 if par  == "IMPAR"  else -1))
+                self.alto_levels.append(last_a      + (1 if rang == "ALTO"   else -1))
+                self.bajo_levels.append(last_b      + (1 if rang == "BAJO"   else -1))
             self.spin_history.append({"number": n, "real": real})
             if len(self.spin_history) > 300:
                 self.spin_history.pop(0)
@@ -1507,141 +1658,95 @@ class RouletteEngine:
 
     # ─── DETECCIÓN DE SEÑAL POR CATEGORÍA ────────────────────────────────────
 
-    def _evaluate_ml_category(self, category: str) -> Optional[dict]:
-        """
-        Evalúa COLOR, PARIDAD o RANGO usando CategoryPredictor (16 combos).
-        Retorna dict {category, bet_value, probability, trigger_number} o None.
-        """
-        pred = self.category_ml.predict_category(category)
-        if pred is None or pred.get("total", 0) < 5:
-            return None
-        pred_clean = {k: v for k, v in pred.items() if k != "total"}
-        if not pred_clean:
-            return None
-        best_val  = max(pred_clean, key=pred_clean.get)
-        best_prob = pred_clean[best_val]
-        if best_prob < self.min_prob_threshold:
-            return None
-        trigger_number = self.spin_history[-1]["number"] if self.spin_history else 0
+    # ── Mapas de niveles por categoría y valor ──────────────────────────────────
+    def _levels_for(self, category: str, bet_value: str) -> list:
+        """Retorna el array de niveles acumulados para categoría+valor."""
         return {
-            "category":       category,
-            "bet_value":      best_val,
-            "probability":    best_prob,
-            "trigger_number": trigger_number,
-        }
+            ("COLOR",   "ROJO"):  self.original_levels,
+            ("COLOR",   "NEGRO"): self.inverted_levels,
+            ("PARIDAD", "PAR"):   self.par_levels,
+            ("PARIDAD", "IMPAR"): self.impar_levels,
+            ("RANGO",   "ALTO"):  self.alto_levels,
+            ("RANGO",   "BAJO"):  self.bajo_levels,
+        }.get((category, bet_value), [])
 
-    def _evaluate_color_candidate(self) -> Optional[dict]:
+    def _evaluate_category(self, category: str) -> Optional[dict]:
         """
-        Evalúa COLOR usando EMA pura (sin tabla predefinida).
-        Condiciones:
-          1. CategoryPredictor predice el color con ≥ min_prob_threshold
-          2. EMA confirma la señal (AMXSignalSystem.check_signal)
-          3. Markov/ML no contradicen (≥ 50% acuerdo)
-        Retorna dict {category, bet_value, probability, trigger_number} o None.
+        Sistema unificado de detección para COLOR, PARIDAD y RANGO.
+        Misma lógica para las 3 categorías:
+          1. CategoryPredictor → valor con mayor probabilidad ≥ min_prob_threshold
+          2. EMA 4/8/20 sobre nivel acumulado confirma la señal (AMXSignalSystem)
+          3. Probabilidad unificada Markov+ML ≥ min_prob_threshold
+        Retorna {category, bet_value, probability, trigger_number, ema_score} o None.
         """
         trigger = self.spin_history[-1]["number"] if self.spin_history else 0
 
-        # ── CategoryPredictor para COLOR ──────────────────────────────────────
-        cat_pred = self.category_ml.predict_category("COLOR")
-        if cat_pred is None:
+        # Paso 1 — CategoryPredictor
+        pred = self.category_ml.predict_category(category)
+        if pred is None or pred.get("total", 0) < 5:
             return None
-        clean    = {k: v for k, v in cat_pred.items() if k != "total"}
+        clean     = {k: v for k, v in pred.items() if k != "total"}
         if not clean:
             return None
-        best_color = max(clean, key=clean.get)
-        cat_prob   = clean[best_color]
+        best_val  = max(clean, key=clean.get)
+        cat_prob  = clean[best_val]
         if cat_prob < self.min_prob_threshold:
             return None
 
-        # ── EMA confirma la señal ─────────────────────────────────────────────
-        levels = self.original_levels if best_color == "ROJO" else self.inverted_levels
-        ema_sig = self.amx_system.check_signal(levels, best_color)
-        if not ema_sig:
+        # Paso 2 — EMA confirma la señal
+        levels  = self._levels_for(category, best_val)
+        ema_sig = self.amx_system.check_signal(levels, best_val)
+        if ema_sig is None:
             return None
         ema_sig["trigger_number"] = trigger
 
-        # ── Markov/ML no contradicen ──────────────────────────────────────────
-        if not self._passes_markov_ml_filter(best_color):
-            return None
-
-        # ── Probabilidad unificada ────────────────────────────────────────────
-        unified = self._get_category_probability("COLOR", best_color, trigger)
-        # Bonus de fuerza EMA sobre la probabilidad final
-        ema_bonus = 0.03 if ema_sig.get("strength") == "strong" else 0.0
+        # Paso 3 — Probabilidad unificada Markov+ML
+        markov_pred = self.markov.predict(self.spin_history)
+        ml_pred     = self.ml_predictor.predict(self.spin_history)
+        unified     = self.unified_prob_system.get_joint_probability(
+            category, best_val, markov_pred, ml_pred, cat_prob)
+        # Bonus EMA fuerte
+        ema_bonus  = 0.03 if ema_sig.get("strength") == "strong" else 0.0
         final_prob = min(0.95, unified["combined_prob"] + ema_bonus)
 
+        if final_prob < self.min_prob_threshold:
+            return None
+
         return {
-            "category":       "COLOR",
-            "bet_value":      best_color,
+            "category":       category,
+            "bet_value":      best_val,
             "probability":    final_prob,
             "trigger_number": trigger,
-            "amx_signal":     ema_sig,
             "ema_score":      ema_sig.get("score", 0),
+            "ema_pattern":    ema_sig.get("pattern", ""),
         }
+
+    def _evaluate_ml_category(self, category: str) -> Optional[dict]:
+        """Alias de compatibilidad → usa _evaluate_category."""
+        return self._evaluate_category(category)
+
+    def _evaluate_color_candidate(self) -> Optional[dict]:
+        """Alias de compatibilidad → usa _evaluate_category("COLOR")."""
+        return self._evaluate_category("COLOR")
 
     def _detect_best_category_signal(self) -> Optional[dict]:
         """
-        Evalúa las 3 categorías (COLOR / PARIDAD / RANGO) con máxima calidad.
-        Sin tabla de color predefinida — todo basado en EMA + CategoryPredictor + Markov.
-
-        Para cada categoría calcula un score de confianza compuesto:
-          score = cat_prob × ema_factor × markov_agreement
-        Retorna el candidato con mayor score que supere min_prob_threshold.
+        Evalúa las 3 categorías con el sistema unificado (_evaluate_category).
+        Cada categoría usa: CategoryPredictor → EMA 4/8/20 → prob unificada.
+        Retorna la categoría con mayor probabilidad final.
         """
-        candidates   = []
-        trigger      = self.spin_history[-1]["number"] if self.spin_history else 0
-
-        # ── COLOR — evaluación con EMA + CategoryPredictor ───────────────────
-        color_cand = self._evaluate_color_candidate()
-        if color_cand:
-            candidates.append(color_cand)
-
-        # ── PARIDAD y RANGO — CategoryPredictor + Markov agreemement ─────────
-        for cat in ("PARIDAD", "RANGO"):
-            cand = self._evaluate_ml_category(cat)
-            if cand is None:
-                continue
-
-            # Refuerzo con Markov de COLOR si el predictor tiene suficientes datos
-            # (COLOR y PARIDAD están correlacionados por los pares rojo/negro)
-            markov_factor = 1.0
-            mp = self.markov.predict(self.spin_history)
-            if mp:
-                # Si Markov apoya fuertemente algún color → señal más confiable
-                top_markov = max(mp.values())
-                if top_markov >= 0.60:
-                    markov_factor = 1.05
-
-            adjusted_prob = min(0.95, cand["probability"] * markov_factor)
-            cand["probability"] = adjusted_prob
-            candidates.append(cand)
-
+        candidates = []
+        for cat in ("COLOR", "PARIDAD", "RANGO"):
+            cand = self._evaluate_category(cat)
+            if cand:
+                candidates.append(cand)
         if not candidates:
             return None
-
-        # ── Elegir el candidato con mayor probabilidad ────────────────────────
-        best = max(candidates, key=lambda x: x["probability"])
-        if best["probability"] < self.min_prob_threshold:
-            return None
-        return best
+        return max(candidates, key=lambda x: x["probability"])
 
     def _detect_best_in_category(self, category: str) -> Optional[dict]:
-        """
-        Evalúa SOLO la categoría activa para reintentos.
-        Para COLOR: re-evalúa con EMA+CategoryPredictor.
-        Para PARIDAD/RANGO: re-evalúa CategoryPredictor con ajuste Markov.
-        """
-        if category == "COLOR":
-            return self._evaluate_color_candidate()
-        cand = self._evaluate_ml_category(category)
-        if cand is None:
-            return None
-        mp = self.markov.predict(self.spin_history)
-        if mp:
-            top_markov = max(mp.values())
-            if top_markov >= 0.60:
-                cand["probability"] = min(0.95, cand["probability"] * 1.05)
-        return cand if cand["probability"] >= self.min_prob_threshold else None
+        """Reintento: re-evalúa con el sistema unificado para la categoría activa."""
+        return self._evaluate_category(category)
 
     # ─── FILTROS ─────────────────────────────────────────────────────────────
     def _get_predictor_votes(self, color: str) -> int:
@@ -1713,23 +1818,8 @@ class RouletteEngine:
 
     # ─── DETECCIÓN AMX / SHOULD_ACTIVATE ─────────────────────────────────────
     def _detect_amx_signal(self) -> Optional[dict]:
-        """
-        Detecta señal AMX usando EMA pura, sin tabla de color.
-        Prueba ROJO (original_levels) y NEGRO (inverted_levels).
-        Retorna la señal del color con mayor score EMA.
-        """
-        if len(self.original_levels) < 20: return None
-        best_sig = None
-        for color, levels in [("ROJO", self.original_levels),
-                               ("NEGRO", self.inverted_levels)]:
-            sig = self.amx_system.check_signal(levels, color)
-            if sig is None: continue
-            trigger = self.spin_history[-1]["number"] if self.spin_history else 0
-            sig["trigger_number"] = trigger
-            sig["expected_color"] = color
-            if best_sig is None or sig["score"] > best_sig["score"]:
-                best_sig = sig
-        return best_sig
+        """Alias de compatibilidad → usa _evaluate_category("COLOR")."""
+        return self._evaluate_category("COLOR")
 
 
     def should_activate(self) -> Optional[str]:
@@ -2062,19 +2152,29 @@ class RouletteEngine:
             self.spin_history.pop(0)
         self.result_sequence.append({"number": number, "real": real})
 
-        # Niveles
+        # Niveles acumulados — COLOR, PARIDAD, RANGO
         last_o = self.original_levels[-1] if self.original_levels else 0
-        last_i = self.inverted_levels[-1] if self.inverted_levels else 0
-        if number == 0:
-            if self.last_nonzero_color:
-                self.original_levels.append(last_o + (1 if self.last_nonzero_color == "ROJO" else -1))
-                self.inverted_levels.append(last_i + (1 if self.last_nonzero_color == "NEGRO" else -1))
-            else:
-                self.original_levels.append(last_o)
-                self.inverted_levels.append(last_i)
+        last_i = self.inverted_levels[-1]  if self.inverted_levels  else 0
+        last_p = self.par_levels[-1]        if self.par_levels        else 0
+        last_ip= self.impar_levels[-1]      if self.impar_levels      else 0
+        last_a = self.alto_levels[-1]        if self.alto_levels        else 0
+        last_b = self.bajo_levels[-1]        if self.bajo_levels        else 0
+
+        if number == 0:  # VERDE — repite el último valor
+            lnz = self.last_nonzero_color
+            self.original_levels.append(last_o + (1 if lnz == 'ROJO'  else -1) if lnz else last_o)
+            self.inverted_levels.append(last_i + (1 if lnz == 'NEGRO' else -1) if lnz else last_i)
+            self.par_levels.append(last_p);   self.impar_levels.append(last_ip)
+            self.alto_levels.append(last_a);  self.bajo_levels.append(last_b)
         else:
-            self.original_levels.append(last_o + (1 if real == "ROJO" else -1))
-            self.inverted_levels.append(last_i + (1 if real == "NEGRO" else -1))
+            par  = get_paridad(number)  # 'PAR' | 'IMPAR'
+            rang = get_rango(number)    # 'ALTO'| 'BAJO'
+            self.original_levels.append(last_o + (1 if real == 'ROJO'  else -1))
+            self.inverted_levels.append(last_i + (1 if real == 'NEGRO' else -1))
+            self.par_levels.append(last_p  + (1 if par  == 'PAR'  else -1))
+            self.impar_levels.append(last_ip + (1 if par  == 'IMPAR' else -1))
+            self.alto_levels.append(last_a + (1 if rang == 'ALTO' else -1))
+            self.bajo_levels.append(last_b + (1 if rang == 'BAJO' else -1))
             self.last_nonzero_color = real
 
         while len(self.original_levels) > len(self.spin_history):
