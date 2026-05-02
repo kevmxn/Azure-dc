@@ -458,7 +458,7 @@ class UnifiedProbabilitySystem:
             current = levels[-1]
             diff = (current - ema20) / (abs(ema20) + 1) * 0.2
             self.ema_trend_factor = max(0.8, min(1.2, 1.0 + diff if current > ema20 else 1.0 - abs(diff)))
-        sr = find_support_resistance(levels, lookback=30)
+        sr = find_support_resistance(levels, ventana=30)
         if sr['support'] is not None and sr['resistance'] is not None:
             range_size = sr['resistance'] - sr['support']
             if range_size > 0:
@@ -817,7 +817,7 @@ def generate_chart(levels: list, spin_history: list, bet_color: str,
     for i, spin in enumerate(hist_sl):
         c = dot_colors.get(spin["real"], "#ffffff")
         ax.scatter(i, y[i], color=c, s=22, zorder=5, edgecolors="white", linewidths=0.3)
-    sr = find_support_resistance(levels, lookback=30)
+    sr = find_support_resistance(levels, ventana=30)
     sup_v, res_v = sr['support'], sr['resistance']
     res_color = "#e84040" if is_rojo else "#888888"
     sup_color = "#888888" if is_rojo else "#e84040"
@@ -983,7 +983,7 @@ def generate_category_chart(
                        edgecolors="white", linewidths=0.3)
 
     # Soporte / Resistencia
-    sr = find_support_resistance(list(arr), lookback=30)
+    sr = find_support_resistance(list(arr), ventana=30)
     sup_v, res_v = sr['support'], sr['resistance']
     res_color = line_c
     sup_color = neg_color if bet_value == pos_val else pos_color
