@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("RouletteBotAMX")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-TOKEN_RUSSIAN = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
+TOKEN   = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
 
 _session = requests.Session()
 _retry = Retry(
@@ -57,16 +57,16 @@ _adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
 _session.mount("https://", _adapter)
 _session.mount("http://",  _adapter)
 
-def _make_bot(token: str) -> telebot.TeleBot:
-    b = telebot.TeleBot(token, threaded=False)
-    b.session = _session
-    return b
+bot = telebot.TeleBot(TOKEN, threaded=False)
+bot.session = _session
 
-bot_russian = _make_bot(TOKEN_RUSSIAN)
+
+
+
 
 # ─── DB CONFIG ────────────────────────────────────────────────────────────────
 DB_PATH       = "russian-azure.db"   # dump SQL histórico
-LIVE_DB_PATH  = "live_spins.db"      # SQLite persistente de giros en vivo
+LIVE_DB_PATH  = "russian_live.db"    # SQLite persistente de giros en vivo
 
 def _get_live_db() -> "sqlite3.Connection":
     """Abre (o crea) la DB SQLite de giros en vivo."""
@@ -157,12 +157,11 @@ RUSSIAN_COLOR_DATA = [
 # ─── ROULETTE CONFIGS ─────────────────────────────────────────────────────────
 ROULETTE_CONFIGS = {
     "Russian Roulette": {
-        "bot":       bot_russian,
+        "bot":       bot,
         "ws_key":    221,
         "chat_id":   -1003835197023,
         "thread_id": 8344,
         "db_table":  "russian_roulette",
-        "color_data": RUSSIAN_COLOR_DATA,
         "min_prob_threshold": 0.60,
     },
 }
@@ -533,37 +532,39 @@ class UnifiedProbabilitySystem:
         logger.info(f"[AMX V22] Pesos: Markov={self.weights['markov']:.2f} ML={self.weights['ml']:.2f} | M={markov_acc:.2%} ML={ml_acc:.2%}")
         self.markov_correct = self.markov_total = self.ml_correct = self.ml_total = 0
 
-    def get_joint_probability(self, markov_pred, ml_pred, color: str, table_prob: float) -> dict:
-        markov_prob = markov_pred.get(color, 0.5) if markov_pred else 0.5
-        ml_prob     = ml_pred.get(color, 0.5)     if ml_pred     else 0.5
-        model_prob  = self.weights["markov"] * markov_prob + self.weights["ml"] * ml_prob
-        confidence  = self.calculate_confidence(markov_pred, ml_pred, color)
-        if markov_pred is None and ml_pred is None:
-            combined_prob = table_prob
+    def get_joint_probability(self, category: str, bet_value: str,
+                              markov_pred, ml_pred, cat_prob: Optional[float]) -> dict:
+        """
+        Probabilidad unificada Markov + ML + CategoryPredictor.
+        Sin tabla predefinida: para COLOR usa Markov/ML directo (table_prob neutral 0.5).
+        Para PARIDAD/RANGO usa cat_prob como señal principal.
+        """
+        if category == "COLOR":
+            m_p  = markov_pred.get(bet_value, 0.5) if markov_pred else 0.5
+            ml_p = ml_pred.get(bet_value, 0.5)     if ml_pred     else 0.5
         else:
-            table_weight  = max(0.1, 1.0 - confidence) * 0.3
-            combined_prob = (1.0 - table_weight) * model_prob + table_weight * table_prob
-        combined_prob *= self.ema_trend_factor * self.sr_factor
-        combined_prob  = max(0.3, min(0.9, combined_prob))
-        threshold      = self.calculate_dynamic_threshold()
-        signal_strength = ("strong"   if combined_prob >= threshold + 0.1 else
-                           "moderate" if combined_prob >= threshold        else "weak")
+            m_p  = cat_prob if cat_prob is not None else 0.5
+            ml_p = cat_prob if cat_prob is not None else 0.5
+
+        model_prob    = self.weights["markov"] * m_p + self.weights["ml"] * ml_p
+        # Factores dinámicos (EMA trend + SR + volatilidad)
+        combined_prob = model_prob * self.ema_trend_factor * self.sr_factor
+        combined_prob = max(0.30, min(0.95, combined_prob))
+
+        strength = ("strong"   if combined_prob >= 0.70 else
+                    "moderate" if combined_prob >= 0.60 else "weak")
         return {
             "combined_prob":    combined_prob,
-            "markov_prob":      markov_prob,
-            "ml_prob":          ml_prob,
-            "table_prob":       table_prob,
-            "confidence":       confidence,
-            "threshold":        threshold,
-            "signal_strength":  signal_strength,
+            "markov_prob":      m_p,
+            "ml_prob":          ml_p,
+            "signal_strength":  strength,
             "weights":          self.weights.copy(),
             "ema_trend_factor": self.ema_trend_factor,
             "sr_factor":        self.sr_factor,
             "volatility":       self.volatility,
         }
 
-# ─── DETAILED STATS ───────────────────────────────────────────────────────────
-class DetailedStats:
+
     def __init__(self):
         self.signal_history: deque = deque(maxlen=50)
         self.wins_attempt_1: int = 0
@@ -759,65 +760,78 @@ class AMXSignalSystem:
             ema.append(prev)
         return ema
 
-    def check_signal_tendencia(self, positions, color_data, current_number,
-                               expected_color, prob_threshold) -> Optional[dict]:
+    def check_signal(self, positions: list, expected_color: str) -> Optional[dict]:
+        """
+        Evalúa condiciones EMA puras — sin tabla de color predefinida.
+        Combina modo moderado y tendencia; retorna el resultado más fuerte.
+        """
         if len(positions) < 20:
             return None
         ema4  = self.calculate_ema(positions, 4)
         ema8  = self.calculate_ema(positions, 8)
         ema20 = self.calculate_ema(positions, 20)
-        if any(v is None for v in [ema4[-1], ema8[-1], ema20[-1], ema4[-2], ema8[-2], ema20[-2]]):
+        if any(v is None for v in [ema4[-1], ema8[-1], ema20[-1],
+                                    ema4[-2], ema8[-2], ema20[-2]]):
             return None
-        current_pos   = positions[-1]
-        cruce_alcista = ema4[-2] <= ema20[-2] and ema4[-1] > ema20[-1]
-        sobre_tres    = current_pos > ema4[-1] and current_pos > ema8[-1] and current_pos > ema20[-1]
-        cruce_ema8    = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
-        cerca_ema4    = abs(current_pos - ema4[-1]) <= 0.5
-        dos_ok        = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
-        if not ((cruce_alcista or sobre_tres) or cruce_ema8 or
-                (sobre_tres and dos_ok) or (sobre_tres and cerca_ema4)):
-            return None
-        entry = next((e for e in color_data if e["id"] == current_number), None)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
-        if entry["senal"] != expected_color or prob < prob_threshold:
-            return None
-        return {"type": "SKRILL_2.0", "mode": "tendencia",
-                "expected_color": expected_color,
-                "probability": prob, "trigger_number": current_number,
-                "strength": "strong" if (cruce_alcista or cruce_ema8) else "moderate"}
+        cur = positions[-1]
+        ce4, ce8, ce20 = ema4[-1], ema8[-1], ema20[-1]
+        pe4, pe8, pe20 = ema4[-2], ema8[-2], ema20[-2]
 
-    def check_signal_moderado(self, positions, color_data, current_number,
-                              expected_color, prob_threshold) -> Optional[dict]:
-        if len(positions) < 20:
-            return None
-        ema4  = self.calculate_ema(positions, 4)
-        ema8  = self.calculate_ema(positions, 8)
-        ema20 = self.calculate_ema(positions, 20)
-        if any(v is None for v in [ema4[-1], ema8[-1], ema20[-1], ema8[-2], ema20[-2]]):
-            return None
-        cruce_ema8  = ema8[-2] <= ema20[-2] and ema8[-1] > ema20[-1]
-        sobre_emas  = positions[-1] > ema4[-1] and positions[-1] > ema8[-1]
+        # ── Condiciones ───────────────────────────────────────────────────────
+        cruce_4_20  = pe4 <= pe20 and ce4 > ce20
+        cruce_8_20  = pe8 <= pe20 and ce8 > ce20
+        sobre_3     = cur > ce4 and cur > ce8 and cur > ce20
+        sobre_2     = cur > ce4 and cur > ce8
         patron_v    = False
         if len(positions) >= 3:
             a, b, c = positions[-3], positions[-2], positions[-1]
-            patron_v = b < a and b < c and abs(a - c) <= 1 and c > a
-        dos_ok   = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
-        emas_alc = ema4[-1] > ema8[-1] > ema20[-1]
-        cond_racha = dos_ok and emas_alc and sobre_emas
-        if not (cruce_ema8 or patron_v or cond_racha):
+            patron_v = b < a and b < c and c > a
+        emas_alin   = ce4 > ce8 > ce20
+        racha_ok    = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
+
+        # ── Fuerza de la señal ─────────────────────────────────────────────
+        score = 0
+        mode  = "moderado"
+        if cruce_4_20:   score += 3; mode = "tendencia"
+        if cruce_8_20:   score += 2
+        if sobre_3:      score += 2
+        if sobre_2:      score += 1
+        if patron_v:     score += 2
+        if emas_alin:    score += 1
+        if racha_ok:     score += 1
+
+        if score < 2:    # umbral mínimo de condiciones
             return None
-        entry = next((e for e in color_data if e["id"] == current_number), None)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-        prob = entry["rojo"] if expected_color == "ROJO" else entry["negro"]
-        if entry["senal"] != expected_color or prob < prob_threshold:
-            return None
-        return {"type": "ALERTA_2.0", "mode": "moderado",
-                "expected_color": expected_color,
-                "probability": prob, "trigger_number": current_number,
-                "pattern": "V" if patron_v else "EMA_CROSS"}
+
+        strength = "strong" if score >= 5 else "moderate"
+        return {
+            "type":           "AMX_EMA",
+            "mode":           mode,
+            "expected_color": expected_color,
+            "score":          score,
+            "strength":       strength,
+            "trigger_number": 0,   # se rellena por el caller
+            "pattern":        ("V" if patron_v else
+                               "CROSS_4_20" if cruce_4_20 else
+                               "CROSS_8_20" if cruce_8_20 else "EMA"),
+        }
+
+    # Aliases de compatibilidad con código existente
+    def check_signal_tendencia(self, positions, color_data, current_number,
+                               expected_color, prob_threshold) -> Optional[dict]:
+        sig = self.check_signal(positions, expected_color)
+        if sig and sig["score"] >= 4:
+            sig["trigger_number"] = current_number
+            return sig
+        return None
+
+    def check_signal_moderado(self, positions, color_data, current_number,
+                              expected_color, prob_threshold) -> Optional[dict]:
+        sig = self.check_signal(positions, expected_color)
+        if sig:
+            sig["trigger_number"] = current_number
+            return sig
+        return None
 
     def register_signal_sent(self):
         self.last_signal_time = time.time()
@@ -826,19 +840,92 @@ class AMXSignalSystem:
         self.so_cooldown = time.time()
 
 # ─── SOPORTE Y RESISTENCIA ────────────────────────────────────────────────────
-def find_support_resistance(levels: list, lookback: int = 30) -> dict:
-    if len(levels) < lookback:
-        return {'support': None, 'resistance': None}
-    recent = levels[-lookback:]
-    supp, res = [], []
-    for i in range(2, len(recent) - 2):
-        if recent[i] < recent[i-1] and recent[i] < recent[i-2] and \
-           recent[i] < recent[i+1] and recent[i] < recent[i+2]:
-            supp.append(recent[i])
-        if recent[i] > recent[i-1] and recent[i] > recent[i-2] and \
-           recent[i] > recent[i+1] and recent[i] > recent[i+2]:
-            res.append(recent[i])
-    return {'support': supp[-1] if supp else None, 'resistance': res[-1] if res else None}
+def find_support_resistance(levels: list,
+                            tolerancia: float = 0.5,
+                            min_rebotes: int = 2,
+                            ventana: int = 5,
+                            max_niveles: int = 3) -> dict:
+    """
+    Detecta múltiples soportes y resistencias usando mínimos/máximos locales.
+    Algoritmo traducido del JS (index_v3.html · detectarSoportesResistencias).
+
+    - Ventana deslizante de (2*ventana+1) puntos.
+    - Soporte: punto es mínimo local en su ventana y < punto anterior y siguiente.
+    - Resistencia: punto es máximo local en su ventana y > punto anterior y siguiente.
+    - Agrupa niveles dentro de `tolerancia` y cuenta rebotes.
+    - Solo válidos con ≥ min_rebotes rebotes.
+    - Marca como fuerte si ≥3 rebotes o fuerza_total ≥4.
+    - Retorna los `max_niveles` más recientes de cada tipo.
+    """
+    if len(levels) < ventana * 2 + 2:
+        return {"supports": [], "resistances": [],
+                "support": None, "resistance": None}
+
+    soportes:     list = []
+    resistencias: list = []
+
+    for i in range(ventana, len(levels) - ventana):
+        window = levels[i - ventana: i + ventana + 1]
+        minimo = min(window)
+        if (window.index(minimo) == ventana and
+                levels[i] < levels[i-1] and levels[i] < levels[i+1]):
+            nivel     = levels[i]
+            fuerza    = abs(levels[i-1] - levels[i]) + abs(levels[i+1] - levels[i])
+            existente = next((s for s in soportes
+                              if abs(s["nivel"] - nivel) <= tolerancia), None)
+            if existente:
+                existente["rebotes"]      += 1
+                existente["fuerza_total"] += fuerza
+                existente["ultimos_idx"].append(i)
+                if nivel > existente["nivel"]: existente["nivel"] = nivel
+            else:
+                soportes.append({"nivel": nivel, "rebotes": 1,
+                                  "fuerza_total": fuerza,
+                                  "ultimos_idx": [i], "fuerte": False})
+
+    for i in range(ventana, len(levels) - ventana):
+        window = levels[i - ventana: i + ventana + 1]
+        maximo = max(window)
+        if (window.index(maximo) == ventana and
+                levels[i] > levels[i-1] and levels[i] > levels[i+1]):
+            nivel     = levels[i]
+            fuerza    = abs(levels[i-1] - levels[i]) + abs(levels[i+1] - levels[i])
+            existente = next((r for r in resistencias
+                              if abs(r["nivel"] - nivel) <= tolerancia), None)
+            if existente:
+                existente["rebotes"]      += 1
+                existente["fuerza_total"] += fuerza
+                existente["ultimos_idx"].append(i)
+                if nivel > existente["nivel"]: existente["nivel"] = nivel
+            else:
+                resistencias.append({"nivel": nivel, "rebotes": 1,
+                                      "fuerza_total": fuerza,
+                                      "ultimos_idx": [i], "fuerte": False})
+
+    soportes_val = [s for s in soportes if s["rebotes"] >= min_rebotes]
+    resist_val   = [r for r in resistencias if r["rebotes"] >= min_rebotes]
+
+    for s in soportes_val:
+        s["fuerte"] = s["rebotes"] >= 3 or s["fuerza_total"] >= 4
+    for r in resist_val:
+        r["fuerte"] = r["rebotes"] >= 3 or r["fuerza_total"] >= 4
+
+    soportes_final   = sorted(soportes_val,
+                               key=lambda x: x["ultimos_idx"][-1],
+                               reverse=True)[:max_niveles]
+    resistencias_final = sorted(resist_val,
+                                 key=lambda x: x["ultimos_idx"][-1],
+                                 reverse=True)[:max_niveles]
+
+    sup_simple = soportes_final[0]["nivel"]    if soportes_final    else None
+    res_simple = resistencias_final[0]["nivel"] if resistencias_final else None
+
+    return {
+        "supports":    soportes_final,
+        "resistances": resistencias_final,
+        "support":     sup_simple,
+        "resistance":  res_simple,
+    }
 
 # ─── CHART GENERATION ────────────────────────────────────────────────────────
 def generate_chart(levels: list, spin_history: list, bet_color: str,
@@ -1173,11 +1260,18 @@ class RouletteEngine:
         self.chat_id    = cfg["chat_id"]
         self.thread_id  = cfg["thread_id"]
         self.db_table   = cfg["db_table"]     # tabla de pre-entrenamiento
-        self.color_data = cfg["color_data"]
 
         self.spin_history:      list = []
-        self.original_levels:   list = []
-        self.inverted_levels:   list = []
+        # Niveles acumulados por categoría (para EMA independiente)
+        # COLOR
+        self.original_levels:   list = []   # +1 ROJO,  -1 NEGRO
+        self.inverted_levels:   list = []   # +1 NEGRO, -1 ROJO
+        # PARIDAD
+        self.par_levels:        list = []   # +1 PAR,   -1 IMPAR
+        self.impar_levels:      list = []   # +1 IMPAR, -1 PAR
+        # RANGO
+        self.alto_levels:       list = []   # +1 ALTO,  -1 BAJO
+        self.bajo_levels:       list = []   # +1 BAJO,  -1 ALTO
         self.last_nonzero_color: Optional[str] = None
         self.anti_block: set  = set()
 
@@ -1369,7 +1463,7 @@ class RouletteEngine:
         return out
 
     def get_entry(self, number: int) -> Optional[dict]:
-        return next((e for e in self.color_data if e["id"] == number), None)
+        return None  # color_data eliminada — señales basadas en EMA+ML
 
     def get_signal(self, number: int) -> Optional[str]:
         e = self.get_entry(number)
@@ -1438,84 +1532,116 @@ class RouletteEngine:
 
     def _evaluate_color_candidate(self) -> Optional[dict]:
         """
-        Evalúa COLOR vía AMX + should_activate.
+        Evalúa COLOR usando EMA pura (sin tabla predefinida).
+        Condiciones:
+          1. CategoryPredictor predice el color con ≥ min_prob_threshold
+          2. EMA confirma la señal (AMXSignalSystem.check_signal)
+          3. Markov/ML no contradicen (≥ 50% acuerdo)
         Retorna dict {category, bet_value, probability, trigger_number} o None.
         """
-        # Intenta AMX
-        signal = self._detect_amx_signal()
-        if signal:
-            if not self._passes_markov_ml_filter(signal["expected_color"]):
-                signal = None
+        trigger = self.spin_history[-1]["number"] if self.spin_history else 0
 
-        # Fallback should_activate
-        if not signal:
-            expected = self.should_activate()
-            if expected:
-                bet_color_candidate = self.determine_bet_color(expected)
-                if self._passes_markov_ml_filter(bet_color_candidate):
-                    prob = self.get_prob(
-                        self.spin_history[-1]["number"] if self.spin_history else 0,
-                        bet_color_candidate
-                    )
-                    return {
-                        "category":       "COLOR",
-                        "bet_value":      bet_color_candidate,
-                        "probability":    prob,
-                        "trigger_number": self.spin_history[-1]["number"] if self.spin_history else 0,
-                        "amx_signal":     None,
-                    }
+        # ── CategoryPredictor para COLOR ──────────────────────────────────────
+        cat_pred = self.category_ml.predict_category("COLOR")
+        if cat_pred is None:
+            return None
+        clean    = {k: v for k, v in cat_pred.items() if k != "total"}
+        if not clean:
+            return None
+        best_color = max(clean, key=clean.get)
+        cat_prob   = clean[best_color]
+        if cat_prob < self.min_prob_threshold:
             return None
 
-        prob = signal["probability"]
+        # ── EMA confirma la señal ─────────────────────────────────────────────
+        levels = self.original_levels if best_color == "ROJO" else self.inverted_levels
+        ema_sig = self.amx_system.check_signal(levels, best_color)
+        if not ema_sig:
+            return None
+        ema_sig["trigger_number"] = trigger
+
+        # ── Markov/ML no contradicen ──────────────────────────────────────────
+        if not self._passes_markov_ml_filter(best_color):
+            return None
+
+        # ── Probabilidad unificada ────────────────────────────────────────────
+        unified = self._get_category_probability("COLOR", best_color, trigger)
+        # Bonus de fuerza EMA sobre la probabilidad final
+        ema_bonus = 0.03 if ema_sig.get("strength") == "strong" else 0.0
+        final_prob = min(0.95, unified["combined_prob"] + ema_bonus)
+
         return {
             "category":       "COLOR",
-            "bet_value":      signal["expected_color"],
-            "probability":    prob,
-            "trigger_number": signal["trigger_number"],
-            "amx_signal":     signal,
+            "bet_value":      best_color,
+            "probability":    final_prob,
+            "trigger_number": trigger,
+            "amx_signal":     ema_sig,
+            "ema_score":      ema_sig.get("score", 0),
         }
 
     def _detect_best_category_signal(self) -> Optional[dict]:
         """
-        Evalúa las 3 categorías usando CategoryPredictor (16 combos por categoría).
-        Selecciona la sub-categoría (COLOR / PARIDAD / RANGO) con mayor probabilidad.
-        El candidato COLOR también debe pasar el filtro AMX/Markov para ser válido.
-        """
-        candidates = []
-        trigger_number = self.spin_history[-1]["number"] if self.spin_history else 0
+        Evalúa las 3 categorías (COLOR / PARIDAD / RANGO) con máxima calidad.
+        Sin tabla de color predefinida — todo basado en EMA + CategoryPredictor + Markov.
 
-        # ── Evaluar las 3 sub-categorías desde el combo predictor ─────────────
-        for cat in ("COLOR", "PARIDAD", "RANGO"):
+        Para cada categoría calcula un score de confianza compuesto:
+          score = cat_prob × ema_factor × markov_agreement
+        Retorna el candidato con mayor score que supere min_prob_threshold.
+        """
+        candidates   = []
+        trigger      = self.spin_history[-1]["number"] if self.spin_history else 0
+
+        # ── COLOR — evaluación con EMA + CategoryPredictor ───────────────────
+        color_cand = self._evaluate_color_candidate()
+        if color_cand:
+            candidates.append(color_cand)
+
+        # ── PARIDAD y RANGO — CategoryPredictor + Markov agreemement ─────────
+        for cat in ("PARIDAD", "RANGO"):
             cand = self._evaluate_ml_category(cat)
             if cand is None:
                 continue
-            # COLOR: además debe pasar el filtro AMX / Markov
-            if cat == "COLOR":
-                if not self._passes_markov_ml_filter(cand["bet_value"]):
-                    # Intentar también vía AMX clásico
-                    amx_cand = self._evaluate_color_candidate()
-                    if amx_cand:
-                        candidates.append(amx_cand)
-                    continue
-            candidates.append(cand)
 
-        # ── Fallback: si no hay candidato COLOR del combo, probar AMX/should_activate
-        if not any(c["category"] == "COLOR" for c in candidates):
-            amx_cand = self._evaluate_color_candidate()
-            if amx_cand:
-                candidates.append(amx_cand)
+            # Refuerzo con Markov de COLOR si el predictor tiene suficientes datos
+            # (COLOR y PARIDAD están correlacionados por los pares rojo/negro)
+            markov_factor = 1.0
+            mp = self.markov.predict(self.spin_history)
+            if mp:
+                # Si Markov apoya fuertemente algún color → señal más confiable
+                top_markov = max(mp.values())
+                if top_markov >= 0.60:
+                    markov_factor = 1.05
+
+            adjusted_prob = min(0.95, cand["probability"] * markov_factor)
+            cand["probability"] = adjusted_prob
+            candidates.append(cand)
 
         if not candidates:
             return None
-        return max(candidates, key=lambda x: x["probability"])
+
+        # ── Elegir el candidato con mayor probabilidad ────────────────────────
+        best = max(candidates, key=lambda x: x["probability"])
+        if best["probability"] < self.min_prob_threshold:
+            return None
+        return best
 
     def _detect_best_in_category(self, category: str) -> Optional[dict]:
         """
         Evalúa SOLO la categoría activa para reintentos.
+        Para COLOR: re-evalúa con EMA+CategoryPredictor.
+        Para PARIDAD/RANGO: re-evalúa CategoryPredictor con ajuste Markov.
         """
         if category == "COLOR":
             return self._evaluate_color_candidate()
-        return self._evaluate_ml_category(category)
+        cand = self._evaluate_ml_category(category)
+        if cand is None:
+            return None
+        mp = self.markov.predict(self.spin_history)
+        if mp:
+            top_markov = max(mp.values())
+            if top_markov >= 0.60:
+                cand["probability"] = min(0.95, cand["probability"] * 1.05)
+        return cand if cand["probability"] >= self.min_prob_threshold else None
 
     # ─── FILTROS ─────────────────────────────────────────────────────────────
     def _get_predictor_votes(self, color: str) -> int:
@@ -1587,34 +1713,24 @@ class RouletteEngine:
 
     # ─── DETECCIÓN AMX / SHOULD_ACTIVATE ─────────────────────────────────────
     def _detect_amx_signal(self) -> Optional[dict]:
-        if len(self.amx_system.ultimos_puntos) < 20: return None
-        current_number = self.spin_history[-1]["number"] if self.spin_history else 0
-        entry = self.get_entry(current_number)
-        if not entry or entry["senal"] == "NO APOSTAR": return None
-        expected_color = entry["senal"]
-        recent_colors = [s["real"] for s in self.spin_history[-5:]]
-        momentum = sum(1 for c in reversed(recent_colors)
-                       if c == expected_color or (c == "VERDE" and False))
-        actual_momentum = 0
-        for c in reversed(recent_colors):
-            if c == expected_color: actual_momentum += 1
-            elif c != "VERDE": break
-        if actual_momentum < 2: return None
-        try:
-            if self.amx_system.mode == "tendencia":
-                signal = self.amx_system.check_signal_tendencia(
-                    self.amx_system.ultimos_puntos, self.color_data,
-                    current_number, expected_color, self.min_prob_threshold)
-            else:
-                signal = self.amx_system.check_signal_moderado(
-                    self.amx_system.ultimos_puntos, self.color_data,
-                    current_number, expected_color, self.min_prob_threshold)
-        except Exception as e:
-            logger.warning(f"[{self.name}] Error AMX: {e}")
-            return None
-        if signal:
-            signal["predictor_votes"] = self._get_predictor_votes(expected_color)
-        return signal
+        """
+        Detecta señal AMX usando EMA pura, sin tabla de color.
+        Prueba ROJO (original_levels) y NEGRO (inverted_levels).
+        Retorna la señal del color con mayor score EMA.
+        """
+        if len(self.original_levels) < 20: return None
+        best_sig = None
+        for color, levels in [("ROJO", self.original_levels),
+                               ("NEGRO", self.inverted_levels)]:
+            sig = self.amx_system.check_signal(levels, color)
+            if sig is None: continue
+            trigger = self.spin_history[-1]["number"] if self.spin_history else 0
+            sig["trigger_number"] = trigger
+            sig["expected_color"] = color
+            if best_sig is None or sig["score"] > best_sig["score"]:
+                best_sig = sig
+        return best_sig
+
 
     def should_activate(self) -> Optional[str]:
         losses   = self.consec_losses
@@ -1692,11 +1808,11 @@ class RouletteEngine:
         self.unified_prob_system.update_weights()
 
     def _get_unified_probability(self, color: str, trigger_number: int) -> dict:
-        table_prob  = self.get_prob(trigger_number, color)
+        """Sin tabla: usa solo Markov/ML para COLOR."""
         markov_pred = self.markov.predict(self.spin_history)
         ml_pred     = self.ml_predictor.predict(self.spin_history)
         return self.unified_prob_system.get_joint_probability(
-            markov_pred, ml_pred, color, table_prob)
+            "COLOR", color, markov_pred, ml_pred, None)
 
     def _get_category_probability(self, category: str, bet_value: str,
                                   trigger_number: int) -> dict:
@@ -1708,7 +1824,7 @@ class RouletteEngine:
         prob = pred.get(bet_value, 0.5) if pred else 0.5
         return {
             "combined_prob": prob, "markov_prob": 0.5, "ml_prob": prob,
-            "table_prob": prob, "confidence": 0.6,
+            "confidence": 0.6,
             "threshold": self.min_prob_threshold, "signal_strength": "moderate",
             "weights": self.unified_prob_system.weights.copy(),
             "ema_trend_factor": 1.0, "sr_factor": 1.0, "volatility": 1.0,
@@ -1982,6 +2098,12 @@ class RouletteEngine:
         self.markov.update(self.spin_history)
         self.ml_predictor.add_spin(self.spin_history)
         self.category_ml.add_spin(number, real)
+        # Mejoras Mega: streak + volatilidad + factores EMA/SR + pesos adaptativos
+        self.unified_prob_system.update_streak(real)
+        _lv = self.original_levels if real == "ROJO" else self.inverted_levels
+        self.unified_prob_system.calculate_volatility(_lv)
+        self.unified_prob_system.update_trend_factors(_lv)
+        self.unified_prob_system.update_weights()
 
         # ── Control de calentamiento WS ───────────────────────────────────────
         if not self.warmup_done:
@@ -2065,7 +2187,12 @@ class RouletteEngine:
             attempt_number = self.waiting_attempt_number
             # Re-evaluar TODAS las categorías y elegir la de mayor probabilidad ≥ 60%
             best = self._detect_best_category_signal()
-            if best and best["probability"] >= self.min_prob_threshold:
+            if not best or best["probability"] < self.min_prob_threshold:
+                ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
+                ord_str = ords.get(attempt_number, f"{attempt_number}°")
+                tg_send_text(self.bot, self.chat_id, self.thread_id,
+                             f"🔔 Sin confirmación para enviar señal para el intento {ord_str}")
+            elif best and best["probability"] >= self.min_prob_threshold:
                 unified_prob = self._get_category_probability(
                     best["category"], best["bet_value"], number)
                 # Verificar umbral 60% en probabilidad unificada
@@ -2073,6 +2200,10 @@ class RouletteEngine:
                     logger.debug(
                         f"[{self.name}] Reintento descartado [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
+                    ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
+                    ord_str = ords.get(attempt_number, f"{attempt_number}°")
+                    tg_send_text(self.bot, self.chat_id, self.thread_id,
+                                 f"🔔 Sin confirmación para enviar señal para el intento {ord_str}")
                 else:
                     self.active_category    = best["category"]
                     self.bet_value          = best["bet_value"]
@@ -2200,16 +2331,24 @@ def health():
 
 # ─── SELF-PING ────────────────────────────────────────────────────────────────
 async def self_ping_loop():
-    port     = int(os.environ.get("PORT", 10000))
-    url      = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
+    """
+    Self-ping cada 4 minutos — anti-sleep Render Free.
+    Render duerme tras 15 min sin tráfico; 4 min garantiza continuidad.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        logger.warning("[KeepAlive] RENDER_EXTERNAL_URL no definida — self-ping inactivo")
+        return
     ping_url = f"{url}/ping"
+    logger.info(f"[KeepAlive] ✅ Self-ping activo → {ping_url} cada 4 min")
+    await asyncio.sleep(30)
     while True:
-        await asyncio.sleep(300)
         try:
-            with urllib.request.urlopen(ping_url, timeout=10) as r:
-                logger.info(f"Self-ping OK: {r.status}")
+            with urllib.request.urlopen(ping_url, timeout=15) as r:
+                logger.info(f"[KeepAlive] 🟢 OK [{r.status}] → {ping_url}")
         except Exception as e:
-            logger.warning(f"Self-ping failed: {e}")
+            logger.warning(f"[KeepAlive] ❌ Falló → {ping_url}: {e}")
+        await asyncio.sleep(240)   # 4 minutos
 
 # ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
 engines: dict[str, RouletteEngine] = {}
@@ -2324,15 +2463,15 @@ async def main():
     tasks.append(asyncio.create_task(self_ping_loop()))
 
     # Registrar handlers y lanzar polling independiente para cada bot
-    _register_handlers(bot_russian)
+    _register_handlers(bot)
 
     def _poll(b: telebot.TeleBot, label: str):
         logger.info(f"Iniciando polling Telegram — {label}")
         b.polling(none_stop=True, interval=1, timeout=30)
 
-    threading.Thread(target=_poll, args=(bot_russian, "Russian"), daemon=True).start()
+    threading.Thread(target=_poll, args=(bot, "Russian"), daemon=True).start()
 
-    logger.info("🎰 Roulette Bot AMX UNIFIED iniciado (Russian Roulette)")
+    logger.info("🎰 Russian Roulette Bot AMX iniciado")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
