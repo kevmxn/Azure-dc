@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
@@ -14,6 +13,7 @@ Roulette Telegram Signal Bot - Sistema AMX UNIFIED
       · DOCENAS / COLUMNAS → 2 intentos
       · Estadísticas separadas: COLOR+PARIDAD+RANGO (CPR) y DOCENAS+COLUMNAS (DC)
       · Mensajes "Sin confirmación" se reemplazan, solo uno visible en cada momento
+      · FIX: trigger_number asignado correctamente en estado Idle
 """
 
 import asyncio
@@ -2107,7 +2107,6 @@ class RouletteEngine:
             if not best or best["probability"] < self.min_prob_threshold:
                 ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
                 ord_str = ords.get(attempt_number, f"{attempt_number}°")
-                # Borrar mensaje anterior de "Sin confirmación" si existe
                 if self.no_confirmation_msg_id:
                     tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
                 msg = tg_send_text(self.bot, self.chat_id, self.thread_id,
@@ -2130,7 +2129,6 @@ class RouletteEngine:
                     if msg:
                         self.no_confirmation_msg_id = msg
                 else:
-                    # Borrar cualquier mensaje de "Sin confirmación" previo
                     if self.no_confirmation_msg_id:
                         tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
                         self.no_confirmation_msg_id = None
@@ -2158,6 +2156,8 @@ class RouletteEngine:
                 self.bet_value       = best["bet_value"]
                 self.signal_pair     = best.get("signal_pair", ())
                 self.bet_color       = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
+                # ✅ CORRECCIÓN: asignar trigger_number explícitamente
+                self.trigger_number  = number
                 _max = cat_max(best["category"])
                 self.attempts_left   = _max
                 self.total_attempts  = _max
