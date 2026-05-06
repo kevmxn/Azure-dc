@@ -124,8 +124,8 @@ CATEGORY_ICONS = {
     "PAR":  "🟣", "IMPAR": "🟡",
     "BAJO": "🟤", "ALTO":  "🔵",
     "VERDE": "🟢",
-    "D1": "🟡", "D2": "🔵", "D3": "🔴",
-    "C1": "🟡", "C2": "🔵", "C3": "🔴",
+    "D1": "🟡", "D2": "🔵", "D3": "🟠",
+    "C1": "🟡", "C2": "🔵", "C3": "🟠",
 }
 
 RUSSIAN_COLOR_DATA = [
@@ -2039,7 +2039,7 @@ class RouletteEngine:
         trig_disp = self._trigger_display(self.trigger_number, self.active_category)
         return (
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
-            f"🎰 Juego: {self.name}\n"
+            f"🎰 Juego: {self.name}\n\n"
             f"👉 Después de: {trig_disp}\n"
             f"🧨 Apostar a: <b>{self.bet_value}</b> {val_icon}\n\n"
             f"💡 Probabilidad: {prob_pct}%\n"
@@ -2084,8 +2084,8 @@ class RouletteEngine:
         return (
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
             f"🎰 {self.name}\n"
-            f"🧨 Después de: {trig_disp}\n"
-            f"🎯 Apostar a: {apuesta_str}\n\n"
+            f"👉 Después de: {trig_disp}\n"
+            f"🧨 Apostar a: {apuesta_str}\n\n"
             f"💡 Probabilidad: {prob_pct}%\n"
             f"🎲 Labouchère: [{self.bet_sys.sequence_display()}]\n"
             f"📍 Apuesta: {bet:.2f} usd\n"
@@ -2235,4 +2235,461 @@ class RouletteEngine:
             logger.error(f"[{self.name}] ❌ Error en process_number({number}): {e}", exc_info=True)
             if self.signal_active:
                 self.signal_active       = False
-               
+                self.waiting_for_attempt = False
+                self.attempts_left       = MAX_ATTEMPTS
+
+    def _process_number_inner(self, number: int):
+        real = REAL_COLOR_MAP.get(number, "VERDE")
+
+        # Persistir giro en SQLite (estado 24/7)
+        self._persist_spin(number)
+
+        # Limpieza semanal (cada ~5000 giros)
+        if len(self.spin_history) > 0 and len(self.spin_history) % 5000 == 0:
+            self._cleanup_old_live_spins()
+
+        # Actualizar historial
+        self.spin_history.append({"number": number, "real": real})
+        if len(self.spin_history) > 300:
+            self.spin_history.pop(0)
+        self.result_sequence.append({"number": number, "real": real})
+
+        # Niveles acumulados — 5 categorías
+        if number == 0:
+            self.rojo_levels.append(self.rojo_levels[-1] if self.rojo_levels else 0)
+            self.negro_levels.append(self.negro_levels[-1] if self.negro_levels else 0)
+            self.par_levels.append(self.par_levels[-1] if self.par_levels else 0)
+            self.impar_levels.append(self.impar_levels[-1] if self.impar_levels else 0)
+            self.alto_levels.append(self.alto_levels[-1] if self.alto_levels else 0)
+            self.bajo_levels.append(self.bajo_levels[-1] if self.bajo_levels else 0)
+            self.d1_levels.append(self.d1_levels[-1] if self.d1_levels else 0)
+            self.d2_levels.append(self.d2_levels[-1] if self.d2_levels else 0)
+            self.d3_levels.append(self.d3_levels[-1] if self.d3_levels else 0)
+            self.c1_levels.append(self.c1_levels[-1] if self.c1_levels else 0)
+            self.c2_levels.append(self.c2_levels[-1] if self.c2_levels else 0)
+            self.c3_levels.append(self.c3_levels[-1] if self.c3_levels else 0)
+        else:
+            par    = get_paridad(number)
+            rang   = get_rango(number)
+            dozen  = get_dozen(number)
+            column = get_column(number)
+            self.rojo_levels.append((self.rojo_levels[-1] if self.rojo_levels else 0) + (1 if real=="ROJO"  else -1))
+            self.negro_levels.append((self.negro_levels[-1] if self.negro_levels else 0) + (1 if real=="NEGRO" else -1))
+            self.par_levels.append((self.par_levels[-1] if self.par_levels else 0)     + (1 if par=="PAR"   else -1))
+            self.impar_levels.append((self.impar_levels[-1] if self.impar_levels else 0) + (1 if par=="IMPAR" else -1))
+            self.alto_levels.append((self.alto_levels[-1] if self.alto_levels else 0)  + (1 if rang=="ALTO" else -1))
+            self.bajo_levels.append((self.bajo_levels[-1] if self.bajo_levels else 0)  + (1 if rang=="BAJO" else -1))
+            self.d1_levels.append((self.d1_levels[-1] if self.d1_levels else 0) + (1 if dozen==1 else -1))
+            self.d2_levels.append((self.d2_levels[-1] if self.d2_levels else 0) + (1 if dozen==2 else -1))
+            self.d3_levels.append((self.d3_levels[-1] if self.d3_levels else 0) + (1 if dozen==3 else -1))
+            self.c1_levels.append((self.c1_levels[-1] if self.c1_levels else 0) + (1 if column==1 else -1))
+            self.c2_levels.append((self.c2_levels[-1] if self.c2_levels else 0) + (1 if column==2 else -1))
+            self.c3_levels.append((self.c3_levels[-1] if self.c3_levels else 0) + (1 if column==3 else -1))
+            self.last_nonzero_color = real
+
+        while len(self.rojo_levels) > len(self.spin_history):
+            self.rojo_levels.pop(0)
+        while len(self.negro_levels) > len(self.spin_history):
+            self.negro_levels.pop(0)
+        min_len = min(len(self.rojo_levels), len(self.negro_levels))
+        self.rojo_levels = self.rojo_levels[-min_len:]
+        self.negro_levels = self.negro_levels[-min_len:]
+
+        # AMX y rachas
+        self._update_amx_positions(real)
+        self.amx_system.update_streak(real, self.get_signal(number))
+        if self.signal_active or self.waiting_for_attempt:
+            ref_color = self.bet_value if self.active_category == "COLOR" else "ROJO"
+            self._update_unified_system(ref_color)
+        if real != "VERDE":
+            self.unified_prob_system.update_streak(real)
+
+        # Actualizar predictores
+        self.markov.update(self.spin_history)
+        self.ml_predictor.add_spin(self.spin_history)
+        self.category_ml.add_spin(number, real)
+        # Mejoras Mega: streak + volatilidad + factores EMA/SR + pesos adaptativos
+        self.unified_prob_system.update_streak(real)
+        _lv = self.rojo_levels if real == "ROJO" else self.negro_levels
+        self.unified_prob_system.calculate_volatility(_lv)
+        self.unified_prob_system.update_trend_factors(_lv)
+        self.unified_prob_system.update_weights()
+
+        # ── Control de calentamiento WS ───────────────────────────────────────
+        if not self.warmup_done:
+            self.ws_spins_count += 1
+            if self.ws_spins_count < WARMUP_SPINS:
+                logger.info(f"[{self.name}] Calentamiento WS: {self.ws_spins_count}/{WARMUP_SPINS} giros")
+                return
+            # Umbral alcanzado → activar señales
+            self.warmup_done = True
+            logger.info(f"[{self.name}] ✅ Calentamiento completado. Iniciando señales.")
+            tg_send_text(self.bot, self.chat_id, self.thread_id,
+                         f"🟢 <b>{self.name}</b> — Sistema listo. Emitiendo señales.")
+
+        # ══════════════════════════════════════════════════════════════════════
+        #  MÁQUINA DE ESTADOS
+        # ══════════════════════════════════════════════════════════════════════
+
+        # ── ESTADO 1: Señal activa ─────────────────────────────────────────
+        if self.signal_active:
+            result = self._is_win(number, real)
+
+            # Verde → esperar
+            if result is None:
+                self.attempts_left -= 1
+                if self.attempts_left <= 0:
+                    # Contar como pérdida
+                    self._handle_full_loss(number, real)
+                    return
+                attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
+                self.signal_active = False
+                self.waiting_for_attempt = True
+                self.waiting_attempt_number = attempt_number
+                self.skip_one_after_zero = True
+                self._send_waiting_message(attempt_number)
+                return
+
+            current_attempt = MAX_ATTEMPTS - self.attempts_left + 1
+
+            if result:
+                # ── GANAMOS ───────────────────────────────────────────────
+                bet = self.bet_sys.win()
+                self.stats.record_signal_result(current_attempt, True, bet, self.bet_sys.bankroll)
+                if self.active_category == "COLOR":
+                    self._record_prediction_result(self.bet_value, real)
+                self.signal_active   = False
+                self.active_category = None
+                self._check_recovery()
+                self._send_result(number, real, True, bet, current_attempt)
+                self._check_daily_report()
+                self._check_stats()
+                self.signal_msg_ids = []
+            else:
+                # ── PERDEMOS ──────────────────────────────────────────────
+                self.attempts_left -= 1
+                bet = self.bet_sys.loss()
+                if self.attempts_left <= 0:
+                    self._handle_full_loss(number, real, bet)
+                else:
+                    attempt_number = MAX_ATTEMPTS - self.attempts_left + 1
+                    chosen = self._best_retry_value(number)
+                    if chosen is not None:
+                        self.bet_value      = chosen
+                        self.trigger_number = number
+                        unified_prob = self._get_category_probability(
+                            self.active_category, chosen, number)
+                        self._send_signal(attempt_number, unified_prob)
+                    else:
+                        self.signal_active          = False
+                        self.waiting_for_attempt    = True
+                        self.waiting_attempt_number = attempt_number
+                        self._send_waiting_message(attempt_number)
+
+        # ── ESTADO 2: Esperando condiciones para intento 2/3 ──────────────
+        elif self.waiting_for_attempt:
+            if real == "VERDE":
+                self.skip_one_after_zero = True
+                return
+            if self.skip_one_after_zero:
+                self.skip_one_after_zero = False
+                return
+            attempt_number = self.waiting_attempt_number
+            # Re-evaluar TODAS las categorías y elegir la de mayor probabilidad ≥ 60%
+            best = self._detect_best_category_signal()
+            if not best or best["probability"] < self.min_prob_threshold:
+                ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
+                ord_str = ords.get(attempt_number, f"{attempt_number}°")
+                tg_send_text(self.bot, self.chat_id, self.thread_id,
+                             f"🔔 Sin confirmación para enviar señal para el intento {ord_str}")
+            elif best and best["probability"] >= self.min_prob_threshold:
+                unified_prob = self._get_category_probability(
+                    best["category"], best["bet_value"], number)
+                # Verificar umbral 60% en probabilidad unificada
+                if unified_prob["combined_prob"] < self.min_prob_threshold:
+                    logger.debug(
+                        f"[{self.name}] Reintento descartado [{best['category']}] "
+                        f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
+                    ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
+                    ord_str = ords.get(attempt_number, f"{attempt_number}°")
+                    tg_send_text(self.bot, self.chat_id, self.thread_id,
+                                 f"🔔 Sin confirmación para enviar señal para el intento {ord_str}")
+                else:
+                    self.active_category    = best["category"]
+                    self.bet_value          = best["bet_value"]
+                    self.bet_color          = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
+                    self.trigger_number     = number
+                    self.signal_active      = True
+                    self.waiting_for_attempt = False
+                    self._send_signal(attempt_number, unified_prob)
+
+        # ── ESTADO 3: Idle – buscar señal ────────────────────────────────
+        else:
+            self.signal_msg_ids = []
+            best = self._detect_best_category_signal()
+            if best:
+                unified_prob = self._get_category_probability(
+                    best["category"], best["bet_value"], best["trigger_number"])
+                # Verificar umbral 60% antes de emitir
+                if unified_prob["combined_prob"] < self.min_prob_threshold:
+                    logger.debug(
+                        f"[{self.name}] Señal descartada [{best['category']}] "
+                        f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
+                    return
+                self.signal_active   = True
+                self.active_category = best["category"]
+                self.bet_value       = best["bet_value"]
+                self.signal_pair     = best.get("signal_pair", ())
+                self.bet_color       = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
+                _max = cat_max(best["category"])
+                self.attempts_left   = _max
+                self.total_attempts  = _max
+                self._send_signal(1, unified_prob)
+                self.amx_system.register_signal_sent()
+
+    def _handle_full_loss(self, number: int, real: str, bet: float = None):
+        """Maneja la pérdida final (3er intento fallido o verde agotando intentos)."""
+        if bet is None:
+            bet = self.bet_sys.loss()
+        self.consec_losses += 1
+        if self.consec_losses >= 10:
+            self.consec_losses = 0
+            self.recovery_active = False
+            self.recovery_target = 0.0
+        else:
+            self.recovery_active = True
+            self.recovery_target = self.level1_bankroll + BASE_BET
+        self.stats.record_signal_result(0, False, bet, self.bet_sys.bankroll)
+        if self.active_category == "COLOR":
+            self._record_prediction_result(self.bet_value, real)
+        self.signal_active   = False
+        self.active_category = None
+        self._send_result(number, real, False, bet, 0)
+        self._check_daily_report()
+        self._check_stats()
+        self.signal_msg_ids = []
+
+    # ─── WEBSOCKET ────────────────────────────────────────────────────────────
+    async def run_ws(self):
+        reconnect_delay = 5
+        while self.running:
+            try:
+                async with websockets.connect(
+                    WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10
+                ) as ws:
+                    self.ws = ws
+                    reconnect_delay = 5
+                    logger.info(f"[{self.name}] WS conectado")
+                    await ws.send(json.dumps({
+                        "type": "subscribe", "casinoId": CASINO_ID,
+                        "currency": "USD", "key": [self.ws_key],
+                    }))
+                    async for message in ws:
+                        if not self.running: break
+                        try:
+                            data = json.loads(message)
+                        except Exception:
+                            continue
+                        if "last20Results" in data and isinstance(data["last20Results"], list):
+                            tmp = []
+                            for r in data["last20Results"]:
+                                gid = r.get("gameId")
+                                num = r.get("result")
+                                if gid and num is not None:
+                                    try: n = int(num)
+                                    except: continue
+                                    if 0 <= n <= 36 and gid not in self.anti_block:
+                                        tmp.append((gid, n))
+                                        self.anti_block.add(gid)
+                                        if len(self.anti_block) > 1000:
+                                            self.anti_block.clear()
+                            for gid, n in reversed(tmp):
+                                self.process_number(n)
+                        gid = data.get("gameId")
+                        res = data.get("result")
+                        if gid and res is not None:
+                            try: n = int(res)
+                            except: continue
+                            if 0 <= n <= 36 and gid not in self.anti_block:
+                                if len(self.anti_block) > 1000:
+                                    self.anti_block.clear()
+                                self.anti_block.add(gid)
+                                self.process_number(n)
+            except Exception as e:
+                logger.warning(f"[{self.name}] WS desconectado: {e}. Recon en {reconnect_delay}s")
+                try:
+                    tg_send_text(self.bot, self.chat_id, self.thread_id,
+                                 f"⚠️ <b>{self.name}</b> — Conexión perdida. Reconectando en {reconnect_delay}s...")
+                except Exception:
+                    pass
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60)
+
+# ─── FLASK KEEPALIVE ──────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "bot": "Roulette Signal Bot AMX V22", "ts": time.time()})
+
+@app.route("/ping")
+def ping():
+    return jsonify({"pong": True, "ts": time.time()})
+
+@app.route("/health")
+def health():
+    return jsonify({"healthy": True})
+
+# ─── SELF-PING ────────────────────────────────────────────────────────────────
+async def self_ping_loop():
+    """
+    Self-ping cada 4 minutos — anti-sleep Render Free.
+    Render duerme tras 15 min sin tráfico; 4 min garantiza continuidad.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        logger.warning("[KeepAlive] RENDER_EXTERNAL_URL no definida — self-ping inactivo")
+        return
+    ping_url = f"{url}/ping"
+    logger.info(f"[KeepAlive] ✅ Self-ping activo → {ping_url} cada 4 min")
+    await asyncio.sleep(30)
+    while True:
+        try:
+            with urllib.request.urlopen(ping_url, timeout=15) as r:
+                logger.info(f"[KeepAlive] 🟢 OK [{r.status}] → {ping_url}")
+        except Exception as e:
+            logger.warning(f"[KeepAlive] ❌ Falló → {ping_url}: {e}")
+        await asyncio.sleep(240)   # 4 minutos
+
+# ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
+engines: dict[str, RouletteEngine] = {}
+
+def _register_handlers(b: telebot.TeleBot):
+    """Registra los comandos de control en un bot dado."""
+
+    @b.message_handler(commands=['start', 'help'])
+    def cmd_start(message):
+        seq = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
+        help_text = f"""
+<b>🎰 Roulette Bot AMX UNIFIED</b>
+Russian Roulette
+
+<b>Características:</b>
+• Sin cooldown entre señales
+• 5 intentos por señal (Labouchère)
+• Secuencia actual: <code>{seq}</code>
+• Calentamiento WS: 21 giros silenciosos
+• Gráficos por categoría: COLOR 🔴⚫️ | PARIDAD 🟣🟡 | RANGO 🟤🔵
+• Pre-entrenamiento con DB histórica (~16k giros/tabla)
+
+Comandos:
+/moderado - Modo MODERADO
+/tendencia - Modo TENDENCIA
+/status - Estado de ruletas
+/secuencia 1 2 1 - Cambiar secuencia Labouchère
+/reset - Resetear estadísticas
+/help - Esta ayuda
+        """
+        b.reply_to(message, help_text, parse_mode="HTML")
+
+    @b.message_handler(commands=['moderado'])
+    def cmd_moderado(message):
+        for engine in engines.values():
+            engine.set_mode("moderado")
+        b.reply_to(message, "✅ <b>Modo MODERADO activado</b>", parse_mode="HTML")
+
+    @b.message_handler(commands=['tendencia'])
+    def cmd_tendencia(message):
+        for engine in engines.values():
+            engine.set_mode("tendencia")
+        b.reply_to(message, "📈 <b>Modo TENDENCIA activado</b>", parse_mode="HTML")
+
+    @b.message_handler(commands=['status'])
+    def cmd_status(message):
+        lines = ["<b>📊 ESTADO AMX UNIFIED</b>\n"]
+        for name, engine in engines.items():
+            mode_icon = "📈" if engine.amx_system.mode == "tendencia" else "📊"
+            if engine.signal_active:
+                cat  = engine.active_category or "?"
+                val  = engine.bet_value or "?"
+                icon = CATEGORY_ICONS.get(val, "")
+                st   = f"🟢 [{cat}] {val}{icon} intento {engine.total_attempts - engine.attempts_left + 1}/{engine.total_attempts}"
+            elif engine.waiting_for_attempt:
+                st = f"⏳ Esperando intento {engine.waiting_attempt_number}/{engine.total_attempts}"
+            else:
+                st = "⚪ Idle"
+            w = engine.unified_prob_system.weights
+            lines.append(f"<b>{name}</b>: {mode_icon} — {st} [M:{w['markov']:.2f} ML:{w['ml']:.2f}]")
+        b.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
+    @b.message_handler(commands=['secuencia'])
+    def cmd_secuencia(message):
+        global LABOUCHERE_SEQUENCE
+        parts = message.text.strip().split()[1:]   # descarta "/secuencia"
+        if not parts:
+            seq_str = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
+            b.reply_to(message,
+                f"🎲 Secuencia actual: <code>{seq_str}</code>\n"
+                f"Uso: /secuencia 1 2 1",
+                parse_mode="HTML")
+            return
+        try:
+            new_seq = [int(x) for x in parts if int(x) > 0]
+            if not new_seq:
+                raise ValueError("secuencia vacía")
+        except ValueError:
+            b.reply_to(message,
+                "⚠️ Formato inválido. Usa números enteros positivos.\n"
+                "Ejemplo: <code>/secuencia 1 2 3 2 1</code>",
+                parse_mode="HTML")
+            return
+        LABOUCHERE_SEQUENCE = new_seq
+        for engine in engines.values():
+            engine.bet_sys.set_sequence(new_seq)
+        seq_str = " - ".join(str(v) for v in new_seq)
+        total_units = sum(new_seq)
+        b.reply_to(message,
+            f"✅ <b>Secuencia Labouchère actualizada</b>\n\n"
+            f"🎲 Nueva secuencia: <code>{seq_str}</code>\n"
+            f"💰 Apuesta inicial: {(new_seq[0]+new_seq[-1])*BASE_BET:.2f} usd "
+            f"({new_seq[0]+new_seq[-1]} unidades)\n"
+            f"📊 Total a recuperar: {total_units*BASE_BET:.2f} usd ({total_units} unidades)",
+            parse_mode="HTML")
+
+    @b.message_handler(commands=['reset'])
+    def cmd_reset(message):
+        for engine in engines.values():
+            engine.stats = DetailedStats()
+        b.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+async def main():
+    global engines
+    engines = {name: RouletteEngine(name, cfg) for name, cfg in ROULETTE_CONFIGS.items()}
+    tasks   = [asyncio.create_task(e.run_ws()) for e in engines.values()]
+    tasks.append(asyncio.create_task(self_ping_loop()))
+
+    # Registrar handlers y lanzar polling independiente para cada bot
+    _register_handlers(bot)
+
+    def _poll(b: telebot.TeleBot, label: str):
+        logger.info(f"Iniciando polling Telegram — {label}")
+        b.polling(none_stop=True, interval=1, timeout=30)
+
+    threading.Thread(target=_poll, args=(bot, "Russian"), daemon=True).start()
+
+    logger.info("🎰 Russian Roulette Bot AMX iniciado")
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped.")
