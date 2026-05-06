@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
@@ -61,10 +60,6 @@ _session.mount("http://",  _adapter)
 bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
-
-
-
-
 # ─── DB CONFIG ────────────────────────────────────────────────────────────────
 DB_PATH       = "russian-azure.db"   # dump SQL histórico
 LIVE_DB_PATH  = "russian_live.db"    # SQLite persistente de giros en vivo
@@ -107,7 +102,6 @@ def get_rango(number: int) -> Optional[str]:
     if number == 0:
         return None
     return "BAJO" if 1 <= number <= 18 else "ALTO"
-
 
 def get_dozen(n: int) -> int:
     """0=VERDE, 1=D1(1-12), 2=D2(13-24), 3=D3(25-36)"""
@@ -167,7 +161,6 @@ RUSSIAN_COLOR_DATA = [
     {"id": 35, "rojo": 0.40, "negro": 0.56, "senal": "NEGRO"},
     {"id": 36, "rojo": 0.40, "negro": 0.56, "senal": "NEGRO"},
 ]
-
 
 # ─── PARES DOCENA / COLUMNA ───────────────────────────────────────────────────
 DOZEN_PAIRS  = {1:(2,3), 2:(1,3), 3:(1,2)}
@@ -452,328 +445,6 @@ class CategoryPredictor:
     def rang_history(self) -> list:
         return list(self._hist["RANGO"])
 
-class UnifiedProbabilitySystem:
-    """
-    Combina Markov y ML con pesos adaptativos.
-    Pesos iniciales: Markov=0.35, ML=0.65 (más peso al ML).
-    """
-    def __init__(self):
-        self.weights = {"markov": 0.35, "ml": 0.65}
-        self.prediction_history: deque = deque(maxlen=200)
-        self.markov_correct: int = 0
-        self.markov_total:   int = 0
-        self.ml_correct:     int = 0
-        self.ml_total:       int = 0
-        self.confidence_factor: float = 0.5
-        self.volatility:        float = 1.0
-        self.current_streak:    int   = 0
-        self.streak_direction: Optional[str] = None
-        self.spins_since_weight_update: int = 0
-        self.WEIGHT_UPDATE_INTERVAL:    int = 50
-        self.base_threshold:    float = 0.50
-        self.dynamic_threshold: float = 0.50
-        self.ema_trend_factor:  float = 1.0
-        self.sr_factor:         float = 1.0
-
-    def calculate_volatility(self, levels: list) -> float:
-        if len(levels) < 20:
-            return 1.0
-        std_dev = np.std(levels[-20:])
-        normalized = min(max(std_dev / 5.0, 0.5), 1.5)
-        self.volatility = normalized
-        return normalized
-
-    def update_streak(self, color: str):
-        if self.streak_direction == color:
-            self.current_streak += 1
-        else:
-            self.streak_direction = color
-            self.current_streak = 1
-
-    def update_trend_factors(self, levels: list):
-        if len(levels) < 20:
-            self.ema_trend_factor = 1.0
-            self.sr_factor = 1.0
-            return
-        ema20 = self._calculate_single_ema(levels, 20)
-        if ema20 is not None and levels:
-            current = levels[-1]
-            diff = (current - ema20) / (abs(ema20) + 1) * 0.2
-            self.ema_trend_factor = max(0.8, min(1.2, 1.0 + diff if current > ema20 else 1.0 - abs(diff)))
-        sr = find_support_resistance(levels, lookback=30)
-        if sr['support'] is not None and sr['resistance'] is not None:
-            range_size = sr['resistance'] - sr['support']
-            if range_size > 0:
-                pos = (levels[-1] - sr['support']) / range_size
-                self.sr_factor = max(0.9, min(1.1, 1.0 + (pos - 0.5) * 0.1))
-        else:
-            self.sr_factor = 1.0
-
-    def _calculate_single_ema(self, data: list, period: int) -> Optional[float]:
-        if len(data) < period:
-            return None
-        mult = 2 / (period + 1)
-        prev = sum(data[:period]) / period
-        for i in range(period, len(data)):
-            prev = (data[i] * mult) + (prev * (1 - mult))
-        return prev
-
-    def calculate_confidence(self, markov_pred, ml_pred, color: str) -> float:
-        if markov_pred is None and ml_pred is None:
-            return 0.3
-        if markov_pred is None or ml_pred is None:
-            return 0.5
-        m_prob  = markov_pred.get(color, 0.5)
-        ml_prob = ml_pred.get(color, 0.5)
-        agreement = 1.0 - abs(m_prob - ml_prob)
-        self.confidence_factor = 0.4 + agreement * 0.6
-        return self.confidence_factor
-
-    def calculate_dynamic_threshold(self) -> float:
-        vol_factor    = self.volatility
-        streak_factor = 1.0 + min(self.current_streak * 0.02, 0.3)
-        conf_factor   = 1.0 - (self.confidence_factor - 0.5) * 0.4
-        self.dynamic_threshold = max(0.45, min(0.65,
-            self.base_threshold * vol_factor * streak_factor * conf_factor))
-        return self.dynamic_threshold
-
-    def record_prediction(self, color: str, markov_pred, ml_pred, actual: str):
-        self.prediction_history.append({
-            "color": color,
-            "markov_pred": markov_pred.get(color, 0.5) if markov_pred else None,
-            "ml_pred":     ml_pred.get(color, 0.5)     if ml_pred     else None,
-            "actual":      actual,
-            "timestamp":   time.time()
-        })
-        if markov_pred is not None:
-            self.markov_total += 1
-            if (markov_pred.get(color, 0) > 0.5) == (actual == color):
-                self.markov_correct += 1
-        if ml_pred is not None:
-            self.ml_total += 1
-            if (ml_pred.get(color, 0) > 0.5) == (actual == color):
-                self.ml_correct += 1
-
-    def update_weights(self):
-        self.spins_since_weight_update += 1
-        if self.spins_since_weight_update < self.WEIGHT_UPDATE_INTERVAL:
-            return
-        self.spins_since_weight_update = 0
-        markov_acc = self.markov_correct / max(self.markov_total, 1)
-        ml_acc     = self.ml_correct     / max(self.ml_total,     1)
-        total_acc  = markov_acc + ml_acc
-        if total_acc > 0:
-            self.weights["markov"] = markov_acc / total_acc
-            self.weights["ml"]     = ml_acc     / total_acc
-        # Rango: ML siempre al menos 0.4, máximo 0.8
-        self.weights["markov"] = max(0.2, min(0.6, self.weights["markov"]))
-        self.weights["ml"]     = max(0.4, min(0.8, self.weights["ml"]))
-        total = self.weights["markov"] + self.weights["ml"]
-        self.weights["markov"] /= total
-        self.weights["ml"]     /= total
-        logger.info(f"[AMX V22] Pesos: Markov={self.weights['markov']:.2f} ML={self.weights['ml']:.2f} | M={markov_acc:.2%} ML={ml_acc:.2%}")
-        self.markov_correct = self.markov_total = self.ml_correct = self.ml_total = 0
-
-    def get_joint_probability(self, category: str, bet_value: str,
-                              markov_pred, ml_pred, cat_prob: Optional[float]) -> dict:
-        """
-        Probabilidad unificada Markov + ML + CategoryPredictor.
-        Sin tabla predefinida: para COLOR usa Markov/ML directo (table_prob neutral 0.5).
-        Para PARIDAD/RANGO usa cat_prob como señal principal.
-        """
-        if category == "COLOR":
-            m_p  = markov_pred.get(bet_value, 0.5) if markov_pred else 0.5
-            ml_p = ml_pred.get(bet_value, 0.5)     if ml_pred     else 0.5
-        else:
-            m_p  = cat_prob if cat_prob is not None else 0.5
-            ml_p = cat_prob if cat_prob is not None else 0.5
-
-        model_prob    = self.weights["markov"] * m_p + self.weights["ml"] * ml_p
-        # Factores dinámicos (EMA trend + SR + volatilidad)
-        combined_prob = model_prob * self.ema_trend_factor * self.sr_factor
-        combined_prob = max(0.30, min(0.95, combined_prob))
-
-        strength = ("strong"   if combined_prob >= 0.70 else
-                    "moderate" if combined_prob >= 0.60 else "weak")
-        return {
-            "combined_prob":    combined_prob,
-            "markov_prob":      m_p,
-            "ml_prob":          ml_p,
-            "signal_strength":  strength,
-            "weights":          self.weights.copy(),
-            "ema_trend_factor": self.ema_trend_factor,
-            "sr_factor":        self.sr_factor,
-            "volatility":       self.volatility,
-        }
-
-
-    def __init__(self):
-        self.signal_history: deque = deque(maxlen=50)
-        self.wins_attempt_1: int = 0
-        self.wins_attempt_2: int = 0
-        self.wins_attempt_3: int = 0
-        self.wins_attempt_4: int = 0
-        self.wins_attempt_5: int = 0
-        self.losses:         int = 0
-        self.total_signals:  int = 0
-        self.history_24h: deque = deque()
-        self.batch_start_bankroll: Optional[float] = None
-        self.batch_start_wins:  int = 0
-        self.batch_start_losses:int = 0
-        self.batch_start_w1:    int = 0
-        self.batch_start_w2:    int = 0
-        self.batch_start_w3:    int = 0
-        self.batch_start_w4:    int = 0
-        self.batch_start_w5:    int = 0
-        self.last_stats_at: int = 0
-        # Reporte diario: fecha del último reporte (formato "YYYY-MM-DD" hora AR)
-        self.last_daily_date: str = ""
-        self.daily_start_bankroll: Optional[float] = None
-        self.daily_signals:  int = 0
-        self.daily_wins:     int = 0
-        self.daily_losses:   int = 0
-        self.daily_w1: int = 0
-        self.daily_w2: int = 0
-        self.daily_w3: int = 0
-        self.daily_w4: int = 0
-        self.daily_w5: int = 0
-
-    def record_signal_result(self, attempt_won: int, final_result: bool,
-                             bet_amount: float, bankroll: float):
-        entry = {"attempt_won": attempt_won, "won": final_result,
-                 "bet": bet_amount, "bankroll": bankroll, "timestamp": time.time()}
-        self.signal_history.append(entry)
-        self.total_signals += 1
-        # Totales globales
-        if final_result:
-            if attempt_won == 1:   self.wins_attempt_1 += 1
-            elif attempt_won == 2: self.wins_attempt_2 += 1
-            elif attempt_won == 3: self.wins_attempt_3 += 1
-            elif attempt_won == 4: self.wins_attempt_4 += 1
-            elif attempt_won == 5: self.wins_attempt_5 += 1
-        else:
-            self.losses += 1
-        # Acumulado diario
-        self.daily_signals += 1
-        if final_result:
-            self.daily_wins += 1
-            if attempt_won == 1:   self.daily_w1 += 1
-            elif attempt_won == 2: self.daily_w2 += 1
-            elif attempt_won == 3: self.daily_w3 += 1
-            elif attempt_won == 4: self.daily_w4 += 1
-            elif attempt_won == 5: self.daily_w5 += 1
-        else:
-            self.daily_losses += 1
-        if self.daily_start_bankroll is None:
-            self.daily_start_bankroll = bankroll - (bet_amount if final_result else -bet_amount)
-        self.history_24h.append(entry)
-        self._trim_24h()
-
-    def _trim_24h(self):
-        cutoff = time.time() - 86400
-        while self.history_24h and self.history_24h[0]["timestamp"] < cutoff:
-            self.history_24h.popleft()
-
-    def should_send_stats(self) -> bool:
-        return (self.total_signals - self.last_stats_at) >= 20
-
-    def mark_stats_sent(self, bankroll: float):
-        self.last_stats_at        = self.total_signals
-        self.batch_start_bankroll = bankroll
-        self.batch_start_wins     = (self.wins_attempt_1 + self.wins_attempt_2 +
-                                     self.wins_attempt_3 + self.wins_attempt_4 +
-                                     self.wins_attempt_5)
-        self.batch_start_losses   = self.losses
-        self.batch_start_w1 = self.wins_attempt_1
-        self.batch_start_w2 = self.wins_attempt_2
-        self.batch_start_w3 = self.wins_attempt_3
-        self.batch_start_w4 = self.wins_attempt_4
-        self.batch_start_w5 = self.wins_attempt_5
-
-    def get_batch_stats(self, current_bankroll: float) -> dict:
-        n = self.total_signals - self.last_stats_at
-        if n == 0: return {}
-        w1 = self.wins_attempt_1 - self.batch_start_w1
-        w2 = self.wins_attempt_2 - self.batch_start_w2
-        w3 = self.wins_attempt_3 - self.batch_start_w3
-        w4 = self.wins_attempt_4 - self.batch_start_w4
-        w5 = self.wins_attempt_5 - self.batch_start_w5
-        l  = self.losses - self.batch_start_losses
-        w  = w1 + w2 + w3 + w4 + w5
-        return {"total": n, "wins": w, "losses": l,
-                "w1": w1, "w2": w2, "w3": w3, "w4": w4, "w5": w5,
-                "efficiency": round(w/n*100,1) if n else 0.0,
-                "e_w1": round(w1/n*100,2) if n else 0.0,
-                "e_w2": round(w2/n*100,2) if n else 0.0,
-                "e_w3": round(w3/n*100,2) if n else 0.0,
-                "e_w4": round(w4/n*100,2) if n else 0.0,
-                "e_w5": round(w5/n*100,2) if n else 0.0,
-                "e_loss": round(l/n*100,2) if n else 0.0,
-                "bankroll_delta": round(current_bankroll - self.batch_start_bankroll, 2)
-                    if self.batch_start_bankroll is not None else 0.0}
-
-    def get_24h_stats(self, current_bankroll: float) -> dict:
-        self._trim_24h()
-        t = len(self.history_24h)
-        if t == 0: return {}
-        w  = sum(1 for e in self.history_24h if e["won"])
-        l  = t - w
-        w1 = sum(1 for e in self.history_24h if e["attempt_won"] == 1)
-        w2 = sum(1 for e in self.history_24h if e["attempt_won"] == 2)
-        w3 = sum(1 for e in self.history_24h if e["attempt_won"] == 3)
-        w4 = sum(1 for e in self.history_24h if e["attempt_won"] == 4)
-        w5 = sum(1 for e in self.history_24h if e["attempt_won"] == 5)
-        bk24 = (round(self.history_24h[-1]["bankroll"] - self.history_24h[0]["bankroll"], 2)
-                if t >= 2 else 0.0)
-        return {"total": t, "wins": w, "losses": l,
-                "w1": w1, "w2": w2, "w3": w3, "w4": w4, "w5": w5,
-                "efficiency": round(w/t*100,1) if t else 0.0,
-                "e_w1": round(w1/t*100,2) if t else 0.0,
-                "e_w2": round(w2/t*100,2) if t else 0.0,
-                "e_w3": round(w3/t*100,2) if t else 0.0,
-                "e_w4": round(w4/t*100,2) if t else 0.0,
-                "e_w5": round(w5/t*100,2) if t else 0.0,
-                "e_loss": round(l/t*100,2) if t else 0.0,
-                "bankroll_delta": bk24}
-
-    def get_daily_stats(self, current_bankroll: float) -> dict:
-        """Retorna las estadísticas acumuladas del día (se resetean a las 12:00 AR)."""
-        t  = self.daily_signals
-        w  = self.daily_wins
-        l  = self.daily_losses
-        bk = round(current_bankroll - self.daily_start_bankroll, 2)              if self.daily_start_bankroll is not None else 0.0
-        return {
-            "total": t, "wins": w, "losses": l,
-            "w1": self.daily_w1, "w2": self.daily_w2,
-            "w3": self.daily_w3, "w4": self.daily_w4, "w5": self.daily_w5,
-            "efficiency": round(w / t * 100, 1) if t else 0.0,
-            "e_w1": round(self.daily_w1/t*100,2) if t else 0.0,
-            "e_w2": round(self.daily_w2/t*100,2) if t else 0.0,
-            "e_w3": round(self.daily_w3/t*100,2) if t else 0.0,
-            "e_w4": round(self.daily_w4/t*100,2) if t else 0.0,
-            "e_w5": round(self.daily_w5/t*100,2) if t else 0.0,
-            "e_loss": round(l/t*100,2) if t else 0.0,
-            "bankroll_delta": bk,
-        }
-
-    def reset_daily(self, date_str: str, current_bankroll: float):
-        """Resetea los contadores diarios y registra la fecha del reporte."""
-        self.last_daily_date      = date_str
-        self.daily_start_bankroll = current_bankroll
-        self.daily_signals  = 0
-        self.daily_wins     = 0
-        self.daily_losses   = 0
-        self.daily_w1 = self.daily_w2 = self.daily_w3 = 0
-        self.daily_w4 = self.daily_w5 = 0
-
-    def reset(self):
-        self.signal_history.clear(); self.history_24h.clear()
-        self.wins_attempt_1 = self.wins_attempt_2 = self.wins_attempt_3 = 0
-        self.wins_attempt_4 = self.wins_attempt_5 = 0
-        self.losses = self.total_signals = self.last_stats_at = 0
-        self.batch_start_bankroll = None
-        self.reset_daily("", 0.0)
-
 # ─── AMX SIGNAL SYSTEM (sin cooldown) ────────────────────────────────────────
 class AMXSignalSystem:
     def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
@@ -968,6 +639,293 @@ def find_support_resistance(levels: list,
         "support":     sup_simple,
         "resistance":  res_simple,
     }
+
+# ─── PROBABILIDAD UNIFICADA (VERSIÓN ÚNICA Y CORREGIDA) ──────────────────────
+class UnifiedProbabilitySystem:
+    """
+    Combina Markov y ML con pesos adaptativos.
+    Pesos iniciales: Markov=0.35, ML=0.65 (más peso al ML).
+    """
+    def __init__(self):
+        self.weights = {"markov": 0.35, "ml": 0.65}
+        self.prediction_history: deque = deque(maxlen=200)
+        self.markov_correct: int = 0
+        self.markov_total:   int = 0
+        self.ml_correct:     int = 0
+        self.ml_total:       int = 0
+        self.confidence_factor: float = 0.5
+        self.volatility:        float = 1.0
+        # Atributos para racha (streak)
+        self.current_streak:    int   = 0
+        self.streak_direction: Optional[str] = None
+        self.spins_since_weight_update: int = 0
+        self.WEIGHT_UPDATE_INTERVAL:    int = 50
+        self.base_threshold:    float = 0.50
+        self.dynamic_threshold: float = 0.50
+        self.ema_trend_factor:  float = 1.0
+        self.sr_factor:         float = 1.0
+
+    def calculate_volatility(self, levels: list) -> float:
+        if len(levels) < 20:
+            return 1.0
+        std_dev = np.std(levels[-20:])
+        normalized = min(max(std_dev / 5.0, 0.5), 1.5)
+        self.volatility = normalized
+        return normalized
+
+    def update_streak(self, color: str):
+        if self.streak_direction == color:
+            self.current_streak += 1
+        else:
+            self.streak_direction = color
+            self.current_streak = 1
+
+    def update_trend_factors(self, levels: list):
+        if len(levels) < 20:
+            self.ema_trend_factor = 1.0
+            self.sr_factor = 1.0
+            return
+        ema20 = self._calculate_single_ema(levels, 20)
+        if ema20 is not None and levels:
+            current = levels[-1]
+            diff = (current - ema20) / (abs(ema20) + 1) * 0.2
+            self.ema_trend_factor = max(0.8, min(1.2, 1.0 + diff if current > ema20 else 1.0 - abs(diff)))
+        sr = find_support_resistance(levels, lookback=30)
+        if sr['support'] is not None and sr['resistance'] is not None:
+            range_size = sr['resistance'] - sr['support']
+            if range_size > 0:
+                pos = (levels[-1] - sr['support']) / range_size
+                self.sr_factor = max(0.9, min(1.1, 1.0 + (pos - 0.5) * 0.1))
+        else:
+            self.sr_factor = 1.0
+
+    def _calculate_single_ema(self, data: list, period: int) -> Optional[float]:
+        if len(data) < period:
+            return None
+        mult = 2 / (period + 1)
+        prev = sum(data[:period]) / period
+        for i in range(period, len(data)):
+            prev = (data[i] * mult) + (prev * (1 - mult))
+        return prev
+
+    def calculate_confidence(self, markov_pred, ml_pred, color: str) -> float:
+        if markov_pred is None and ml_pred is None:
+            return 0.3
+        if markov_pred is None or ml_pred is None:
+            return 0.5
+        m_prob  = markov_pred.get(color, 0.5)
+        ml_prob = ml_pred.get(color, 0.5)
+        agreement = 1.0 - abs(m_prob - ml_prob)
+        self.confidence_factor = 0.4 + agreement * 0.6
+        return self.confidence_factor
+
+    def calculate_dynamic_threshold(self) -> float:
+        vol_factor    = self.volatility
+        streak_factor = 1.0 + min(self.current_streak * 0.02, 0.3)
+        conf_factor   = 1.0 - (self.confidence_factor - 0.5) * 0.4
+        self.dynamic_threshold = max(0.45, min(0.65,
+            self.base_threshold * vol_factor * streak_factor * conf_factor))
+        return self.dynamic_threshold
+
+    def record_prediction(self, color: str, markov_pred, ml_pred, actual: str):
+        self.prediction_history.append({
+            "color": color,
+            "markov_pred": markov_pred.get(color, 0.5) if markov_pred else None,
+            "ml_pred":     ml_pred.get(color, 0.5)     if ml_pred     else None,
+            "actual":      actual,
+            "timestamp":   time.time()
+        })
+        if markov_pred is not None:
+            self.markov_total += 1
+            if (markov_pred.get(color, 0) > 0.5) == (actual == color):
+                self.markov_correct += 1
+        if ml_pred is not None:
+            self.ml_total += 1
+            if (ml_pred.get(color, 0) > 0.5) == (actual == color):
+                self.ml_correct += 1
+
+    def update_weights(self):
+        self.spins_since_weight_update += 1
+        if self.spins_since_weight_update < self.WEIGHT_UPDATE_INTERVAL:
+            return
+        self.spins_since_weight_update = 0
+        markov_acc = self.markov_correct / max(self.markov_total, 1)
+        ml_acc     = self.ml_correct     / max(self.ml_total,     1)
+        total_acc  = markov_acc + ml_acc
+        if total_acc > 0:
+            self.weights["markov"] = markov_acc / total_acc
+            self.weights["ml"]     = ml_acc     / total_acc
+        # Rango: ML siempre al menos 0.4, máximo 0.8
+        self.weights["markov"] = max(0.2, min(0.6, self.weights["markov"]))
+        self.weights["ml"]     = max(0.4, min(0.8, self.weights["ml"]))
+        total = self.weights["markov"] + self.weights["ml"]
+        self.weights["markov"] /= total
+        self.weights["ml"]     /= total
+        logger.info(f"[AMX V22] Pesos: Markov={self.weights['markov']:.2f} ML={self.weights['ml']:.2f} | M={markov_acc:.2%} ML={ml_acc:.2%}")
+        self.markov_correct = self.markov_total = self.ml_correct = self.ml_total = 0
+
+    def get_joint_probability(self, category: str, bet_value: str,
+                              markov_pred, ml_pred, cat_prob: Optional[float]) -> dict:
+        """
+        Probabilidad unificada Markov + ML + CategoryPredictor.
+        Sin tabla predefinida: para COLOR usa Markov/ML directo (table_prob neutral 0.5).
+        Para PARIDAD/RANGO usa cat_prob como señal principal.
+        """
+        if category == "COLOR":
+            m_p  = markov_pred.get(bet_value, 0.5) if markov_pred else 0.5
+            ml_p = ml_pred.get(bet_value, 0.5)     if ml_pred     else 0.5
+        else:
+            m_p  = cat_prob if cat_prob is not None else 0.5
+            ml_p = cat_prob if cat_prob is not None else 0.5
+
+        model_prob    = self.weights["markov"] * m_p + self.weights["ml"] * ml_p
+        # Factores dinámicos (EMA trend + SR + volatilidad)
+        combined_prob = model_prob * self.ema_trend_factor * self.sr_factor
+        combined_prob = max(0.30, min(0.95, combined_prob))
+
+        strength = ("strong"   if combined_prob >= 0.70 else
+                    "moderate" if combined_prob >= 0.60 else "weak")
+        return {
+            "combined_prob":    combined_prob,
+            "markov_prob":      m_p,
+            "ml_prob":          ml_p,
+            "signal_strength":  strength,
+            "weights":          self.weights.copy(),
+            "ema_trend_factor": self.ema_trend_factor,
+            "sr_factor":        self.sr_factor,
+            "volatility":       self.volatility,
+        }
+
+# ─── ESTADÍSTICAS DETALLADAS (DETAILED STATS) ─────────────────────────────────
+class DetailedStats:
+    def __init__(self):
+        self.signal_history: deque = deque(maxlen=50)
+        self.wins_attempt_1: int = 0
+        self.wins_attempt_2: int = 0
+        self.wins_attempt_3: int = 0
+        self.wins_attempt_4: int = 0
+        self.wins_attempt_5: int = 0
+        self.losses:         int = 0
+        self.total_signals:  int = 0
+        self.last_stats_at:  int = 0
+        self.batch_start_bankroll: Optional[float] = None
+        self.batch_start_wins:  int = 0
+        self.batch_start_losses:int = 0
+        self.batch_start_w1: int = 0
+        self.batch_start_w2: int = 0
+        self.batch_start_w3: int = 0
+        self.batch_start_w4: int = 0
+        self.batch_start_w5: int = 0
+        # Diario
+        self.last_daily_date      = ""
+        self.daily_start_bankroll: Optional[float] = None
+        self.daily_signals:  int = 0
+        self.daily_wins:     int = 0
+        self.daily_losses:   int = 0
+        self.daily_w1: int = 0
+        self.daily_w2: int = 0
+        self.daily_w3: int = 0
+        self.daily_w4: int = 0
+        self.daily_w5: int = 0
+
+    def record_signal_result(self, attempt_won: int, final_result: bool,
+                             bet_amount: float, bankroll: float):
+        entry = {"attempt_won": attempt_won, "won": final_result,
+                 "bet": bet_amount, "bankroll": bankroll, "timestamp": time.time()}
+        self.signal_history.append(entry)
+        self.total_signals += 1
+        if final_result:
+            if   attempt_won == 1: self.wins_attempt_1 += 1
+            elif attempt_won == 2: self.wins_attempt_2 += 1
+            elif attempt_won == 3: self.wins_attempt_3 += 1
+            elif attempt_won == 4: self.wins_attempt_4 += 1
+            elif attempt_won == 5: self.wins_attempt_5 += 1
+        else:
+            self.losses += 1
+        # Diario
+        self.daily_signals += 1
+        if final_result:
+            self.daily_wins += 1
+            if   attempt_won == 1: self.daily_w1 += 1
+            elif attempt_won == 2: self.daily_w2 += 1
+            elif attempt_won == 3: self.daily_w3 += 1
+            elif attempt_won == 4: self.daily_w4 += 1
+            elif attempt_won == 5: self.daily_w5 += 1
+        else:
+            self.daily_losses += 1
+        if self.daily_start_bankroll is None:
+            self.daily_start_bankroll = bankroll
+
+    def should_send_stats(self) -> bool:
+        return (self.total_signals - self.last_stats_at) >= 20
+
+    def mark_stats_sent(self, bankroll: float):
+        self.last_stats_at        = self.total_signals
+        self.batch_start_bankroll = bankroll
+        self.batch_start_wins     = (self.wins_attempt_1 + self.wins_attempt_2 +
+                                     self.wins_attempt_3 + self.wins_attempt_4 +
+                                     self.wins_attempt_5)
+        self.batch_start_losses   = self.losses
+        self.batch_start_w1 = self.wins_attempt_1
+        self.batch_start_w2 = self.wins_attempt_2
+        self.batch_start_w3 = self.wins_attempt_3
+        self.batch_start_w4 = self.wins_attempt_4
+        self.batch_start_w5 = self.wins_attempt_5
+
+    def get_batch_stats(self, current_bankroll: float) -> dict:
+        n = self.total_signals - self.last_stats_at
+        if n == 0: return {}
+        w1 = self.wins_attempt_1 - self.batch_start_w1
+        w2 = self.wins_attempt_2 - self.batch_start_w2
+        w3 = self.wins_attempt_3 - self.batch_start_w3
+        w4 = self.wins_attempt_4 - self.batch_start_w4
+        w5 = self.wins_attempt_5 - self.batch_start_w5
+        l  = self.losses - self.batch_start_losses
+        w  = w1+w2+w3+w4+w5
+        bk = round(current_bankroll - self.batch_start_bankroll, 2)              if self.batch_start_bankroll is not None else 0.0
+        return {"total":n,"wins":w,"losses":l,"w1":w1,"w2":w2,"w3":w3,"w4":w4,"w5":w5,
+                "efficiency":round(w/n*100,1) if n else 0.0,
+                "e_w1":round(w1/n*100,2) if n else 0.0,
+                "e_w2":round(w2/n*100,2) if n else 0.0,
+                "e_w3":round(w3/n*100,2) if n else 0.0,
+                "e_w4":round(w4/n*100,2) if n else 0.0,
+                "e_w5":round(w5/n*100,2) if n else 0.0,
+                "e_loss":round(l/n*100,2) if n else 0.0,
+                "bankroll_delta":bk}
+
+    def get_daily_stats(self, current_bankroll: float) -> dict:
+        t  = self.daily_signals
+        w  = self.daily_wins
+        l  = self.daily_losses
+        bk = round(current_bankroll - self.daily_start_bankroll, 2)              if self.daily_start_bankroll is not None else 0.0
+        return {"total":t,"wins":w,"losses":l,
+                "w1":self.daily_w1,"w2":self.daily_w2,"w3":self.daily_w3,
+                "w4":self.daily_w4,"w5":self.daily_w5,
+                "efficiency":round(w/t*100,1) if t else 0.0,
+                "e_w1":round(self.daily_w1/t*100,2) if t else 0.0,
+                "e_w2":round(self.daily_w2/t*100,2) if t else 0.0,
+                "e_w3":round(self.daily_w3/t*100,2) if t else 0.0,
+                "e_w4":round(self.daily_w4/t*100,2) if t else 0.0,
+                "e_w5":round(self.daily_w5/t*100,2) if t else 0.0,
+                "e_loss":round(l/t*100,2) if t else 0.0,
+                "bankroll_delta":bk}
+
+    def reset_daily(self, date_str: str, current_bankroll: float):
+        self.last_daily_date      = date_str
+        self.daily_start_bankroll = current_bankroll
+        self.daily_signals  = 0
+        self.daily_wins     = 0
+        self.daily_losses   = 0
+        self.daily_w1 = self.daily_w2 = self.daily_w3 = 0
+        self.daily_w4 = self.daily_w5 = 0
+
+    def reset(self):
+        self.signal_history.clear()
+        self.wins_attempt_1 = self.wins_attempt_2 = self.wins_attempt_3 = 0
+        self.wins_attempt_4 = self.wins_attempt_5 = 0
+        self.losses = self.total_signals = self.last_stats_at = 0
+        self.batch_start_bankroll = None
+        self.reset_daily("", 0.0)
 
 # ─── CHART GENERATION ────────────────────────────────────────────────────────
 def generate_chart(levels: list, spin_history: list, bet_color: str,
@@ -1295,137 +1253,6 @@ def tg_delete(bot_inst, chat_id, msg_id):
 
 # ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
 
-# ─── DETAILED STATS ───────────────────────────────────────────────────────────
-class DetailedStats:
-    def __init__(self):
-        self.signal_history: deque = deque(maxlen=50)
-        self.wins_attempt_1: int = 0
-        self.wins_attempt_2: int = 0
-        self.wins_attempt_3: int = 0
-        self.wins_attempt_4: int = 0
-        self.wins_attempt_5: int = 0
-        self.losses:         int = 0
-        self.total_signals:  int = 0
-        self.last_stats_at:  int = 0
-        self.batch_start_bankroll: Optional[float] = None
-        self.batch_start_wins:  int = 0
-        self.batch_start_losses:int = 0
-        self.batch_start_w1: int = 0
-        self.batch_start_w2: int = 0
-        self.batch_start_w3: int = 0
-        self.batch_start_w4: int = 0
-        self.batch_start_w5: int = 0
-        # Diario
-        self.last_daily_date      = ""
-        self.daily_start_bankroll: Optional[float] = None
-        self.daily_signals:  int = 0
-        self.daily_wins:     int = 0
-        self.daily_losses:   int = 0
-        self.daily_w1: int = 0
-        self.daily_w2: int = 0
-        self.daily_w3: int = 0
-        self.daily_w4: int = 0
-        self.daily_w5: int = 0
-
-    def record_signal_result(self, attempt_won: int, final_result: bool,
-                             bet_amount: float, bankroll: float):
-        entry = {"attempt_won": attempt_won, "won": final_result,
-                 "bet": bet_amount, "bankroll": bankroll, "timestamp": time.time()}
-        self.signal_history.append(entry)
-        self.total_signals += 1
-        if final_result:
-            if   attempt_won == 1: self.wins_attempt_1 += 1
-            elif attempt_won == 2: self.wins_attempt_2 += 1
-            elif attempt_won == 3: self.wins_attempt_3 += 1
-            elif attempt_won == 4: self.wins_attempt_4 += 1
-            elif attempt_won == 5: self.wins_attempt_5 += 1
-        else:
-            self.losses += 1
-        # Diario
-        self.daily_signals += 1
-        if final_result:
-            self.daily_wins += 1
-            if   attempt_won == 1: self.daily_w1 += 1
-            elif attempt_won == 2: self.daily_w2 += 1
-            elif attempt_won == 3: self.daily_w3 += 1
-            elif attempt_won == 4: self.daily_w4 += 1
-            elif attempt_won == 5: self.daily_w5 += 1
-        else:
-            self.daily_losses += 1
-        if self.daily_start_bankroll is None:
-            self.daily_start_bankroll = bankroll
-
-    def should_send_stats(self) -> bool:
-        return (self.total_signals - self.last_stats_at) >= 20
-
-    def mark_stats_sent(self, bankroll: float):
-        self.last_stats_at        = self.total_signals
-        self.batch_start_bankroll = bankroll
-        self.batch_start_wins     = (self.wins_attempt_1 + self.wins_attempt_2 +
-                                     self.wins_attempt_3 + self.wins_attempt_4 +
-                                     self.wins_attempt_5)
-        self.batch_start_losses   = self.losses
-        self.batch_start_w1 = self.wins_attempt_1
-        self.batch_start_w2 = self.wins_attempt_2
-        self.batch_start_w3 = self.wins_attempt_3
-        self.batch_start_w4 = self.wins_attempt_4
-        self.batch_start_w5 = self.wins_attempt_5
-
-    def get_batch_stats(self, current_bankroll: float) -> dict:
-        n = self.total_signals - self.last_stats_at
-        if n == 0: return {}
-        w1 = self.wins_attempt_1 - self.batch_start_w1
-        w2 = self.wins_attempt_2 - self.batch_start_w2
-        w3 = self.wins_attempt_3 - self.batch_start_w3
-        w4 = self.wins_attempt_4 - self.batch_start_w4
-        w5 = self.wins_attempt_5 - self.batch_start_w5
-        l  = self.losses - self.batch_start_losses
-        w  = w1+w2+w3+w4+w5
-        bk = round(current_bankroll - self.batch_start_bankroll, 2)              if self.batch_start_bankroll is not None else 0.0
-        return {"total":n,"wins":w,"losses":l,"w1":w1,"w2":w2,"w3":w3,"w4":w4,"w5":w5,
-                "efficiency":round(w/n*100,1) if n else 0.0,
-                "e_w1":round(w1/n*100,2) if n else 0.0,
-                "e_w2":round(w2/n*100,2) if n else 0.0,
-                "e_w3":round(w3/n*100,2) if n else 0.0,
-                "e_w4":round(w4/n*100,2) if n else 0.0,
-                "e_w5":round(w5/n*100,2) if n else 0.0,
-                "e_loss":round(l/n*100,2) if n else 0.0,
-                "bankroll_delta":bk}
-
-    def get_daily_stats(self, current_bankroll: float) -> dict:
-        t  = self.daily_signals
-        w  = self.daily_wins
-        l  = self.daily_losses
-        bk = round(current_bankroll - self.daily_start_bankroll, 2)              if self.daily_start_bankroll is not None else 0.0
-        return {"total":t,"wins":w,"losses":l,
-                "w1":self.daily_w1,"w2":self.daily_w2,"w3":self.daily_w3,
-                "w4":self.daily_w4,"w5":self.daily_w5,
-                "efficiency":round(w/t*100,1) if t else 0.0,
-                "e_w1":round(self.daily_w1/t*100,2) if t else 0.0,
-                "e_w2":round(self.daily_w2/t*100,2) if t else 0.0,
-                "e_w3":round(self.daily_w3/t*100,2) if t else 0.0,
-                "e_w4":round(self.daily_w4/t*100,2) if t else 0.0,
-                "e_w5":round(self.daily_w5/t*100,2) if t else 0.0,
-                "e_loss":round(l/t*100,2) if t else 0.0,
-                "bankroll_delta":bk}
-
-    def reset_daily(self, date_str: str, current_bankroll: float):
-        self.last_daily_date      = date_str
-        self.daily_start_bankroll = current_bankroll
-        self.daily_signals  = 0
-        self.daily_wins     = 0
-        self.daily_losses   = 0
-        self.daily_w1 = self.daily_w2 = self.daily_w3 = 0
-        self.daily_w4 = self.daily_w5 = 0
-
-    def reset(self):
-        self.signal_history.clear()
-        self.wins_attempt_1 = self.wins_attempt_2 = self.wins_attempt_3 = 0
-        self.wins_attempt_4 = self.wins_attempt_5 = 0
-        self.losses = self.total_signals = self.last_stats_at = 0
-        self.batch_start_bankroll = None
-        self.reset_daily("", 0.0)
-
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
         self.name       = name
@@ -1463,11 +1290,11 @@ class RouletteEngine:
         self.waiting_attempt_number: int  = 0
         self.skip_one_after_zero:    bool = False
 
-        # Categoría activa: "COLOR", "PARIDAD", "RANGO" o None
-        self.active_category:  Optional[str] = None   # COLOR/PARIDAD/RANGO/DOCENA/COLUMNA
-        self.bet_value:        Optional[str] = None   # valor apostado
-        self.signal_pair:       tuple          = ()     # DOCENA/COLUMNA: 2 apostadas
-        self.bet_color:        Optional[str] = None   # para gráfico (solo COLOR)
+        # Categoría activa
+        self.active_category:  Optional[str] = None
+        self.bet_value:        Optional[str] = None
+        self.signal_pair:       tuple          = ()
+        self.bet_color:        Optional[str] = None
         self.attempts_left:    int  = 0
         self.total_attempts:   int  = 0
         self.trigger_number:   Optional[int] = None
@@ -1512,7 +1339,6 @@ class RouletteEngine:
         live_loaded = self._load_live_history()
 
         # ── Calentamiento WebSocket ────────────────────────────
-        # Si ya cargamos suficientes giros live, no necesitamos esperar
         self.ws_spins_count: int  = live_loaded
         self.warmup_done:    bool = live_loaded >= WARMUP_SPINS
 
@@ -1921,7 +1747,6 @@ class RouletteEngine:
         """Alias de compatibilidad → usa _evaluate_category("COLOR")."""
         return self._evaluate_category("COLOR")
 
-
     def should_activate(self) -> Optional[str]:
         losses   = self.consec_losses
         min_spin = 22 + losses * 2
@@ -2092,7 +1917,8 @@ class RouletteEngine:
             f"♻️ Intento {attempt}/{self.total_attempts}"
         )
 
-
+    def _send_signal(self, attempt: int, unified_prob: dict):
+        """Envía el mensaje de señal activa (gráfico + texto)."""
         # Borrar mensaje de señal anterior si existe
         if self.signal_msg_ids:
             for mid in self.signal_msg_ids:
