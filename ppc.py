@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
@@ -14,6 +15,7 @@ Roulette Telegram Signal Bot - Sistema AMX UNIFIED
       · Estadísticas separadas: COLOR+PARIDAD+RANGO (CPR) y DOCENAS+COLUMNAS (DC)
       · Mensajes "Sin confirmación" se reemplazan, solo uno visible en cada momento
       · FIX: trigger_number asignado correctamente en estado Idle
+      · La misma apuesta (ej. BAJO) se repite en todos los intentos hasta ganar o fin
 """
 
 import asyncio
@@ -1252,6 +1254,10 @@ class RouletteEngine:
         self.total_attempts:   int  = 0
         self.trigger_number:   Optional[int] = None
 
+        # Para recuperar la apuesta original después de un cero
+        self.zero_wait_category: Optional[str] = None
+        self.zero_wait_bet_value: Optional[str] = None
+
         self.signal_msg_ids: list = []
         self.waiting_msg_id: Optional[int] = None
         self.no_confirmation_msg_id: Optional[int] = None
@@ -2047,12 +2053,15 @@ class RouletteEngine:
         if self.signal_active:
             result = self._is_win(number, real)
 
-            if result is None:
+            if result is None:          # 0 (VERDE)
                 self.attempts_left -= 1
                 if self.attempts_left <= 0:
                     self._handle_full_loss(number, real)
                     return
                 attempt_number = self.total_attempts - self.attempts_left + 1
+                # Guardar categoría y valor actuales para reanudarlos
+                self.zero_wait_category = self.active_category
+                self.zero_wait_bet_value = self.bet_value
                 self.signal_active = False
                 self.waiting_for_attempt = True
                 self.waiting_attempt_number = attempt_number
@@ -2070,6 +2079,8 @@ class RouletteEngine:
                     self._record_prediction_result(self.bet_value, real)
                 self.signal_active   = False
                 self.active_category = None
+                self.zero_wait_category = None
+                self.zero_wait_bet_value = None
                 self._check_recovery()
                 self._send_result(number, real, True, bet, current_attempt)
                 self._check_daily_report()
@@ -2082,18 +2093,11 @@ class RouletteEngine:
                     self._handle_full_loss(number, real, bet)
                 else:
                     attempt_number = self.total_attempts - self.attempts_left + 1
-                    chosen = self._best_retry_value(number)
-                    if chosen is not None:
-                        self.bet_value      = chosen
-                        self.trigger_number = number
-                        unified_prob = self._get_category_probability(
-                            self.active_category, chosen, number)
-                        self._send_signal(attempt_number, unified_prob)
-                    else:
-                        self.signal_active          = False
-                        self.waiting_for_attempt    = True
-                        self.waiting_attempt_number = attempt_number
-                        self._send_waiting_message(attempt_number)
+                    # ** Mantener el mismo bet_value **
+                    self.trigger_number = number
+                    unified_prob = self._get_category_probability(
+                        self.active_category, self.bet_value, number)
+                    self._send_signal(attempt_number, unified_prob)
 
         elif self.waiting_for_attempt:
             if real == "VERDE":
@@ -2102,6 +2106,24 @@ class RouletteEngine:
             if self.skip_one_after_zero:
                 self.skip_one_after_zero = False
                 return
+
+            # Primero verificar si venimos de una espera por cero
+            if self.zero_wait_category is not None:
+                # Reanudar la misma señal
+                self.active_category = self.zero_wait_category
+                self.bet_value = self.zero_wait_bet_value
+                self.bet_color = self.bet_value if self.active_category == "COLOR" else "ROJO"
+                self.zero_wait_category = None
+                self.zero_wait_bet_value = None
+                self.trigger_number = number
+                unified_prob = self._get_category_probability(
+                    self.active_category, self.bet_value, number)
+                self.signal_active = True
+                self.waiting_for_attempt = False
+                self._send_signal(self.waiting_attempt_number, unified_prob)
+                return
+
+            # Si llegamos aquí, es un estado de espera normal (solo si se diera por algún otro motivo)
             attempt_number = self.waiting_attempt_number
             best = self._detect_best_category_signal()
             if not best or best["probability"] < self.min_prob_threshold:
@@ -2156,7 +2178,6 @@ class RouletteEngine:
                 self.bet_value       = best["bet_value"]
                 self.signal_pair     = best.get("signal_pair", ())
                 self.bet_color       = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
-                # ✅ CORRECCIÓN: asignar trigger_number explícitamente
                 self.trigger_number  = number
                 _max = cat_max(best["category"])
                 self.attempts_left   = _max
@@ -2181,6 +2202,8 @@ class RouletteEngine:
             self._record_prediction_result(self.bet_value, real)
         self.signal_active   = False
         self.active_category = None
+        self.zero_wait_category = None
+        self.zero_wait_bet_value = None
         self._send_result(number, real, False, bet, 0)
         self._check_daily_report()
         self._check_stats()
@@ -2291,6 +2314,7 @@ Russian Roulette
 • Gráficos por categoría: COLOR 🔴⚫️ | PARIDAD 🟣🟡 | RANGO 🟤🔵
 • Estadísticas separadas CPR (3 intentos) / DC (2 intentos)
 • Pre-entrenamiento con DB histórica (~16k giros/tabla)
+• Misma apuesta repetida en todos los intentos (ej. BAJO se mantiene)
 
 Comandos:
 /moderado - Modo MODERADO
