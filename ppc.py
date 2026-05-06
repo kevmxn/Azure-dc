@@ -1,4 +1,5 @@
 
+
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot - Sistema AMX UNIFIED
@@ -1265,11 +1266,8 @@ class RouletteEngine:
 
         self.bet_sys = Labouchere(LABOUCHERE_SEQUENCE, BASE_BET)
 
+        # consec_losses solo afecta el min_spin en should_activate()
         self.consec_losses:   int   = 0
-        self.recovery_active: bool  = False
-        self.recovery_target: float = 0.0
-        self.level1_bankroll: float = 0.0
-        self.signal_is_level1: bool = False
 
         self.amx_system = AMXSignalSystem(mode="moderado")
         self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)
@@ -1697,13 +1695,12 @@ class RouletteEngine:
             return "NEGRO"
 
     def _check_recovery(self):
-        if not self.recovery_active: return
-        if self.bet_sys.bankroll >= self.recovery_target:
-            logger.info(f"[{self.name}] Recuperación completada!")
+        # La secuencia Labouchère se resetea sola cuando se eliminan todos los extremos.
+        # Solo reiniciamos el contador de pérdidas consecutivas cuando el bankroll
+        # recupera terreno positivo, sin tocar la secuencia.
+        if self.consec_losses > 0 and self.bet_sys.bankroll >= 0:
+            logger.info(f"[{self.name}] Bankroll recuperado — consec_losses reseteado.")
             self.consec_losses = 0
-            self.recovery_active = False
-            self.recovery_target = 0.0
-            self.bet_sys.reset()
 
     def _update_amx_positions(self, color: str):
         last_pos = self.amx_system.ultimos_puntos[-1] if self.amx_system.ultimos_puntos else 0
@@ -2189,13 +2186,10 @@ class RouletteEngine:
         if bet is None:
             bet = self.bet_sys.loss()
         self.consec_losses += 1
+        # Labouchère: la secuencia crece con la pérdida (loss() ya la agregó).
+        # Solo reseteamos consec_losses a los 10 sin tocar la secuencia.
         if self.consec_losses >= 10:
             self.consec_losses = 0
-            self.recovery_active = False
-            self.recovery_target = 0.0
-        else:
-            self.recovery_active = True
-            self.recovery_target = self.level1_bankroll + BASE_BET
         self.stats.record_signal_result(0, False, bet,
                                         self.bet_sys.bankroll, self.active_category)
         if self.active_category == "COLOR":
