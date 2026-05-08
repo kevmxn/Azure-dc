@@ -1310,7 +1310,7 @@ class RouletteEngine:
 
         if near_cats:
             cat_list = ' | '.join(near_cats)
-            text = f"🚨 <b>POSIBLE ENTRADA</b> 🚨\n\n⭐️ <b>CATEGORIAS: {cat_list}</b> 🌟"
+            text = f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n"
             if set(near_cats) != set(self._last_near_cats):
                 if self.pre_alert_msg_id:
                     tg_delete(self.bot, self.chat_id, self.pre_alert_msg_id)
