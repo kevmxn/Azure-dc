@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot — Martingala con AMX tendencia
@@ -8,9 +7,10 @@ Roulette Telegram Signal Bot — Martingala con AMX tendencia
   · Reinicio de ficha a nivel 1 al ganar
   · Modo AMX tendencia por defecto
   · Cooldown 5 spins post-pérdida
-  · Estadísticas unificadas con historial de 20 señales
+  · Estadísticas unificadas con historial de 20 señales + 24 horas
   · Pre-entrenamiento con russian-azure.db
   · HTML tags corregidos; INTENTO muestra nivel Martingala real
+  · Alerta "POSIBLE ENTRADA" según categorías CPR restantes
 """
 
 import asyncio
@@ -855,6 +855,13 @@ class RouletteEngine:
 
         self._live_conn = _get_live_db()
 
+        # Alerta "POSIBLE ENTRADA"
+        self.pre_alert_msg_id: Optional[int] = None
+        self._last_near_cats: list = []
+        
+        # Bandera para procesar estadísticas después de registrar la señal
+        self._pending_stats = False
+
         self._pretrain_from_db(DB_PATH, self.db_table)
         live_loaded = self._load_live_history()
 
@@ -1211,14 +1218,19 @@ class RouletteEngine:
         return (
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
             f"🎰 <b>{self.name}</b>\n"
-            f"👉 <b>ÚLTIMA NÚMER: {trig_disp}</b>\n"
+            f"👉 <b>ÚLTIMO NÚMERO: {trig_disp}</b>\n"
             f"❄️ <b>ENTRAR EN: {apuesta_str}</b>\n\n"
-            f"💡 <i>PROBABILIDAD IA: {prob_pct}%</i>\n"
-            f"📈 <i>SECUENCIA MARTINGALA {nivel_actual}/6</i>\n"
-            f"📍 <i>APUESTA: {bet:.2f} usd</i>\n"
+            f"💡 <i>PROBABILIDAD IA {prob_pct}%</i>\n"
+            f"📈 <i>NIVEL SECUENCIA: {nivel_actual}/6</i>\n"
+            f"📍 <i>MONTO APUESTA: {bet:.2f} usd</i>\n"
         )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
+        # Eliminar pre-alert si existe
+        if self.pre_alert_msg_id:
+            tg_delete(self.bot, self.chat_id, self.pre_alert_msg_id)
+            self.pre_alert_msg_id = None
+
         if self.signal_msg_ids:
             for mid in self.signal_msg_ids:
                 tg_delete(self.bot, self.chat_id, mid)
@@ -1261,26 +1273,71 @@ class RouletteEngine:
         bankroll         = self.bet_sys.bankroll
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
-        status            = f"✅ <b>¡GREEN {number} {cat_val}!</b> {cat_icon}" if won else f"❌ <b>¡LOSS {number} {cat_val}!</b> {cat_icon}"
+        status            = f"✅ <b>¡GREEN {number} {cat_val}!</b> {cat_icon}!" if won else f"❌ <b>¡LOSS {number} {cat_val}!</b> {cat_icon}"
 
         text = (
             f"{status}\n\n"
             f"❄️ <b>CATEGORIA: {self.bet_value}</b> {bet_icon}\n"
             f"💰 <i>BANKROLL: {bankroll:.2f} usd</i>\n"
-            f"♻️ <i>INTENTO {level_used}/6</i>"
+            f"♻️ <i>NIVEL DE INTENTO {level_used}/6</i>"
         )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
                     f"cat_val={cat_val} nivel_usado={level_used} bankroll={bankroll:.2f}")
 
+    # ── Alerta "POSIBLE ENTRADA" ───────────────────────────────────────────
+    def _check_and_send_pre_alert(self):
+        if self.signal_active or self.waiting_for_attempt:
+            return
+        remaining = {"COLOR", "PARIDAD", "RANGO"} - self.cpr_cycle_used
+        near_cats = []
+        for cat in sorted(remaining):
+            pred = self.category_ml.predict_category(cat)
+            if pred is None or pred.get("total", 0) < 5:
+                continue
+            clean = {k: v for k, v in pred.items() if k != "total"}
+            if not clean:
+                continue
+            best_val = max(clean, key=clean.get)
+            cat_prob = clean[best_val]
+            if cat_prob < 0.50:          # umbral reducido para "posible"
+                continue
+            levels = self._levels_for(cat, best_val)
+            ema_sig = self.amx_system.check_signal(levels, best_val)
+            if ema_sig is None:
+                continue
+            near_cats.append(cat)
+
+        if near_cats:
+            cat_list = ' | '.join(near_cats)
+            text = f"🚨 <b>POSIBLE ENTRADA</b> 🚨\n\n⭐️ <b>CATEGORIAS: {cat_list}</b> 🌟"
+            if set(near_cats) != set(self._last_near_cats):
+                if self.pre_alert_msg_id:
+                    tg_delete(self.bot, self.chat_id, self.pre_alert_msg_id)
+                    self.pre_alert_msg_id = None
+                msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
+                if msg_id:
+                    self.pre_alert_msg_id = msg_id
+                self._last_near_cats = near_cats.copy()
+        else:
+            if self.pre_alert_msg_id:
+                tg_delete(self.bot, self.chat_id, self.pre_alert_msg_id)
+                self.pre_alert_msg_id = None
+            self._last_near_cats = []
+
+    # ── ESTADÍSTICAS (CORREGIDO: se envían después de registrar la señal) ──
     def _check_stats(self):
-        if not self.stats.should_send_stats(): return
+        if not self.stats.should_send_stats():
+            return
         current_bankroll = self.bet_sys.bankroll
         self.stats.mark_stats_sent(current_bankroll)
 
+        parts = []
+
+        # 1) Últimas 20 señales
         last20 = list(self.stats.signal_history)[-20:]
         if last20:
-            lines = ["📊 <b>ESTADISTICAS 20 SEÑALES</b>\n"]
+            lines = ["📊 <b>ESTADISTICAS 20 SEÑALES</b>"]
             for i, entry in enumerate(last20, start=1):
                 if entry['won']:
                     gale = "GALE #0" if entry['attempt_won'] == 1 else "GALE #1"
@@ -1288,19 +1345,23 @@ class RouletteEngine:
                 else:
                     line = f"❌ LOSS {i}, CATEGORIA {entry['category']}, GALE #1"
                 lines.append(line)
-            tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines))
+            parts.append("\n".join(lines))
 
+        # 2) Estadísticas diarias (24h)
         sd = self.stats.get_daily_stats(current_bankroll)
         if sd['total'] > 0:
-            lines_daily = [
-                "\n📅 <b>ESTADISTICAS 24 HORAS</b>",
-                f"🈯️ TOTAL: {sd['total']} E:{sd['efficiency']}%",
-                f"1️⃣ GALE #0: {sd['w1']} E:{sd['e_w1']}%",
-                f"2️⃣ GALE #1: {sd['w2']} E:{sd['e_w2']}%",
-                f"🈲 LOSS: {sd['losses']} E:{sd['e_loss']}%",
+            daily_lines = [
+                "📅 <b>ESTADISTICAS 24 HORAS</b>",
+                f"🈯️ TOTAL DE SEÑALES: {sd['total']} = {sd['efficiency']}%",
+                f"1️⃣ GALE #0: {sd['w1']} = {sd['e_w1']}%",
+                f"2️⃣ GALE #1: {sd['w2']} = {sd['e_w2']}%",
+                f"🈲 LOSS: {sd['losses']} = {sd['e_loss']}%",
                 f"💰 CAPITAL ACUMULADO: {sd['bankroll_delta']:.2f} usd"
             ]
-            tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines_daily))
+            parts.append("\n".join(daily_lines))
+
+        if parts:
+            tg_send_text(self.bot, self.chat_id, self.thread_id, "\n\n".join(parts))
 
     def _check_daily_report(self):
         import datetime
@@ -1411,16 +1472,6 @@ class RouletteEngine:
             f"BK:{self.bet_sys.bankroll:>7.2f}$ Martingala Nivel {self.bet_sys.level} | "
             f"{sig_state}")
 
-        if not self.warmup_done:
-            self.ws_spins_count += 1
-            if self.ws_spins_count < WARMUP_SPINS:
-                logger.info(f"[{self.name}] Calentamiento WS: {self.ws_spins_count}/{WARMUP_SPINS} giros")
-                return
-            self.warmup_done = True
-            logger.info(f"[{self.name}] ✅ Calentamiento completado. Iniciando señales.")
-            tg_send_text(self.bot, self.chat_id, self.thread_id,
-                         f"🟢 <b>{self.name}</b> — Sistema listo. Emitiendo señales.")
-
         # ═══ MÁQUINA DE ESTADOS ═══
         if self.signal_active:
             result = self._is_win(number, real)
@@ -1439,8 +1490,7 @@ class RouletteEngine:
                     self.zero_wait_category = None
                     self.zero_wait_bet_value = None
                     self._send_result(number, real, False, bet, level_used)
-                    self._check_daily_report()
-                    self._check_stats()
+                    self._pending_stats = True   # ← activar estadísticas
                     self.signal_msg_ids = []
                     return
                 attempt_number = self.total_attempts - self.attempts_left + 1
@@ -1466,8 +1516,7 @@ class RouletteEngine:
                 self.zero_wait_category = None
                 self.zero_wait_bet_value = None
                 self._send_result(number, real, True, bet, level_used)
-                self._check_daily_report()
-                self._check_stats()
+                self._pending_stats = True   # ← activar estadísticas
                 self.signal_msg_ids = []
             else:
                 # Pérdida normal (sin cero)
@@ -1476,7 +1525,7 @@ class RouletteEngine:
                     level_used = self.bet_sys.level
                     self._handle_full_loss(number, real, level_used)
                 else:
-                    self.bet_sys.loss()   # ← avanza 1 nivel antes del siguiente intento
+                    self.bet_sys.loss()   # avanza 1 nivel antes del siguiente intento
                     attempt_number = self.total_attempts - self.attempts_left + 1
                     self.trigger_number = number
                     unified_prob = self._get_category_probability(
@@ -1558,9 +1607,6 @@ class RouletteEngine:
                         f"[{self.name}] Señal descartada [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
                     return
-                # Al iniciar nueva señal, NO reiniciar nivel si viene de una pérdida (ya lo tiene)
-                # Pero si el sistema está fresco (sin pérdidas acumuladas), mantenemos el nivel actual.
-                # No forzamos a nivel 1, así se acumula entre señales.
                 self.signal_active   = True
                 self.active_category = best["category"]
                 self.bet_value       = best["bet_value"]
@@ -1571,6 +1617,26 @@ class RouletteEngine:
                 self.attempts_left   = MAX_ATTEMPTS
                 self._send_signal(1, unified_prob)
                 self.amx_system.register_signal_sent()
+
+        # --- Procesar estadísticas pendientes (después de registrar la señal) ---
+        if self._pending_stats:
+            self._check_daily_report()
+            self._check_stats()
+            self._pending_stats = False
+
+        # ── LLAMADA PRE-ALERT (solo en reposo) ──────────────────────────
+        if not self.signal_active and not self.waiting_for_attempt:
+            self._check_and_send_pre_alert()
+
+        if not self.warmup_done:
+            self.ws_spins_count += 1
+            if self.ws_spins_count < WARMUP_SPINS:
+                logger.info(f"[{self.name}] Calentamiento WS: {self.ws_spins_count}/{WARMUP_SPINS} giros")
+                return
+            self.warmup_done = True
+            logger.info(f"[{self.name}] ✅ Calentamiento completado. Iniciando señales.")
+            tg_send_text(self.bot, self.chat_id, self.thread_id,
+                         f"🟢 <b>{self.name}</b> — Sistema listo. Emitiendo señales.")
 
     def _handle_full_loss(self, number: int, real: str, level_used: int):
         """Pérdida definitiva de la señal: aplica full_loss (sube 1 nivel y cuenta consecutiva)."""
@@ -1584,8 +1650,7 @@ class RouletteEngine:
         self.zero_wait_category = None
         self.zero_wait_bet_value = None
         self._send_result(number, real, False, bet, level_used)
-        self._check_daily_report()
-        self._check_stats()
+        self._pending_stats = True   # ← activar estadísticas
         self.signal_msg_ids = []
 
     async def run_ws(self):
@@ -1691,7 +1756,8 @@ Russian Roulette
 • Modo AMX <b>tendencia</b> activado por defecto
 • Cooldown 5 spins tras pérdida
 • Calentamiento WS: 21 giros silenciosos
-• Estadísticas unificadas con historial de 20 señales
+• Estadísticas unificadas con historial de 20 señales + 24 horas
+• Alerta "POSIBLE ENTRADA" según categorías CPR restantes
 
 Comandos:
 /moderado - Cambiar a modo MODERADO (menos agresivo)
