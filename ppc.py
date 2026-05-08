@@ -128,7 +128,7 @@ ROULETTE_CONFIGS = {
         "chat_id":   -1003835197023,
         "thread_id": 8344,
         "db_table":  "russian_roulette",
-        "min_prob_threshold": 0.60,
+        "min_prob_threshold": 0.55,
     },
 }
 
@@ -971,7 +971,10 @@ class RouletteEngine:
         self.spins_since_loss:    int = 9999  # inicia "listo"
 
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)
+        # Ciclo CPR: registra qué categorías (COLOR/PARIDAD/RANGO) ya se
+        # resolvieron en el ciclo actual. Al completar las 3 se reinicia.
+        self.cpr_cycle_used: set = set()
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.55)
 
         self.unified_prob_system = UnifiedProbabilitySystem()
 
@@ -1254,7 +1257,11 @@ class RouletteEngine:
 
     def _detect_best_category_signal(self) -> Optional[dict]:
         candidates = []
+        CPR = {"COLOR", "PARIDAD", "RANGO"}
         for cat in ("COLOR", "PARIDAD", "RANGO", "DOCENA", "COLUMNA"):
+            # CPR: solo evaluar si no fue resuelta en este ciclo
+            if cat in CPR and cat in self.cpr_cycle_used:
+                continue
             cand = self._evaluate_category(cat)
             if cand:
                 candidates.append(cand)
@@ -1277,6 +1284,19 @@ class RouletteEngine:
         if self.consec_losses > 0 and self.bet_sys.bankroll >= 0:
             logger.info(f"[{self.name}] Bankroll recuperado — consec_losses reseteado.")
             self.consec_losses = 0
+
+    def _mark_cpr_used(self, category: str):
+        """Marca una categoría CPR como resuelta en el ciclo actual.
+        Al completar COLOR + PARIDAD + RANGO, reinicia el ciclo."""
+        if category not in ("COLOR", "PARIDAD", "RANGO"):
+            return
+        self.cpr_cycle_used.add(category)
+        logger.info(
+            f"[{self.name}] Ciclo CPR: usadas={self.cpr_cycle_used} "
+            f"({len(self.cpr_cycle_used)}/3)")
+        if self.cpr_cycle_used >= {"COLOR", "PARIDAD", "RANGO"}:
+            self.cpr_cycle_used.clear()
+            logger.info(f"[{self.name}] 🔄 Ciclo CPR completado — reiniciando ciclo")
 
 
     def _get_unified_probability(self, color: str, trigger_number: int) -> dict:
@@ -1570,6 +1590,26 @@ class RouletteEngine:
         self.category_ml.add_spin(number, real)
         self.unified_prob_system.update_weights()
 
+        # ── LOG POR GIRO ────────────────────────────────────────────────
+        par_v  = get_paridad(number) or "VERDE"
+        rang_v = get_rango(number)   or "VERDE"
+        doz_v  = f"D{get_dozen(number)}"  if number != 0 else "VERDE"
+        col_v  = f"C{get_column(number)}" if number != 0 else "VERDE"
+        if self.signal_active:
+            sig_state = (f"🟢 [{self.active_category}] {self.bet_value} "
+                         f"intento {self.total_attempts - self.attempts_left + 1}"
+                         f"/{self.total_attempts}")
+        elif self.waiting_for_attempt:
+            sig_state = f"⏳ Esperando intento {self.waiting_attempt_number}"
+        else:
+            remaining = {"COLOR","PARIDAD","RANGO"} - self.cpr_cycle_used
+            sig_state = f"⚪ Idle | CPR disp: {'|'.join(sorted(remaining)) if remaining else 'ninguna'}"
+        logger.info(
+            f"[{self.name}] 🎰 #{len(self.spin_history)} "
+            f"N:{number:>2} {real:<5} | {par_v:<5} {rang_v:<4} {doz_v} {col_v} | "
+            f"BK:{self.bet_sys.bankroll:>7.2f}$ Seq:[{self.bet_sys.sequence_display()}] | "
+            f"{sig_state}")
+
         if not self.warmup_done:
             self.ws_spins_count += 1
             if self.ws_spins_count < WARMUP_SPINS:
@@ -1606,6 +1646,7 @@ class RouletteEngine:
                 bet = self.bet_sys.win()
                 self.stats.record_signal_result(current_attempt, True, bet,
                                                 self.bet_sys.bankroll, self.active_category)
+                self._mark_cpr_used(self.active_category)
                 self.signal_active   = False
                 self.active_category = None
                 self.zero_wait_category = None
@@ -1730,6 +1771,7 @@ class RouletteEngine:
             self.consec_losses = 0
         self.stats.record_signal_result(0, False, bet,
                                         self.bet_sys.bankroll, self.active_category)
+        self._mark_cpr_used(self.active_category)
         self.signal_active   = False
         self.active_category = None
         self.zero_wait_category = None
@@ -1883,7 +1925,9 @@ Comandos:
             else:
                 st = "⚪ Idle"
             w = engine.unified_prob_system.weights
-            lines.append(f"<b>{name}</b>: {mode_icon} — {st} [M:{w['markov']:.2f} ML:{w['ml']:.2f}]")
+            remaining = {"COLOR","PARIDAD","RANGO"} - engine.cpr_cycle_used
+            cycle_str = f"CPR pendientes: {'|'.join(sorted(remaining)) if remaining else '🔄 reiniciando'}"
+            lines.append(f"<b>{name}</b>: {mode_icon} — {st} [M:{w['markov']:.2f} ML:{w['ml']:.2f}] | {cycle_str}")
         b.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
     @b.message_handler(commands=['secuencia'])
@@ -1924,6 +1968,7 @@ Comandos:
     def cmd_reset(message):
         for engine in engines.values():
             engine.stats = DetailedStats()
+            engine.cpr_cycle_used.clear()
         b.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
 
 def run_flask():
