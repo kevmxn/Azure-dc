@@ -1,13 +1,16 @@
+
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot — Martingala con AMX tendencia
   · Máximo 2 intentos por señal
-  · Martingala avanza 2 niveles por pérdida dentro del ciclo CPR
-  · Reinicio de ficha a nivel 1 tras dos señales perdidas consecutivas
+  · Martingala avanza 1 nivel por pérdida (dentro y entre señales)
+  · Si pierde en nivel 6, vuelve a nivel 1
+  · Reinicio de ficha a nivel 1 al ganar
   · Modo AMX tendencia por defecto
   · Cooldown 5 spins post-pérdida
   · Estadísticas unificadas con historial de 20 señales
   · Pre-entrenamiento con russian-azure.db
+  · HTML tags corregidos; INTENTO muestra nivel Martingala real
 """
 
 import asyncio
@@ -131,20 +134,19 @@ ROULETTE_CONFIGS = {
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 2   # Intentos por señal (Martingala es independiente a 6 niveles)
+MAX_ATTEMPTS = 2   # Intentos por señal
 
 BASE_BET  = 0.50   # Apuesta base nivel 1
 VISIBLE   = 50
 WARMUP_SPINS = 21
 
-# ─── MARTINGALA ───────────────────────────────────────────────────────────────
+# ─── MARTINGALA (AVANCE DE 1 NIVEL POR PÉRDIDA, RESET A 1 SI NIVEL 6 PIERDE) ─
 class Martingale:
-    """Sistema de apuestas Martingala con niveles fijos y reinicio tras dos pérdidas consecutivas."""
     def __init__(self, base: float):
         self.base = base
-        self.level = 1              # nivel actual (1..6)
+        self.level = 1
         self.bankroll = 0.0
-        self.consecutive_losses = 0   # señales completas perdidas seguidas
+        self.consecutive_losses = 0
 
     def current_bet(self) -> float:
         bets = {1: self.base,
@@ -163,31 +165,25 @@ class Martingale:
         return bet
 
     def loss(self) -> float:
-        """Registra una pérdida: descuenta apuesta y avanza 2 niveles (agresivo dentro del ciclo CPR)."""
+        """Registra una pérdida: descuenta apuesta, sube 1 nivel (máx 6).
+        Si ya está en nivel 6, vuelve a nivel 1."""
         bet = self.current_bet()
         self.bankroll = round(self.bankroll - bet, 2)
-        # Avance de 2 niveles, sin superar el máximo 6
-        self.level = min(self.level + 2, 6)
+        if self.level >= 6:
+            self.level = 1
+        else:
+            self.level = self.level + 1
         return bet
 
     def full_loss(self) -> float:
-        """Señal completa perdida en nivel 6. Resetea a 1 y cuenta pérdida consecutiva."""
-        bet = self.current_bet()   # nivel 6
-        self.bankroll = round(self.bankroll - bet, 2)
+        """Señal completamente perdida (sin intentos restantes): aplica pérdida y cuenta consecutiva."""
+        bet = self.loss()
         self.consecutive_losses += 1
-        self.level = 1
         return bet
 
     def reset(self):
         self.level = 1
         self.consecutive_losses = 0
-
-    @property
-    def step(self) -> int:
-        return self.level
-
-    def is_fresh(self) -> bool:
-        return self.level == 1 and self.consecutive_losses == 0
 
 # ─── MARKOV CHAIN ────────────────────────────────────────────────────────────
 class MarkovChainPredictor:
@@ -833,7 +829,7 @@ class RouletteEngine:
         self.no_confirmation_msg_id: Optional[int] = None
         self.result_sequence: deque = deque(maxlen=10)
 
-        # Martingala (avance de 2 niveles por pérdida)
+        # Martingala (avance de 1 nivel por pérdida, si nivel 6 pierde vuelve a 1)
         self.bet_sys = Martingale(BASE_BET)
 
         # Cooldown: spins a ignorar tras pérdida total antes de aceptar nueva señal
@@ -865,7 +861,7 @@ class RouletteEngine:
         self.ws_spins_count: int  = live_loaded
         self.warmup_done:    bool = live_loaded >= WARMUP_SPINS
 
-    # ── Métodos previos no modificados ───────────────────────────────────
+    # ── Métodos auxiliares (sin cambios significativos) ──────────────────
     def _pretrain_from_db(self, db_path: str, table_name: str):
         if not os.path.exists(db_path):
             logger.warning(f"[{self.name}] DB no encontrada: {db_path}")
@@ -1196,7 +1192,7 @@ class RouletteEngine:
         else: val = real
         return val, self._category_icon(val)
 
-    # ── CORREGIDO: cierre de etiquetas HTML ──────────────────────────────
+    # ── MENSAJES ─────────────────────────────────────────────────────────
     def _build_signal_text(self, attempt: int, unified_prob: Optional[dict]) -> str:
         bet      = self.bet_sys.current_bet()
         prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
@@ -1216,10 +1212,10 @@ class RouletteEngine:
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
             f"🎰 <b>{self.name}</b>\n"
             f"👉 <b>ÚLTIMA NÚMER: {trig_disp}</b>\n"
-            f"❄️ <b>ENTRAR A: {apuesta_str}</b>\n\n"
-            f"💡 <i>Probabilidad: {prob_pct}%</i>\n"
-            f"📈 <i>Martingala Nivel {nivel_actual}/6</i>\n"
-            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
+            f"❄️ <b>ENTRAR EN: {apuesta_str}</b>\n\n"
+            f"💡 <i>PROBABILIDAD IA: {prob_pct}%</i>\n"
+            f"📈 <i>SECUENCIA MARTINGALA {nivel_actual}/6</i>\n"
+            f"📍 <i>APUESTA: {bet:.2f} usd</i>\n"
         )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
@@ -1252,7 +1248,6 @@ class RouletteEngine:
             self.no_confirmation_msg_id = None
         logger.info(f"[{self.name}] ⏳ Esperando condiciones intento {attempt_number}")
 
-    # ── CORREGIDO: INTENTO ahora muestra nivel Martingala usado ──────────
     def _send_result(self, number: int, real: str, won: bool, bet: float,
                      level_used: int, delete_signals: bool = True):
         if delete_signals and self.signal_msg_ids:
@@ -1267,11 +1262,12 @@ class RouletteEngine:
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
         status            = f"✅ <b>¡GREEN {number} {cat_val}!</b> {cat_icon}" if won else f"❌ <b>¡LOSS {number} {cat_val}!</b> {cat_icon}"
+
         text = (
             f"{status}\n\n"
             f"❄️ <b>CATEGORIA: {self.bet_value}</b> {bet_icon}\n"
             f"💰 <i>BANKROLL: {bankroll:.2f} usd</i>\n"
-            f"♻️ <i>INTENTO {level_used}/6</i>"      # ← usa el nivel Martingala
+            f"♻️ <i>INTENTO {level_used}/6</i>"
         )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
@@ -1282,7 +1278,6 @@ class RouletteEngine:
         current_bankroll = self.bet_sys.bankroll
         self.stats.mark_stats_sent(current_bankroll)
 
-        # --- Últimas 20 señales ---
         last20 = list(self.stats.signal_history)[-20:]
         if last20:
             lines = ["📊 <b>ESTADISTICAS 20 SEÑALES</b>\n"]
@@ -1295,7 +1290,6 @@ class RouletteEngine:
                 lines.append(line)
             tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines))
 
-        # --- Estadísticas diarias ---
         sd = self.stats.get_daily_stats(current_bankroll)
         if sd['total'] > 0:
             lines_daily = [
@@ -1317,7 +1311,6 @@ class RouletteEngine:
         today_str = now_ar.strftime("%Y-%m-%d")
         if self.stats.last_daily_date == today_str:
             return
-
         current_bankroll = self.bet_sys.bankroll
         self.stats.reset_daily(today_str, current_bankroll)
         logger.info(f"[{self.name}] Daily counters reset for {today_str}")
@@ -1433,12 +1426,10 @@ class RouletteEngine:
             result = self._is_win(number, real)
 
             if result is None:          # 0 (VERDE)
-                # Avanzar Martingala porque el cero es pérdida
                 level_used = self.bet_sys.level
-                bet = self.bet_sys.loss()        # descuenta y sube 2 niveles
+                bet = self.bet_sys.loss()            # avanza 1 nivel
                 self.attempts_left -= 1
                 if self.attempts_left <= 0:
-                    # Señal completa perdida (sin intentos restantes)
                     self.spins_since_loss = 0
                     self.stats.record_signal_result(0, False, bet,
                                                     self.bet_sys.bankroll, self.active_category)
@@ -1452,7 +1443,6 @@ class RouletteEngine:
                     self._check_stats()
                     self.signal_msg_ids = []
                     return
-                # Quedan intentos → esperar cero
                 attempt_number = self.total_attempts - self.attempts_left + 1
                 self.zero_wait_category = self.active_category
                 self.zero_wait_bet_value = self.bet_value
@@ -1466,7 +1456,7 @@ class RouletteEngine:
             current_attempt = self.total_attempts - self.attempts_left + 1
 
             if result:
-                level_used = self.bet_sys.level   # nivel que GANÓ
+                level_used = self.bet_sys.level
                 bet = self.bet_sys.win()
                 self.stats.record_signal_result(current_attempt, True, bet,
                                                 self.bet_sys.bankroll, self.active_category)
@@ -1475,16 +1465,18 @@ class RouletteEngine:
                 self.active_category = None
                 self.zero_wait_category = None
                 self.zero_wait_bet_value = None
-                self._send_result(number, real, True, bet, level_used)   # ← muestra nivel ganador
+                self._send_result(number, real, True, bet, level_used)
                 self._check_daily_report()
                 self._check_stats()
                 self.signal_msg_ids = []
             else:
+                # Pérdida normal (sin cero)
                 self.attempts_left -= 1
                 if self.attempts_left <= 0:
-                    level_used = self.bet_sys.level   # nivel con el que perdió
+                    level_used = self.bet_sys.level
                     self._handle_full_loss(number, real, level_used)
                 else:
+                    self.bet_sys.loss()   # ← avanza 1 nivel antes del siguiente intento
                     attempt_number = self.total_attempts - self.attempts_left + 1
                     self.trigger_number = number
                     unified_prob = self._get_category_probability(
@@ -1566,7 +1558,9 @@ class RouletteEngine:
                         f"[{self.name}] Señal descartada [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
                     return
-                self.bet_sys.level = 1
+                # Al iniciar nueva señal, NO reiniciar nivel si viene de una pérdida (ya lo tiene)
+                # Pero si el sistema está fresco (sin pérdidas acumuladas), mantenemos el nivel actual.
+                # No forzamos a nivel 1, así se acumula entre señales.
                 self.signal_active   = True
                 self.active_category = best["category"]
                 self.bet_value       = best["bet_value"]
@@ -1579,11 +1573,8 @@ class RouletteEngine:
                 self.amx_system.register_signal_sent()
 
     def _handle_full_loss(self, number: int, real: str, level_used: int):
-        """Finaliza señal perdida usando el nivel indicado, avanzando Martingala."""
-        if self.bet_sys.level < 6:
-            bet = self.bet_sys.loss()
-        else:
-            bet = self.bet_sys.full_loss()
+        """Pérdida definitiva de la señal: aplica full_loss (sube 1 nivel y cuenta consecutiva)."""
+        bet = self.bet_sys.full_loss()
         self.spins_since_loss = 0
         self.stats.record_signal_result(0, False, bet,
                                         self.bet_sys.bankroll, self.active_category)
@@ -1592,7 +1583,7 @@ class RouletteEngine:
         self.active_category = None
         self.zero_wait_category = None
         self.zero_wait_bet_value = None
-        self._send_result(number, real, False, bet, level_used)   # muestra nivel que perdió
+        self._send_result(number, real, False, bet, level_used)
         self._check_daily_report()
         self._check_stats()
         self.signal_msg_ids = []
@@ -1694,9 +1685,9 @@ def _register_handlers(b: telebot.TeleBot):
 Russian Roulette
 
 <b>Características:</b>
-• Sistema Martingala con niveles: 0.50 / 2.00 / 8.00 / 16.00 € (avance x2)
+• Sistema Martingala con niveles: 0.50 / 2.00 / 8.00 / 16.00 € (avance x1)
 • Máximo 2 intentos por señal
-• Reinicio a nivel 1 tras dos señales perdidas consecutivas
+• Reinicio a nivel 1 al ganar; si nivel 6 pierde vuelve a 1
 • Modo AMX <b>tendencia</b> activado por defecto
 • Cooldown 5 spins tras pérdida
 • Calentamiento WS: 21 giros silenciosos
