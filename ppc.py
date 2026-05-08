@@ -1195,6 +1195,7 @@ class RouletteEngine:
         else: val = real
         return val, self._category_icon(val)
 
+    # ── CORREGIDO: cierre de etiquetas HTML ──────────────────────────────
     def _build_signal_text(self, attempt: int, unified_prob: Optional[dict]) -> str:
         bet      = self.bet_sys.current_bet()
         prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
@@ -1212,12 +1213,12 @@ class RouletteEngine:
             apuesta_str = f"<b>{self.bet_value}</b> {val_icon}"
         return (
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
-            f"🎰 <b>{self.name}<b>\n"
-            f"👉 <b>ÚLTIMA NÚMER: {trig_disp}<b>\n"
-            f"❄️ <b>ENTRAR A: {apuesta_str}<b>\n\n"
-            f"💡 <i>Probabilidad: {prob_pct}%<i>\n"
-            f"📈 <i>Martingala Nivel {nivel_actual}/6<i>\n"
-            f"📍 <i>Apuesta: {bet:.2f} usd<i>\n"
+            f"🎰 <b>{self.name}</b>\n"                  # ✅ cerrado con </b>
+            f"👉 <b>ÚLTIMA NÚMER: {trig_disp}</b>\n"    # ✅ corregido
+            f"❄️ <b>ENTRAR A: {apuesta_str}</b>\n\n"   # ✅ corregido
+            f"💡 <i>Probabilidad: {prob_pct}%</i>\n"    # ✅ corregido
+            f"📈 <i>Martingala Nivel {nivel_actual}/6</i>\n"  # ✅ corregido
+            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"        # ✅ corregido
         )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
@@ -1250,6 +1251,7 @@ class RouletteEngine:
             self.no_confirmation_msg_id = None
         logger.info(f"[{self.name}] ⏳ Esperando condiciones intento {attempt_number}")
 
+    # ── CORREGIDO: cierre de etiquetas <i> ───────────────────────────────
     def _send_result(self, number: int, real: str, won: bool, bet: float,
                      attempt_won: int, delete_signals: bool = True):
         if delete_signals and self.signal_msg_ids:
@@ -1263,18 +1265,20 @@ class RouletteEngine:
         bankroll         = self.bet_sys.bankroll
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
-        status            = "✅ ¡<b>GREEN {number} {cat_val}</b> {cat_icon}!" if won else "❌ ¡<b>LOSS {number} {cat_val}</b> {cat_icon}!"
+        status            = f"✅ ¡<b>GREEN {number} {cat_val}</b> {cat_icon}!" if won else f"❌ ¡<b>LOSS {number} {cat_val}</b> {cat_icon}!"
         nivel = self.bet_sys.level
 
         text = (
             f"{status}\n\n"
             f"❄️ <b>CATEGORIA: {self.bet_value}</b> {bet_icon}\n"
-            f"💰 <i>BANKROLL: {bankroll:.2f} usd<i>\n"
-            f"♻️ <i>INTENTO {attempt_won}/6<i>"
+            f"💰 <i>BANKROLL: {bankroll:.2f} usd</i>\n"    # ✅ corregido
+            f"♻️ <i>INTENTO {attempt_won}/6</i>"          # ✅ corregido
         )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
                     f"cat_val={cat_val} intento={attempt_won} nivel={nivel} bankroll={bankroll:.2f}")
+
+    # ── FIN DE CORRECCIONES ───────────────────────────────────────────────
 
     def _check_stats(self):
         if not self.stats.should_send_stats(): return
