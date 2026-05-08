@@ -1,5 +1,4 @@
 
-
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot — Russian Roulette (UNIFIED)
@@ -129,7 +128,7 @@ ROULETTE_CONFIGS = {
         "chat_id":   -1003835197023,
         "thread_id": 8344,
         "db_table":  "russian_roulette",
-        "min_prob_threshold": 0.65,
+        "min_prob_threshold": 0.60,
     },
 }
 
@@ -972,7 +971,7 @@ class RouletteEngine:
         self.spins_since_loss:    int = 9999  # inicia "listo"
 
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.65)
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)
 
         self.unified_prob_system = UnifiedProbabilitySystem()
 
@@ -1191,7 +1190,7 @@ class RouletteEngine:
         trigger = self.spin_history[-1]["number"] if self.spin_history else 0
 
         pred = self.category_ml.predict_category(category)
-        if pred is None or pred.get("total", 0) < 8:
+        if pred is None or pred.get("total", 0) < 5:
             return None
         clean = {k: v for k, v in pred.items() if k != "total"}
         if not clean:
