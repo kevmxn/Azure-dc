@@ -2,25 +2,19 @@
 
 #!/usr/bin/env python3
 """
-Roulette Telegram Signal Bot - Sistema AMX UNIFIED
-  - Russian Roulette
-  - Pre-entrenamiento con russian-azure.db (tabla russian_roulette)
-  - 5 intentos por señal (D'Alembert)
-  - Calentamiento WS: 21 giros silenciosos antes de emitir señales
-  - Gráficos por categoría: COLOR / PARIDAD 🟣🟡 / RANGO 🟤🔵
-  - Lock de categoría activa hasta resolución
-  - Tras resolución: evalúa las 3 categorías y elige la de mayor probabilidad
-  - Ajustes:
-      · COLOR / PARIDAD / RANGO → 3 intentos
-      · DOCENAS / COLUMNAS → 2 intentos
-      · Estadísticas separadas: COLOR+PARIDAD+RANGO (CPR) y DOCENAS+COLUMNAS (DC)
-      · Mensajes "Sin confirmación" se reemplazan, solo uno visible en cada momento
-      · FIX: trigger_number asignado correctamente en estado Idle
-      · La misma apuesta (ej. BAJO) se repite en todos los intentos hasta ganar o fin
+Roulette Telegram Signal Bot — Russian Roulette (UNIFIED)
+  · 5 categorías: COLOR / PARIDAD / RANGO (3 intentos) + DOCENA / COLUMNA (2 intentos)
+  · Labouchère independiente de la señal — reset solo al vaciar la secuencia
+  · CategoryPredictor PATTERN_LEN=12, min_total=8
+  · AMX EMA score ≥ 3
+  · min_prob_threshold = 0.65
+  · Cooldown 5 spins post-pérdida
+  · Estadísticas separadas CPR vs DC
+  · Pre-entrenamiento con russian-azure.db
+  · Calentamiento WS: 21 giros silenciosos
 """
 
 import asyncio
-import io
 import json
 import logging
 import os
@@ -32,9 +26,6 @@ import urllib.request
 from collections import deque, defaultdict
 from typing import Optional, Literal
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import numpy as np
 import telebot
 import websockets
@@ -138,7 +129,7 @@ ROULETTE_CONFIGS = {
         "chat_id":   -1003835197023,
         "thread_id": 8344,
         "db_table":  "russian_roulette",
-        "min_prob_threshold": 0.60,
+        "min_prob_threshold": 0.65,
     },
 }
 
@@ -240,7 +231,7 @@ class MarkovChainPredictor:
         state  = tuple(recent[-self.order:])
         counts = dict(self.transition_counts.get(state, {}))
         total  = sum(counts.values())
-        if total < 5:
+        if total < 8:
             return None
         return {
             "ROJO":  counts.get("ROJO",  0) / total,
@@ -286,7 +277,7 @@ class MLPatternPredictor:
 
 # ─── CATEGORY PREDICTOR ──────────────────────────────────────────────────────
 class CategoryPredictor:
-    PATTERN_LEN = 10
+    PATTERN_LEN = 12
 
     def __init__(self):
         self._hist: dict[str, list[str]] = {
@@ -365,9 +356,6 @@ class AMXSignalSystem:
     def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
         self.mode = mode
         self.last_signal_time: float = 0
-        self.cooldown_seconds: int   = 0
-        self.so_cooldown: Optional[float] = None
-        self.ultimos_puntos: list = []
         self.last_two_expected = deque(maxlen=2)
         self.last_two_colors   = deque(maxlen=2)
 
@@ -422,7 +410,7 @@ class AMXSignalSystem:
         if emas_alin:    score += 1
         if racha_ok:     score += 1
 
-        if score < 2:
+        if score < 3:
             return None
 
         strength = "strong" if score >= 5 else "moderate"
@@ -438,27 +426,10 @@ class AMXSignalSystem:
                                "CROSS_8_20" if cruce_8_20 else "EMA"),
         }
 
-    def check_signal_tendencia(self, positions, color_data, current_number,
-                               expected_color, prob_threshold) -> Optional[dict]:
-        sig = self.check_signal(positions, expected_color)
-        if sig and sig["score"] >= 4:
-            sig["trigger_number"] = current_number
-            return sig
-        return None
 
-    def check_signal_moderado(self, positions, color_data, current_number,
-                              expected_color, prob_threshold) -> Optional[dict]:
-        sig = self.check_signal(positions, expected_color)
-        if sig:
-            sig["trigger_number"] = current_number
-            return sig
-        return None
 
     def register_signal_sent(self):
         self.last_signal_time = time.time()
-
-    def register_so_failed(self):
-        self.so_cooldown = time.time()
 
 # ─── SOPORTE Y RESISTENCIA ────────────────────────────────────────────────────
 def find_support_resistance(levels: list,
@@ -909,273 +880,6 @@ class DetailedStats:
         self.batch_start_bankroll = None
         self.reset_daily("", 0.0)
 
-# ─── CHART GENERATION ────────────────────────────────────────────────────────
-def generate_chart(levels: list, spin_history: list, bet_color: str,
-                   visible: int = VISIBLE,
-                   markov_pred: Optional[dict] = None,
-                   ml_pred: Optional[dict] = None,
-                   unified_prob: Optional[dict] = None) -> io.BytesIO:
-    arr = np.array(levels, dtype=float)
-    n   = len(arr)
-    def calc_ema(data, period):
-        if len(data) < period:
-            return np.full(len(data), np.nan)
-        mult = 2 / (period + 1)
-        out  = np.full(len(data), np.nan)
-        out[period - 1] = np.mean(data[:period])
-        for i in range(period, len(data)):
-            out[i] = (data[i] - out[i-1]) * mult + out[i-1]
-        return out
-    ema4  = calc_ema(arr, 4)
-    ema8  = calc_ema(arr, 8)
-    ema20 = calc_ema(arr, 20)
-    start   = max(0, n - visible)
-    sl      = slice(start, n)
-    x       = np.arange(len(arr[sl]))
-    hist_sl = spin_history[start:]
-    visible_levels = arr[sl]
-    last_level = visible_levels[-1] if len(visible_levels) > 0 else 0
-    lookback_50 = min(50, len(arr))
-    recent_50 = arr[-lookback_50:]
-    min_level_50, max_level_50 = np.min(recent_50), np.max(recent_50)
-    data_range = max_level_50 - min_level_50
-    margin = max(data_range * 0.15, 1.0)
-    offset_from_last_to_min = last_level - min_level_50
-    y_min = min_level_50 - margin - offset_from_last_to_min * 0.3
-    y_max = max_level_50 + margin + offset_from_last_to_min * 0.3
-    visible_height = y_max - y_min
-    last_level_position = (last_level - y_min) / visible_height if visible_height > 0 else 0.5
-    if last_level_position < 0.2:
-        y_min = last_level - visible_height * 0.2
-    elif last_level_position > 0.8:
-        y_max = last_level + visible_height * 0.2
-    is_rojo = bet_color == "ROJO"
-    bg, ax_bg, grid_c = "#0b101f", "#0f1a2a", "#1e2e48"
-    line_c  = "#e84040" if is_rojo else "#9090bb"
-    ema4_c, ema8_c, ema20_c = "#ff9f43", "#48dbfb", "#1dd1a1"
-    title_c = "#ff8080" if is_rojo else "#b0b8d0"
-    fig, ax = plt.subplots(figsize=(8, 3.8), facecolor=bg)
-    ax.set_facecolor(ax_bg)
-    y, e4, e8, e20 = arr[sl], ema4[sl], ema8[sl], ema20[sl]
-    ax.fill_between(x, y, alpha=0.10, color=line_c)
-    ax.plot(x, y, color=line_c, linewidth=0.8, zorder=3)
-    ax.plot(x, e4, color=ema4_c, linewidth=0.7, linestyle="--", label="EMA 4", zorder=4)
-    ax.plot(x, e8, color=ema8_c, linewidth=0.7, linestyle="--", label="EMA 8", zorder=4)
-    ax.plot(x, e20, color=ema20_c, linewidth=1.0, label="EMA 20", zorder=4)
-    ax.set_ylim(y_min, y_max)
-    dot_colors = {"ROJO": "#e84040", "NEGRO": "#aaaacc", "VERDE": "#2ecc71"}
-    for i, spin in enumerate(hist_sl):
-        c = dot_colors.get(spin["real"], "#ffffff")
-        ax.scatter(i, y[i], color=c, s=22, zorder=5, edgecolors="white", linewidths=0.3)
-    sr = find_support_resistance(levels[-30:] if len(levels) > 30 else levels)
-    sup_v, res_v = sr['support'], sr['resistance']
-    res_color = "#e84040" if is_rojo else "#888888"
-    sup_color = "#888888" if is_rojo else "#e84040"
-    if sup_v is not None:
-        ax.axhline(y=sup_v, color=sup_color, linestyle='--', linewidth=1.5, alpha=0.7)
-        ax.text(x[-1], sup_v, f' S {sup_v:.1f}', color=sup_color, fontsize=7, va='bottom', ha='right')
-    if res_v is not None:
-        ax.axhline(y=res_v, color=res_color, linestyle='--', linewidth=1.5, alpha=0.7)
-        ax.text(x[-1], res_v, f' R {res_v:.1f}', color=res_color, fontsize=7, va='top', ha='right')
-    tick_step = max(1, len(x) // 8)
-    tick_x    = list(range(0, len(x), tick_step))
-    tick_lbs  = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
-    ax.set_xticks(tick_x); ax.set_xticklabels(tick_lbs, color="#8899bb", fontsize=7)
-    ax.tick_params(axis='y', colors="#8899bb", labelsize=7)
-    ax.tick_params(axis='x', colors="#8899bb", labelsize=7)
-    ax.spines['bottom'].set_color(grid_c); ax.spines['left'].set_color(grid_c)
-    ax.spines['top'].set_visible(False);   ax.spines['right'].set_visible(False)
-    ax.grid(axis='y', color=grid_c, linewidth=0.4, alpha=0.5)
-    pred_info = ""
-    if unified_prob:
-        pred_info += f" | Unif:{unified_prob['combined_prob']*100:.0f}%"
-        pred_info += f" | M:{unified_prob['markov_prob']*100:.0f}% ML:{unified_prob['ml_prob']*100:.0f}%"
-    emoji = "🔴" if is_rojo else "⚫️"
-    ax.set_title(f"{emoji} {bet_color} — últimos {visible} giros · EMA 4/8/20{pred_info}",
-                 color=title_c, fontsize=8.5, pad=6)
-    from matplotlib.lines import Line2D
-    legend_els = [
-        Line2D([0],[0], color=line_c,  linewidth=0.8, label="Nivel"),
-        Line2D([0],[0], color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4"),
-        Line2D([0],[0], color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8"),
-        Line2D([0],[0], color=ema20_c, linewidth=1.0, label="EMA 20"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor='#e84040', markersize=5, label="Rojo"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor='#aaaacc', markersize=5, label="Negro"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor='#2ecc71', markersize=5, label="Verde"),
-    ]
-    if sup_v is not None:
-        legend_els.append(Line2D([0],[0], color=sup_color, linestyle='--', linewidth=1.5, label='Soporte'))
-    if res_v is not None:
-        legend_els.append(Line2D([0],[0], color=res_color, linestyle='--', linewidth=1.5, label='Resistencia'))
-    ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
-              facecolor="#0b101f", edgecolor=grid_c, labelcolor="white",
-              framealpha=0.8, ncol=2)
-    plt.tight_layout(pad=0.8)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, facecolor=bg)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-def generate_category_chart(
-    category: str,
-    bet_value: str,
-    cat_history: list,
-    spin_history: list,
-    unified_prob: Optional[dict] = None,
-    visible: int = VISIBLE,
-) -> io.BytesIO:
-    if category == "PARIDAD":
-        pos_val, neg_val   = "PAR", "IMPAR"
-        pos_color, neg_color = "#a855f7", "#eab308"
-        bet_icon = CATEGORY_ICONS.get(bet_value, "")
-        title_color = "#c084fc" if bet_value == "PAR" else "#fde047"
-    else:
-        pos_val, neg_val   = "ALTO", "BAJO"
-        pos_color, neg_color = "#3b82f6", "#92400e"
-        bet_icon = CATEGORY_ICONS.get(bet_value, "")
-        title_color = "#60a5fa" if bet_value == "ALTO" else "#d97706"
-
-    levels = []
-    acc = 0
-    for v in cat_history:
-        if v == pos_val:
-            acc += 1
-        elif v == neg_val:
-            acc -= 1
-        levels.append(acc)
-
-    arr = np.array(levels, dtype=float)
-    n   = len(arr)
-
-    def calc_ema(data, period):
-        if len(data) < period:
-            return np.full(len(data), np.nan)
-        mult = 2 / (period + 1)
-        out  = np.full(len(data), np.nan)
-        out[period - 1] = np.mean(data[:period])
-        for i in range(period, len(data)):
-            out[i] = (data[i] - out[i-1]) * mult + out[i-1]
-        return out
-
-    ema4  = calc_ema(arr, 4)
-    ema8  = calc_ema(arr, 8)
-    ema20 = calc_ema(arr, 20)
-
-    start = max(0, n - visible)
-    sl    = slice(start, n)
-    x     = np.arange(len(arr[sl]))
-
-    hist_sl = spin_history[-(len(arr[sl])):]
-
-    visible_levels = arr[sl]
-    if len(visible_levels) == 0:
-        fig, ax = plt.subplots(figsize=(8, 3.8), facecolor="#0b101f")
-        ax.text(0.5, 0.5, "Sin datos suficientes", color="white",
-                ha="center", va="center", transform=ax.transAxes, fontsize=14)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=120, facecolor="#0b101f")
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-
-    lookback = min(50, len(arr))
-    recent   = arr[-lookback:]
-    mn, mx   = np.min(recent), np.max(recent)
-    rng      = max(mx - mn, 1.0)
-    margin   = rng * 0.18
-    last_lv  = visible_levels[-1]
-    y_min = mn - margin
-    y_max = mx + margin
-    lp = (last_lv - y_min) / (y_max - y_min) if (y_max - y_min) > 0 else 0.5
-    if lp < 0.2:  y_min = last_lv - (y_max - y_min) * 0.2
-    if lp > 0.8:  y_max = last_lv + (y_max - y_min) * 0.2
-
-    line_c   = pos_color if bet_value == pos_val else neg_color
-    bg, ax_bg, grid_c = "#0b101f", "#0f1a2a", "#1e2e48"
-    ema4_c, ema8_c, ema20_c = "#ff9f43", "#48dbfb", "#1dd1a1"
-
-    fig, ax = plt.subplots(figsize=(8, 3.8), facecolor=bg)
-    ax.set_facecolor(ax_bg)
-
-    y   = arr[sl]
-    e4  = ema4[sl]
-    e8  = ema8[sl]
-    e20 = ema20[sl]
-
-    ax.fill_between(x, y, alpha=0.10, color=line_c)
-    ax.plot(x, y,  color=line_c,  linewidth=0.8, zorder=3)
-    ax.plot(x, e4, color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4",  zorder=4)
-    ax.plot(x, e8, color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8",  zorder=4)
-    ax.plot(x, e20,color=ema20_c, linewidth=1.0,                 label="EMA 20", zorder=4)
-    ax.set_ylim(y_min, y_max)
-
-    dot_map = {pos_val: pos_color, neg_val: neg_color}
-    cat_slice = cat_history[start:]
-    for i, val in enumerate(cat_slice):
-        c = dot_map.get(val, "#ffffff")
-        if i < len(y):
-            ax.scatter(i, y[i], color=c, s=22, zorder=5,
-                       edgecolors="white", linewidths=0.3)
-
-    sr = find_support_resistance(list(arr)[-30:] if len(arr) > 30 else list(arr))
-    sup_v, res_v = sr['support'], sr['resistance']
-    res_color = line_c
-    sup_color = neg_color if bet_value == pos_val else pos_color
-    if sup_v is not None:
-        ax.axhline(y=sup_v, color=sup_color, linestyle='--', linewidth=1.5, alpha=0.7)
-        ax.text(x[-1], sup_v, f' S {sup_v:.1f}', color=sup_color,
-                fontsize=7, va='bottom', ha='right')
-    if res_v is not None:
-        ax.axhline(y=res_v, color=res_color, linestyle='--', linewidth=1.5, alpha=0.7)
-        ax.text(x[-1], res_v, f' R {res_v:.1f}', color=res_color,
-                fontsize=7, va='top', ha='right')
-
-    tick_step = max(1, len(x) // 8)
-    tick_x    = list(range(0, len(x), tick_step))
-    tick_lbs  = [str(hist_sl[i]["number"]) if i < len(hist_sl) else "" for i in tick_x]
-    ax.set_xticks(tick_x); ax.set_xticklabels(tick_lbs, color="#8899bb", fontsize=7)
-    ax.tick_params(axis='y', colors="#8899bb", labelsize=7)
-    ax.tick_params(axis='x', colors="#8899bb", labelsize=7)
-    ax.spines['bottom'].set_color(grid_c); ax.spines['left'].set_color(grid_c)
-    ax.spines['top'].set_visible(False);   ax.spines['right'].set_visible(False)
-    ax.grid(axis='y', color=grid_c, linewidth=0.4, alpha=0.5)
-
-    pred_info = ""
-    if unified_prob:
-        pred_info += f" | Unif:{unified_prob['combined_prob']*100:.0f}%"
-        pred_info += f" | ML:{unified_prob['ml_prob']*100:.0f}%"
-    ax.set_title(
-        f"{bet_icon} {category}: {bet_value} — últimos {visible} giros · EMA 4/8/20{pred_info}",
-        color=title_color, fontsize=8.5, pad=6
-    )
-
-    from matplotlib.lines import Line2D
-    legend_els = [
-        Line2D([0],[0], color=line_c,  linewidth=0.8, label="Nivel"),
-        Line2D([0],[0], color=ema4_c,  linewidth=0.7, linestyle="--", label="EMA 4"),
-        Line2D([0],[0], color=ema8_c,  linewidth=0.7, linestyle="--", label="EMA 8"),
-        Line2D([0],[0], color=ema20_c, linewidth=1.0,                 label="EMA 20"),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor=pos_color,
-               markersize=5, label=pos_val),
-        Line2D([0],[0], marker='o', color='w', markerfacecolor=neg_color,
-               markersize=5, label=neg_val),
-    ]
-    if sup_v is not None:
-        legend_els.append(Line2D([0],[0], color=sup_color, linestyle='--',
-                                  linewidth=1.5, label='Soporte'))
-    if res_v is not None:
-        legend_els.append(Line2D([0],[0], color=res_color, linestyle='--',
-                                  linewidth=1.5, label='Resistencia'))
-    ax.legend(handles=legend_els, loc="upper left", fontsize=6.5,
-              facecolor="#0b101f", edgecolor=grid_c, labelcolor="white",
-              framealpha=0.8, ncol=2)
-    plt.tight_layout(pad=0.8)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, facecolor=bg)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 12
@@ -1201,11 +905,6 @@ def _tg_call(fn, *args, **kwargs):
                 logger.error(f"Telegram call failed: {e}")
                 return None
 
-def tg_send_photo(bot_inst, chat_id, thread_id, photo_buf, caption) -> Optional[int]:
-    photo_buf.seek(0)
-    msg = _tg_call(bot_inst.send_photo, chat_id=chat_id, photo=photo_buf,
-                   caption=caption, parse_mode="HTML", message_thread_id=thread_id)
-    return msg.message_id if msg else None
 
 def tg_send_text(bot_inst, chat_id, thread_id, text) -> Optional[int]:
     msg = _tg_call(bot_inst.send_message, chat_id=chat_id, text=text,
@@ -1266,11 +965,14 @@ class RouletteEngine:
 
         self.bet_sys = Labouchere(LABOUCHERE_SEQUENCE, BASE_BET)
 
-        # consec_losses solo afecta el min_spin en should_activate()
+        # consec_losses se usa para ajustar el cooldown
         self.consec_losses:   int   = 0
+        # Cooldown: spins a ignorar tras pérdida total antes de aceptar nueva señal
+        self.LOSS_COOLDOWN_SPINS: int = 5   # ajustable
+        self.spins_since_loss:    int = 9999  # inicia "listo"
 
         self.amx_system = AMXSignalSystem(mode="moderado")
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.65)
 
         self.unified_prob_system = UnifiedProbabilitySystem()
 
@@ -1438,18 +1140,6 @@ class RouletteEngine:
             out.append(prev)
         return out
 
-    def get_entry(self, number: int) -> Optional[dict]:
-        return None
-
-    def get_signal(self, number: int) -> Optional[str]:
-        e = self.get_entry(number)
-        return e["senal"] if e else None
-
-    def get_prob(self, number: int, color: str) -> float:
-        e = self.get_entry(number)
-        if not e: return 0.0
-        return e["rojo"] if color == "ROJO" else e["negro"]
-
     def _opposite_color(self, color: str) -> str:
         return "NEGRO" if color == "ROJO" else "ROJO"
 
@@ -1501,7 +1191,7 @@ class RouletteEngine:
         trigger = self.spin_history[-1]["number"] if self.spin_history else 0
 
         pred = self.category_ml.predict_category(category)
-        if pred is None or pred.get("total", 0) < 5:
+        if pred is None or pred.get("total", 0) < 8:
             return None
         clean = {k: v for k, v in pred.items() if k != "total"}
         if not clean:
@@ -1563,12 +1253,6 @@ class RouletteEngine:
             "ema_pattern":    ema_sig.get("pattern", ""),
         }
 
-    def _evaluate_ml_category(self, category: str) -> Optional[dict]:
-        return self._evaluate_category(category)
-
-    def _evaluate_color_candidate(self) -> Optional[dict]:
-        return self._evaluate_category("COLOR")
-
     def _detect_best_category_signal(self) -> Optional[dict]:
         candidates = []
         for cat in ("COLOR", "PARIDAD", "RANGO", "DOCENA", "COLUMNA"):
@@ -1579,9 +1263,6 @@ class RouletteEngine:
             return None
         return max(candidates, key=lambda x: x["probability"])
 
-    def _detect_best_in_category(self, category: str) -> Optional[dict]:
-        return self._evaluate_category(category)
-
     def _get_predictor_votes(self, color: str) -> int:
         votes = 0
         mp = self.markov.predict(self.spin_history)
@@ -1589,110 +1270,6 @@ class RouletteEngine:
         ml = self.ml_predictor.predict(self.spin_history)
         if ml and ml.get(color, 0) > 0.50: votes += 1
         return votes
-
-    def _passes_markov_ml_filter(self, color: str) -> bool:
-        mp = self.markov.predict(self.spin_history)
-        ml = self.ml_predictor.predict(self.spin_history)
-        if mp is not None and mp.get(color, 0) < 0.50:
-            logger.info(f"[{self.name}] Bloqueada: Markov {mp.get(color,0)*100:.0f}% < 50%")
-            return False
-        if ml is not None and ml.get(color, 0) < 0.50:
-            logger.info(f"[{self.name}] Bloqueada: ML {ml.get(color,0)*100:.0f}% < 50%")
-            return False
-        return True
-
-    def _best_retry_value(self, trigger_number: int) -> Optional[str]:
-        if self.active_category == "COLOR":
-            return self._best_retry_color(trigger_number)
-        pred = self.category_ml.predict_category(self.active_category)
-        if pred is None or pred.get("total", 0) < 3:
-            return self.bet_value
-        pred_clean = {k: v for k, v in pred.items() if k != "total"}
-        best_val   = max(pred_clean, key=pred_clean.get)
-        best_prob  = pred_clean[best_val]
-        if best_prob >= self.min_prob_threshold:
-            return best_val
-        return None
-
-    def _check_retry_conditions(self, color: str, trigger_number: int) -> bool:
-        entry = self.get_entry(trigger_number)
-        if not entry or entry["senal"] == "NO APOSTAR": return False
-        if entry["senal"] != color: return False
-        prob = entry["rojo"] if color == "ROJO" else entry["negro"]
-        if prob < self.min_prob_threshold: return False
-        levels = self.rojo_levels if color == "ROJO" else self.negro_levels
-        if len(levels) < 20: return False
-        ema20 = self.calculate_ema(levels, 20)
-        li = len(levels) - 1
-        if ema20[li] is None or levels[li] <= ema20[li]: return False
-        opp = self._opposite_color(color)
-        mp = self.markov.predict(self.spin_history)
-        ml = self.ml_predictor.predict(self.spin_history)
-        if mp and ml and mp.get(opp, 0) > 0.65 and ml.get(opp, 0) > 0.65:
-            return False
-        return True
-
-    def _best_retry_color(self, trigger_number: int) -> Optional[str]:
-        same_ok = self._check_retry_conditions(self.bet_value, trigger_number)
-        opp     = self._opposite_color(self.bet_value)
-        opp_ok  = self._check_retry_conditions(opp, trigger_number)
-        if same_ok and opp_ok:
-            chosen = self.bet_value if self._get_predictor_votes(self.bet_value) >= self._get_predictor_votes(opp) else opp
-            return chosen
-        if same_ok: return self.bet_value
-        if opp_ok:  return opp
-        return None
-
-    def _detect_amx_signal(self) -> Optional[dict]:
-        return self._evaluate_category("COLOR")
-
-    def should_activate(self) -> Optional[str]:
-        losses   = self.consec_losses
-        min_spin = 22 + losses * 2
-        if len(self.spin_history) < min_spin: return None
-        last_num = self.spin_history[-1]["number"]
-        entry = self.get_entry(last_num)
-        if not entry or entry["senal"] == "NO APOSTAR": return None
-        expected = entry["senal"]
-        if len(self.rojo_levels) < 20 or len(self.negro_levels) < 20: return None
-        ema4o  = self.calculate_ema(self.rojo_levels,  4)
-        ema8o  = self.calculate_ema(self.rojo_levels,  8)
-        ema20o = self.calculate_ema(self.rojo_levels, 20)
-        ema4i  = self.calculate_ema(self.negro_levels,  4)
-        ema8i  = self.calculate_ema(self.negro_levels,  8)
-        ema20i = self.calculate_ema(self.negro_levels, 20)
-        req = min(3 + losses, 13)
-        li  = len(self.rojo_levels) - 1
-        def check(levels, e20, e8, e4, idx):
-            for off in range(req):
-                i = idx - (req - 1) + off
-                if i < 0 or i >= len(levels) or i >= len(e20): return False
-                if e20[i] is None or levels[i] <= e20[i]: return False
-                if losses >= 2:
-                    if i >= len(e8) or e8[i] is None or levels[i] <= e8[i]: return False
-                if losses >= 4:
-                    if i >= len(e4) or e4[i] is None or levels[i] <= e4[i]: return False
-            return True
-        if expected == "ROJO"  and check(self.rojo_levels, ema20o, ema8o, ema4o, li): return "ROJO"
-        if expected == "NEGRO" and check(self.negro_levels, ema20i, ema8i, ema4i, li): return "NEGRO"
-        return None
-
-    def determine_bet_color(self, expected: str) -> str:
-        if len(self.spin_history) < 20: return expected
-        ema20o = self.calculate_ema(self.rojo_levels, 20)
-        ema20i = self.calculate_ema(self.negro_levels, 20)
-        li = len(self.rojo_levels) - 1
-        if li < 0 or li >= len(ema20o) or li >= len(ema20i): return expected
-        if ema20o[li] is None or ema20i[li] is None: return expected
-        last_sig = self.get_signal(self.spin_history[-1]["number"])
-        if expected == "ROJO":
-            if self.rojo_levels[li] < ema20o[li]:
-                return "NEGRO" if last_sig == "NEGRO" else "ROJO"
-            return "ROJO"
-        else:
-            if self.negro_levels[li] < ema20i[li]:
-                return "ROJO" if last_sig == "ROJO" else "NEGRO"
-            return "NEGRO"
 
     def _check_recovery(self):
         # La secuencia Labouchère se resetea sola cuando se eliminan todos los extremos.
@@ -1702,20 +1279,6 @@ class RouletteEngine:
             logger.info(f"[{self.name}] Bankroll recuperado — consec_losses reseteado.")
             self.consec_losses = 0
 
-    def _update_amx_positions(self, color: str):
-        last_pos = self.amx_system.ultimos_puntos[-1] if self.amx_system.ultimos_puntos else 0
-        if color == "ROJO":      new_pos = last_pos + 1
-        elif color == "NEGRO":   new_pos = last_pos - 1
-        else:                    new_pos = last_pos
-        self.amx_system.ultimos_puntos.append(new_pos)
-        if len(self.amx_system.ultimos_puntos) > 300:
-            self.amx_system.ultimos_puntos = self.amx_system.ultimos_puntos[-200:]
-
-    def _update_unified_system(self, color: str):
-        levels = self.rojo_levels if color == "ROJO" else self.negro_levels
-        self.unified_prob_system.calculate_volatility(levels)
-        self.unified_prob_system.update_trend_factors(levels)
-        self.unified_prob_system.update_weights()
 
     def _get_unified_probability(self, color: str, trigger_number: int) -> dict:
         markov_pred = self.markov.predict(self.spin_history)
@@ -1737,31 +1300,6 @@ class RouletteEngine:
             "ema_trend_factor": 1.0, "sr_factor": 1.0, "volatility": 1.0,
         }
 
-    def _record_prediction_result(self, color: str, actual: str):
-        markov_pred = self.markov.predict(self.spin_history)
-        ml_pred     = self.ml_predictor.predict(self.spin_history)
-        self.unified_prob_system.record_prediction(color, markov_pred, ml_pred, actual)
-
-    def _format_sequence(self, spin_history: list) -> str:
-        emojis = {"ROJO": "🔴", "NEGRO": "⚫️", "VERDE": "🟢"}
-        recent = spin_history[-10:] if len(spin_history) >= 10 else spin_history
-        return " --> ".join(emojis.get(s["real"], "❓") for s in recent)
-
-    def _build_caption(self, attempt: int, unified_prob: Optional[dict]) -> str:
-        bet      = self.bet_sys.current_bet()
-        prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
-        val_icon = self._category_icon(self.bet_value)
-        trig_disp = self._trigger_display(self.trigger_number, self.active_category)
-        return (
-            f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
-            f"🎰 Juego: {self.name}\n\n"
-            f"👉 Después de: {trig_disp}\n"
-            f"🧨 Apostar a: <b>{self.bet_value}</b> {val_icon}\n\n"
-            f"💡 Probabilidad: {prob_pct}%\n"
-            f"🎲 Labouchère: [{self.bet_sys.sequence_display()}]\n"
-            f"📍 Apuesta: {bet:.2f} usd\n"
-            f"♻️ Intento {attempt}/{self.total_attempts}"
-        )
 
     def _chart_color(self) -> str:
         if self.active_category == "COLOR":
@@ -2019,21 +1557,18 @@ class RouletteEngine:
         self.rojo_levels = self.rojo_levels[-min_len:]
         self.negro_levels = self.negro_levels[-min_len:]
 
-        self._update_amx_positions(real)
-        self.amx_system.update_streak(real, self.get_signal(number))
-        if self.signal_active or self.waiting_for_attempt:
-            ref_color = self.bet_value if self.active_category == "COLOR" else "ROJO"
-            self._update_unified_system(ref_color)
+        self.amx_system.update_streak(real, None)
         if real != "VERDE":
             self.unified_prob_system.update_streak(real)
+            ref_lv = self.rojo_levels if real == "ROJO" else self.negro_levels
+            self.unified_prob_system.calculate_volatility(ref_lv)
+            self.unified_prob_system.update_trend_factors(ref_lv)
 
         self.markov.update(self.spin_history)
         self.ml_predictor.add_spin(self.spin_history)
+        if not (self.signal_active or self.waiting_for_attempt):
+            self.spins_since_loss += 1
         self.category_ml.add_spin(number, real)
-        self.unified_prob_system.update_streak(real)
-        _lv = self.rojo_levels if real == "ROJO" else self.negro_levels
-        self.unified_prob_system.calculate_volatility(_lv)
-        self.unified_prob_system.update_trend_factors(_lv)
         self.unified_prob_system.update_weights()
 
         if not self.warmup_done:
@@ -2072,8 +1607,6 @@ class RouletteEngine:
                 bet = self.bet_sys.win()
                 self.stats.record_signal_result(current_attempt, True, bet,
                                                 self.bet_sys.bankroll, self.active_category)
-                if self.active_category == "COLOR":
-                    self._record_prediction_result(self.bet_value, real)
                 self.signal_active   = False
                 self.active_category = None
                 self.zero_wait_category = None
@@ -2161,6 +1694,11 @@ class RouletteEngine:
 
         else:
             self.signal_msg_ids = []
+            # Cooldown post-pérdida: esperar N spins antes de nueva señal
+            if self.spins_since_loss < self.LOSS_COOLDOWN_SPINS:
+                logger.debug(
+                    f"[{self.name}] Cooldown post-pérdida: {self.spins_since_loss}/{self.LOSS_COOLDOWN_SPINS} spins")
+                return
             best = self._detect_best_category_signal()
             if best:
                 unified_prob = self._get_category_probability(
@@ -2186,14 +1724,13 @@ class RouletteEngine:
         if bet is None:
             bet = self.bet_sys.loss()
         self.consec_losses += 1
+        self.spins_since_loss = 0  # inicia cooldown post-pérdida
         # Labouchère: la secuencia crece con la pérdida (loss() ya la agregó).
         # Solo reseteamos consec_losses a los 10 sin tocar la secuencia.
         if self.consec_losses >= 10:
             self.consec_losses = 0
         self.stats.record_signal_result(0, False, bet,
                                         self.bet_sys.bankroll, self.active_category)
-        if self.active_category == "COLOR":
-            self._record_prediction_result(self.bet_value, real)
         self.signal_active   = False
         self.active_category = None
         self.zero_wait_category = None
