@@ -1,16 +1,12 @@
-
 #!/usr/bin/env python3
 """
-Roulette Telegram Signal Bot — Russian Roulette (UNIFIED)
-  · 5 categorías: COLOR / PARIDAD / RANGO (3 intentos) + DOCENA / COLUMNA (2 intentos)
-  · Labouchère independiente de la señal — reset solo al vaciar la secuencia
-  · CategoryPredictor PATTERN_LEN=12, min_total=8
-  · AMX EMA score ≥ 3
-  · min_prob_threshold = 0.65
+Roulette Telegram Signal Bot — Martingala con AMX tendencia
+  · Máximo 6 intentos (niveles 1..6)
+  · Reinicio de ficha a nivel 1 tras dos señales perdidas consecutivas
+  · Modo AMX tendencia por defecto
   · Cooldown 5 spins post-pérdida
   · Estadísticas separadas CPR vs DC
   · Pre-entrenamiento con russian-azure.db
-  · Calentamiento WS: 21 giros silenciosos
 """
 
 import asyncio
@@ -134,76 +130,66 @@ ROULETTE_CONFIGS = {
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 5   # solo usado en recuperación de errores
-CAT_MAX_ATTEMPTS = {
-    "COLOR":   3,
-    "PARIDAD": 3,
-    "RANGO":   3,
-    "DOCENA":  2,
-    "COLUMNA": 2,
-}
+MAX_ATTEMPTS = 6   # Máximo número de intentos (niveles Martingala)
 
-def cat_max(category: str) -> int:
-    return CAT_MAX_ATTEMPTS.get(category, 3)
-
-BASE_BET  = 0.10
+BASE_BET  = 0.50   # Apuesta base nivel 1
 VISIBLE   = 50
 WARMUP_SPINS = 21
 
-# ─── LABOUCHÈRE ───────────────────────────────────────────────────────────────
-LABOUCHERE_SEQUENCE: list[int] = [1, 2, 1]
-
-class Labouchere:
-    def __init__(self, sequence: list[int], base: float):
-        self.base            = base
-        self.original_seq    = list(sequence)
-        self.sequence        = list(sequence)
-        self.bankroll        = 0.0
-
-    @property
-    def step(self) -> int:
-        return max(0, len(self.sequence) - len(self.original_seq))
-
-    def is_fresh(self) -> bool:
-        return self.sequence == self.original_seq
-
-    def reset(self):
-        self.sequence = list(self.original_seq)
-
-    def set_sequence(self, new_seq: list[int]):
-        self.original_seq = list(new_seq)
-        self.sequence     = list(new_seq)
+# ─── MARTINGALA ───────────────────────────────────────────────────────────────
+class Martingale:
+    """Sistema de apuestas Martingala con niveles fijos y reinicio tras dos pérdidas consecutivas."""
+    def __init__(self, base: float):
+        self.base = base
+        self.level = 1              # nivel actual (1..6)
+        self.bankroll = 0.0
+        self.consecutive_losses = 0   # señales completas perdidas seguidas
 
     def current_bet(self) -> float:
-        if not self.sequence:
-            self.reset()
-        if len(self.sequence) == 1:
-            val = self.sequence[0]
-        else:
-            val = self.sequence[0] + self.sequence[-1]
-        return round(self.base * val, 2)
+        """Devuelve la apuesta según el nivel actual."""
+        bets = {1: self.base,
+                2: self.base * 2,
+                3: self.base * 4,
+                4: self.base * 8,
+                5: self.base * 16,
+                6: self.base * 32}
+        return round(bets.get(self.level, self.base * 32), 2)
 
     def win(self) -> float:
+        """Registra una ganancia: suma la apuesta, resetea nivel y pérdidas consecutivas."""
         bet = self.current_bet()
         self.bankroll = round(self.bankroll + bet, 2)
-        if len(self.sequence) >= 2:
-            self.sequence.pop(0)
-            self.sequence.pop(-1)
-        elif len(self.sequence) == 1:
-            self.sequence.pop(0)
-        if not self.sequence:
-            self.reset()
+        self.level = 1
+        self.consecutive_losses = 0
         return bet
 
     def loss(self) -> float:
+        """Registra una pérdida: resta la apuesta e incrementa el nivel si no estamos en el máximo."""
         bet = self.current_bet()
         self.bankroll = round(self.bankroll - bet, 2)
-        units = round(bet / self.base)
-        self.sequence.append(units if units > 0 else 1)
+        if self.level < 6:
+            self.level += 1
         return bet
 
-    def sequence_display(self) -> str:
-        return " - ".join(str(v) for v in self.sequence)
+    def full_loss(self) -> float:
+        """Señal completa perdida (se ha perdido en nivel 6). Incrementa pérdidas consecutivas y resetea nivel."""
+        bet = self.current_bet()   # será la apuesta de nivel 6
+        self.bankroll = round(self.bankroll - bet, 2)
+        self.consecutive_losses += 1
+        self.level = 1
+        return bet
+
+    def reset(self):
+        """Reinicia nivel y pérdidas consecutivas (sin tocar bankroll)."""
+        self.level = 1
+        self.consecutive_losses = 0
+
+    @property
+    def step(self) -> int:
+        return self.level
+
+    def is_fresh(self) -> bool:
+        return self.level == 1 and self.consecutive_losses == 0
 
 # ─── MARKOV CHAIN ────────────────────────────────────────────────────────────
 class MarkovChainPredictor:
@@ -276,7 +262,7 @@ class MLPatternPredictor:
 
 # ─── CATEGORY PREDICTOR ──────────────────────────────────────────────────────
 class CategoryPredictor:
-    PATTERN_LEN = 12
+    PATTERN_LEN = 11
 
     def __init__(self):
         self._hist: dict[str, list[str]] = {
@@ -352,7 +338,7 @@ class CategoryPredictor:
 
 # ─── AMX SIGNAL SYSTEM ───────────────────────────────────────────────────────
 class AMXSignalSystem:
-    def __init__(self, mode: Literal["tendencia", "moderado"] = "moderado"):
+    def __init__(self, mode: Literal["tendencia", "moderado"] = "tendencia"):  # por defecto tendencia
         self.mode = mode
         self.last_signal_time: float = 0
         self.last_two_expected = deque(maxlen=2)
@@ -424,8 +410,6 @@ class AMXSignalSystem:
                                "CROSS_4_20" if cruce_4_20 else
                                "CROSS_8_20" if cruce_8_20 else "EMA"),
         }
-
-
 
     def register_signal_sent(self):
         self.last_signal_time = time.time()
@@ -962,15 +946,14 @@ class RouletteEngine:
         self.no_confirmation_msg_id: Optional[int] = None
         self.result_sequence: deque = deque(maxlen=10)
 
-        self.bet_sys = Labouchere(LABOUCHERE_SEQUENCE, BASE_BET)
+        # Martingala
+        self.bet_sys = Martingale(BASE_BET)
 
-        # consec_losses se usa para ajustar el cooldown
-        self.consec_losses:   int   = 0
         # Cooldown: spins a ignorar tras pérdida total antes de aceptar nueva señal
-        self.LOSS_COOLDOWN_SPINS: int = 5   # ajustable
+        self.LOSS_COOLDOWN_SPINS: int = 5
         self.spins_since_loss:    int = 9999  # inicia "listo"
 
-        self.amx_system = AMXSignalSystem(mode="moderado")
+        self.amx_system = AMXSignalSystem(mode="tendencia")   # FORZADO tendencia
         # Ciclo CPR: registra qué categorías (COLOR/PARIDAD/RANGO) ya se
         # resolvieron en el ciclo actual. Al completar las 3 se reinicia.
         self.cpr_cycle_used: set = set()
@@ -1278,12 +1261,8 @@ class RouletteEngine:
         return votes
 
     def _check_recovery(self):
-        # La secuencia Labouchère se resetea sola cuando se eliminan todos los extremos.
-        # Solo reiniciamos el contador de pérdidas consecutivas cuando el bankroll
-        # recupera terreno positivo, sin tocar la secuencia.
-        if self.consec_losses > 0 and self.bet_sys.bankroll >= 0:
-            logger.info(f"[{self.name}] Bankroll recuperado — consec_losses reseteado.")
-            self.consec_losses = 0
+        # No necesario con Martingala, se mantiene por compatibilidad
+        pass
 
     def _mark_cpr_used(self, category: str):
         """Marca una categoría CPR como resuelta en el ciclo actual.
@@ -1297,7 +1276,6 @@ class RouletteEngine:
         if self.cpr_cycle_used >= {"COLOR", "PARIDAD", "RANGO"}:
             self.cpr_cycle_used.clear()
             logger.info(f"[{self.name}] 🔄 Ciclo CPR completado — reiniciando ciclo")
-
 
     def _get_unified_probability(self, color: str, trigger_number: int) -> dict:
         markov_pred = self.markov.predict(self.spin_history)
@@ -1318,7 +1296,6 @@ class RouletteEngine:
             "weights": self.unified_prob_system.weights.copy(),
             "ema_trend_factor": 1.0, "sr_factor": 1.0, "volatility": 1.0,
         }
-
 
     def _chart_color(self) -> str:
         if self.active_category == "COLOR":
@@ -1343,6 +1320,7 @@ class RouletteEngine:
         cat_labels = {"COLOR":"🔴⚫ COLOR","PARIDAD":"🟣🟡 PARIDAD",
                       "RANGO":"🔵🟤 RANGO","DOCENA":"🤍 DOCENA","COLUMNA":"💚 COLUMNA"}
         cat_label = cat_labels.get(self.active_category or "COLOR", self.active_category or "")
+        nivel_actual = self.bet_sys.level
         if self.signal_pair and self.active_category in ("DOCENA","COLUMNA"):
             p1, p2 = self.signal_pair
             i1 = self._category_icon(p1); i2 = self._category_icon(p2)
@@ -1355,9 +1333,9 @@ class RouletteEngine:
             f"👉 Después de: {trig_disp}\n"
             f"🧨 Apostar a: {apuesta_str}\n\n"
             f"💡 Probabilidad: {prob_pct}%\n"
-            f"🎲 Labouchère: [{self.bet_sys.sequence_display()}]\n"
+            f"📈 Martingala Nivel {nivel_actual}/6\n"
             f"📍 Apuesta: {bet:.2f} usd\n"
-            f"♻️ Intento {attempt}/{self.total_attempts}"
+            f"♻️ Intento {attempt}/6"
         )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
@@ -1377,7 +1355,7 @@ class RouletteEngine:
         prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
         logger.info(
             f"[{self.name}] 🎯 [{self.active_category}] {self.bet_value} "
-            f"intento={attempt} trig={self.trigger_number} prob={prob_pct}%"
+            f"intento={attempt} nivel={self.bet_sys.level} trig={self.trigger_number} prob={prob_pct}%"
         )
 
     def _send_waiting_message(self, attempt_number: int):
@@ -1404,16 +1382,18 @@ class RouletteEngine:
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
         status            = "✅ ¡GREEN!" if won else "❌ ¡LOSS!"
+        nivel = self.bet_sys.level
 
         text = (
             f"{status}\n\n"
             f"🎯 Aposté a: <b>{self.bet_value}</b> {bet_icon}\n"
             f"🔢 Salió: {number} <b>{cat_val}</b> {cat_icon}\n"
-            f"💰 Bankroll: {bankroll:.2f} usd"
+            f"💰 Bankroll: {bankroll:.2f} usd\n"
+            f"🎲 Martingala Nivel {nivel}/6 (intento {attempt_won})"
         )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
-                    f"cat_val={cat_val} intento={attempt_won} bankroll={bankroll:.2f}")
+                    f"cat_val={cat_val} intento={attempt_won} nivel={nivel} bankroll={bankroll:.2f}")
 
     def _check_stats(self):
         if not self.stats.should_send_stats(): return
@@ -1597,8 +1577,7 @@ class RouletteEngine:
         col_v  = f"C{get_column(number)}" if number != 0 else "VERDE"
         if self.signal_active:
             sig_state = (f"🟢 [{self.active_category}] {self.bet_value} "
-                         f"intento {self.total_attempts - self.attempts_left + 1}"
-                         f"/{self.total_attempts}")
+                         f"nivel {self.bet_sys.level}/6")
         elif self.waiting_for_attempt:
             sig_state = f"⏳ Esperando intento {self.waiting_attempt_number}"
         else:
@@ -1607,7 +1586,7 @@ class RouletteEngine:
         logger.info(
             f"[{self.name}] 🎰 #{len(self.spin_history)} "
             f"N:{number:>2} {real:<5} | {par_v:<5} {rang_v:<4} {doz_v} {col_v} | "
-            f"BK:{self.bet_sys.bankroll:>7.2f}$ Seq:[{self.bet_sys.sequence_display()}] | "
+            f"BK:{self.bet_sys.bankroll:>7.2f}$ Martingala Nivel {self.bet_sys.level} | "
             f"{sig_state}")
 
         if not self.warmup_done:
@@ -1643,7 +1622,7 @@ class RouletteEngine:
             current_attempt = self.total_attempts - self.attempts_left + 1
 
             if result:
-                bet = self.bet_sys.win()
+                bet = self.bet_sys.win()   # Esto resetea nivel y pérdidas consecutivas
                 self.stats.record_signal_result(current_attempt, True, bet,
                                                 self.bet_sys.bankroll, self.active_category)
                 self._mark_cpr_used(self.active_category)
@@ -1651,19 +1630,20 @@ class RouletteEngine:
                 self.active_category = None
                 self.zero_wait_category = None
                 self.zero_wait_bet_value = None
-                self._check_recovery()
                 self._send_result(number, real, True, bet, current_attempt)
                 self._check_daily_report()
                 self._check_stats()
                 self.signal_msg_ids = []
             else:
+                # Pérdida en este intento
+                bet = self.bet_sys.loss()   # resta la apuesta y sube nivel (si no es último)
                 self.attempts_left -= 1
-                bet = self.bet_sys.loss()
-                if self.attempts_left <= 0:
+                if self.attempts_left <= 0 or self.bet_sys.level == 6:   # nivel máximo alcanzado y perdido
+                    # Señal completamente perdida
                     self._handle_full_loss(number, real, bet)
                 else:
+                    # Reintentar con el siguiente nivel
                     attempt_number = self.total_attempts - self.attempts_left + 1
-                    # ** Mantener el mismo bet_value **
                     self.trigger_number = number
                     unified_prob = self._get_category_probability(
                         self.active_category, self.bet_value, number)
@@ -1697,7 +1677,7 @@ class RouletteEngine:
             attempt_number = self.waiting_attempt_number
             best = self._detect_best_category_signal()
             if not best or best["probability"] < self.min_prob_threshold:
-                ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
+                ords = {2:"2°",3:"3°",4:"4°",5:"5°",6:"6°"}
                 ord_str = ords.get(attempt_number, f"{attempt_number}°")
                 if self.no_confirmation_msg_id:
                     tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
@@ -1712,7 +1692,7 @@ class RouletteEngine:
                     logger.debug(
                         f"[{self.name}] Reintento descartado [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
-                    ords = {2:"2°",3:"3°",4:"4°",5:"5°"}
+                    ords = {2:"2°",3:"3°",4:"4°",5:"5°",6:"6°"}
                     ord_str = ords.get(attempt_number, f"{attempt_number}°")
                     if self.no_confirmation_msg_id:
                         tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
@@ -1748,27 +1728,25 @@ class RouletteEngine:
                         f"[{self.name}] Señal descartada [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
                     return
+                # Inicializar nueva señal con Martingala nivel 1 (ya lo está, pero aseguramos)
+                self.bet_sys.level = 1
                 self.signal_active   = True
                 self.active_category = best["category"]
                 self.bet_value       = best["bet_value"]
                 self.signal_pair     = best.get("signal_pair", ())
                 self.bet_color       = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
                 self.trigger_number  = number
-                _max = cat_max(best["category"])
-                self.attempts_left   = _max
-                self.total_attempts  = _max
+                self.total_attempts  = MAX_ATTEMPTS
+                self.attempts_left   = MAX_ATTEMPTS
                 self._send_signal(1, unified_prob)
                 self.amx_system.register_signal_sent()
 
     def _handle_full_loss(self, number: int, real: str, bet: float = None):
         if bet is None:
-            bet = self.bet_sys.loss()
-        self.consec_losses += 1
+            bet = self.bet_sys.current_bet()
+        # Registrar pérdida completa (ya se perdió el último intento)
+        self.bet_sys.full_loss()   # incrementa consecutive_losses y resetea nivel a 1
         self.spins_since_loss = 0  # inicia cooldown post-pérdida
-        # Labouchère: la secuencia crece con la pérdida (loss() ya la agregó).
-        # Solo reseteamos consec_losses a los 10 sin tocar la secuencia.
-        if self.consec_losses >= 10:
-            self.consec_losses = 0
         self.stats.record_signal_result(0, False, bet,
                                         self.bet_sys.bankroll, self.active_category)
         self._mark_cpr_used(self.active_category)
@@ -1841,7 +1819,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "bot": "Roulette Signal Bot AMX V22", "ts": time.time()})
+    return jsonify({"status": "ok", "bot": "Roulette Signal Bot Martingala AMX", "ts": time.time()})
 
 @app.route("/ping")
 def ping():
@@ -1873,26 +1851,23 @@ engines: dict[str, RouletteEngine] = {}
 def _register_handlers(b: telebot.TeleBot):
     @b.message_handler(commands=['start', 'help'])
     def cmd_start(message):
-        seq = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
         help_text = f"""
-<b>🎰 Roulette Bot AMX UNIFIED</b>
+<b>🎰 Roulette Bot AMX — Martingala</b>
 Russian Roulette
 
 <b>Características:</b>
-• Sin cooldown entre señales
-• 3 intentos COLOR/PARIDAD/RANGO, 2 intentos DOCENAS/COLUMNAS (Labouchère)
-• Secuencia actual: <code>{seq}</code>
+• Sistema Martingala con niveles: 0.50 / 1.00 / 2.00 / 4.00 / 8.00 / 16.00 €
+• Máximo 6 intentos por señal
+• Reinicio a nivel 1 tras dos señales perdidas consecutivas
+• Modo AMX <b>tendencia</b> activado por defecto
+• Cooldown 5 spins tras pérdida
 • Calentamiento WS: 21 giros silenciosos
-• Gráficos por categoría: COLOR 🔴⚫️ | PARIDAD 🟣🟡 | RANGO 🟤🔵
 • Estadísticas separadas CPR (3 intentos) / DC (2 intentos)
-• Pre-entrenamiento con DB histórica (~16k giros/tabla)
-• Misma apuesta repetida en todos los intentos (ej. BAJO se mantiene)
 
 Comandos:
-/moderado - Modo MODERADO
-/tendencia - Modo TENDENCIA
-/status - Estado de ruletas
-/secuencia 1 2 1 - Cambiar secuencia Labouchère
+/moderado - Cambiar a modo MODERADO (menos agresivo)
+/tendencia - Cambiar a modo TENDENCIA (más agresivo)
+/status - Estado actual
 /reset - Resetear estadísticas
 /help - Esta ayuda
         """
@@ -1912,14 +1887,14 @@ Comandos:
 
     @b.message_handler(commands=['status'])
     def cmd_status(message):
-        lines = ["<b>📊 ESTADO AMX UNIFIED</b>\n"]
+        lines = ["<b>📊 ESTADO AMX MARTINGALA</b>\n"]
         for name, engine in engines.items():
             mode_icon = "📈" if engine.amx_system.mode == "tendencia" else "📊"
             if engine.signal_active:
                 cat  = engine.active_category or "?"
                 val  = engine.bet_value or "?"
                 icon = CATEGORY_ICONS.get(val, "")
-                st   = f"🟢 [{cat}] {val}{icon} intento {engine.total_attempts - engine.attempts_left + 1}/{engine.total_attempts}"
+                st   = f"🟢 [{cat}] {val}{icon} nivel {engine.bet_sys.level}/6"
             elif engine.waiting_for_attempt:
                 st = f"⏳ Esperando intento {engine.waiting_attempt_number}/{engine.total_attempts}"
             else:
@@ -1930,46 +1905,13 @@ Comandos:
             lines.append(f"<b>{name}</b>: {mode_icon} — {st} [M:{w['markov']:.2f} ML:{w['ml']:.2f}] | {cycle_str}")
         b.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
-    @b.message_handler(commands=['secuencia'])
-    def cmd_secuencia(message):
-        global LABOUCHERE_SEQUENCE
-        parts = message.text.strip().split()[1:]
-        if not parts:
-            seq_str = " - ".join(str(v) for v in LABOUCHERE_SEQUENCE)
-            b.reply_to(message,
-                f"🎲 Secuencia actual: <code>{seq_str}</code>\n"
-                f"Uso: /secuencia 1 2 1",
-                parse_mode="HTML")
-            return
-        try:
-            new_seq = [int(x) for x in parts if int(x) > 0]
-            if not new_seq:
-                raise ValueError("secuencia vacía")
-        except ValueError:
-            b.reply_to(message,
-                "⚠️ Formato inválido. Usa números enteros positivos.\n"
-                "Ejemplo: <code>/secuencia 1 2 3 2 1</code>",
-                parse_mode="HTML")
-            return
-        LABOUCHERE_SEQUENCE = new_seq
-        for engine in engines.values():
-            engine.bet_sys.set_sequence(new_seq)
-        seq_str = " - ".join(str(v) for v in new_seq)
-        total_units = sum(new_seq)
-        b.reply_to(message,
-            f"✅ <b>Secuencia Labouchère actualizada</b>\n\n"
-            f"🎲 Nueva secuencia: <code>{seq_str}</code>\n"
-            f"💰 Apuesta inicial: {(new_seq[0]+new_seq[-1])*BASE_BET:.2f} usd "
-            f"({new_seq[0]+new_seq[-1]} unidades)\n"
-            f"📊 Total a recuperar: {total_units*BASE_BET:.2f} usd ({total_units} unidades)",
-            parse_mode="HTML")
-
     @b.message_handler(commands=['reset'])
     def cmd_reset(message):
         for engine in engines.values():
             engine.stats = DetailedStats()
             engine.cpr_cycle_used.clear()
-        b.reply_to(message, "🔄 <b>Estadísticas reseteadas</b>", parse_mode="HTML")
+            engine.bet_sys.reset()
+        b.reply_to(message, "🔄 <b>Estadísticas y Martingala reseteadas</b>", parse_mode="HTML")
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -1989,7 +1931,7 @@ async def main():
 
     threading.Thread(target=_poll, args=(bot, "Russian"), daemon=True).start()
 
-    logger.info("🎰 Russian Roulette Bot AMX iniciado")
+    logger.info("🎰 Russian Roulette Bot AMX Martingala iniciado")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
