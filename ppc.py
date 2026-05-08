@@ -865,6 +865,7 @@ class RouletteEngine:
         self.ws_spins_count: int  = live_loaded
         self.warmup_done:    bool = live_loaded >= WARMUP_SPINS
 
+    # ── Métodos previos no modificados ───────────────────────────────────
     def _pretrain_from_db(self, db_path: str, table_name: str):
         if not os.path.exists(db_path):
             logger.warning(f"[{self.name}] DB no encontrada: {db_path}")
@@ -1213,12 +1214,12 @@ class RouletteEngine:
             apuesta_str = f"<b>{self.bet_value}</b> {val_icon}"
         return (
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
-            f"🎰 <b>{self.name}</b>\n"                  # ✅ cerrado con </b>
-            f"👉 <b>ÚLTIMA NÚMER: {trig_disp}</b>\n"    # ✅ corregido
-            f"❄️ <b>ENTRAR A: {apuesta_str}</b>\n\n"   # ✅ corregido
-            f"💡 <i>Probabilidad: {prob_pct}%</i>\n"    # ✅ corregido
-            f"📈 <i>Martingala Nivel {nivel_actual}/6</i>\n"  # ✅ corregido
-            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"        # ✅ corregido
+            f"🎰 <b>{self.name}</b>\n"
+            f"👉 <b>ÚLTIMA NÚMER: {trig_disp}</b>\n"
+            f"❄️ <b>ENTRAR A: {apuesta_str}</b>\n\n"
+            f"💡 <i>Probabilidad: {prob_pct}%</i>\n"
+            f"📈 <i>Martingala Nivel {nivel_actual}/6</i>\n"
+            f"📍 <i>Apuesta: {bet:.2f} usd</i>\n"
         )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
@@ -1251,9 +1252,9 @@ class RouletteEngine:
             self.no_confirmation_msg_id = None
         logger.info(f"[{self.name}] ⏳ Esperando condiciones intento {attempt_number}")
 
-    # ── CORREGIDO: cierre de etiquetas <i> ───────────────────────────────
+    # ── CORREGIDO: INTENTO ahora muestra nivel Martingala usado ──────────
     def _send_result(self, number: int, real: str, won: bool, bet: float,
-                     attempt_won: int, delete_signals: bool = True):
+                     level_used: int, delete_signals: bool = True):
         if delete_signals and self.signal_msg_ids:
             for mid in self.signal_msg_ids:
                 tg_delete(self.bot, self.chat_id, mid)
@@ -1265,20 +1266,16 @@ class RouletteEngine:
         bankroll         = self.bet_sys.bankroll
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
-        status            = f"✅ ¡<b>GREEN {number} {cat_val}</b> {cat_icon}!" if won else f"❌ ¡<b>LOSS {number} {cat_val}</b> {cat_icon}!"
-        nivel = self.bet_sys.level
-
+        status            = f"✅ <b>¡GREEN {number} {cat_val}!</b> {cat_icon}" if won else f"❌ <b>¡LOSS {number} {cat_val}!</b> {cat_icon}"
         text = (
             f"{status}\n\n"
             f"❄️ <b>CATEGORIA: {self.bet_value}</b> {bet_icon}\n"
-            f"💰 <i>BANKROLL: {bankroll:.2f} usd</i>\n"    # ✅ corregido
-            f"♻️ <i>INTENTO {attempt_won}/6</i>"          # ✅ corregido
+            f"💰 <i>BANKROLL: {bankroll:.2f} usd</i>\n"
+            f"♻️ <i>INTENTO {level_used}/6</i>"      # ← usa el nivel Martingala
         )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
-                    f"cat_val={cat_val} intento={attempt_won} nivel={nivel} bankroll={bankroll:.2f}")
-
-    # ── FIN DE CORRECCIONES ───────────────────────────────────────────────
+                    f"cat_val={cat_val} nivel_usado={level_used} bankroll={bankroll:.2f}")
 
     def _check_stats(self):
         if not self.stats.should_send_stats(): return
@@ -1436,10 +1433,26 @@ class RouletteEngine:
             result = self._is_win(number, real)
 
             if result is None:          # 0 (VERDE)
+                # Avanzar Martingala porque el cero es pérdida
+                level_used = self.bet_sys.level
+                bet = self.bet_sys.loss()        # descuenta y sube 2 niveles
                 self.attempts_left -= 1
                 if self.attempts_left <= 0:
-                    self._handle_full_loss(number, real)
+                    # Señal completa perdida (sin intentos restantes)
+                    self.spins_since_loss = 0
+                    self.stats.record_signal_result(0, False, bet,
+                                                    self.bet_sys.bankroll, self.active_category)
+                    self._mark_cpr_used(self.active_category)
+                    self.signal_active   = False
+                    self.active_category = None
+                    self.zero_wait_category = None
+                    self.zero_wait_bet_value = None
+                    self._send_result(number, real, False, bet, level_used)
+                    self._check_daily_report()
+                    self._check_stats()
+                    self.signal_msg_ids = []
                     return
+                # Quedan intentos → esperar cero
                 attempt_number = self.total_attempts - self.attempts_left + 1
                 self.zero_wait_category = self.active_category
                 self.zero_wait_bet_value = self.bet_value
@@ -1453,6 +1466,7 @@ class RouletteEngine:
             current_attempt = self.total_attempts - self.attempts_left + 1
 
             if result:
+                level_used = self.bet_sys.level   # nivel que GANÓ
                 bet = self.bet_sys.win()
                 self.stats.record_signal_result(current_attempt, True, bet,
                                                 self.bet_sys.bankroll, self.active_category)
@@ -1461,14 +1475,15 @@ class RouletteEngine:
                 self.active_category = None
                 self.zero_wait_category = None
                 self.zero_wait_bet_value = None
-                self._send_result(number, real, True, bet, current_attempt)
+                self._send_result(number, real, True, bet, level_used)   # ← muestra nivel ganador
                 self._check_daily_report()
                 self._check_stats()
                 self.signal_msg_ids = []
             else:
                 self.attempts_left -= 1
                 if self.attempts_left <= 0:
-                    self._handle_full_loss(number, real)
+                    level_used = self.bet_sys.level   # nivel con el que perdió
+                    self._handle_full_loss(number, real, level_used)
                 else:
                     attempt_number = self.total_attempts - self.attempts_left + 1
                     self.trigger_number = number
@@ -1563,7 +1578,8 @@ class RouletteEngine:
                 self._send_signal(1, unified_prob)
                 self.amx_system.register_signal_sent()
 
-    def _handle_full_loss(self, number: int, real: str, bet: float = None):
+    def _handle_full_loss(self, number: int, real: str, level_used: int):
+        """Finaliza señal perdida usando el nivel indicado, avanzando Martingala."""
         if self.bet_sys.level < 6:
             bet = self.bet_sys.loss()
         else:
@@ -1576,7 +1592,7 @@ class RouletteEngine:
         self.active_category = None
         self.zero_wait_category = None
         self.zero_wait_bet_value = None
-        self._send_result(number, real, False, bet, 0)
+        self._send_result(number, real, False, bet, level_used)   # muestra nivel que perdió
         self._check_daily_report()
         self._check_stats()
         self.signal_msg_ids = []
