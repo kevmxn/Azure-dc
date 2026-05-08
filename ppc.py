@@ -1577,7 +1577,7 @@ class RouletteEngine:
                     text = (
                         f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n"
                         f"💡 <i>PRÓXIMO GIRO:{best['category']} → {best['bet_value']}</i> {icon}\n"
-                        f"📈 <i>PROBABILIDAD: {best['probability']:.0%}<i/>\n"
+                        f"📈 <i>PROBABILIDAD: {best['probability']:.0%}</i>\n"
                         f"⚠️ Esperando confirmación en el siguiente giro…"
                     )
                     msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
