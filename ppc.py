@@ -807,6 +807,7 @@ class RouletteEngine:
         self._live_conn = _get_live_db()
 
         self.pending_prediction: Optional[dict] = None
+        # (cpr_cycle_used eliminado — todas las categorías disponibles siempre)
         self.pre_alert_threshold: float = 0.50   # mínimo para lanzar pre‑alerta
 
         self._pretrain_from_db(DB_PATH, self.db_table)
@@ -1323,8 +1324,11 @@ class RouletteEngine:
             self.spins_since_loss += 1
         self.unified_prob_system.update_weights()
 
-        # ══════ COMPROBAR PRE‑ALERTA ANTERIOR ══════
-        if self.pending_prediction is not None:
+        # ── Calentamiento ───────────────────────────────────────────────
+        # (warmup procesado arriba)
+
+        # ══════ COMPROBAR PRE‑ALERTA ANTERIOR (solo en estado idle) ══════
+        if self.pending_prediction is not None and not self.signal_active and not self.waiting_for_attempt:
             pred = self.pending_prediction
             cat = pred["category"]
             val = pred["bet_value"]
@@ -1366,6 +1370,7 @@ class RouletteEngine:
                     self.attempts_left = MAX_ATTEMPTS
                     self._send_signal(1, unified_prob)
                     self.amx_system.register_signal_sent()
+                    return  # señal activa, no procesar resto del spin
                 else:
                     logger.info(f"[{self.name}] Pre‑alerta confirmada pero sin señal >=60% para {cat}")
                 return  # Salir sin procesar el resto
@@ -1494,27 +1499,27 @@ class RouletteEngine:
                 logger.debug(
                     f"[{self.name}] Cooldown post-pérdida: {self.spins_since_loss}/{self.LOSS_COOLDOWN_SPINS} spins")
             else:
-                best = self._detect_best_category_signal()
-                if best and best["probability"] >= self.pre_alert_threshold:
-                    unified = best["signal_prob_details"]
-                    icon = self._category_icon(best["bet_value"])
-                    text = (
-                        f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n"
-                        f"💡 <i>PRÓXIMO GIRO: {best['category']} → {best['bet_value']}</i> {icon}\n"
-                        f"📈 <i>PROBABILIDAD: {best['probability']:.0%}</i>\n"
-                        f"⚠️ Esperando confirmación en el siguiente giro…"
-                    )
-                    msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
-                    self.pending_prediction = {
-                        "category": best["category"],
-                        "bet_value": best["bet_value"],
-                        "signal_pair": best.get("signal_pair", ()),
-                        "probability": best["probability"],
-                        "unified_prob": unified,
-                        "pre_alert_msg_id": msg_id,
-                    }
-                else:
-                    self.pending_prediction = None
+                # Solo nueva pre-alerta si no hay una pendiente
+                if self.pending_prediction is None:
+                    best = self._detect_best_category_signal()
+                    if best and best["probability"] >= self.pre_alert_threshold:
+                        unified = best["signal_prob_details"]
+                        icon = self._category_icon(best["bet_value"])
+                        text = (
+                            f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n"
+                            f"💡 <i>PRÓXIMO GIRO: {best['category']} → {best['bet_value']}</i> {icon}\n"
+                            f"📈 <i>PROBABILIDAD: {best['probability']:.0%}</i>\n"
+                            f"⚠️ Esperando confirmación en el siguiente giro…"
+                        )
+                        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
+                        self.pending_prediction = {
+                            "category": best["category"],
+                            "bet_value": best["bet_value"],
+                            "signal_pair": best.get("signal_pair", ()),
+                            "probability": best["probability"],
+                            "unified_prob": unified,
+                            "pre_alert_msg_id": msg_id,
+                        }
 
         # ── Estadísticas pendientes ──────────────────────────────────
         if self._pending_stats:
@@ -1727,3 +1732,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped.")
+
