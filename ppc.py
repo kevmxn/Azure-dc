@@ -213,7 +213,10 @@ class MarkovChainPredictor:
         total  = sum(counts.values())
         if total < 8:
             return None
-        return {k: v / total for k, v in counts.items(), "total": total}
+        # Corregido: primero generar el dict de probabilidades, luego añadir "total"
+        probs = {k: v / total for k, v in counts.items()}
+        probs["total"] = total
+        return probs
 
 # ─── ML PATTERN PREDICTOR (genérico) ──────────────────────────────────────────
 class MLPatternPredictor:
@@ -242,7 +245,10 @@ class MLPatternPredictor:
         total   = sum(counts.values())
         if total < 2:
             return None
-        return {k: v / total for k, v in counts.items(), "total": total}
+        # Corregido: igual que el anterior
+        probs = {k: v / total for k, v in counts.items()}
+        probs["total"] = total
+        return probs
 
 # ─── CATEGORY PREDICTOR ──────────────────────────────────────────────────────
 class CategoryPredictor:
