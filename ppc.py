@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot — Martingala con AMX tendencia
-  · Máximo 6 intentos (niveles 1..6)
+  · Máximo 2 intentos por señal
+  · Martingala avanza 2 niveles por pérdida dentro del ciclo CPR
   · Reinicio de ficha a nivel 1 tras dos señales perdidas consecutivas
   · Modo AMX tendencia por defecto
   · Cooldown 5 spins post-pérdida
-  · Estadísticas separadas CPR vs DC
+  · Estadísticas unificadas con historial de 20 señales
   · Pre-entrenamiento con russian-azure.db
 """
 
@@ -118,7 +119,7 @@ COLUMN_PAIRS = {1:(2,3), 2:(1,3), 3:(1,2)}
 
 # ─── ROULETTE CONFIGS ─────────────────────────────────────────────────────────
 ROULETTE_CONFIGS = {
-    "Russian Roulette": {
+    "RUSSIAN ROULETTE": {
         "bot":       bot,
         "ws_key":    221,
         "chat_id":   -1003835197023,
@@ -130,7 +131,7 @@ ROULETTE_CONFIGS = {
 
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-MAX_ATTEMPTS = 6   # Máximo número de intentos (niveles Martingala)
+MAX_ATTEMPTS = 2   # Intentos por señal (Martingala es independiente a 6 niveles)
 
 BASE_BET  = 0.50   # Apuesta base nivel 1
 VISIBLE   = 50
@@ -146,7 +147,6 @@ class Martingale:
         self.consecutive_losses = 0   # señales completas perdidas seguidas
 
     def current_bet(self) -> float:
-        """Devuelve la apuesta según el nivel actual."""
         bets = {1: self.base,
                 2: self.base * 2,
                 3: self.base * 4,
@@ -156,7 +156,6 @@ class Martingale:
         return round(bets.get(self.level, self.base * 32), 2)
 
     def win(self) -> float:
-        """Registra una ganancia: suma la apuesta, resetea nivel y pérdidas consecutivas."""
         bet = self.current_bet()
         self.bankroll = round(self.bankroll + bet, 2)
         self.level = 1
@@ -164,23 +163,22 @@ class Martingale:
         return bet
 
     def loss(self) -> float:
-        """Registra una pérdida: resta la apuesta e incrementa el nivel si no estamos en el máximo."""
+        """Registra una pérdida: descuenta apuesta y avanza 2 niveles (agresivo dentro del ciclo CPR)."""
         bet = self.current_bet()
         self.bankroll = round(self.bankroll - bet, 2)
-        if self.level < 6:
-            self.level += 1
+        # Avance de 2 niveles, sin superar el máximo 6
+        self.level = min(self.level + 2, 6)
         return bet
 
     def full_loss(self) -> float:
-        """Señal completa perdida (se ha perdido en nivel 6). Incrementa pérdidas consecutivas y resetea nivel."""
-        bet = self.current_bet()   # será la apuesta de nivel 6
+        """Señal completa perdida en nivel 6. Resetea a 1 y cuenta pérdida consecutiva."""
+        bet = self.current_bet()   # nivel 6
         self.bankroll = round(self.bankroll - bet, 2)
         self.consecutive_losses += 1
         self.level = 1
         return bet
 
     def reset(self):
-        """Reinicia nivel y pérdidas consecutivas (sin tocar bankroll)."""
         self.level = 1
         self.consecutive_losses = 0
 
@@ -338,7 +336,7 @@ class CategoryPredictor:
 
 # ─── AMX SIGNAL SYSTEM ───────────────────────────────────────────────────────
 class AMXSignalSystem:
-    def __init__(self, mode: Literal["tendencia", "moderado"] = "tendencia"):  # por defecto tendencia
+    def __init__(self, mode: Literal["tendencia", "moderado"] = "tendencia"):
         self.mode = mode
         self.last_signal_time: float = 0
         self.last_two_expected = deque(maxlen=2)
@@ -639,60 +637,23 @@ class DetailedStats:
     def __init__(self):
         self.signal_history: deque = deque(maxlen=50)
 
-        self.wins_attempt_1: int = 0
-        self.wins_attempt_2: int = 0
-        self.wins_attempt_3: int = 0
-        self.wins_attempt_4: int = 0
-        self.wins_attempt_5: int = 0
-        self.losses:         int = 0
-        self.total_signals:  int = 0
+        self.wins_1: int = 0
+        self.wins_2: int = 0
+        self.losses: int = 0
+        self.total_signals: int = 0
 
-        self.last_stats_at:  int = 0
+        self.last_stats_at: int = 0
         self.batch_start_bankroll: Optional[float] = None
-        self.batch_start_wins:  int = 0
-        self.batch_start_losses:int = 0
         self.batch_start_w1: int = 0
         self.batch_start_w2: int = 0
-        self.batch_start_w3: int = 0
-        self.batch_start_w4: int = 0
-        self.batch_start_w5: int = 0
-
-        # Grupo CPR: COLOR + PARIDAD + RANGO
-        self.cp_wins_1: int = 0
-        self.cp_wins_2: int = 0
-        self.cp_wins_3: int = 0
-        self.cp_losses: int = 0
-        self.batch_cp_w1: int = 0
-        self.batch_cp_w2: int = 0
-        self.batch_cp_w3: int = 0
-        self.batch_cp_losses: int = 0
-
-        # Grupo DC: DOCENAS + COLUMNAS
-        self.dc_wins_1: int = 0
-        self.dc_wins_2: int = 0
-        self.dc_losses: int = 0
-        self.batch_dc_w1: int = 0
-        self.batch_dc_w2: int = 0
-        self.batch_dc_losses: int = 0
+        self.batch_start_losses: int = 0
 
         self.last_daily_date      = ""
         self.daily_start_bankroll: Optional[float] = None
-        self.daily_signals:  int = 0
-        self.daily_wins:     int = 0
-        self.daily_losses:   int = 0
-        self.daily_w1: int = 0
-        self.daily_w2: int = 0
-        self.daily_w3: int = 0
-        self.daily_w4: int = 0
-        self.daily_w5: int = 0
-
-        self.daily_cp_w1: int = 0
-        self.daily_cp_w2: int = 0
-        self.daily_cp_w3: int = 0
-        self.daily_cp_losses: int = 0
-        self.daily_dc_w1: int = 0
-        self.daily_dc_w2: int = 0
-        self.daily_dc_losses: int = 0
+        self.daily_w1:   int = 0
+        self.daily_w2:   int = 0
+        self.daily_losses: int = 0
+        self.daily_signals: int = 0
 
     def record_signal_result(self, attempt_won: int, final_result: bool,
                              bet_amount: float, bankroll: float, category: str):
@@ -702,56 +663,22 @@ class DetailedStats:
         self.signal_history.append(entry)
         self.total_signals += 1
 
-        if category in ("COLOR", "PARIDAD", "RANGO"):
-            group = "CPR"
-        elif category in ("DOCENA", "COLUMNA"):
-            group = "DC"
-        else:
-            group = "CPR"
-
         if final_result:
             if attempt_won == 1:
-                self.wins_attempt_1 += 1
-                if group == "CPR": self.cp_wins_1 += 1
-                elif group == "DC": self.dc_wins_1 += 1
+                self.wins_1 += 1
             elif attempt_won == 2:
-                self.wins_attempt_2 += 1
-                if group == "CPR": self.cp_wins_2 += 1
-                elif group == "DC": self.dc_wins_2 += 1
-            elif attempt_won == 3:
-                self.wins_attempt_3 += 1
-                if group == "CPR": self.cp_wins_3 += 1
-            elif attempt_won == 4:
-                self.wins_attempt_4 += 1
-            elif attempt_won == 5:
-                self.wins_attempt_5 += 1
+                self.wins_2 += 1
         else:
             self.losses += 1
-            if group == "CPR": self.cp_losses += 1
-            elif group == "DC": self.dc_losses += 1
 
         self.daily_signals += 1
         if final_result:
-            self.daily_wins += 1
-            if attempt_won == 1: self.daily_w1 += 1
-            elif attempt_won == 2: self.daily_w2 += 1
-            elif attempt_won == 3: self.daily_w3 += 1
-            elif attempt_won == 4: self.daily_w4 += 1
-            elif attempt_won == 5: self.daily_w5 += 1
+            if attempt_won == 1:
+                self.daily_w1 += 1
+            elif attempt_won == 2:
+                self.daily_w2 += 1
         else:
             self.daily_losses += 1
-
-        if final_result:
-            if group == "CPR":
-                if attempt_won == 1: self.daily_cp_w1 += 1
-                elif attempt_won == 2: self.daily_cp_w2 += 1
-                elif attempt_won == 3: self.daily_cp_w3 += 1
-            elif group == "DC":
-                if attempt_won == 1: self.daily_dc_w1 += 1
-                elif attempt_won == 2: self.daily_dc_w2 += 1
-        else:
-            if group == "CPR": self.daily_cp_losses += 1
-            elif group == "DC": self.daily_dc_losses += 1
 
         if self.daily_start_bankroll is None:
             self.daily_start_bankroll = bankroll
@@ -762,104 +689,65 @@ class DetailedStats:
     def mark_stats_sent(self, bankroll: float):
         self.last_stats_at        = self.total_signals
         self.batch_start_bankroll = bankroll
-        self.batch_start_wins     = (self.wins_attempt_1 + self.wins_attempt_2 +
-                                     self.wins_attempt_3 + self.wins_attempt_4 +
-                                     self.wins_attempt_5)
+        self.batch_start_w1       = self.wins_1
+        self.batch_start_w2       = self.wins_2
         self.batch_start_losses   = self.losses
-        self.batch_start_w1 = self.wins_attempt_1
-        self.batch_start_w2 = self.wins_attempt_2
-        self.batch_start_w3 = self.wins_attempt_3
-        self.batch_start_w4 = self.wins_attempt_4
-        self.batch_start_w5 = self.wins_attempt_5
-        self.batch_cp_w1 = self.cp_wins_1
-        self.batch_cp_w2 = self.cp_wins_2
-        self.batch_cp_w3 = self.cp_wins_3
-        self.batch_cp_losses = self.cp_losses
-        self.batch_dc_w1 = self.dc_wins_1
-        self.batch_dc_w2 = self.dc_wins_2
-        self.batch_dc_losses = self.dc_losses
 
-    def get_batch_stats(self, group: str, current_bankroll: float) -> dict:
-        if group == "CPR":
-            w1 = self.cp_wins_1 - self.batch_cp_w1
-            w2 = self.cp_wins_2 - self.batch_cp_w2
-            w3 = self.cp_wins_3 - self.batch_cp_w3
-            l  = self.cp_losses - self.batch_cp_losses
-            w  = w1 + w2 + w3
-            t  = w + l
-            bk = round(current_bankroll - self.batch_start_bankroll, 2) if self.batch_start_bankroll is not None else 0.0
-            return {"total":t,"wins":w,"losses":l,
-                    "w1":w1,"w2":w2,"w3":w3,
-                    "efficiency":round(w/t*100,1) if t else 0.0,
-                    "e_w1":round(w1/t*100,2) if t else 0.0,
-                    "e_w2":round(w2/t*100,2) if t else 0.0,
-                    "e_w3":round(w3/t*100,2) if t else 0.0,
-                    "e_loss":round(l/t*100,2) if t else 0.0,
-                    "bankroll_delta":bk}
-        else:   # DC
-            w1 = self.dc_wins_1 - self.batch_dc_w1
-            w2 = self.dc_wins_2 - self.batch_dc_w2
-            l  = self.dc_losses - self.batch_dc_losses
-            w  = w1 + w2
-            t  = w + l
-            bk = round(current_bankroll - self.batch_start_bankroll, 2) if self.batch_start_bankroll is not None else 0.0
-            return {"total":t,"wins":w,"losses":l,
-                    "w1":w1,"w2":w2,
-                    "efficiency":round(w/t*100,1) if t else 0.0,
-                    "e_w1":round(w1/t*100,2) if t else 0.0,
-                    "e_w2":round(w2/t*100,2) if t else 0.0,
-                    "e_loss":round(l/t*100,2) if t else 0.0,
-                    "bankroll_delta":bk}
+    def get_batch_stats(self, current_bankroll: float) -> dict:
+        w1 = self.wins_1 - self.batch_start_w1
+        w2 = self.wins_2 - self.batch_start_w2
+        l  = self.losses - self.batch_start_losses
+        wins = w1 + w2
+        total = wins + l
+        bk = round(current_bankroll - self.batch_start_bankroll, 2) if self.batch_start_bankroll is not None else 0.0
+        return {
+            "total": total,
+            "wins": wins,
+            "losses": l,
+            "w1": w1,
+            "w2": w2,
+            "efficiency": round(wins / total * 100, 1) if total else 0.0,
+            "e_w1": round(w1 / total * 100, 2) if total else 0.0,
+            "e_w2": round(w2 / total * 100, 2) if total else 0.0,
+            "e_loss": round(l / total * 100, 2) if total else 0.0,
+            "bankroll_delta": bk,
+        }
 
-    def get_daily_stats(self, group: str, current_bankroll: float) -> dict:
-        if group == "CPR":
-            t = self.daily_cp_w1 + self.daily_cp_w2 + self.daily_cp_w3 + self.daily_cp_losses
-            w = self.daily_cp_w1 + self.daily_cp_w2 + self.daily_cp_w3
-            l = self.daily_cp_losses
-            bk = round(current_bankroll - self.daily_start_bankroll, 2) if self.daily_start_bankroll is not None else 0.0
-            return {"total":t,"wins":w,"losses":l,
-                    "w1":self.daily_cp_w1,"w2":self.daily_cp_w2,"w3":self.daily_cp_w3,
-                    "efficiency":round(w/t*100,1) if t else 0.0,
-                    "e_w1":round(self.daily_cp_w1/t*100,2) if t else 0.0,
-                    "e_w2":round(self.daily_cp_w2/t*100,2) if t else 0.0,
-                    "e_w3":round(self.daily_cp_w3/t*100,2) if t else 0.0,
-                    "e_loss":round(l/t*100,2) if t else 0.0,
-                    "bankroll_delta":bk}
-        else:   # DC
-            t = self.daily_dc_w1 + self.daily_dc_w2 + self.daily_dc_losses
-            w = self.daily_dc_w1 + self.daily_dc_w2
-            l = self.daily_dc_losses
-            bk = round(current_bankroll - self.daily_start_bankroll, 2) if self.daily_start_bankroll is not None else 0.0
-            return {"total":t,"wins":w,"losses":l,
-                    "w1":self.daily_dc_w1,"w2":self.daily_dc_w2,
-                    "efficiency":round(w/t*100,1) if t else 0.0,
-                    "e_w1":round(self.daily_dc_w1/t*100,2) if t else 0.0,
-                    "e_w2":round(self.daily_dc_w2/t*100,2) if t else 0.0,
-                    "e_loss":round(l/t*100,2) if t else 0.0,
-                    "bankroll_delta":bk}
+    def get_daily_stats(self, current_bankroll: float) -> dict:
+        w1 = self.daily_w1
+        w2 = self.daily_w2
+        l  = self.daily_losses
+        wins = w1 + w2
+        total = wins + l
+        bk = round(current_bankroll - self.daily_start_bankroll, 2) if self.daily_start_bankroll is not None else 0.0
+        return {
+            "total": total,
+            "wins": wins,
+            "losses": l,
+            "w1": w1,
+            "w2": w2,
+            "efficiency": round(wins / total * 100, 1) if total else 0.0,
+            "e_w1": round(w1 / total * 100, 2) if total else 0.0,
+            "e_w2": round(w2 / total * 100, 2) if total else 0.0,
+            "e_loss": round(l / total * 100, 2) if total else 0.0,
+            "bankroll_delta": bk,
+        }
 
     def reset_daily(self, date_str: str, current_bankroll: float):
         self.last_daily_date      = date_str
         self.daily_start_bankroll = current_bankroll
-        self.daily_signals  = 0
-        self.daily_wins     = 0
-        self.daily_losses   = 0
-        self.daily_w1 = self.daily_w2 = self.daily_w3 = 0
-        self.daily_w4 = self.daily_w5 = 0
-        self.daily_cp_w1 = self.daily_cp_w2 = self.daily_cp_w3 = 0
-        self.daily_cp_losses = 0
-        self.daily_dc_w1 = self.daily_dc_w2 = 0
-        self.daily_dc_losses = 0
+        self.daily_w1   = 0
+        self.daily_w2   = 0
+        self.daily_losses = 0
+        self.daily_signals = 0
 
     def reset(self):
         self.signal_history.clear()
-        self.wins_attempt_1 = self.wins_attempt_2 = self.wins_attempt_3 = 0
-        self.wins_attempt_4 = self.wins_attempt_5 = 0
-        self.losses = self.total_signals = self.last_stats_at = 0
-        self.cp_wins_1 = self.cp_wins_2 = self.cp_wins_3 = 0
-        self.cp_losses = 0
-        self.dc_wins_1 = self.dc_wins_2 = 0
-        self.dc_losses = 0
+        self.wins_1 = 0
+        self.wins_2 = 0
+        self.losses = 0
+        self.total_signals = 0
+        self.last_stats_at = 0
         self.batch_start_bankroll = None
         self.reset_daily("", 0.0)
 
@@ -937,7 +825,6 @@ class RouletteEngine:
         self.total_attempts:   int  = 0
         self.trigger_number:   Optional[int] = None
 
-        # Para recuperar la apuesta original después de un cero
         self.zero_wait_category: Optional[str] = None
         self.zero_wait_bet_value: Optional[str] = None
 
@@ -946,7 +833,7 @@ class RouletteEngine:
         self.no_confirmation_msg_id: Optional[int] = None
         self.result_sequence: deque = deque(maxlen=10)
 
-        # Martingala
+        # Martingala (avance de 2 niveles por pérdida)
         self.bet_sys = Martingale(BASE_BET)
 
         # Cooldown: spins a ignorar tras pérdida total antes de aceptar nueva señal
@@ -1242,7 +1129,6 @@ class RouletteEngine:
         candidates = []
         CPR = {"COLOR", "PARIDAD", "RANGO"}
         for cat in ("COLOR", "PARIDAD", "RANGO", "DOCENA", "COLUMNA"):
-            # CPR: solo evaluar si no fue resuelta en este ciclo
             if cat in CPR and cat in self.cpr_cycle_used:
                 continue
             cand = self._evaluate_category(cat)
@@ -1261,12 +1147,9 @@ class RouletteEngine:
         return votes
 
     def _check_recovery(self):
-        # No necesario con Martingala, se mantiene por compatibilidad
         pass
 
     def _mark_cpr_used(self, category: str):
-        """Marca una categoría CPR como resuelta en el ciclo actual.
-        Al completar COLOR + PARIDAD + RANGO, reinicia el ciclo."""
         if category not in ("COLOR", "PARIDAD", "RANGO"):
             return
         self.cpr_cycle_used.add(category)
@@ -1329,13 +1212,12 @@ class RouletteEngine:
             apuesta_str = f"<b>{self.bet_value}</b> {val_icon}"
         return (
             f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
-            f"🎰 {self.name}\n"
-            f"👉 Después de: {trig_disp}\n"
-            f"🧨 Apostar a: {apuesta_str}\n\n"
-            f"💡 Probabilidad: {prob_pct}%\n"
-            f"📈 Martingala Nivel {nivel_actual}/6\n"
-            f"📍 Apuesta: {bet:.2f} usd\n"
-            f"♻️ Intento {attempt}/6"
+            f"🎰 <b>{self.name}<b>\n"
+            f"👉 <b>ÚLTIMA NÚMER: {trig_disp}<b>\n"
+            f"❄️ <b>ENTRAR A: {apuesta_str}<b>\n\n"
+            f"💡 <i>Probabilidad: {prob_pct}%<i>\n"
+            f"📈 <i>Martingala Nivel {nivel_actual}/6<i>\n"
+            f"📍 <i>Apuesta: {bet:.2f} usd<i>\n"
         )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
@@ -1381,15 +1263,14 @@ class RouletteEngine:
         bankroll         = self.bet_sys.bankroll
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
-        status            = "✅ ¡GREEN!" if won else "❌ ¡LOSS!"
+        status            = "✅ ¡<b>GREEN {number} {cat_val}</b> {cat_icon}!" if won else "❌ ¡<b>LOSS {number} {cat_val}</b> {cat_icon}!"
         nivel = self.bet_sys.level
 
         text = (
             f"{status}\n\n"
-            f"🎯 Aposté a: <b>{self.bet_value}</b> {bet_icon}\n"
-            f"🔢 Salió: {number} <b>{cat_val}</b> {cat_icon}\n"
-            f"💰 Bankroll: {bankroll:.2f} usd\n"
-            f"🎲 Martingala Nivel {nivel}/6 (intento {attempt_won})"
+            f"❄️ <b>CATEGORIA: {self.bet_value}</b> {bet_icon}\n"
+            f"💰 <i>BANKROLL: {bankroll:.2f} usd<i>\n"
+            f"♻️ <i>INTENTO {attempt_won}/6<i>"
         )
         tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         logger.info(f"[{self.name}] {'WIN' if won else 'LOSS'} #{number} "
@@ -1400,55 +1281,31 @@ class RouletteEngine:
         current_bankroll = self.bet_sys.bankroll
         self.stats.mark_stats_sent(current_bankroll)
 
-        s20_cp = self.stats.get_batch_stats("CPR", current_bankroll)
-        s20_dc = self.stats.get_batch_stats("DC", current_bankroll)
-        s24_cp = self.stats.get_daily_stats("CPR", current_bankroll)
-        s24_dc = self.stats.get_daily_stats("DC", current_bankroll)
+        # --- Últimas 20 señales ---
+        last20 = list(self.stats.signal_history)[-20:]
+        if last20:
+            lines = ["📊 <b>ESTADISTICAS 20 SEÑALES</b>\n"]
+            for i, entry in enumerate(last20, start=1):
+                if entry['won']:
+                    gale = "GALE #0" if entry['attempt_won'] == 1 else "GALE #1"
+                    line = f"✅ WIN {i}, CATEGORIA {entry['category']}, {gale}"
+                else:
+                    line = f"❌ LOSS {i}, CATEGORIA {entry['category']}, GALE #1"
+                lines.append(line)
+            tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines))
 
-        lines = []
-        lines.append("<b>📊 ESTADISTICAS POR LOTES</b>")
-        if s20_cp.get("total", 0) > 0:
-            lines.append(
-                "👉🏼 <b>COLOR / PARIDAD / RANGO</b> (3 intentos)\n"
-                f"🈯️ T:{s20_cp['total']} E:{s20_cp['efficiency']}%\n"
-                f"1️⃣ W:{s20_cp['w1']} E:{s20_cp['e_w1']}%\n"
-                f"2️⃣ W:{s20_cp['w2']} E:{s20_cp['e_w2']}%\n"
-                f"3️⃣ W:{s20_cp['w3']} E:{s20_cp['e_w3']}%\n"
-                f"🈲 L:{s20_cp['losses']} E:{s20_cp['e_loss']}%\n"
-                f"💰 {s20_cp['bankroll_delta']:.2f} usd"
-            )
-        if s20_dc.get("total", 0) > 0:
-            lines.append(
-                "👉🏼 <b>DOCENAS / COLUMNAS</b> (2 intentos)\n"
-                f"🈯️ T:{s20_dc['total']} E:{s20_dc['efficiency']}%\n"
-                f"1️⃣ W:{s20_dc['w1']} E:{s20_dc['e_w1']}%\n"
-                f"2️⃣ W:{s20_dc['w2']} E:{s20_dc['e_w2']}%\n"
-                f"🈲 L:{s20_dc['losses']} E:{s20_dc['e_loss']}%\n"
-                f"💰 {s20_dc['bankroll_delta']:.2f} usd"
-            )
-
-        lines.append("\n<b>📅 ESTADISTICAS 24 HORAS</b>")
-        if s24_cp.get("total", 0) > 0:
-            lines.append(
-                "👉🏼 <b>COLOR / PARIDAD / RANGO</b>\n"
-                f"🈯️ T:{s24_cp['total']} E:{s24_cp['efficiency']}%\n"
-                f"1️⃣ W:{s24_cp['w1']} E:{s24_cp['e_w1']}%\n"
-                f"2️⃣ W:{s24_cp['w2']} E:{s24_cp['e_w2']}%\n"
-                f"3️⃣ W:{s24_cp['w3']} E:{s24_cp['e_w3']}%\n"
-                f"🈲 L:{s24_cp['losses']} E:{s24_cp['e_loss']}%\n"
-                f"💰 {s24_cp['bankroll_delta']:.2f} usd"
-            )
-        if s24_dc.get("total", 0) > 0:
-            lines.append(
-                "👉🏼 <b>DOCENAS / COLUMNAS</b>\n"
-                f"🈯️ T:{s24_dc['total']} E:{s24_dc['efficiency']}%\n"
-                f"1️⃣ W:{s24_dc['w1']} E:{s24_dc['e_w1']}%\n"
-                f"2️⃣ W:{s24_dc['w2']} E:{s24_dc['e_w2']}%\n"
-                f"🈲 L:{s24_dc['losses']} E:{s24_dc['e_loss']}%\n"
-                f"💰 {s24_dc['bankroll_delta']:.2f} usd"
-            )
-
-        tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines))
+        # --- Estadísticas diarias ---
+        sd = self.stats.get_daily_stats(current_bankroll)
+        if sd['total'] > 0:
+            lines_daily = [
+                "\n📅 <b>ESTADISTICAS 24 HORAS</b>",
+                f"🈯️ TOTAL: {sd['total']} E:{sd['efficiency']}%",
+                f"1️⃣ GALE #0: {sd['w1']} E:{sd['e_w1']}%",
+                f"2️⃣ GALE #1: {sd['w2']} E:{sd['e_w2']}%",
+                f"🈲 LOSS: {sd['losses']} E:{sd['e_loss']}%",
+                f"💰 CAPITAL ACUMULADO: {sd['bankroll_delta']:.2f} usd"
+            ]
+            tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines_daily))
 
     def _check_daily_report(self):
         import datetime
@@ -1461,37 +1318,8 @@ class RouletteEngine:
             return
 
         current_bankroll = self.bet_sys.bankroll
-        sd_cp = self.stats.get_daily_stats("CPR", current_bankroll)
-        sd_dc = self.stats.get_daily_stats("DC", current_bankroll)
-
-        if sd_cp["total"] == 0 and sd_dc["total"] == 0:
-            self.stats.reset_daily(today_str, current_bankroll)
-            return
-
-        date_label = now_ar.strftime("%d/%m/%Y")
-        lines = [f"📅 <b>REPORTE DIARIO — {date_label}</b>"]
-        if sd_cp["total"] > 0:
-            lines.append(
-                "👉🏼 <b>COLOR / PARIDAD / RANGO</b>\n"
-                f"🈯️ T:{sd_cp['total']} E:{sd_cp['efficiency']}%\n"
-                f"1️⃣ W:{sd_cp['w1']} E:{sd_cp['e_w1']}%\n"
-                f"2️⃣ W:{sd_cp['w2']} E:{sd_cp['e_w2']}%\n"
-                f"3️⃣ W:{sd_cp['w3']} E:{sd_cp['e_w3']}%\n"
-                f"🈲 L:{sd_cp['losses']} E:{sd_cp['e_loss']}%\n"
-                f"💰 {sd_cp['bankroll_delta']:.2f} usd"
-            )
-        if sd_dc["total"] > 0:
-            lines.append(
-                "👉🏼 <b>DOCENAS / COLUMNAS</b>\n"
-                f"🈯️ T:{sd_dc['total']} E:{sd_dc['efficiency']}%\n"
-                f"1️⃣ W:{sd_dc['w1']} E:{sd_dc['e_w1']}%\n"
-                f"2️⃣ W:{sd_dc['w2']} E:{sd_dc['e_w2']}%\n"
-                f"🈲 L:{sd_dc['losses']} E:{sd_dc['e_loss']}%\n"
-                f"💰 {sd_dc['bankroll_delta']:.2f} usd"
-            )
-        tg_send_text(self.bot, self.chat_id, self.thread_id, "\n".join(lines))
-        logger.info(f"[{self.name}] Reporte diario enviado ({today_str})")
         self.stats.reset_daily(today_str, current_bankroll)
+        logger.info(f"[{self.name}] Daily counters reset for {today_str}")
 
     def process_number(self, number: int):
         try:
@@ -1577,7 +1405,7 @@ class RouletteEngine:
         col_v  = f"C{get_column(number)}" if number != 0 else "VERDE"
         if self.signal_active:
             sig_state = (f"🟢 [{self.active_category}] {self.bet_value} "
-                         f"nivel {self.bet_sys.level}/6")
+                         f"Martingala nivel {self.bet_sys.level}/6")
         elif self.waiting_for_attempt:
             sig_state = f"⏳ Esperando intento {self.waiting_attempt_number}"
         else:
@@ -1609,7 +1437,6 @@ class RouletteEngine:
                     self._handle_full_loss(number, real)
                     return
                 attempt_number = self.total_attempts - self.attempts_left + 1
-                # Guardar categoría y valor actuales para reanudarlos
                 self.zero_wait_category = self.active_category
                 self.zero_wait_bet_value = self.bet_value
                 self.signal_active = False
@@ -1622,7 +1449,7 @@ class RouletteEngine:
             current_attempt = self.total_attempts - self.attempts_left + 1
 
             if result:
-                bet = self.bet_sys.win()   # Esto resetea nivel y pérdidas consecutivas
+                bet = self.bet_sys.win()
                 self.stats.record_signal_result(current_attempt, True, bet,
                                                 self.bet_sys.bankroll, self.active_category)
                 self._mark_cpr_used(self.active_category)
@@ -1635,14 +1462,10 @@ class RouletteEngine:
                 self._check_stats()
                 self.signal_msg_ids = []
             else:
-                # Pérdida en este intento
-                bet = self.bet_sys.loss()   # resta la apuesta y sube nivel (si no es último)
                 self.attempts_left -= 1
-                if self.attempts_left <= 0 or self.bet_sys.level == 6:   # nivel máximo alcanzado y perdido
-                    # Señal completamente perdida
-                    self._handle_full_loss(number, real, bet)
+                if self.attempts_left <= 0:
+                    self._handle_full_loss(number, real)
                 else:
-                    # Reintentar con el siguiente nivel
                     attempt_number = self.total_attempts - self.attempts_left + 1
                     self.trigger_number = number
                     unified_prob = self._get_category_probability(
@@ -1657,9 +1480,7 @@ class RouletteEngine:
                 self.skip_one_after_zero = False
                 return
 
-            # Primero verificar si venimos de una espera por cero
             if self.zero_wait_category is not None:
-                # Reanudar la misma señal
                 self.active_category = self.zero_wait_category
                 self.bet_value = self.zero_wait_bet_value
                 self.bet_color = self.bet_value if self.active_category == "COLOR" else "ROJO"
@@ -1673,11 +1494,10 @@ class RouletteEngine:
                 self._send_signal(self.waiting_attempt_number, unified_prob)
                 return
 
-            # Si llegamos aquí, es un estado de espera normal (solo si se diera por algún otro motivo)
             attempt_number = self.waiting_attempt_number
             best = self._detect_best_category_signal()
             if not best or best["probability"] < self.min_prob_threshold:
-                ords = {2:"2°",3:"3°",4:"4°",5:"5°",6:"6°"}
+                ords = {2:"2°"}
                 ord_str = ords.get(attempt_number, f"{attempt_number}°")
                 if self.no_confirmation_msg_id:
                     tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
@@ -1692,7 +1512,7 @@ class RouletteEngine:
                     logger.debug(
                         f"[{self.name}] Reintento descartado [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
-                    ords = {2:"2°",3:"3°",4:"4°",5:"5°",6:"6°"}
+                    ords = {2:"2°"}
                     ord_str = ords.get(attempt_number, f"{attempt_number}°")
                     if self.no_confirmation_msg_id:
                         tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
@@ -1714,7 +1534,6 @@ class RouletteEngine:
 
         else:
             self.signal_msg_ids = []
-            # Cooldown post-pérdida: esperar N spins antes de nueva señal
             if self.spins_since_loss < self.LOSS_COOLDOWN_SPINS:
                 logger.debug(
                     f"[{self.name}] Cooldown post-pérdida: {self.spins_since_loss}/{self.LOSS_COOLDOWN_SPINS} spins")
@@ -1728,7 +1547,6 @@ class RouletteEngine:
                         f"[{self.name}] Señal descartada [{best['category']}] "
                         f"{best['bet_value']} prob={unified_prob['combined_prob']*100:.0f}% < 60%")
                     return
-                # Inicializar nueva señal con Martingala nivel 1 (ya lo está, pero aseguramos)
                 self.bet_sys.level = 1
                 self.signal_active   = True
                 self.active_category = best["category"]
@@ -1742,11 +1560,11 @@ class RouletteEngine:
                 self.amx_system.register_signal_sent()
 
     def _handle_full_loss(self, number: int, real: str, bet: float = None):
-        if bet is None:
-            bet = self.bet_sys.current_bet()
-        # Registrar pérdida completa (ya se perdió el último intento)
-        self.bet_sys.full_loss()   # incrementa consecutive_losses y resetea nivel a 1
-        self.spins_since_loss = 0  # inicia cooldown post-pérdida
+        if self.bet_sys.level < 6:
+            bet = self.bet_sys.loss()
+        else:
+            bet = self.bet_sys.full_loss()
+        self.spins_since_loss = 0
         self.stats.record_signal_result(0, False, bet,
                                         self.bet_sys.bankroll, self.active_category)
         self._mark_cpr_used(self.active_category)
@@ -1856,13 +1674,13 @@ def _register_handlers(b: telebot.TeleBot):
 Russian Roulette
 
 <b>Características:</b>
-• Sistema Martingala con niveles: 0.50 / 1.00 / 2.00 / 4.00 / 8.00 / 16.00 €
-• Máximo 6 intentos por señal
+• Sistema Martingala con niveles: 0.50 / 2.00 / 8.00 / 16.00 € (avance x2)
+• Máximo 2 intentos por señal
 • Reinicio a nivel 1 tras dos señales perdidas consecutivas
 • Modo AMX <b>tendencia</b> activado por defecto
 • Cooldown 5 spins tras pérdida
 • Calentamiento WS: 21 giros silenciosos
-• Estadísticas separadas CPR (3 intentos) / DC (2 intentos)
+• Estadísticas unificadas con historial de 20 señales
 
 Comandos:
 /moderado - Cambiar a modo MODERADO (menos agresivo)
