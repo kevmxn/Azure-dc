@@ -10,8 +10,8 @@ Roulette Telegram Signal Bot — Martingala con AMX + Predicción Markov/ML/Patr
   · Cooldown 5 spins post-pérdida
   · Estadísticas unificadas con historial de 20 señales + 24 horas
   · Pre-entrenamiento con russian-azure.db
-  · PRE-ALERTA (50-59% prob) → misma categoría → confirmación → señal para 12°
-  · Señal directa si prob >= 60%
+  · PRE‑ALERTA (≥50% prob) → confirmación → señal para 12° (si ≥60%)
+  · Solo se emite señal tras confirmación de pre‑alerta
   · Sin restricción de categorías (CPR eliminado)
 """
 
@@ -130,7 +130,7 @@ ROULETTE_CONFIGS = {
         "chat_id":   -1003835197023,
         "thread_id": 8344,
         "db_table":  "russian_roulette",
-        "min_prob_threshold": 0.60,           # señal directa o post-confirmación
+        "min_prob_threshold": 0.60,           # solo para señal final
     },
 }
 
@@ -788,7 +788,7 @@ class RouletteEngine:
         self.spins_since_loss:    int = 9999
 
         self.amx_system = AMXSignalSystem(mode="tendencia")
-        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)
+        self.min_prob_threshold = cfg.get("min_prob_threshold", 0.60)   # solo para señal final
 
         self.unified_prob_system = UnifiedProbabilitySystem()
 
@@ -807,8 +807,7 @@ class RouletteEngine:
         self._live_conn = _get_live_db()
 
         self.pending_prediction: Optional[dict] = None
-        self.pre_alert_threshold: float = 0.50
-        self.pre_alert_max: float = 0.59
+        self.pre_alert_threshold: float = 0.50   # mínimo para lanzar pre‑alerta
 
         self._pretrain_from_db(DB_PATH, self.db_table)
         live_loaded = self._load_live_history()
@@ -1058,6 +1057,7 @@ class RouletteEngine:
             "volatility": self.unified_prob_system.volatility,
         }
 
+    # ── Evaluación de categoría (sin restricción de umbral mínimo interno) ─
     def _evaluate_category(self, category: str) -> Optional[dict]:
         trigger = self.spin_history[-1]["number"] if self.spin_history else 0
 
@@ -1068,11 +1068,7 @@ class RouletteEngine:
         if not clean:
             return None
         best_val = max(clean, key=clean.get)
-        cat_prob = clean[best_val]
-        if cat_prob < self.min_prob_threshold:
-            # Para pre‑alerta se evalúa aparte, aquí solo si la probabilidad base < 0.60
-            # pero igual seguimos porque luego se filtra por el umbral que corresponda
-            pass
+        # Ya no forzamos cat_prob >= min_prob_threshold; dejamos que el llamante decida
 
         levels  = self._levels_for(category, best_val)
         ema_sig = self.amx_system.check_signal(levels, best_val)
@@ -1081,7 +1077,6 @@ class RouletteEngine:
 
         unified = self._blend_prediction(category, best_val)
         final_prob = unified["combined_prob"]
-        # No filtramos aquí por min_prob_threshold, eso se hace en el caller
 
         if category == "DOCENA":
             excl_num  = int(best_val[1])
@@ -1115,7 +1110,7 @@ class RouletteEngine:
             return None
         return max(candidates, key=lambda x: x["probability"])
 
-    # ── MENSAJES ─────────────────────────────────────────────────────────
+    # ── Mensajes (sin cambios) ─────────────────────────────────────────
     def _build_signal_text(self, attempt: int, unified_prob: Optional[dict]) -> str:
         bet      = self.bet_sys.current_bet()
         prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
@@ -1187,7 +1182,7 @@ class RouletteEngine:
         bankroll         = self.bet_sys.bankroll
         cat_val, cat_icon = self._cat_val(number, real)
         bet_icon          = self._category_icon(self.bet_value or "")
-        status            = f"✅ <b>¡GREEN {number} {cat_val}!</b> {cat_icon}!" if won else f"❌ <b>¡LOSS {number} {cat_val}!</b> {cat_icon}"
+        status            = f"✅ <b>¡GREEN {number} {cat_val}!</b> {cat_icon}" if won else f"❌ <b>¡LOSS {number} {cat_val}!</b> {cat_icon}"
 
         text = (
             f"{status}\n\n"
@@ -1380,7 +1375,7 @@ class RouletteEngine:
                     tg_delete(self.bot, self.chat_id, pred["pre_alert_msg_id"])
                 self.pending_prediction = None
                 logger.info(f"[{self.name}] ❌ Pre‑alerta no confirmada ({actual_val} ≠ {val})")
-                # Continuar con el flujo normal
+                # Continuar con el flujo normal (posible nueva pre‑alerta)
 
         # ═══ MÁQUINA DE ESTADOS (señales activas) ═══
         if self.signal_active:
@@ -1500,42 +1495,24 @@ class RouletteEngine:
                     f"[{self.name}] Cooldown post-pérdida: {self.spins_since_loss}/{self.LOSS_COOLDOWN_SPINS} spins")
             else:
                 best = self._detect_best_category_signal()
-                if best:
-                    prob = best["probability"]
-                    if prob >= self.min_prob_threshold:
-                        # Señal directa >=60%
-                        unified = best["signal_prob_details"]
-                        self.signal_active = True
-                        self.active_category = best["category"]
-                        self.bet_value = best["bet_value"]
-                        self.signal_pair = best.get("signal_pair", ())
-                        self.bet_color = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
-                        self.trigger_number = self.spin_history[-1]["number"]
-                        self.total_attempts = MAX_ATTEMPTS
-                        self.attempts_left = MAX_ATTEMPTS
-                        self._send_signal(1, unified)
-                        self.amx_system.register_signal_sent()
-                    elif self.pre_alert_threshold <= prob <= self.pre_alert_max:
-                        # Pre‑alerta (50-59%)
-                        unified = best["signal_prob_details"]
-                        icon = self._category_icon(best["bet_value"])
-                        text = (
-                            f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n"
-                            f"💡 <i>PRÓXIMO GIRO: {best['category']} → {best['bet_value']}</i> {icon}\n"
-                            f"📈 <i>PROBABILIDAD: {best['probability']:.0%}</i>\n"
-                            f"⚠️ Esperando confirmación en el siguiente giro…"
-                        )
-                        msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
-                        self.pending_prediction = {
-                            "category": best["category"],
-                            "bet_value": best["bet_value"],
-                            "signal_pair": best.get("signal_pair", ()),
-                            "probability": best["probability"],
-                            "unified_prob": unified,
-                            "pre_alert_msg_id": msg_id,
-                        }
-                    else:
-                        self.pending_prediction = None
+                if best and best["probability"] >= self.pre_alert_threshold:
+                    unified = best["signal_prob_details"]
+                    icon = self._category_icon(best["bet_value"])
+                    text = (
+                        f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n"
+                        f"💡 <i>PRÓXIMO GIRO: {best['category']} → {best['bet_value']}</i> {icon}\n"
+                        f"📈 <i>PROBABILIDAD: {best['probability']:.0%}</i>\n"
+                        f"⚠️ Esperando confirmación en el siguiente giro…"
+                    )
+                    msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
+                    self.pending_prediction = {
+                        "category": best["category"],
+                        "bet_value": best["bet_value"],
+                        "signal_pair": best.get("signal_pair", ()),
+                        "probability": best["probability"],
+                        "unified_prob": unified,
+                        "pre_alert_msg_id": msg_id,
+                    }
                 else:
                     self.pending_prediction = None
 
@@ -1666,10 +1643,10 @@ Russian Roulette
 
 <b>Características:</b>
 • Martingala con máx. 2 intentos, niveles 0.50/2.00/.../32.00
-• Señal directa si probabilidad >= 60%
-• Pre‑alerta (50‑59%) → confirmación → señal para el 12° giro
+• Solo se emite señal tras confirmación de pre‑alerta
+• Pre‑alerta se lanza con probabilidad ≥50% (sin límite superior)
+• Confirmación → recálculo misma categoría → señal si ≥60%
 • Sin restricción de categorías
-• Pre‑entrenamiento con russian-azure.db
 
 Comandos:
 /moderado - Modo moderado
