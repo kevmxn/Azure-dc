@@ -143,7 +143,7 @@ class Martingale2Dozen:
         return round(self.current_bet_per_item() * 2, 2)
 
     def win(self) -> float:
-        profit = self.current_bet_per_item() # Net win es igual a la apuesta por item
+        profit = self.current_bet_per_item()
         self.bankroll = round(self.bankroll + profit, 2)
         self.level = 1
         self.consecutive_losses = 0
@@ -262,18 +262,22 @@ class DozenColumnLast5Predictor:
             counts = defaultdict(int)
             for d in last5_d: counts[d] += 1
             sorted_d = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-            top2_key = tuple(sorted([sorted_d[0][0], sorted_d[1][0]]))
-            self.dozen_pattern_results[top2_key]["total"] += 1
-            if dozen in top2_key: self.dozen_pattern_results[top2_key]["hits"] += 1
+            # CORRECCIÓN: Verificar que hay al menos 2 docenas en los últimos 5
+            if len(sorted_d) >= 2:
+                top2_key = tuple(sorted([sorted_d[0][0], sorted_d[1][0]]))
+                self.dozen_pattern_results[top2_key]["total"] += 1
+                if dozen in top2_key: self.dozen_pattern_results[top2_key]["hits"] += 1
 
         if len(self.column_history) >= 5:
             last5_c = self.column_history[-5:]
             counts = defaultdict(int)
             for c in last5_c: counts[c] += 1
             sorted_c = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-            top2_key = tuple(sorted([sorted_c[0][0], sorted_c[1][0]]))
-            self.column_pattern_results[top2_key]["total"] += 1
-            if column in top2_key: self.column_pattern_results[top2_key]["hits"] += 1
+            # CORRECCIÓN: Verificar que hay al menos 2 columnas en los últimos 5
+            if len(sorted_c) >= 2:
+                top2_key = tuple(sorted([sorted_c[0][0], sorted_c[1][0]]))
+                self.column_pattern_results[top2_key]["total"] += 1
+                if column in top2_key: self.column_pattern_results[top2_key]["hits"] += 1
 
         self.dozen_history.append(dozen)
         self.column_history.append(column)
@@ -321,7 +325,6 @@ class AMXSignalSystem:
     def check_signal(self, positions: list, val: str) -> Optional[dict]:
         if len(positions) < 20: return None
         ema4 = self.calculate_ema(positions, 4); ema8 = self.calculate_ema(positions, 8)
-        # CORRECCIÓN DE SINTAXIS AQUÍ (is None)
         if ema4[-1] is None or ema8[-1] is None: return None
         cruce_4_8 = ema4[-2] <= ema8[-2] and ema4[-1] > ema8[-1]
         sobre = positions[-1] > ema4[-1] and positions[-1] > ema8[-1]
@@ -495,6 +498,7 @@ class RouletteEngine:
         return f"{number} {val} {self._category_icon(val)}"
 
     def _format_pair_numbers(self, pair: tuple) -> str:
+        if len(pair) < 2: return "N/A" # Protección extra
         nums = []
         for p in pair:
             num_str = str(p[-1])
@@ -649,11 +653,11 @@ class RouletteEngine:
             f"👉 <b>ÚLTIMO NÚMERO: {trig_disp}</b>"
         ]
 
-        if self.active_category == "DOCENA" and self.bet_dozen_pair:
+        if self.active_category == "DOCENA" and len(self.bet_dozen_pair) >= 2:
             pair_str = self._format_pair_numbers(self.bet_dozen_pair)
             lines.append(f"❄️ <b>ENTRAR EN DOCENAS: {pair_str}</b>")
             lines.append(f"♦️ <b>APUESTA EN DOCENA: {bet_per_item:.2f}</b>")
-        elif self.active_category == "COLUMNA" and self.bet_column_pair:
+        elif self.active_category == "COLUMNA" and len(self.bet_column_pair) >= 2:
             pair_str = self._format_pair_numbers(self.bet_column_pair)
             lines.append(f"☢ <b>ENTRAR EN COLUMNAS: {pair_str}</b>")
             lines.append(f"♦️ <b>APUESTA EN COLUMNA: {bet_per_item:.2f}</b>")
@@ -831,6 +835,7 @@ async def ws_listen(engine: RouletteEngine):
             await asyncio.sleep(10)
 
 def run_flask():
+    # Render inyecta el puerto por variable de entorno
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port, threaded=True)
 
