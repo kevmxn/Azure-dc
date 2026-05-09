@@ -446,6 +446,11 @@ class RouletteEngine:
         self.pending_prediction: Optional[dict] = None; self.pre_alert_threshold: float = 0.50
         self._pretrain_from_db(DB_PATH, self.db_table); live_loaded = self._load_live_history()
         self.ws_spins_count: int = live_loaded; self.warmup_done: bool = live_loaded >= WARMUP_SPINS; self._pending_stats: bool = False
+        
+        # Combinación de apuestas
+        self.bet_color_val: Optional[str] = None
+        self.bet_par_val: Optional[str] = None
+        self.bet_rango_val: Optional[str] = None
 
     def _pretrain_from_db(self, db_path: str, table_name: str):
         if not os.path.exists(db_path): return
@@ -569,6 +574,13 @@ class RouletteEngine:
             if cand: candidates.append(cand)
         return max(candidates, key=lambda x: x["probability"]) if candidates else None
 
+    def _get_best_val_for_cat(self, category: str) -> Optional[str]:
+        pred = self.category_ml.predict_category(category)
+        if not pred: return None
+        clean = {k: v for k, v in pred.items() if k != "total"}
+        if not clean: return None
+        return max(clean, key=clean.get)
+
     # ══════════════════════════════════════════════════════════════════════
     # SISTEMA DE PRE‑ALERTA 11° → SIMULACIÓN ACIERTO → 12° ≥ 60%
     # ══════════════════════════════════════════════════════════════════════
@@ -679,24 +691,51 @@ class RouletteEngine:
         if msg_id: self.pending_prediction = {"pre_alert_msg_id": msg_id, "pre_alert_11": best_11, "pre_alert_12": best_12, "trigger_number": best_11.get("trigger_number", 0)}
 
     def _activate_prealert_signal(self, signal_12: Optional[dict], trigger_number: int):
-        self.signal_active = True; self.active_category = signal_12["category"]; self.bet_value = signal_12["bet_value"]
-        self.signal_pair = signal_12.get("signal_pair", ()); self.bet_color = signal_12["bet_value"] if signal_12["category"] == "COLOR" else "ROJO"
+        # 1. Evaluamos la combinación completa (COLOR, PARIDAD, RANGO)
+        self._evaluate_combo_signal()
+        
+        # 2. Definimos la categoría principal (la que tenga mayor probabilidad para la martingala)
+        probs = {
+            "COLOR": self._blend_prediction("COLOR", self.bet_color_val)["combined_prob"] if self.bet_color_val else 0,
+            "PARIDAD": self._blend_prediction("PARIDAD", self.bet_par_val)["combined_prob"] if self.bet_par_val else 0,
+            "RANGO": self._blend_prediction("RANGO", self.bet_rango_val)["combined_prob"] if self.bet_rango_val else 0
+        }
+        primary_cat = max(probs, key=probs.get)
+        
+        self.active_category = primary_cat
+        if primary_cat == "COLOR": self.bet_value = self.bet_color_val
+        elif primary_cat == "PARIDAD": self.bet_value = self.bet_par_val
+        elif primary_cat == "RANGO": self.bet_value = self.bet_rango_val
+        else: self.bet_value = signal_12["bet_value"] # Fallback
+        
+        self.signal_pair = (); self.bet_color = self.bet_value if self.active_category == "COLOR" else "ROJO"
         self.trigger_number = trigger_number; self.total_attempts = MAX_ATTEMPTS; self.attempts_left = MAX_ATTEMPTS
-        self._send_signal(1, signal_12["signal_prob_details"]); self.amx_system.register_signal_sent()
+        
+        # Usamos la probabilidad de la categoría principal para el detalle
+        primary_unified = self._blend_prediction(self.active_category, self.bet_value)
+        self._send_signal(1, primary_unified); self.amx_system.register_signal_sent()
 
     # ══════════════════════════════════════════════════════════════════════
-    # EVALUACIÓN INTELIGENTE 2° OPORTUNIDAD (13° GIRO)
+    # EVALUACIÓN COMBINADA Y 2° OPORTUNIDAD
     # ══════════════════════════════════════════════════════════════════════
+    def _evaluate_combo_signal(self):
+        """Busca la mejor opción para COLOR, PARIDAD y RANGO en conjunto"""
+        self.bet_color_val = self._get_best_val_for_cat("COLOR")
+        self.bet_par_val = self._get_best_val_for_cat("PARIDAD")
+        self.bet_rango_val = self._get_best_val_for_cat("RANGO")
+        logger.info(f"[{self.name}] 🎲 Combo evaluado: COLOR={self.bet_color_val}, PARIDAD={self.bet_par_val}, RANGO={self.bet_rango_val}")
+
     def _evaluate_2nd_attempt_choice(self) -> Optional[dict]:
         cat = self.active_category
         if not cat: return self._blend_prediction(cat, self.bet_value)
+
+        # Re-evaluamos el combo completo para el 2° intento
+        self._evaluate_combo_signal()
 
         possible_vals = []
         if cat == "COLOR": possible_vals = ["ROJO", "NEGRO"]
         elif cat == "PARIDAD": possible_vals = ["PAR", "IMPAR"]
         elif cat == "RANGO": possible_vals = ["ALTO", "BAJO"]
-        elif cat == "DOCENA": possible_vals = ["D1", "D2", "D3"]
-        elif cat == "COLUMNA": possible_vals = ["C1", "C2", "C3"]
         else: return self._blend_prediction(cat, self.bet_value)
 
         best_val = None; best_prob = -1.0; best_pred = None; best_pair = ()
@@ -705,13 +744,10 @@ class RouletteEngine:
             pred = self._blend_prediction(cat, val)
             if pred and pred["combined_prob"] > best_prob:
                 best_prob = pred["combined_prob"]; best_val = val; best_pred = pred
-                if cat == "DOCENA": pair = DOZEN_PAIRS[int(val[1])]; best_pair = (f"D{pair[0]}", f"D{pair[1]}")
-                elif cat == "COLUMNA": pair = COLUMN_PAIRS[int(val[1])]; best_pair = (f"C{pair[0]}", f"C{pair[1]}")
-                else: best_pair = ()
 
         if best_val and best_val != self.bet_value:
             logger.info(f"[{self.name}] 🔄 2° Intento: Cambiando a {cat} -> {best_val} ({best_prob:.0%})")
-            self.bet_value = best_val; self.signal_pair = best_pair; self.bet_color = self.bet_value if cat == "COLOR" else "ROJO"
+            self.bet_value = best_val; self.signal_pair = (); self.bet_color = self.bet_value if cat == "COLOR" else "ROJO"
         elif best_val:
             logger.info(f"[{self.name}] 🔄 2° Intento: Manteniendo {cat} -> {best_val} ({best_prob:.0%})")
 
@@ -719,14 +755,31 @@ class RouletteEngine:
 
     # ── Mensajes y Resultados ─────────────────────────────────────────
     def _build_signal_text(self, attempt: int, unified_prob: Optional[dict]) -> str:
-        bet = self.bet_sys.current_bet(); prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
-        val_icon = self._category_icon(self.bet_value or ""); trig_disp = self._trigger_display(self.trigger_number, self.active_category or "COLOR")
+        bet = self.bet_sys.current_bet()
+        prob_pct = int((unified_prob["combined_prob"] if unified_prob else 0.5) * 100)
+        trig_disp = self._trigger_display(self.trigger_number, self.active_category or "COLOR")
         nivel_actual = self.bet_sys.level
-        if self.signal_pair and self.active_category in ("DOCENA","COLUMNA"):
-            p1, p2 = self.signal_pair; i1 = self._category_icon(p1); i2 = self._category_icon(p2)
-            apuesta_str = f"<b>{p1}</b> {i1} y <b>{p2}</b> {i2}"
-        else: apuesta_str = f"<b>{self.bet_value}</b> {val_icon}"
-        return (f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n🎰 <b>{self.name}</b>\n👉 <b>ÚLTIMO NÚMERO: {trig_disp}</b>\n❄️ <b>ENTRAR EN: {apuesta_str}</b>\n\n💡 <i>PROBABILIDAD IA {prob_pct}%</i>\n📈 <i>NIVEL SECUENCIA: {nivel_actual}/6</i>\n📍 <i>MONTO APUESTA: {bet:.2f} usd</i>\n")
+        
+        # Líneas de combinación
+        combo_lines = []
+        if self.bet_color_val:
+            combo_lines.append(f"❄️ <b>ENTRAR EN: {self.bet_color_val}</b> {self._category_icon(self.bet_color_val)}")
+        if self.bet_par_val:
+            combo_lines.append(f"❄️ <b>ENTRAR EN: {self.bet_par_val}</b> {self._category_icon(self.bet_par_val)}")
+        if self.bet_rango_val:
+            combo_lines.append(f"❄️ <b>ENTRAR EN: {self.bet_rango_val}</b> {self._category_icon(self.bet_rango_val)}")
+            
+        combo_str = "\n".join(combo_lines)
+
+        return (
+            f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n"
+            f"🎰 <b>{self.name}</b>\n"
+            f"👉 <b>ÚLTIMO NÚMERO: {trig_disp}</b>\n"
+            f"{combo_str}\n\n"
+            f"💡 <i>PROBABILIDAD IA {prob_pct}%</i>\n"
+            f"📈 <i>NIVEL SECUENCIA: {nivel_actual}/6</i>\n"
+            f"📍 <i>APUESTA POR CATEGORIA: {bet:.2f} usd</i>\n"
+        )
 
     def _send_signal(self, attempt: int, unified_prob: dict):
         if self.pending_prediction and self.pending_prediction.get("pre_alert_msg_id"): tg_delete(self.bot, self.chat_id, self.pending_prediction["pre_alert_msg_id"]); self.pending_prediction = None
@@ -845,18 +898,14 @@ class RouletteEngine:
                 
                 signal_12 = pred.get("pre_alert_12")
                 if signal_12:
-                    # Actualizamos la probabilidad con los datos reales frescos, pero MANTENEMOS la categoría y valor predichos
                     fresh_unified = self._blend_prediction(signal_12["category"], signal_12["bet_value"])
-                    if fresh_unified:
-                        signal_12["signal_prob_details"] = fresh_unified
-                        signal_12["probability"] = fresh_unified["combined_prob"]
-                    
+                    if fresh_unified: signal_12["signal_prob_details"] = fresh_unified; signal_12["probability"] = fresh_unified["combined_prob"]
                     self.pending_prediction = None
                     logger.info(f"[{self.name}] 🎯 Activando señal del 12° giro: {signal_12['bet_value']} [{signal_12['category']}] ({signal_12['probability']:.0%})")
                     self._activate_prealert_signal(signal_12, number)
                     return
                 else:
-                    logger.warning(f"[{self.name}] ⚠️ Pre-alerta confirmada pero sin datos del 12° giro. Ignorando.")
+                    logger.warning(f"[{self.name}] ⚠️ Pre-alerta confirmada pero sin datos del 12° giro.")
                     self.pending_prediction = None
             else:
                 logger.info(f"[{self.name}] ❌ PRE-ALERTA NO CONFIRMADA: Se esperaba {val_11}, salió {actual_val}")
@@ -888,7 +937,7 @@ class RouletteEngine:
                 if self.attempts_left <= 0: level_used = self.bet_sys.level; self._handle_full_loss(number, real, level_used)
                 else:
                     self.bet_sys.loss()
-                    best_pred_2nd = self._evaluate_2nd_attempt_choice() # <--- EVALUAR MISMA CATEGORÍA Y VALOR CONTRARIO
+                    best_pred_2nd = self._evaluate_2nd_attempt_choice()
                     attempt_number = self.total_attempts - self.attempts_left + 1; self.trigger_number = number
                     if not best_pred_2nd: best_pred_2nd = self._blend_prediction(self.active_category, self.bet_value)
                     self._send_signal(attempt_number, best_pred_2nd)
@@ -928,7 +977,9 @@ class RouletteEngine:
                     else:
                         if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id); self.no_confirmation_msg_id = None
                         self.active_category = best["category"]; self.bet_value = best["bet_value"]; self.bet_color = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
-                        self.trigger_number = number; self.signal_active = True; self.waiting_for_attempt = False; self._send_signal(attempt_number, unified_prob)
+                        self.trigger_number = number; self.signal_active = True; self.waiting_for_attempt = False
+                        self._evaluate_combo_signal()
+                        self._send_signal(attempt_number, unified_prob)
         else:
             self.signal_msg_ids = []
             if self.spins_since_loss >= self.LOSS_COOLDOWN_SPINS and self.pending_prediction is None:
