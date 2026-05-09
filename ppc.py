@@ -15,7 +15,6 @@ import os
 import re
 import sqlite3
 import time
-import urllib.request
 from collections import deque, defaultdict
 from typing import Optional, Literal
 
@@ -326,7 +325,8 @@ class AMXSignalSystem:
     def check_signal(self, positions: list, val: str) -> Optional[dict]:
         if len(positions) < 20: return None
         ema4 = self.calculate_ema(positions, 4); ema8 = self.calculate_ema(positions, 8)
-        if ema4[-1] is None or ema8[-1] None: return None
+        # CORRECCIÓN DE SINTAXIS AQUÍ (is None)
+        if ema4[-1] is None or ema8[-1] is None: return None
         cruce_4_8 = ema4[-2] <= ema8[-2] and ema4[-1] > ema8[-1]
         sobre = positions[-1] > ema4[-1] and positions[-1] > ema8[-1]
         score = 0
@@ -456,6 +456,7 @@ class RouletteEngine:
         self.dcz_predictor.add_spin(number)
 
         if number != 0:
+            # Secuencias completas para Markov/ML
             docena_seq = [f"D{get_dozen(s['number'])}" for s in history if s['number'] != 0]
             columna_seq = [f"C{get_column(s['number'])}" for s in history if s['number'] != 0]
             if len(docena_seq) >= self.markov_docena.order:
@@ -537,18 +538,22 @@ class RouletteEngine:
     def _calculate_dcz_probability(self, analysis: dict, mode: Literal["docena", "columna"]) -> Optional[dict]:
         w = self.unified_prob_system.weights
 
+        # Secuencias completas para Markov/ML (no solo los últimos 5)
+        docena_seq = [f"D{get_dozen(s['number'])}" for s in self.spin_history if s['number'] != 0]
+        columna_seq = [f"C{get_column(s['number'])}" for s in self.spin_history if s['number'] != 0]
+
         if mode == "docena":
             top2 = analysis["top2_dozen"]
             dcz = self.dcz_predictor.predict_dozen(analysis["last5"])
-            m_pred = self.markov_docena.predict([f"D{get_dozen(n)}" for n in analysis["last5"]])
-            ml_pred = self.ml_docena.predict([f"D{get_dozen(n)}" for n in analysis["last5"]])
+            m_pred = self.markov_docena.predict(docena_seq)
+            ml_pred = self.ml_docena.predict(docena_seq)
             cat_pred = self.category_ml.predict_category("DOCENA")
             hit_count = analysis["dozen_hit_count"]
         else:
             top2 = analysis["top2_column"]
             dcz = self.dcz_predictor.predict_column(analysis["last5"])
-            m_pred = self.markov_columna.predict([f"C{get_column(n)}" for n in analysis["last5"]])
-            ml_pred = self.ml_columna.predict([f"C{get_column(n)}" for n in analysis["last5"]])
+            m_pred = self.markov_columna.predict(columna_seq)
+            ml_pred = self.ml_columna.predict(columna_seq)
             cat_pred = self.category_ml.predict_category("COLUMNA")
             hit_count = analysis["column_hit_count"]
 
