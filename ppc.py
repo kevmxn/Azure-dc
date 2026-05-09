@@ -128,10 +128,6 @@ WARMUP_SPINS = 21
 
 # ─── MARTINGALA PARA 2 DOCENAS/COLUMNAS (Pago 2:1) ────────────────────────────
 class Martingale2Dozen:
-    """
-    Progresión matemática para apuestas de 2 docenas/columnas (Pago 2:1).
-    Nivel 1: 0.50 c/u (Total 1.00) | Nivel 2: 0.75 c/u (Total 1.50) | Nivel 3: 1.50 c/u...
-    """
     def __init__(self, base: float):
         self.base = base
         self.level = 1
@@ -359,7 +355,20 @@ class DetailedStats:
         else: self.losses += 1
 
     def should_send_stats(self) -> bool: return (self.total_signals - self.last_stats_at) >= 20
-    def mark_stats_sent(self, bankroll: float): self.last_stats_at = self.total_signals; self.batch_start_bankroll = bankroll
+    
+    def mark_stats_sent(self, bankroll: float): 
+        self.last_stats_at = self.total_signals
+        self.batch_start_bankroll = bankroll
+        self.batch_start_w1 = self.wins_1
+        self.batch_start_w2 = self.wins_2
+        self.batch_start_losses = self.losses
+
+    def get_batch_stats(self, current_bankroll: float) -> dict:
+        w1 = self.wins_1 - self.batch_start_w1; w2 = self.wins_2 - self.batch_start_w2
+        l = self.losses - self.batch_start_losses
+        wins = w1 + w2; total = wins + l
+        bk = round(current_bankroll - self.batch_start_bankroll, 2) if self.batch_start_bankroll is not None else 0.0
+        return {"total": total, "wins": wins, "losses": l, "efficiency": round(wins / total * 100, 1) if total else 0.0, "bankroll_delta": bk}
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_MAX_RETRIES = 12
@@ -456,7 +465,6 @@ class RouletteEngine:
         self.dcz_predictor.add_spin(number)
 
         if number != 0:
-            # Secuencias completas para Markov/ML
             docena_seq = [f"D{get_dozen(s['number'])}" for s in history if s['number'] != 0]
             columna_seq = [f"C{get_column(s['number'])}" for s in history if s['number'] != 0]
             if len(docena_seq) >= self.markov_docena.order:
@@ -487,10 +495,9 @@ class RouletteEngine:
         return f"{number} {val} {self._category_icon(val)}"
 
     def _format_pair_numbers(self, pair: tuple) -> str:
-        """Convierte ('D1', 'D3') o ('C1', 'C3') en '01 y 03'"""
         nums = []
         for p in pair:
-            num_str = str(p[-1]) # Obtiene el '1' de 'D1'
+            num_str = str(p[-1])
             nums.append(f"0{num_str}" if len(num_str) == 1 else num_str)
         return f"{nums[0]} y {nums[1]}"
 
@@ -538,7 +545,7 @@ class RouletteEngine:
     def _calculate_dcz_probability(self, analysis: dict, mode: Literal["docena", "columna"]) -> Optional[dict]:
         w = self.unified_prob_system.weights
 
-        # Secuencias completas para Markov/ML (no solo los últimos 5)
+        # Secuencias completas para Markov/ML
         docena_seq = [f"D{get_dozen(s['number'])}" for s in self.spin_history if s['number'] != 0]
         columna_seq = [f"C{get_column(s['number'])}" for s in self.spin_history if s['number'] != 0]
 
@@ -642,7 +649,6 @@ class RouletteEngine:
             f"👉 <b>ÚLTIMO NÚMERO: {trig_disp}</b>"
         ]
 
-        # Formato estricto solicitado
         if self.active_category == "DOCENA" and self.bet_dozen_pair:
             pair_str = self._format_pair_numbers(self.bet_dozen_pair)
             lines.append(f"❄️ <b>ENTRAR EN DOCENAS: {pair_str}</b>")
@@ -670,9 +676,6 @@ class RouletteEngine:
             self.signal_msg_ids = []
 
         bankroll = self.bet_sys.bankroll
-        d_val = f"D{get_dozen(number)}" if number != 0 else "0"
-        c_val = f"C{get_column(number)}" if number != 0 else "0"
-        
         status = f"✅ <b>¡GREEN {number}!</b>" if won else f"❌ <b>¡LOSS {number}!</b>"
         cat_label = "2 DOCENAS" if self.active_category == "DOCENA" else "2 COLUMNAS"
 
@@ -695,7 +698,6 @@ class RouletteEngine:
         self.waiting_for_attempt = True
         self.waiting_attempt_number = 1
 
-        # Evaluar el combo paralelo
         self._evaluate_combo_signal()
 
         unified_prob = {"combined_prob": best_signal["probability"]}
@@ -716,6 +718,21 @@ class RouletteEngine:
                 self.bet_value = new_val
             return {"combined_prob": result["probability"]}
         return None
+
+    def _check_stats(self):
+        if not self.stats.should_send_stats(): return
+        current_bankroll = self.bet_sys.bankroll
+        self.stats.mark_stats_sent(current_bankroll)
+        batch = self.stats.get_batch_stats(current_bankroll)
+        
+        text = (
+            f"📊 <b>ESTADÍSTICAS DEL BATCH</b>\n\n"
+            f"🔸 Señales: {batch['total']}\n"
+            f"✅ Aciertos: {batch['wins']} ({batch['efficiency']}%)\n"
+            f"❌ Pérdidas: {batch['losses']}\n"
+            f"💰 Bankroll Δ: {batch['bankroll_delta']:.2f} usd"
+        )
+        tg_send_text(self.bot, self.chat_id, self.thread_id, text)
 
     # ══════════════════════════════════════════════════════════════════════
     # PROCESAMIENTO PRINCIPAL DE GIROS
@@ -740,7 +757,6 @@ class RouletteEngine:
                 self._send_result(number, True)
                 self.signal_active = False
                 self.waiting_for_attempt = False
-                return
             elif won is False:
                 lost = self.bet_sys.full_loss()
                 if self.attempts_left > 1:
@@ -750,17 +766,16 @@ class RouletteEngine:
                     self._evaluate_2nd_attempt_choice()
                     pred = {"combined_prob": 0.80} # Default para texto
                     self._send_signal(2, pred)
-                    return
                 else:
                     # Pérdida total
                     self.stats.record_signal_result(2, False, lost, self.bet_sys.bankroll, self.active_category)
                     self._send_result(number, False)
                     self.signal_active = False
                     self.waiting_for_attempt = False
-                    return
-            else:
-                # Cayó 0 (Verde) - Repite intento
-                return
+            # Si cayó 0 (Verde), won es None, se repite intento sin consecuencias
+            
+            self._check_stats()
+            return
 
         # 2. Buscar nueva señal si no hay activa
         if not self.signal_active:
@@ -805,12 +820,19 @@ async def ws_listen(engine: RouletteEngine):
                         except ValueError:
                             pass
                             
+        except asyncio.TimeoutError:
+            logger.warning(f"[{engine.name}] WS Timeout, reenviando subscribe...")
+            continue
+        except websockets.exceptions.ConnectionClosed:
+            logger.error(f"[{engine.name}] WS Conexión cerrada. Reconectando en 10s...")
+            await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"[{engine.name}] WS Error: {e}. Reconectando en 10s...")
             await asyncio.sleep(10)
 
 def run_flask():
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 def run_ws_loop():
     loop = asyncio.new_event_loop()
@@ -820,5 +842,6 @@ def run_ws_loop():
     loop.run_until_complete(asyncio.gather(*tasks))
 
 if __name__ == "__main__":
+    import threading
     threading.Thread(target=run_flask, daemon=True).start()
     run_ws_loop()
