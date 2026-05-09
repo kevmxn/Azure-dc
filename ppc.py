@@ -282,10 +282,24 @@ class AMXSignalSystem:
         if len(positions) >= 3:
             a, b, c = positions[-3], positions[-2], positions[-1]; patron_v = b < a and b < c and c > a
         emas_alin = ce4 > ce8 > ce20; racha_ok = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
+        
         score = 0; mode  = "moderado"
-        if cruce_4_20: score += 3; mode = "tendencia"
-        if cruce_8_20: score += 2; if sobre_3: score += 2; if sobre_2: score += 1
-        if patron_v: score += 2; if emas_alin: score += 1; if racha_ok: score += 1
+        if cruce_4_20:
+            score += 3
+            mode = "tendencia"
+        if cruce_8_20:
+            score += 2
+        if sobre_3:
+            score += 2
+        if sobre_2:
+            score += 1
+        if patron_v:
+            score += 2
+        if emas_alin:
+            score += 1
+        if racha_ok:
+            score += 1
+            
         if score < 3: return None
         strength = "strong" if score >= 5 else "moderate"
         return {"type": "AMX_EMA", "mode": mode, "expected_color": expected_color, "score": score, "strength": strength, "trigger_number": 0, "pattern": ("V" if patron_v else "CROSS_4_20" if cruce_4_20 else "CROSS_8_20" if cruce_8_20 else "EMA")}
@@ -976,7 +990,7 @@ def _register_handlers(b: telebot.TeleBot):
         for engine in engines.values(): engine.set_mode("moderado")
         b.reply_to(message, "✅ <b>Modo MODERADO activado</b>", parse_mode="HTML")
     @b.message_handler(commands=['tendencia'])
-    def cmd_tendencia(message):
+    def cmd_tendado(message):
         for engine in engines.values(): engine.set_mode("tendencia")
         b.reply_to(message, "📈 <b>Modo TENDENCIA activado</b>", parse_mode="HTML")
     @b.message_handler(commands=['status'])
