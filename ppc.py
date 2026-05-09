@@ -10,7 +10,7 @@ Roulette Telegram Signal Bot — Martingala con AMX + Predicción Markov/ML/Patr
   · Estadísticas unificadas con historial de 20 señales + 24 horas
   · Pre-entrenamiento con russian-azure.db
   · PRE‑ALERTA (≥50% prob 11°) → Simula acierto → Señal 12° (si ≥60%)
-  · 2° Oportunidad (13° giro) cambia al valor OPUESTO de la categoría
+  · 2° Oportunidad (13° giro): Evalúa misma categoría y apuesta al valor de mayor probabilidad (opuesto o mismo)
   · Solo se emite señal tras confirmación de pre‑alerta
 """
 
@@ -387,11 +387,11 @@ class DetailedStats:
     def get_batch_stats(self, current_bankroll: float) -> dict:
         w1 = self.wins_1 - self.batch_start_w1; w2 = self.wins_2 - self.batch_start_w2; l = self.losses - self.batch_start_losses; wins = w1 + w2; total = wins + l
         bk = round(current_bankroll - self.batch_start_bankroll, 2) if self.batch_start_bankroll is not None else 0.0
-        return {"total": total, "wins": wins, "losses": l, "w1": w1, "w2": w2, "efficiency": round(wins / total * 100, 1) if total else 0.0, "bankroll_delta": bk}
+        return {"total": total, "wins": wins, "losses": l, "w1": w1, "w2": w2, "efficiency": round(wins / total * 100, 1) if total else 0.0, "e_w1": round(w1 / total * 100, 2) if total else 0.0, "e_w2": round(w2 / total * 100, 2) if total else 0.0, "e_loss": round(l / total * 100, 2) if total else 0.0, "bankroll_delta": bk}
     def get_daily_stats(self, current_bankroll: float) -> dict:
         w1 = self.daily_w1; w2 = self.daily_w2; l = self.daily_losses; wins = w1 + w2; total = wins + l
         bk = round(current_bankroll - self.daily_start_bankroll, 2) if self.daily_start_bankroll is not None else 0.0
-        return {"total": total, "wins": wins, "losses": l, "w1": w1, "w2": w2, "efficiency": round(wins / total * 100, 1) if total else 0.0, "bankroll_delta": bk}
+        return {"total": total, "wins": wins, "losses": l, "w1": w1, "w2": w2, "efficiency": round(wins / total * 100, 1) if total else 0.0, "e_w1": round(w1 / total * 100, 2) if total else 0.0, "e_w2": round(w2 / total * 100, 2) if total else 0.0, "e_loss": round(l / total * 100, 2) if total else 0.0, "bankroll_delta": bk}
     def reset_daily(self, date_str: str, current_bankroll: float): self.last_daily_date = date_str; self.daily_start_bankroll = current_bankroll; self.daily_w1 = 0; self.daily_w2 = 0; self.daily_losses = 0
     def reset(self): self.signal_history.clear(); self.wins_1 = 0; self.wins_2 = 0; self.losses = 0; self.total_signals = 0; self.last_stats_at = 0; self.batch_start_bankroll = None; self.reset_daily("", 0.0)
 
@@ -487,6 +487,10 @@ class RouletteEngine:
         except Exception:
             try: self._live_conn = _get_live_db(); self._live_conn.execute("INSERT INTO live_spins (table_name, number, ts) VALUES (?,?,?)", (self.db_table, number, int(time.time()))); self._live_conn.commit()
             except Exception: pass
+
+    def _cleanup_old_live_spins(self):
+        try: cutoff = int(time.time()) - 7 * 86400; self._live_conn.execute("DELETE FROM live_spins WHERE table_name=? AND ts<?", (self.db_table, cutoff)); self._live_conn.commit()
+        except Exception: pass
 
     def set_mode(self, mode: Literal["tendencia", "moderado"]): self.amx_system = AMXSignalSystem(mode=mode)
 
@@ -642,28 +646,15 @@ class RouletteEngine:
         total = sum(counts.values())
         return counts.get(target_val, 0) / total if total >= 2 else None
 
-    # ── NUEVO DISEÑO DE PRE‑ALERTA ──────────────────────────────────
+    # ── DISEÑO DE PRE‑ALERTA ──────────────────────────────────
     def _send_pre_alert(self, pre_alert_data: dict):
         best_11 = pre_alert_data["pre_alert_11"]; best_12 = pre_alert_data["pre_alert_12"]
-        
-        # Confirmación (11° giro)
-        val_11 = best_11["bet_value"]
-        icon_11 = self._category_icon(val_11)
-        
-        # Posible Señal (12° giro)
+        val_11 = best_11["bet_value"]; icon_11 = self._category_icon(val_11)
         if best_12.get("signal_pair"):
-            p1, p2 = best_12["signal_pair"]
-            signal_str = f"{p1} {self._category_icon(p1)} y {p2} {self._category_icon(p2)}"
+            p1, p2 = best_12["signal_pair"]; signal_str = f"{p1} {self._category_icon(p1)} y {p2} {self._category_icon(p2)}"
         else:
-            val_12 = best_12["bet_value"]
-            signal_str = f"{val_12} {self._category_icon(val_12)}"
-            
-        text = (
-            f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n"
-            f"💡 <i>CONFIRMACION: {val_11}</i> {icon_11}\n"
-            f"❄️ <i>POSIBLE SEÑAL EN: {signal_str}</i>"
-        )
-        
+            val_12 = best_12["bet_value"]; signal_str = f"{val_12} {self._category_icon(val_12)}"
+        text = (f"🚨 <b>ATENCIÓN POSIBLE ENTRADA</b> 🚨\n\n💡 <i>CONFIRMACION: {val_11}</i> {icon_11}\n❄️ <i>POSIBLE SEÑAL EN: {signal_str}</i>")
         msg_id = tg_send_text(self.bot, self.chat_id, self.thread_id, text)
         if msg_id: self.pending_prediction = {"pre_alert_msg_id": msg_id, "pre_alert_11": best_11, "pre_alert_12": best_12, "trigger_number": best_11.get("trigger_number", 0)}
 
@@ -674,23 +665,42 @@ class RouletteEngine:
         self._send_signal(1, signal_12["signal_prob_details"]); self.amx_system.register_signal_sent()
 
     # ══════════════════════════════════════════════════════════════════════
-    # CONVERSIÓN OPUESTA PARA 2° OPORTUNIDAD (13° GIRO)
+    # EVALUACIÓN INTELIGENTE 2° OPORTUNIDAD (13° GIRO)
     # ══════════════════════════════════════════════════════════════════════
-    def _swap_to_opposite(self):
-        cat = self.active_category; val = self.bet_value
-        if cat == "COLOR":
-            self.bet_value = "NEGRO" if val == "ROJO" else "ROJO"; self.signal_pair = ()
-        elif cat == "PARIDAD":
-            self.bet_value = "IMPAR" if val == "PAR" else "PAR"; self.signal_pair = ()
-        elif cat == "RANGO":
-            self.bet_value = "ALTO" if val == "BAJO" else "BAJO"; self.signal_pair = ()
-        elif cat == "DOCENA":
-            excl_num = int(val[1]); new_excl_num = (excl_num % 3) + 1
-            self.bet_value = f"D{new_excl_num}"; pair = DOZEN_PAIRS[new_excl_num]; self.signal_pair = (f"D{pair[0]}", f"D{pair[1]}")
-        elif cat == "COLUMNA":
-            excl_num = int(val[1]); new_excl_num = (excl_num % 3) + 1
-            self.bet_value = f"C{new_excl_num}"; pair = COLUMN_PAIRS[new_excl_num]; self.signal_pair = (f"C{pair[0]}", f"C{pair[1]}")
-        self.bet_color = self.bet_value if cat == "COLOR" else "ROJO"
+    def _evaluate_2nd_attempt_choice(self) -> Optional[dict]:
+        """
+        Evalúa si continuar con el mismo valor en la categoría o cambiar al opuesto 
+        (o al de mayor probabilidad en Doc/Col) para el 13° giro.
+        Retorna el unified_prob del valor elegido.
+        """
+        cat = self.active_category
+        if not cat: return self._blend_prediction(cat, self.bet_value)
+
+        possible_vals = []
+        if cat == "COLOR": possible_vals = ["ROJO", "NEGRO"]
+        elif cat == "PARIDAD": possible_vals = ["PAR", "IMPAR"]
+        elif cat == "RANGO": possible_vals = ["ALTO", "BAJO"]
+        elif cat == "DOCENA": possible_vals = ["D1", "D2", "D3"]
+        elif cat == "COLUMNA": possible_vals = ["C1", "C2", "C3"]
+        else: return self._blend_prediction(cat, self.bet_value)
+
+        best_val = None; best_prob = -1.0; best_pred = None; best_pair = ()
+
+        for val in possible_vals:
+            pred = self._blend_prediction(cat, val)
+            if pred and pred["combined_prob"] > best_prob:
+                best_prob = pred["combined_prob"]; best_val = val; best_pred = pred
+                if cat == "DOCENA": pair = DOZEN_PAIRS[int(val[1])]; best_pair = (f"D{pair[0]}", f"D{pair[1]}")
+                elif cat == "COLUMNA": pair = COLUMN_PAIRS[int(val[1])]; best_pair = (f"C{pair[0]}", f"C{pair[1]}")
+                else: best_pair = ()
+
+        if best_val and best_val != self.bet_value:
+            logger.info(f"[{self.name}] 🔄 2° Intento: Cambiando a {cat} -> {best_val} ({best_prob:.0%})")
+            self.bet_value = best_val; self.signal_pair = best_pair; self.bet_color = self.bet_value if cat == "COLOR" else "ROJO"
+        elif best_val:
+            logger.info(f"[{self.name}] 🔄 2° Intento: Manteniendo {cat} -> {best_val} ({best_prob:.0%})")
+
+        return best_pred if best_pred else self._blend_prediction(cat, self.bet_value)
 
     # ── Mensajes y Resultados ─────────────────────────────────────────
     def _build_signal_text(self, attempt: int, unified_prob: Optional[dict]) -> str:
@@ -845,10 +855,10 @@ class RouletteEngine:
                 if self.attempts_left <= 0: level_used = self.bet_sys.level; self._handle_full_loss(number, real, level_used)
                 else:
                     self.bet_sys.loss()
-                    self._swap_to_opposite() # <--- CONVERSIÓN AL OPUESTO PARA 13° GIRO
+                    best_pred_2nd = self._evaluate_2nd_attempt_choice() # <--- EVALUAR MISMA CATEGORÍA Y VALOR CONTRARIO
                     attempt_number = self.total_attempts - self.attempts_left + 1; self.trigger_number = number
-                    unified_prob = self._blend_prediction(self.active_category, self.bet_value)
-                    self._send_signal(attempt_number, unified_prob)
+                    if not best_pred_2nd: best_pred_2nd = self._blend_prediction(self.active_category, self.bet_value)
+                    self._send_signal(attempt_number, best_pred_2nd)
 
         elif self.waiting_for_attempt:
             if real == "VERDE": self.skip_one_after_zero = True; return
@@ -857,26 +867,35 @@ class RouletteEngine:
                 self.active_category = self.zero_wait_category; self.bet_value = self.zero_wait_bet_value
                 self.bet_color = self.bet_value if self.active_category == "COLOR" else "ROJO"
                 self.zero_wait_category = None; self.zero_wait_bet_value = None; self.trigger_number = number
-                if self.waiting_attempt_number == 2: self._swap_to_opposite()
-                unified_prob = self._blend_prediction(self.active_category, self.bet_value)
-                self.signal_active = True; self.waiting_for_attempt = False; self._send_signal(self.waiting_attempt_number, unified_prob); return
+                best_pred_2nd = self._evaluate_2nd_attempt_choice() if self.waiting_attempt_number == 2 else self._blend_prediction(self.active_category, self.bet_value)
+                self.signal_active = True; self.waiting_for_attempt = False; self._send_signal(self.waiting_attempt_number, best_pred_2nd); return
 
             attempt_number = self.waiting_attempt_number
-            best = self._detect_best_category_signal()
-            if not best or best["probability"] < self.min_prob_threshold:
-                if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
-                msg = tg_send_text(self.bot, self.chat_id, self.thread_id, f"🔔 Sin confirmación para enviar señal para el intento {attempt_number}°")
-                if msg: self.no_confirmation_msg_id = msg
-            else:
-                unified_prob = best["signal_prob_details"]
-                if unified_prob["combined_prob"] < self.min_prob_threshold:
+            if attempt_number == 2:
+                best_pred_2nd = self._evaluate_2nd_attempt_choice()
+                if best_pred_2nd and best_pred_2nd["combined_prob"] >= self.min_prob_threshold:
+                    if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id); self.no_confirmation_msg_id = None
+                    self.trigger_number = number; self.signal_active = True; self.waiting_for_attempt = False; self._send_signal(attempt_number, best_pred_2nd)
+                else:
                     if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
-                    msg = tg_send_text(self.bot, self.chat_id, self.thread_id, f"🔔 Sin confirmación para enviar señal para el intento {attempt_number}°")
+                    msg = tg_send_text(self.bot, self.chat_id, self.thread_id, f"🔔 Sin confirmación para enviar señal para el intento 2°")
+                    if msg: self.no_confirmation_msg_id = msg
+            else:
+                best = self._detect_best_category_signal()
+                if not best or best["probability"] < self.min_prob_threshold:
+                    if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
+                    msg = tg_send_text(self.bot, self.chat_id, self.thread_id, f"🔔 Sin confirmación para enviar señal para el intento 1°")
                     if msg: self.no_confirmation_msg_id = msg
                 else:
-                    if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id); self.no_confirmation_msg_id = None
-                    self.active_category = best["category"]; self.bet_value = best["bet_value"]; self.bet_color = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
-                    self.trigger_number = number; self.signal_active = True; self.waiting_for_attempt = False; self._send_signal(attempt_number, unified_prob)
+                    unified_prob = best["signal_prob_details"]
+                    if unified_prob["combined_prob"] < self.min_prob_threshold:
+                        if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id)
+                        msg = tg_send_text(self.bot, self.chat_id, self.thread_id, f"🔔 Sin confirmación para enviar señal para el intento 1°")
+                        if msg: self.no_confirmation_msg_id = msg
+                    else:
+                        if self.no_confirmation_msg_id: tg_delete(self.bot, self.chat_id, self.no_confirmation_msg_id); self.no_confirmation_msg_id = None
+                        self.active_category = best["category"]; self.bet_value = best["bet_value"]; self.bet_color = best["bet_value"] if best["category"] == "COLOR" else "ROJO"
+                        self.trigger_number = number; self.signal_active = True; self.waiting_for_attempt = False; self._send_signal(attempt_number, unified_prob)
         else:
             self.signal_msg_ids = []
             if self.spins_since_loss >= self.LOSS_COOLDOWN_SPINS and self.pending_prediction is None:
@@ -950,7 +969,7 @@ engines: dict[str, RouletteEngine] = {}
 def _register_handlers(b: telebot.TeleBot):
     @b.message_handler(commands=['start', 'help'])
     def cmd_start(message):
-        help_text = """<b>🎰 Roulette Bot AMX — Martingala</b>\nRussian Roulette\n\n<b>Características:</b>\n• Martingala con máx. 2 intentos\n• 2° Intento (13° giro) apuesta al valor OPUESTO\n• Solo se emite señal tras confirmación de pre‑alerta (11° giro)\n\nComandos:\n/moderado - Modo moderado\n/tendencia - Modo tendencia\n/status - Estado actual\n/reset - Resetear estadísticas\n/help - Esta ayuda"""
+        help_text = """<b>🎰 Roulette Bot AMX — Martingala</b>\nRussian Roulette\n\n<b>Características:</b>\n• Martingala con máx. 2 intentos\n• 2° Intento: Evalúa si mantiene o apusta al valor contrario\n• Solo se emite señal tras confirmación de pre‑alerta (11° giro)\n\nComandos:\n/moderado - Modo moderado\n/tendencia - Modo tendencia\n/status - Estado actual\n/reset - Resetear estadísticas\n/help - Esta ayuda"""
         b.reply_to(message, help_text, parse_mode="HTML")
     @b.message_handler(commands=['moderado'])
     def cmd_moderado(message):
