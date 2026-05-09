@@ -10,7 +10,7 @@ Roulette Telegram Signal Bot — Martingala con AMX + Predicción Markov/ML/Patr
   · Estadísticas unificadas con historial de 20 señales + 24 horas
   · Pre-entrenamiento con russian-azure.db
   · PRE‑ALERTA (≥50% prob 11°) → Simula acierto → Señal 12° (si ≥60%)
-  · 2° Oportunidad (13° giro): Evalúa misma categoría y apuesta al valor de mayor probabilidad (opuesto o mismo)
+  · 2° Oportunidad (13° giro): Evalúa misma categoría y apuesta al valor de mayor probabilidad
   · Solo se emite señal tras confirmación de pre‑alerta
 """
 
@@ -284,21 +284,13 @@ class AMXSignalSystem:
         emas_alin = ce4 > ce8 > ce20; racha_ok = len(self.last_two_expected) >= 2 and all(self.last_two_expected)
         
         score = 0; mode  = "moderado"
-        if cruce_4_20:
-            score += 3
-            mode = "tendencia"
-        if cruce_8_20:
-            score += 2
-        if sobre_3:
-            score += 2
-        if sobre_2:
-            score += 1
-        if patron_v:
-            score += 2
-        if emas_alin:
-            score += 1
-        if racha_ok:
-            score += 1
+        if cruce_4_20: score += 3; mode = "tendencia"
+        if cruce_8_20: score += 2
+        if sobre_3: score += 2
+        if sobre_2: score += 1
+        if patron_v: score += 2
+        if emas_alin: score += 1
+        if racha_ok: score += 1
             
         if score < 3: return None
         strength = "strong" if score >= 5 else "moderate"
@@ -582,15 +574,29 @@ class RouletteEngine:
     # ══════════════════════════════════════════════════════════════════════
     def _evaluate_pre_alert(self) -> Optional[dict]:
         best_11 = self._detect_best_category_signal()
-        if best_11 is None or best_11["probability"] < self.pre_alert_threshold: return None
+        if best_11 is None:
+            logger.debug(f"[{self.name}] Pre-alerta: Sin candidatos 11°")
+            return None
+        if best_11["probability"] < self.pre_alert_threshold:
+            logger.debug(f"[{self.name}] Pre-alerta: 11° mejor es {best_11['bet_value']} {best_11['probability']:.0%} < {self.pre_alert_threshold:.0%}")
+            return None
+            
         sim_number = self._get_simulated_number(best_11)
         if sim_number is None: return None
         sim_real = REAL_COLOR_MAP.get(sim_number, "VERDE")
+        
+        logger.info(f"[{self.name}] 🔮 Pre-alerta 11°: {best_11['bet_value']} [{best_11['category']}] ({best_11['probability']:.0%}). Simulando #{sim_number} {sim_real}...")
+        
         best_12 = None; best_12_prob = 0.0
         for cat in ("COLOR", "PARIDAD", "RANGO", "DOCENA", "COLUMNA"):
             result = self._simulate_spin12_category(cat, sim_number, sim_real)
             if result and result["probability"] > best_12_prob: best_12 = result; best_12_prob = result["probability"]
-        if best_12 is None or best_12_prob < self.min_prob_threshold: return None
+            
+        if best_12 is None or best_12_prob < self.min_prob_threshold:
+            logger.info(f"[{self.name}] ❌ Pre-alerta cancelada: 12° mejor simulado es {best_12_prob:.0%} < {self.min_prob_threshold:.0%}")
+            return None
+            
+        logger.info(f"[{self.name}] ✅ Pre-alerta válida: 12° será {best_12['bet_value']} [{best_12['category']}] ({best_12_prob:.0%})")
         return {"pre_alert_11": best_11, "pre_alert_12": best_12, "sim_number": sim_number}
 
     def _simulate_spin12_category(self, cat: str, sim_number: int, sim_real: str) -> Optional[dict]:
@@ -682,11 +688,6 @@ class RouletteEngine:
     # EVALUACIÓN INTELIGENTE 2° OPORTUNIDAD (13° GIRO)
     # ══════════════════════════════════════════════════════════════════════
     def _evaluate_2nd_attempt_choice(self) -> Optional[dict]:
-        """
-        Evalúa si continuar con el mismo valor en la categoría o cambiar al opuesto 
-        (o al de mayor probabilidad en Doc/Col) para el 13° giro.
-        Retorna el unified_prob del valor elegido.
-        """
         cat = self.active_category
         if not cat: return self._blend_prediction(cat, self.bet_value)
 
@@ -827,20 +828,38 @@ class RouletteEngine:
 
         # ══════ COMPROBAR PRE‑ALERTA ANTERIOR ══════
         if self.pending_prediction is not None and not self.signal_active and not self.waiting_for_attempt:
-            pred = self.pending_prediction; cat = pred.get("pre_alert_11", {}).get("category"); val = pred.get("pre_alert_11", {}).get("bet_value")
+            pred = self.pending_prediction; cat_11 = pred.get("pre_alert_11", {}).get("category"); val_11 = pred.get("pre_alert_11", {}).get("bet_value")
+            logger.info(f"[{self.name}] 🔍 Pre-alerta pendiente: Esperando 11° giro {val_11} [{cat_11}]. Salió #{number} {real}")
+            
             actual_val = None
             if number != 0:
-                if cat == "COLOR": actual_val = REAL_COLOR_MAP.get(number)
-                elif cat == "PARIDAD": actual_val = get_paridad(number)
-                elif cat == "RANGO": actual_val = get_rango(number)
-                elif cat == "DOCENA": actual_val = f"D{get_dozen(number)}"
-                elif cat == "COLUMNA": actual_val = f"C{get_column(number)}"
-            if actual_val == val:
+                if cat_11 == "COLOR": actual_val = REAL_COLOR_MAP.get(number)
+                elif cat_11 == "PARIDAD": actual_val = get_paridad(number)
+                elif cat_11 == "RANGO": actual_val = get_rango(number)
+                elif cat_11 == "DOCENA": actual_val = f"D{get_dozen(number)}"
+                elif cat_11 == "COLUMNA": actual_val = f"C{get_column(number)}"
+                
+            if actual_val == val_11:
+                logger.info(f"[{self.name}] ✅ PRE-ALERTA CONFIRMADA EN 11° GIRO: {actual_val}")
                 if pred.get("pre_alert_msg_id"): tg_delete(self.bot, self.chat_id, pred["pre_alert_msg_id"])
-                self.pending_prediction = None
-                best_12 = self._detect_best_category_signal()
-                if best_12 and best_12["probability"] >= self.min_prob_threshold: self._activate_prealert_signal(best_12, number); return
+                
+                signal_12 = pred.get("pre_alert_12")
+                if signal_12:
+                    # Actualizamos la probabilidad con los datos reales frescos, pero MANTENEMOS la categoría y valor predichos
+                    fresh_unified = self._blend_prediction(signal_12["category"], signal_12["bet_value"])
+                    if fresh_unified:
+                        signal_12["signal_prob_details"] = fresh_unified
+                        signal_12["probability"] = fresh_unified["combined_prob"]
+                    
+                    self.pending_prediction = None
+                    logger.info(f"[{self.name}] 🎯 Activando señal del 12° giro: {signal_12['bet_value']} [{signal_12['category']}] ({signal_12['probability']:.0%})")
+                    self._activate_prealert_signal(signal_12, number)
+                    return
+                else:
+                    logger.warning(f"[{self.name}] ⚠️ Pre-alerta confirmada pero sin datos del 12° giro. Ignorando.")
+                    self.pending_prediction = None
             else:
+                logger.info(f"[{self.name}] ❌ PRE-ALERTA NO CONFIRMADA: Se esperaba {val_11}, salió {actual_val}")
                 if pred.get("pre_alert_msg_id"): tg_delete(self.bot, self.chat_id, pred["pre_alert_msg_id"])
                 self.pending_prediction = None
 
