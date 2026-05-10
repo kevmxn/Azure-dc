@@ -61,7 +61,7 @@ AZURE_TABLE = "russian_roulette"
 BASE_BET     = 0.50
 MAX_ATTEMPTS = 2
 WARMUP_SPINS = 25
-MIN_PROB     = 0.80
+MIN_PROB     = 0.78
 TRAIN_INTERVAL = 100
 
 REAL_COLOR_MAP: dict[int, str] = {
