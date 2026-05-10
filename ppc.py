@@ -5,7 +5,9 @@ Roulette Telegram Signal Bot — Docenas y Columnas Exclusivamente
   · Valida que la secuencia se haya repetido históricamente
   · Predice 6° giro: Markov + ML + Patrones(longitud 5) + AMX
   · Las 2 más probables deben coincidir con el flujo y superar 80%
-  · Compatible con Render (Flask silenciado)
+  · Compatible con Render (Keep-alive, puerto dinámico, formato WS correcto)
+  · Deduplicación por gameId
+  · Reporte diario a las 12:00 AR (15:00 UTC)
 """
 
 import asyncio
@@ -17,6 +19,7 @@ import sqlite3
 import threading
 import time
 from collections import deque, defaultdict
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict
 
 import numpy as np
@@ -28,16 +31,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Evitar reloader y banners de Flask
-os.environ['WERKZEUG_RUN_MAIN'] = 'true'
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s')
 logger = logging.getLogger("RouletteBotDC")
 
-# Silenciar Flask y Werkzeug
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
@@ -50,11 +49,9 @@ _session = requests.Session()
 _retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
                allowed_methods=["GET", "POST"], raise_on_status=False)
 _adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
+_session.mount("https://", _adapter); _session.mount("http://", _adapter)
 
-bot = telebot.TeleBot(TOKEN, threaded=False)
-bot.session = _session
+bot = telebot.TeleBot(TOKEN, threaded=False); bot.session = _session
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -68,8 +65,7 @@ def _get_live_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL,
         number INTEGER NOT NULL, ts INTEGER NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_table ON live_spins(table_name, id)")
-    conn.commit()
-    return conn
+    conn.commit(); return conn
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS & CONFIG
@@ -91,7 +87,7 @@ ROULETTE_CONFIGS = {
     "RUSSIAN ROULETTE": {
         "bot": bot, "ws_key": 221, "chat_id": -1003835197023,
         "thread_id": 8344, "db_table": "russian_roulette",
-        "min_prob_threshold": 0.80,  # 80% Mínimo umbral requerido
+        "min_prob_threshold": 0.80,
     },
 }
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
@@ -100,9 +96,10 @@ MAX_ATTEMPTS  = 2
 BASE_BET      = 0.50
 WARMUP_SPINS  = 21
 LOSS_COOLDOWN = 5
+AR_TIMEZONE = timezone(timedelta(hours=-3))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MARTINGALE (Adaptado para 2 docenas/columnas - Pago 2 a 1)
+# MARTINGALE
 # ═══════════════════════════════════════════════════════════════════════════════
 class Martingale:
     def __init__(self, base: float):
@@ -114,14 +111,12 @@ class Martingale:
         return round(max(needed, self.base), 2)
 
     def win(self) -> float:
-        bet = self.current_bet()
-        self.bankroll = round(self.bankroll + bet, 2)
+        bet = self.current_bet(); self.bankroll = round(self.bankroll + bet, 2)
         self.level = 1; self.cumulative_loss = 0.0; self.consecutive_losses = 0
         return bet
 
     def loss(self) -> float:
-        bet = self.current_bet()
-        total_loss = round(bet * 2, 2)
+        bet = self.current_bet(); total_loss = round(bet * 2, 2)
         self.bankroll = round(self.bankroll - total_loss, 2)
         self.cumulative_loss = round(self.cumulative_loss + total_loss, 2)
         if self.level >= 6: self.level = 1; self.cumulative_loss = 0.0
@@ -177,7 +172,6 @@ class MLPatternPredictor:
         return probs
 
 class CategoryPredictorDC:
-    """Patrones de 5 últimos números exclusivamente para D y C"""
     PATTERN_LEN = 5
     def __init__(self):
         self._hist: dict = {"DOCENA": [], "COLUMNA": []}
@@ -247,17 +241,33 @@ class AMXSignalSystemDC:
 # STATISTICS & TG HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 class DetailedStats:
-    def __init__(self): self.signal_history: deque = deque(maxlen=50); self.wins_1 = 0; self.wins_2 = 0; self.losses = 0; self.total_signals = 0
+    def __init__(self): 
+        self.signal_history: deque = deque(maxlen=50); self.wins_1 = 0; self.wins_2 = 0
+        self.losses = 0; self.total_signals = 0
+        self.daily_w1 = 0; self.daily_w2 = 0; self.daily_losses = 0
+        self.daily_start_bankroll: Optional[float] = None
+
     def record(self, attempt_won: int, final_result: bool, bet: float, bankroll: float, category: str, pair: str):
         self.signal_history.append({"attempt_won": attempt_won, "won": final_result, "bet": bet, "bankroll": bankroll, "timestamp": time.time(), "category": category, "pair": pair})
         self.total_signals += 1
         if final_result:
-            if attempt_won == 1: self.wins_1 += 1
-            else: self.wins_2 += 1
-        else: self.losses += 1
-    def summary(self, bankroll: float) -> str:
-        w = self.wins_1 + self.wins_2; t = w + self.losses; eff = round(w/t*100,1) if t else 0
-        return (f"📊 <b>ESTADÍSTICAS</b>\n\n✅ W1: {self.wins_1} | ✅ W2: {self.wins_2}\n❌ Losses: {self.losses}\n📈 Eff: {eff}%\n💰 Bankroll: {bankroll:.2f} usd")
+            if attempt_won == 1: self.wins_1 += 1; self.daily_w1 += 1
+            else: self.wins_2 += 1; self.daily_w2 += 1
+        else: self.losses += 1; self.daily_losses += 1
+        if self.daily_start_bankroll is None: self.daily_start_bankroll = bankroll
+
+    def get_daily_stats(self, current_bankroll: float) -> dict:
+        w1 = self.daily_w1; w2 = self.daily_w2; l = self.daily_losses
+        wins = w1 + w2; total = wins + l
+        bk = round(current_bankroll - self.daily_start_bankroll, 2) if self.daily_start_bankroll is not None else 0.0
+        return {"total": total, "wins": wins, "losses": l, "w1": w1, "w2": w2,
+                "efficiency": round(wins/total*100, 1) if total else 0.0,
+                "e_w1": round(w1/total*100, 2) if total else 0.0,
+                "e_w2": round(w2/total*100, 2) if total else 0.0,
+                "e_loss": round(l/total*100, 2) if total else 0.0, "bankroll_delta": bk}
+
+    def reset_daily(self, current_bankroll: float):
+        self.daily_w1 = 0; self.daily_w2 = 0; self.daily_losses = 0; self.daily_start_bankroll = current_bankroll
 
 _TG_MAX_RETRIES = 12
 def _tg_call(fn, *args, **kwargs):
@@ -280,7 +290,7 @@ def tg_send(bot_inst, chat_id, thread_id, text) -> Optional[int]:
 def tg_delete(bot_inst, chat_id, msg_id): _tg_call(bot_inst.delete_message, chat_id=chat_id, message_id=msg_id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ROULETTE ENGINE — LÓGICA EXCLUSIVA DOCENAS Y COLUMNAS
+# ROULETTE ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 class RouletteEngine:
     def __init__(self, name: str, cfg: dict):
@@ -302,6 +312,7 @@ class RouletteEngine:
         self.bet_sys = Martingale(BASE_BET); self.spins_since_loss: int = 999
         self.stats = DetailedStats()
         self.ws = None; self.running = True; self._live_conn = _get_live_db()
+        self.last_game_id: Optional[str] = None  # Deduplicación
 
         self._pretrain_from_db(DB_PATH, self.db_table)
         live_loaded = self._load_live_history()
@@ -358,9 +369,6 @@ class RouletteEngine:
                 self._live_conn = _get_live_db(); self._live_conn.execute("INSERT INTO live_spins (table_name, number, ts) VALUES (?,?,?)", (self.db_table, number, int(time.time()))); self._live_conn.commit()
             except Exception: pass
 
-    # ══════════════════════════════════════════════════════════════════
-    # 1. CLASIFICACIÓN ÚLTIMOS 5 RESULTADOS
-    # ══════════════════════════════════════════════════════════════════
     def _classify_last5(self) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
         last5 = self.spin_history[-5:]
@@ -380,20 +388,14 @@ class RouletteEngine:
         if not result["dozen_pattern"] and not result["column_pattern"]: return None
         return result
 
-    # ══════════════════════════════════════════════════════════════════
-    # 2. VALIDACIÓN HISTÓRICA DE SECUENCIA
-    # ══════════════════════════════════════════════════════════════════
     def _validate_historical_pair(self, cat_type: str, pair_set: set) -> bool:
         seq = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         if len(seq) < 10: return False
         count = 0
         for i in range(len(seq) - 4):
             if set(seq[i:i+5]) == pair_set: count += 1
-        return count >= 2  # La actual + al menos 1 previa
+        return count >= 2
 
-    # ══════════════════════════════════════════════════════════════════
-    # 3. PREDICCIÓN MARKOV + ML + PATRONES(5) + AMX
-    # ══════════════════════════════════════════════════════════════════
     def _predict_top_2(self, cat_type: str) -> Tuple[list, float]:
         all_vals = ["D1","D2","D3"] if cat_type == "DOCENA" else ["C1","C2","C3"]
         markov_probs = {v:0.0 for v in all_vals}; ml_probs = {v:0.0 for v in all_vals}; pattern_probs = {v:0.0 for v in all_vals}
@@ -421,7 +423,6 @@ class RouletteEngine:
         top2_vals = [sorted_probs[0][0], sorted_probs[1][0]]
         top2_prob_sum = sorted_probs[0][1] + sorted_probs[1][1]
         
-        # AMX Boost
         amx_boost = 0.0
         if len(self.d_levels[1]) >= 20:
             pair_nums = [int(v[1]) for v in top2_vals]; miss_num = list({1,2,3} - set(pair_nums))[0]
@@ -438,9 +439,6 @@ class RouletteEngine:
         top2_prob_sum = min(0.99, top2_prob_sum + amx_boost)
         return top2_vals, top2_prob_sum
 
-    # ══════════════════════════════════════════════════════════════════
-    # DETECCIÓN Y EMISIÓN DE SEÑAL
-    # ══════════════════════════════════════════════════════════════════
     def _try_detect_signal(self):
         classification = self._classify_last5()
         if classification is None: return
@@ -498,9 +496,7 @@ class RouletteEngine:
         )
         msg_id = tg_send(self.bot, self.chat_id, self.thread_id, text)
         if msg_id: self.signal_msg_ids.append(msg_id)
-        logger.info(f"[{self.name}] 🎯 SEÑAL {self.active_type}: {self.active_pair} (Prob: {prob:.0%})")
 
-    # ── Verificar resultado y 2° Intento ──────────────────────────────
     def _check_signal_result(self, number: int, real_color: str):
         won = False
         if number != 0:
@@ -533,7 +529,6 @@ class RouletteEngine:
     def _send_result_message(self, number: int, real: str, won: bool, amount: float, attempt_num: int):
         for mid in self.signal_msg_ids: tg_delete(self.bot, self.chat_id, mid)
         self.signal_msg_ids = []
-        
         d_val = f"D{get_dozen(number)}" if number != 0 else "0"; c_val = f"C{get_column(number)}" if number != 0 else "0"
         pair_display = self._format_pair_display(self.active_pair)
         status = f"✅ <b>¡GREEN! {number} {real} ({d_val}/{c_val})</b>" if won else f"❌ <b>¡LOSS! {number} {real} ({d_val}/{c_val})</b>"
@@ -549,9 +544,20 @@ class RouletteEngine:
         )
         tg_send(self.bot, self.chat_id, self.thread_id, text)
 
-    # ══════════════════════════════════════════════════════════════════
-    # MAIN SPIN PROCESSOR
-    # ══════════════════════════════════════════════════════════════════
+    def send_daily_report(self):
+        sd = self.stats.get_daily_stats(self.bet_sys.bankroll)
+        if sd['total'] == 0: return
+        text = (
+            f"📅 <b>REPORTE DIARIO 24 HORAS</b>\n\n"
+            f"🈯️ TOTAL DE SEÑALES: {sd['total']} = {sd['efficiency']}%\n"
+            f"1️⃣ GALE #0: {sd['w1']} = {sd['e_w1']}%\n"
+            f"2️⃣ GALE #1: {sd['w2']} = {sd['e_w2']}%\n"
+            f"❌ LOSS: {sd['losses']} = {sd['e_loss']}%\n"
+            f"💰 BANKROLL DEL DÍA: {sd['bankroll_delta']:.2f} usd"
+        )
+        tg_send(self.bot, self.chat_id, self.thread_id, text)
+        self.stats.reset_daily(self.bet_sys.bankroll)
+
     def process_spin(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE"); self._process_spin_internal(number); self._persist_spin(number)
         if not self.warmup_done:
@@ -562,42 +568,60 @@ class RouletteEngine:
         if self.spins_since_loss < LOSS_COOLDOWN: self.spins_since_loss += 1; return
         self._try_detect_signal()
 
+    # ══════════════════════════════════════════════════════════════════
+    # WS LOOP Y EXTRACTOR CORREGIDO PARA PRAGMATIC
+    # ══════════════════════════════════════════════════════════════════
     async def ws_loop(self):
         while self.running:
             try:
                 async with websockets.connect(WS_URL, additional_headers={"Origin": "https://www.pragmaticplay.com"}, ping_interval=20, ping_timeout=60, close_timeout=5) as ws:
-                    self.ws = ws; await ws.send(json.dumps({"method": "subscribe", "params": {"casinoId": CASINO_ID, "tableId": self.ws_key}}))
-                    logger.info(f"[{self.name}] ✅ WebSocket conectado")
+                    self.ws = ws
+                    # Formato real de Pragmatic Play
+                    await ws.send(json.dumps({"type": "subscribe", "key": self.ws_key, "casinoId": CASINO_ID}))
+                    logger.info(f"[{self.name}] ✅ WebSocket conectado y suscrito")
                     async for raw_msg in ws:
                         if not self.running: break
                         try:
-                            msg = json.loads(raw_msg); number = self._extract_number(msg)
-                            if number is not None: self.process_spin(number)
+                            msg = json.loads(raw_msg)
+                            spin_data = self._extract_number(msg)
+                            if spin_data:
+                                number, game_id = spin_data
+                                if game_id != self.last_game_id:
+                                    self.last_game_id = game_id
+                                    self.process_spin(number)
                         except: pass
             except Exception as e:
                 logger.error(f"[{self.name}] WS error: {e}"); await asyncio.sleep(5)
 
-    def _extract_number(self, msg: dict) -> Optional[int]:
+    def _extract_number(self, msg: dict) -> Optional[Tuple[int, str]]:
+        """Extrae (number, gameId) del formato real de Pragmatic Play"""
         try:
-            for src in [msg.get("params",{}), msg.get("data",{})]:
-                if "result" in src:
-                    r = src["result"]
-                    if isinstance(r, int) and 0<=r<=36: return r
-                    if isinstance(r, dict) and "winningNumber" in r:
-                        n = int(r["winningNumber"])
-                        if 0<=n<=36: return n
-            if msg.get("method") == "gameResult":
-                r = msg.get("params",{}).get("result")
-                if isinstance(r, int) and 0<=r<=36: return r
+            params = msg.get("params", {})
+            # 1. Spin en tiempo real
+            if "result" in params and isinstance(params["result"], dict):
+                res = params["result"]
+                n = int(res.get("result", -1))
+                gid = str(res.get("gameId", ""))
+                if 0 <= n <= 36 and gid: return n, gid
+            
+            # 2. Historial inicial
+            if "last20Results" in params and isinstance(params["last20Results"], list):
+                results = params["last20Results"]
+                if len(results) > 0:
+                    res = results[0] # El más reciente
+                    n = int(res.get("result", -1))
+                    gid = str(res.get("gameId", ""))
+                    if 0 <= n <= 36 and gid: return n, gid
         except: pass
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FLASK HEALTH CHECK — SILENCIOSO PARA RENDER
+# FLASK, KEEP-ALIVE Y SCHEDULER
 # ═══════════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
 @app.route("/health")
+@app.route("/ping")  # Ruta para keep-alive
 def health():
     return jsonify({"status": "ok", "time": time.time()})
 
@@ -605,7 +629,33 @@ def _run_flask():
     import logging as _log
     _log.getLogger('werkzeug').setLevel(_log.ERROR)
     _log.getLogger('flask.app').setLevel(_log.ERROR)
-    app.run(host="0.0.0.0", port=5002, debug=False, use_reloader=False, threaded=True)
+    port = int(os.environ.get('PORT', 5002))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+
+def _self_ping():
+    """Evita que Render Free Tier suspenda la instancia por inactividad"""
+    render_url = os.environ.get('RENDER_EXTERNAL_URL')
+    if not render_url:
+        logger.info("RENDER_EXTERNAL_URL no configurada, self-ping desactivado.")
+        return
+    if not render_url.startswith("http"): render_url = f"https://{render_url}"
+    while True:
+        time.sleep(300)  # Cada 5 minutos
+        try: requests.get(f"{render_url}/ping", timeout=10)
+        except: pass
+
+def _daily_stats_scheduler():
+    """Envía estadísticas diarias a las 12:00 Argentina (15:00 UTC)"""
+    sent_today = False
+    while True:
+        now_ar = datetime.now(AR_TIMEZONE)
+        if now_ar.hour == 12 and now_ar.minute == 0:
+            if not sent_today:
+                for eng in engines.values(): eng.send_daily_report()
+                sent_today = True
+        else:
+            sent_today = False
+        time.sleep(30)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM BOT COMMANDS
@@ -618,7 +668,7 @@ def cmd_start(msg):
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(msg):
-    for eng in engines.values(): _tg_call(bot.send_message, chat_id=msg.chat.id, text=eng.stats.summary(eng.bet_sys.bankroll), parse_mode="HTML")
+    for eng in engines.values(): _tg_call(bot.send_message, chat_id=msg.chat.id, text=eng.stats.get_daily_stats(eng.bet_sys.bankroll), parse_mode="HTML")
 
 @bot.message_handler(commands=["reset"])
 def cmd_reset(msg):
@@ -648,10 +698,16 @@ def main():
     global engines
     for name, cfg in ROULETTE_CONFIGS.items(): engines[name] = RouletteEngine(name, cfg)
     
-    # Flask silencioso en Render
+    # 1. Flask (Render require PORT env)
     threading.Thread(target=_run_flask, daemon=True).start()
     
-    # Telegram bot polling
+    # 2. Keep-alive (Self-ping para Render Free Tier)
+    threading.Thread(target=_self_ping, daemon=True).start()
+    
+    # 3. Reporte Diario Argentina 12:00
+    threading.Thread(target=_daily_stats_scheduler, daemon=True).start()
+    
+    # 4. Telegram bot polling
     def _poll_bot():
         while True:
             try: bot.infinity_polling(timeout=10, long_polling_timeout=5)
@@ -659,9 +715,10 @@ def main():
                 logger.error(f"Bot polling error: {e}"); time.sleep(5)
     threading.Thread(target=_poll_bot, daemon=True).start()
     
-    # WebSocket loops en asyncio
-    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-    tasks = [asyncio.ensure_future(eng.ws_loop()) for eng in engines.values()]
+    # 5. WebSocket loops en asyncio (Event Loop seguro)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    tasks = [loop.create_task(eng.ws_loop()) for eng in engines.values()]
     try: loop.run_until_complete(asyncio.gather(*tasks))
     except KeyboardInterrupt: 
         for eng in engines.values(): eng.running = False
