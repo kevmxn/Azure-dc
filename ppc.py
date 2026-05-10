@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Russian Roulette — Bot de señales para Docenas y Columnas exclusivamente
+Azure Roulette — Bot de señales para Docenas y Columnas
 Sistema PF + PH + ML Cruzado
-  - PF (Frecuencia últimos 5): Top 2 D/C del bloque actual (Peso 65%)
-  - PH (Histórico último nº): Top 2 D/C tras el último nº (Peso 35%)
-  - ML (Markov + NB + SGD + AMX): Features cruzados (D,C) + PF + PH
-  - Entrenamiento cada 100 giros. Umbral: 80%
+  - Capital inicial: 0
+  - Apuesta base: 0.50 por docena/columna
+  - Pre-entrenamiento: tabla roulette_1 (russian-azure.db) — 16.597 giros
+  - WS Key: 227
 """
 
 import asyncio
@@ -18,8 +18,7 @@ import threading
 import time
 import urllib.request
 from collections import deque, defaultdict
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
 import numpy as np
 from sklearn.naive_bayes import MultinomialNB
@@ -33,35 +32,35 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [RussianDC] %(levelname)s %(message)s')
-logger = logging.getLogger("RussianDC")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [AzureDC] %(levelname)s %(message)s')
+logger = logging.getLogger("AzureDC")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
-# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-TOKEN   = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
-CHAT_ID = -1003835197023
-THREAD_ID = 8344
+# ─── TELEGRAM — AZURE ROULETTE ────────────────────────────────────────────────
+TOKEN   = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
+CHAT_ID = -1003522684671
 
 _session = requests.Session()
 _retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
-               allowed_methods=["GET","POST"], raise_on_status=False)
+               allowed_methods=["GET", "POST"], raise_on_status=False)
 _session.mount("https://", HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
 _session.mount("http://",  HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
-bot = telebot.TeleBot(TOKEN, threaded=False); bot.session = _session
+bot = telebot.TeleBot(TOKEN, threaded=False)
+bot.session = _session
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
-WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID = "ppcjd00000007254"
-WS_KEY    = 221
-LIVE_DB   = "russian_live.db"
-AZURE_DB  = "russian-azure.db"
-AZURE_TABLE = "russian_roulette"
+WS_URL      = "wss://dga.pragmaticplaylive.net/ws"
+CASINO_ID   = "ppcjd00000007254"
+WS_KEY      = 227
+LIVE_DB     = "azure_live.db"
+AZURE_DB    = "russian-azure.db"
+AZURE_TABLE = "roulette_1"             # 16.597 giros
 
-BASE_BET     = 0.50
-MAX_ATTEMPTS = 2
-WARMUP_SPINS = 25
-MIN_PROB     = 0.78
+BASE_BET       = 0.50    # Apuesta base por docena/columna
+MAX_ATTEMPTS   = 2       # Gale 0 y Gale 1
+WARMUP_SPINS   = 25
+MIN_PROB       = 0.78
 TRAIN_INTERVAL = 100
 
 REAL_COLOR_MAP: dict[int, str] = {
@@ -72,7 +71,6 @@ REAL_COLOR_MAP: dict[int, str] = {
     28:"NEGRO",29:"NEGRO",30:"ROJO",31:"NEGRO",32:"ROJO",33:"NEGRO",34:"ROJO",
     35:"NEGRO",36:"ROJO",
 }
-COLOR_EMOJI = {"ROJO":"🔴","NEGRO":"⚫️","VERDE":"🟢"}
 
 def get_dozen(n: int) -> int:
     if n == 0: return 0
@@ -84,8 +82,13 @@ def get_column(n: int) -> int:
 
 def _get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(LIVE_DB, check_same_thread=False)
-    conn.execute("""CREATE TABLE IF NOT EXISTS live_spins ( id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, ts INTEGER NOT NULL)""")
-    conn.commit(); return conn
+    conn.execute("""CREATE TABLE IF NOT EXISTS live_spins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        number INTEGER NOT NULL,
+        ts INTEGER NOT NULL
+    )""")
+    conn.commit()
+    return conn
 
 _TG_RETRIES = 12
 def _tg_call(fn, *a, **kw):
@@ -99,22 +102,23 @@ def _tg_call(fn, *a, **kw):
                 except: wait = 30
                 time.sleep(wait); continue
             if attempt == _TG_RETRIES: return None
-            time.sleep(delay); delay = min(delay*2, 60)
+            time.sleep(delay); delay = min(delay * 2, 60)
     return None
 
 def tg_send(text: str) -> Optional[int]:
-    kwargs = dict(chat_id=CHAT_ID, text=text, parse_mode="HTML")
-    if THREAD_ID: kwargs["message_thread_id"] = THREAD_ID
-    msg = _tg_call(bot.send_message, **kwargs)
+    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
     return msg.message_id if msg else None
-
-def tg_delete(msg_id: int): _tg_call(bot.delete_message, chat_id=CHAT_ID, message_id=msg_id)
 
 # ─── EMA ──────────────────────────────────────────────────────────────────────
 def calc_ema(data: list, period: int) -> list:
-    if len(data) < period: return [None]*len(data)
-    mult = 2 / (period + 1); out = [None]*(period-1); prev = sum(data[:period]) / period; out.append(prev)
-    for v in data[period:]: prev = v*mult + prev*(1-mult); out.append(prev)
+    if len(data) < period: return [None] * len(data)
+    mult = 2 / (period + 1)
+    out = [None] * (period - 1)
+    prev = sum(data[:period]) / period
+    out.append(prev)
+    for v in data[period:]:
+        prev = v * mult + prev * (1 - mult)
+        out.append(prev)
     return out
 
 def ema_signal(levels: list, mode: str = "moderado") -> bool:
@@ -127,158 +131,175 @@ def ema_signal(levels: list, mode: str = "moderado") -> bool:
     pe8  = e8[li-1]  if li > 0 and e8[li-1]  is not None else ce8
     pe20 = e20[li-1] if li > 0 and e20[li-1] is not None else ce20
     if mode == "tendencia":
-        return ((pe4 <= pe20 and ce4 > ce20) or (cur > ce4 and cur > ce8 and cur > ce20))
+        return (pe4 <= pe20 and ce4 > ce20) or (cur > ce4 and cur > ce8 and cur > ce20)
     else:
         v_pattern = False
-        if len(levels) >= 3: a, b, c = levels[-3], levels[-2], levels[-1]; v_pattern = (b < a) and (b < c) and (c > a)
-        return ((pe4 <= pe8 and ce4 > ce8) or (pe8 <= pe20 and ce8 > ce20) or (cur > ce4 and cur > ce8) or v_pattern)
+        if len(levels) >= 3:
+            a, b, c = levels[-3], levels[-2], levels[-1]
+            v_pattern = (b < a) and (b < c) and (c > a)
+        return (pe4 <= pe8 and ce4 > ce8) or (pe8 <= pe20 and ce8 > ce20) or (cur > ce4 and cur > ce8) or v_pattern
 
 # ─── MARKOV SUAVIZADO ─────────────────────────────────────────────────────────
 class SmoothedMarkovPredictor:
     def __init__(self, window: int = 60, order: int = 2):
-        self.window = window; self.order = order; self.transition_counts: dict = {}
+        self.window = window; self.order = order
+        self.transition_counts: dict = {}
+
     def update(self, sequence: list):
         self.transition_counts = defaultdict(lambda: defaultdict(int))
         recent = sequence[-self.window:]
         if len(recent) < self.order + 1: return
         for i in range(len(recent) - self.order):
-            state = tuple(recent[i:i+self.order]); nxt = recent[i+self.order]
+            state = tuple(recent[i:i + self.order])
+            nxt = recent[i + self.order]
             self.transition_counts[state][nxt] += 1
+
     def predict(self, sequence: list) -> Optional[dict]:
         if len(sequence) < self.order: return None
-        state = tuple(sequence[-self.order:]); counts = dict(self.transition_counts.get(state, {})); total = sum(counts.values())
+        state = tuple(sequence[-self.order:])
+        counts = dict(self.transition_counts.get(state, {}))
+        total = sum(counts.values())
         if total < 10: return None
         alpha = 2.0; vocab_size = 3
-        probs = {k: (v + alpha) / (total + alpha * vocab_size) for k,v in counts.items()}
-        for c in [1,2,3]:
+        probs = {k: (v + alpha) / (total + alpha * vocab_size) for k, v in counts.items()}
+        for c in [1, 2, 3]:
             if c not in probs: probs[c] = alpha / (total + alpha * vocab_size)
         return probs
 
-# ─── ENSEMBLE ML CRUZADO (D+C+PF+PH Features) ───────────────────────────────
+# ─── ENSEMBLE ML CRUZADO ──────────────────────────────────────────────────────
 class OnlineEnsemblePredictor:
     WINDOW = 5; CLASSES = [1, 2, 3]
-    # Features: 5*(9 one-hot D+C) + 3 (PF D) + 3 (PH D) + 3 (PF C) + 3 (PH C) = 57
+
     def __init__(self):
         self.mnb = MultinomialNB(alpha=2.0, class_prior=[0.333, 0.333, 0.333])
-        self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.005, penalty='l2', alpha=0.01, epsilon=0.2)
+        self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.005,
+                                 penalty='l2', alpha=0.01, epsilon=0.2)
         self.trained = False; self.sample_count = 0
 
-    def _extract_features(self, hist_d: list, hist_c: list, pf_pair_d: tuple, ph_pair_d: tuple, pf_pair_c: tuple, ph_pair_c: tuple) -> Optional[list]:
+    def _extract_features(self, hist_d, hist_c, pf_pair_d, ph_pair_d, pf_pair_c, ph_pair_c) -> Optional[list]:
         if len(hist_d) < self.WINDOW or len(hist_c) < self.WINDOW: return None
-        
         features = []
-        # 1. Patrones (D,C) de los últimos 5 giros (9 one-hot por giro = 45 dimensiones)
         for i in range(1, self.WINDOW + 1):
             d = hist_d[-i]; c = hist_c[-i]
-            pair_idx = (d - 1) * 3 + (c - 1) # 0 a 8
-            vec = [0]*9; vec[pair_idx] = 1
+            vec = [0] * 9; vec[(d - 1) * 3 + (c - 1)] = 1
             features.extend(vec)
-            
-        # 2. PF Top 2 Docenas (3 dims)
-        d_vec = [0,0,0]
-        for d in pf_pair_d: d_vec[d-1] = 1
-        features.extend(d_vec)
-        
-        # 3. PH Top 2 Docenas (3 dims)
-        d_vec_ph = [0,0,0]
-        for d in ph_pair_d: d_vec_ph[d-1] = 1
-        features.extend(d_vec_ph)
-        
-        # 4. PF Top 2 Columnas (3 dims)
-        c_vec = [0,0,0]
-        for c in pf_pair_c: c_vec[c-1] = 1
-        features.extend(c_vec)
-        
-        # 5. PH Top 2 Columnas (3 dims)
-        c_vec_ph = [0,0,0]
-        for c in ph_pair_c: c_vec_ph[c-1] = 1
-        features.extend(c_vec_ph)
-        
+        for pair in (pf_pair_d, ph_pair_d, pf_pair_c, ph_pair_c):
+            vec = [0, 0, 0]
+            for x in pair: vec[x - 1] = 1
+            features.extend(vec)
         return features
 
-    def partial_train(self, hist_d: list, hist_c: list, target: int, pf_d: tuple, ph_d: tuple, pf_c: tuple, ph_c: tuple):
+    def partial_train(self, hist_d, hist_c, target, pf_d, ph_d, pf_c, ph_c):
         feats = self._extract_features(hist_d[:-1], hist_c[:-1], pf_d, ph_d, pf_c, ph_c)
         if feats is None: return
         X = np.array(feats).reshape(1, -1); y = np.array([target])
         if not self.trained:
-            self.mnb.partial_fit(X, y, classes=self.CLASSES); self.sgd.partial_fit(X, y, classes=self.CLASSES); self.trained = True
+            self.mnb.partial_fit(X, y, classes=self.CLASSES)
+            self.sgd.partial_fit(X, y, classes=self.CLASSES)
+            self.trained = True
         else:
             self.mnb.partial_fit(X, y); self.sgd.partial_fit(X, y)
         self.sample_count += 1
 
-    def predict(self, hist_d: list, hist_c: list, pf_d: tuple, ph_d: tuple, pf_c: tuple, ph_c: tuple) -> Optional[dict]:
+    def predict(self, hist_d, hist_c, pf_d, ph_d, pf_c, ph_c) -> Optional[dict]:
         if not self.trained: return None
         feats = self._extract_features(hist_d, hist_c, pf_d, ph_d, pf_c, ph_c)
         if feats is None: return None
         X = np.array(feats).reshape(1, -1)
         try:
-            nb_probs = self.mnb.predict_proba(X)[0]; sgd_probs = self.sgd.predict_proba(X)[0]
-            final_probs = (0.5 * nb_probs + 0.5 * sgd_probs)
-            return {c+1: float(p) for c, p in enumerate(final_probs)}
+            nb_p = self.mnb.predict_proba(X)[0]
+            sg_p = self.sgd.predict_proba(X)[0]
+            final = 0.5 * nb_p + 0.5 * sg_p
+            return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── DETAILED STATS ───────────────────────────────────────────────────────────
+# ─── STATS ────────────────────────────────────────────────────────────────────
 class DetailedStats:
     def __init__(self):
-        self.total = self.wins_a1 = self.wins_a2 = self.losses = 0
-        self.last_stats_at = 0; self.batch_start_bankroll: Optional[float] = None
-        self.batch_w1 = self.batch_w2 = self.batch_l = 0
-        self.last_daily_date = ""; self.daily_start_bankroll: Optional[float] = None
-        self.daily_total = self.daily_w1 = self.daily_w2 = self.daily_l = 0
-    def record(self, attempt: int, won: bool, bankroll: float):
-        self.total += 1; self.daily_total += 1
-        if won: 
-            if attempt == 1: self.wins_a1 += 1; self.daily_w1 += 1
-            else: self.wins_a2 += 1; self.daily_w2 += 1
-        else: self.losses += 1; self.daily_l += 1
-        if self.daily_start_bankroll is None: self.daily_start_bankroll = bankroll
-    def should_send(self) -> bool: return (self.total - self.last_stats_at) >= 20
-    def mark_sent(self, bankroll: float):
-        self.last_stats_at = self.total; self.batch_start_bankroll = bankroll
-        self.batch_w1 = self.wins_a1; self.batch_w2 = self.wins_a2; self.batch_l = self.losses
-    def batch_stats(self, bankroll: float) -> dict:
-        n = self.total - self.last_stats_at; w1 = self.wins_a1 - self.batch_w1; w2 = self.wins_a2 - self.batch_w2; l = self.losses - self.batch_l; w = w1 + w2
-        bk = round(bankroll - self.batch_start_bankroll, 2) if self.batch_start_bankroll is not None else 0.0
-        return {"n":n,"w1":w1,"w2":w2,"l":l,"w":w,"eff":round(w/n*100,1) if n else 0.0,"bk":bk}
-    def daily_stats(self, bankroll: float) -> dict:
-        n = self.daily_total; w = self.daily_w1 + self.daily_w2
-        bk = round(bankroll - self.daily_start_bankroll, 2) if self.daily_start_bankroll is not None else 0.0
-        return {"n":n,"w1":self.daily_w1,"w2":self.daily_w2,"l":self.daily_l,"w":w,"eff":round(w/n*100,1) if n else 0.0,"bk":bk}
-    def reset_daily(self, date_str: str, bankroll: float):
-        self.last_daily_date = date_str; self.daily_start_bankroll = bankroll
-        self.daily_total = self.daily_w1 = self.daily_w2 = self.daily_l = 0
+        self.wins = 0; self.zeros = 0; self.losses = 0
+        self.consecutive = 0
+        self.last_20 = deque(maxlen=20)
+        self.signals_processed = 0
+        self.last_report_signals = 0
 
-# ─── ROULETTE ENGINE ──────────────────────────────────────────────────────────
-class RussianRouletteEngine:
+    def record(self, result_type, attempt, number, val, type_str, bankroll):
+        self.signals_processed += 1
+        if result_type == 'WIN':
+            self.wins += 1; self.consecutive += 1
+        elif result_type == 'LOSS':
+            self.losses += 1; self.consecutive = 0
+        elif result_type == 'EMPATE':
+            self.zeros += 1
+        self.last_20.append({"result": result_type, "attempt": attempt,
+                              "number": number, "val": val, "type": type_str, "balance": bankroll})
+
+    def should_send(self) -> bool:
+        return (self.signals_processed - self.last_report_signals) >= 20
+
+    def mark_sent(self):
+        self.last_report_signals = self.signals_processed
+
+    def get_stats_text(self, bankroll: float) -> str:
+        total = self.wins + self.zeros + self.losses
+        eff = (self.wins / total * 100) if total > 0 else 0.0
+        text  = "📊 RESUMEN DE SEÑALES 📊\n"
+        text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
+        text += f"► Consecutivas = {self.consecutive}\n"
+        text += f"► Assertividade = {eff:.2f}%\n"
+        text += f"► Balance actual: 💰 {bankroll:.2f}\n"
+        text += f"► Total señales procesadas: {total}\n\n"
+        text += "📌 Últimas 20 SEÑALES 📌\n"
+        for s in reversed(list(self.last_20)):
+            a_str = f"🔄 GALE #{s['attempt']}"
+            b_str = f"💰 {s['balance']:.2f}"
+            if s['result'] == 'WIN':
+                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {a_str} | {b_str}\n"
+            elif s['result'] == 'EMPATE':
+                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n"
+            else:
+                text += f"🚫 LOSS #{s['number']} {s['type']} {s['val']} | {a_str} | {b_str}\n"
+        text += "\n| 🟠0 = señal salió el cero\n"
+        text += "| 🚫0 = señal perdida en los 2 intentos\n\n"
+        text += "► PLACAR = ✅X | 🟠Y | 🚫Z = estadísticas de las 24 horas\n"
+        text += "► Consecutivas = señales seguidas ganadas\n"
+        text += "► Assertividade = efectividad de las 24 horas\n"
+        text += "► Total señales procesadas = señales en las 24 horas"
+        return text
+
+# ─── ENGINE ───────────────────────────────────────────────────────────────────
+class AzureRouletteEngine:
     def __init__(self):
         self.spin_history: list = []
         self.dozen_seq: list = []; self.column_seq: list = []
-        self.d_levels: dict[int, list] = {1:[], 2:[], 3:[]}; self.c_levels: dict[int, list] = {1:[], 2:[], 3:[]}
+        self.d_levels: dict = {1: [], 2: [], 3: []}
+        self.c_levels: dict = {1: [], 2: [], 3: []}
+        self.markov_d = SmoothedMarkovPredictor()
+        self.markov_c = SmoothedMarkovPredictor()
+        self.ensemble_d = OnlineEnsemblePredictor()
+        self.ensemble_c = OnlineEnsemblePredictor()
+        self.after_number_dozen: dict = defaultdict(lambda: defaultdict(int))
+        self.after_number_column: dict = defaultdict(lambda: defaultdict(int))
 
-        self.markov_d = SmoothedMarkovPredictor(window=60, order=2); self.markov_c = SmoothedMarkovPredictor(window=60, order=2)
-        self.ensemble_d = OnlineEnsemblePredictor(); self.ensemble_c = OnlineEnsemblePredictor()
+        self.signal_active = False; self.active_type = None
+        self.active_pair: tuple = (); self.active_missing = ""
+        self.attempts_left = MAX_ATTEMPTS
+        self.bankroll: float = 0.0          # ← Capital inicial 0
+        self.trigger_number = 0; self.trigger_color = ""
+        self.stats = DetailedStats()
+        self._db = _get_db()
+        self.spins_since_train = 0
+        self.last_game_id = None
 
-        self.after_number_dozen: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        self.after_number_column: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-
-        self.signal_active: bool = False; self.active_type: Optional[str] = None
-        self.active_pair: tuple = (); self.active_missing: str = ""
-        self.attempts_left: int = MAX_ATTEMPTS; self.signal_msg_ids: list = []
-        self.bet_level = 1; self.cum_loss = 0.0; self.bankroll: float = 0.0
-        self.trigger_number: int = 0; self.trigger_color: str = ""
-
-        self.stats = DetailedStats(); self._db = _get_db()
-        self.spins_since_train: int = 0
-        
-        live_loaded = self._load_live_history(); azure_loaded = self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
-        total_preloaded = live_loaded + azure_loaded
-        self.ws_count: int = total_preloaded; self.warmup_done: bool = total_preloaded >= WARMUP_SPINS
-        self.last_game_id: Optional[str] = None
-        
-        logger.info(f"[RussianDC] 📦 Pre-cargados: {total_preloaded} | Warmup: {'✅' if self.warmup_done else '⏳'}")
+        live_loaded  = self._load_live_history()
+        azure_loaded = self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
+        total = live_loaded + azure_loaded
+        self.ws_count = total
+        self.warmup_done = total >= WARMUP_SPINS
+        logger.info(f"[AzureDC] 📦 Pre-cargados: {total} (Live:{live_loaded} + DB:{azure_loaded}) | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
     def current_bet(self) -> float:
-        needed = self.cum_loss + BASE_BET; return round(max(needed, BASE_BET), 2)
+        level = MAX_ATTEMPTS - self.attempts_left
+        return round(BASE_BET * (2 ** level), 2)
 
     def _pretrain_from_db(self, db_path: str, table_name: str) -> int:
         if not os.path.exists(db_path): return 0
@@ -290,212 +311,186 @@ class RussianRouletteEngine:
                     m = pattern.search(line)
                     if m: spins.append(int(m.group(1)))
         except: return 0
-        if not spins: return 0
         for n in spins: self._update_state(n, persist=False, train_model=False)
         self._train_models()
+        logger.info(f"[AzureDC] ✅ Pre-entrenado con {len(spins)} giros de '{table_name}'")
         return len(spins)
 
     def _load_live_history(self) -> int:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
-        if not rows: return 0
         for (n,) in rows: self._update_state(n, persist=False, train_model=False)
-        self._train_models()
+        if rows: self._train_models()
         return len(rows)
 
     def _persist(self, number: int):
-        try: self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (number, int(time.time()))); self._db.commit()
+        try:
+            self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (number, int(time.time())))
+            self._db.commit()
         except: pass
 
     def _train_models(self):
-        self.markov_d.update(self.dozen_seq); self.markov_c.update(self.column_seq)
+        self.markov_d.update(self.dozen_seq)
+        self.markov_c.update(self.column_seq)
 
-    def _update_state(self, number: int, persist: bool = True, train_model: bool = True):
-        color = REAL_COLOR_MAP.get(number, "VERDE"); d = get_dozen(number); c = get_column(number)
-        
-        # 1. PH Histórico
-        if number != 0 and len(self.spin_history) >= 1:
-            prev_num = self.spin_history[-1]["number"]
-            if prev_num != 0:
-                self.after_number_dozen[prev_num][d] += 1
-                self.after_number_column[prev_num][c] += 1
-                
-        self.spin_history.append({"number":number,"color":color})
-        
-        # 2. Secuencias y Niveles EMA
+    def _update_state(self, number: int, persist=True, train_model=True):
+        color = REAL_COLOR_MAP.get(number, "VERDE")
+        d = get_dozen(number); c = get_column(number)
+        if number != 0 and self.spin_history:
+            prev = self.spin_history[-1]["number"]
+            if prev != 0:
+                self.after_number_dozen[prev][d] += 1
+                self.after_number_column[prev][c] += 1
+        self.spin_history.append({"number": number, "color": color})
         if d != 0:
             self.dozen_seq.append(d)
-            for dd in (1,2,3):
-                delta = 1 if d == dd else -1; prev = self.d_levels[dd][-1] if self.d_levels[dd] else 0
-                self.d_levels[dd].append(prev + delta)
-                
+            for dd in (1, 2, 3):
+                prev = self.d_levels[dd][-1] if self.d_levels[dd] else 0
+                self.d_levels[dd].append(prev + (1 if d == dd else -1))
         if c != 0:
             self.column_seq.append(c)
-            for cc in (1,2,3):
-                delta = 1 if c == cc else -1; prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0
-                self.c_levels[cc].append(prev + delta)
-
-        # 3. Entrenamiento ML (Cada 100 giros)
+            for cc in (1, 2, 3):
+                prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0
+                self.c_levels[cc].append(prev + (1 if c == cc else -1))
         if train_model and d != 0 and c != 0 and len(self.dozen_seq) > 5:
             pf_d, ph_d = self._get_pf("DOCENA"), self._get_ph("DOCENA")
             pf_c, ph_c = self._get_pf("COLUMNA"), self._get_ph("COLUMNA")
             if pf_d and ph_d and pf_c and ph_c:
                 self.ensemble_d.partial_train(self.dozen_seq, self.column_seq, d, pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"])
                 self.ensemble_c.partial_train(self.dozen_seq, self.column_seq, c, pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"])
-                
             self.spins_since_train += 1
             if self.spins_since_train >= TRAIN_INTERVAL:
                 self._train_models(); self.spins_since_train = 0
-                logger.info(f"[RussianDC] 🧠 Modelos re-entrenados (C/100 giros)")
-
+                logger.info("[AzureDC] 🧠 Modelos re-entrenados (c/100 giros)")
         if persist: self._persist(number)
 
-    # ── PF: Top 2 Frecuencia en últimos 5 giros ──────────────────────────────
     def _get_pf(self, cat_type: str) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
-        last5 = self.spin_history[-5:]
-        
-        counts = {1:0, 2:0, 3:0}
-        for s in last5:
+        counts = {1: 0, 2: 0, 3: 0}
+        for s in self.spin_history[-5:]:
             n = s["number"]
             if n != 0:
                 val = get_dozen(n) if cat_type == "DOCENA" else get_column(n)
                 counts[val] += 1
-                
-        active = [k for k,v in counts.items() if v > 0]
-        if len(active) != 2: return None # Estrictamente 2 presentes
-        
-        missing = list({1,2,3} - set(active))[0]
-        prob = (counts[active[0]] + counts[active[1]]) / 5.0
-        return {"pair": tuple(sorted(active)), "missing": missing, "prob": prob}
+        active = [k for k, v in counts.items() if v > 0]
+        if len(active) != 2: return None
+        missing = list({1, 2, 3} - set(active))[0]
+        return {"pair": tuple(sorted(active)), "missing": missing, "prob": sum(counts[a] for a in active) / 5.0}
 
-    # ── PH: Top 2 Histórico tras último número ───────────────────────────────
     def _get_ph(self, cat_type: str) -> Optional[Dict]:
-        if len(self.spin_history) == 0: return None
+        if not self.spin_history: return None
         last_num = self.spin_history[-1]["number"]
         if last_num == 0: return None
-        
         counts = self.after_number_dozen.get(last_num, {}) if cat_type == "DOCENA" else self.after_number_column.get(last_num, {})
         total = sum(counts.values())
         if total < 10: return None
-        
-        sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-        if len(sorted_counts) < 2: return None
-        
-        missing = list({1,2,3} - set([sorted_counts[0][0], sorted_counts[1][0]]))[0]
-        return {
-            "pair": tuple(sorted([sorted_counts[0][0], sorted_counts[1][0]])),
-            "missing": missing,
-            "prob": (sorted_counts[0][1] + sorted_counts[1][1]) / total
-        }
+        sc = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        if len(sc) < 2: return None
+        missing = list({1, 2, 3} - {sc[0][0], sc[1][0]})[0]
+        return {"pair": tuple(sorted([sc[0][0], sc[1][0]])), "missing": missing, "prob": (sc[0][1] + sc[1][1]) / total}
 
-    # ── ML: Probabilidad del Par (Markov + Ensemble Cruzado + AMX) ──────────
     def _predict_pair_ml(self, cat_type: str, missing_num: int) -> float:
-        mk = self.markov_d if cat_type == "DOCENA" else self.markov_c
+        mk   = self.markov_d if cat_type == "DOCENA" else self.markov_c
         hist = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         levels = (self.d_levels if cat_type == "DOCENA" else self.c_levels).get(missing_num, [])
-
-        # Markov Prediction (Missing prob)
-        m_p_miss = mk.predict(hist).get(missing_num, 1/3) if mk.predict(hist) else 1/3
-        
-        # Ensemble Cross-ML Prediction (Missing prob)
+        mk_pred = mk.predict(hist)
+        m_p_miss = mk_pred.get(missing_num, 1/3) if mk_pred else 1/3
         pf_d, ph_d = self._get_pf("DOCENA"), self._get_ph("DOCENA")
         pf_c, ph_c = self._get_pf("COLUMNA"), self._get_ph("COLUMNA")
         ens_p_miss = 1/3
         if pf_d and ph_d and pf_c and ph_c:
-            ens_pred = self.ensemble_d.predict(hist, self.column_seq, pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"]) if cat_type == "DOCENA" else \
-                       self.ensemble_c.predict(self.dozen_seq, hist, pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"])
-            if ens_pred: ens_p_miss = ens_pred.get(missing_num, 1/3)
-        
-        ml_prob_missing = 0.4 * m_p_miss + 0.6 * ens_p_miss
-        
-        # Ajuste AMX
+            ens = self.ensemble_d.predict(hist, self.column_seq, pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"]) \
+                  if cat_type == "DOCENA" else \
+                  self.ensemble_c.predict(self.dozen_seq, hist, pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"])
+            if ens: ens_p_miss = ens.get(missing_num, 1/3)
+        ml_miss = 0.4 * m_p_miss + 0.6 * ens_p_miss
         if len(levels) >= 20:
-            if ema_signal(levels, "tendencia"): ml_prob_missing *= 0.85
-            elif ema_signal(levels, "moderado"): ml_prob_missing *= 0.92
-            
-        return 1.0 - ml_prob_missing # Prob del Par
+            if ema_signal(levels, "tendencia"): ml_miss *= 0.85
+            elif ema_signal(levels, "moderado"): ml_miss *= 0.92
+        return 1.0 - ml_miss
 
-    # ── Detección de señal (PF 65% + PH 35% + ML Boost) ─────────────────────
     def _detect_signal(self) -> Optional[dict]:
         pf_d = self._get_pf("DOCENA"); pf_c = self._get_pf("COLUMNA")
         if not pf_d and not pf_c: return None
-        
         ph_d = self._get_ph("DOCENA"); ph_c = self._get_ph("COLUMNA")
         candidates = []
-
-        # Evaluar Docenas
         if pf_d and ph_d and set(pf_d["pair"]) == set(ph_d["pair"]):
-            base_prob = (0.65 * pf_d["prob"]) + (0.35 * ph_d["prob"])
-            ml_pair_prob = self._predict_pair_ml("DOCENA", pf_d["missing"])
-            final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
-            
-            logger.info(f"[RussianDC] D PF:{pf_d['pair']}({pf_d['prob']:.0%}) PH:{ph_d['pair']}({ph_d['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Fin:{final_prob:.0%}")
-            if final_prob >= MIN_PROB:
-                candidates.append({"type":"DOCENA", "pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])), "missing":f"D{pf_d['missing']}", "prob":final_prob})
-
-        # Evaluar Columnas
+            base = 0.65 * pf_d["prob"] + 0.35 * ph_d["prob"]
+            ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
+            prob = 0.5 * base + 0.5 * ml
+            logger.info(f"[AzureDC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            if prob >= MIN_PROB:
+                candidates.append({"type":"DOCENA","pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])),"missing":f"D{pf_d['missing']}","prob":prob})
         if pf_c and ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
-            base_prob = (0.65 * pf_c["prob"]) + (0.35 * ph_c["prob"])
-            ml_pair_prob = self._predict_pair_ml("COLUMNA", pf_c["missing"])
-            final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
-            
-            logger.info(f"[RussianDC] C PF:{pf_c['pair']}({pf_c['prob']:.0%}) PH:{ph_c['pair']}({ph_c['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Fin:{final_prob:.0%}")
-            if final_prob >= MIN_PROB:
-                candidates.append({"type":"COLUMNA", "pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])), "missing":f"C{pf_c['missing']}", "prob":final_prob})
+            base = 0.65 * pf_c["prob"] + 0.35 * ph_c["prob"]
+            ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
+            prob = 0.5 * base + 0.5 * ml
+            logger.info(f"[AzureDC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            if prob >= MIN_PROB:
+                candidates.append({"type":"COLUMNA","pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])),"missing":f"C{pf_c['missing']}","prob":prob})
+        return max(candidates, key=lambda x: x["prob"]) if candidates else None
 
-        if not candidates: return None
-        return max(candidates, key=lambda x: x["prob"])
+    def _build_signal_text(self, attempt: int) -> str:
+        bet = self.current_bet()
+        nums = sorted([p[1:] for p in self.active_pair])
+        pair_disp = f"{nums[0]} y {nums[1]}"
+        type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
+        return (f"🎰 ENTRADA CONFIRMADA 🎰\n\n"
+                f"🎮 Roulette Azure\n"
+                f"🎯 Entrar en las {type_str}: {pair_disp}\n"
+                f"💰 Balance: {self.bankroll:.2f}\n"
+                f"💸 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
+                f"⚔️ Cubrir el CERO 🟢\n"
+                f"🛟 Max: 1 Gales")
 
-    # ── Mensajes y Resolución ─────────────────────────────────────────────────
-    def _fmt_pair_display(self, pair: tuple) -> str:
-        nums = sorted([p[1:].zfill(2) for p in pair]); return f"{nums[0]} y {nums[1]}"
-
-    def _build_signal_text(self, attempt: int, prob: float) -> str:
-        bet = self.current_bet(); c_emoji = COLOR_EMOJI.get(self.trigger_color, "")
-        pair_disp = self._fmt_pair_display(self.active_pair)
-        line1 = f"❄️ ENTRAR EN DOCENAS: {pair_disp}" if self.active_type == "DOCENA" else f"☢ ENTRAR EN COLUMNAS: {pair_disp}"
-        line2 = f"♦️ APUESTA EN DOCENA: {bet:.2f}" if self.active_type == "DOCENA" else f"♦️ APUESTA EN COLUMNA: {bet:.2f}"
-        return (f"🎯 <b>SEÑAL CONFIRMADA</b> 🎯\n\n🎰 <b>RUSSIAN ROULETTE</b>\n"
-                f"👉 ÚLTIMO NÚMERO: {self.trigger_number} {self.trigger_color} {c_emoji}\n"
-                f"{line1}\n{line2}\n\n♻️ Intento {attempt}/{MAX_ATTEMPTS} <i>[{int(prob*100)}%]</i>")
-
-    def _send_signal(self, attempt: int, prob: float):
-        for mid in self.signal_msg_ids: tg_delete(mid)
-        self.signal_msg_ids = []
-        msg_id = tg_send(self._build_signal_text(attempt, prob))
-        if msg_id: self.signal_msg_ids.append(msg_id)
+    def _send_signal(self, attempt: int):
+        tg_send(self._build_signal_text(attempt))
 
     def _resolve(self, number: int, color: str):
         d, c = get_dozen(number), get_column(number)
-        won = (self.active_type == "DOCENA" and d != 0 and f"D{d}" in self.active_pair) or \
-              (self.active_type == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
+        type_str = self.active_type
+        val_num  = d if type_str == "DOCENA" else c
+        attempt  = MAX_ATTEMPTS - self.attempts_left
+
+        if number == 0:
+            self.attempts_left -= 1
+            tg_send(f"🟠 EMPATE {number} — ZERO — 🔄 GALE #{attempt}\n"
+                    f"🉑 Para la próxima ganaremos 0.00 🉑\n"
+                    f"💰 Balance actual: {self.bankroll:.2f}")
+            self.stats.record('EMPATE', attempt, 0, 0, type_str, self.bankroll)
+            if self.attempts_left > 0: self._send_signal(attempt + 2)
+            else: self._check_stats(); self._reset_signal()
+            return
+
+        won = (type_str == "DOCENA" and d != 0 and f"D{d}" in self.active_pair) or \
+              (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
 
         if won:
-            bet = self.current_bet(); self.bankroll = round(self.bankroll + bet, 2)
-            self.bet_level = 1; self.cum_loss = 0.0
-            attempt = MAX_ATTEMPTS - self.attempts_left + 1
-            for mid in self.signal_msg_ids: tg_delete(mid)
-            self.signal_msg_ids = []
-            val = f"D{d}" if self.active_type == "DOCENA" else f"C{c}"
-            tg_send(f"✅ <b>¡GREEN {val}!</b> -- {number} {color} {COLOR_EMOJI.get(color,'')}\n💰 <i>BANKROLL: {self.bankroll:.2f} usd</i>")
-            self.stats.record(attempt, True, self.bankroll); self._check_daily_report(); self._check_stats(); self._reset_signal()
+            profit = self.current_bet()
+            self.bankroll = round(self.bankroll + profit, 2)
+            tg_send(f"✅ WIN {number} — {type_str} {val_num} — 🔄 GALE #{attempt}\n"
+                    f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
+                    f"💰 Balance actual: {self.bankroll:.2f}")
+            self.stats.record('WIN', attempt, number, val_num, type_str, self.bankroll)
+            self._check_stats(); self._reset_signal()
         else:
-            loss_amt = self.current_bet() * 2; self.bankroll = round(self.bankroll - loss_amt, 2)
-            self.cum_loss = round(self.cum_loss + loss_amt, 2)
+            loss = self.current_bet() * 2
+            self.bankroll = round(self.bankroll - loss, 2)
             self.attempts_left -= 1
-            if self.attempts_left > 0:
-                if self.bet_level < 6: self.bet_level += 1
-                else: self.bet_level = 1; self.cum_loss = 0.0
-                self._send_signal(2, 0.80)
-            else:
-                for mid in self.signal_msg_ids: tg_delete(mid)
-                self.signal_msg_ids = []
-                val = f"D{d}" if self.active_type == "DOCENA" else f"C{c}"
-                tg_send(f"❌ <b>¡LOSS {val}!</b> -- {number} {color}\n💰 <i>BANKROLL: {self.bankroll:.2f} usd</i>\n📈 <i>NIVEL: {self.bet_level}/6</i>")
-                self.stats.record(0, False, self.bankroll); self._check_daily_report(); self._check_stats(); self._reset_signal()
+            tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #{attempt}\n"
+                    f"🚨 Para la próxima ganaremos -{loss:.2f} 🚨\n"
+                    f"💰 Balance actual: {self.bankroll:.2f}")
+            self.stats.record('LOSS', attempt, number, val_num, type_str, self.bankroll)
+            if self.attempts_left > 0: self._send_signal(attempt + 2)
+            else: self._check_stats(); self._reset_signal()
 
-    def _reset_signal(self): self.signal_active = False; self.active_pair = (); self.attempts_left = MAX_ATTEMPTS; self.signal_msg_ids = []
+    def _reset_signal(self):
+        self.signal_active = False; self.active_pair = (); self.attempts_left = MAX_ATTEMPTS
+
+    def _check_stats(self):
+        if not self.stats.should_send(): return
+        tg_send(self.stats.get_stats_text(self.bankroll))
+        self.stats.mark_sent()
 
     def process_number(self, number: int):
         try: self._process_inner(number)
@@ -504,128 +499,107 @@ class RussianRouletteEngine:
     def _process_inner(self, number: int):
         color = REAL_COLOR_MAP.get(number, "VERDE")
         d = get_dozen(number); c = get_column(number)
-        logger.info(f"[RussianDC] 🎰 #{len(self.spin_history)+1}: {number} {color} | D{d} C{c}")
-        
+        logger.info(f"[AzureDC] 🎰 #{len(self.spin_history)+1}: {number} {color} D{d} C{c}")
         self._update_state(number)
-        
         if not self.warmup_done:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
             self.warmup_done = True
-            tg_send("🟢 <b>Russian Roulette DC</b> — Sistema PF+PH+ML Listo.")
-            logger.info("[RussianDC] ✅ WARMUP COMPLETADO")
-            
-        if self.signal_active: self._resolve(number, color)
+            tg_send("🟢 <b>Azure Roulette DC</b> — Sistema PF+PH+ML Listo.")
+            logger.info("[AzureDC] ✅ WARMUP COMPLETADO")
+        if self.signal_active:
+            self._resolve(number, color)
         else:
             sig = self._detect_signal()
             if sig:
                 self.signal_active = True; self.active_type = sig["type"]
                 self.active_pair = sig["pair"]; self.active_missing = sig["missing"]
-                self.attempts_left = MAX_ATTEMPTS; self.trigger_number = number; self.trigger_color = color
-                self._send_signal(1, sig["prob"])
-                logger.info(f"[RussianDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} (Prob: {sig['prob']:.0%})")
+                self.attempts_left = MAX_ATTEMPTS
+                self._send_signal(1)
+                logger.info(f"[AzureDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
-    def _check_stats(self):
-        if not self.stats.should_send(): return
-        s20 = self.stats.batch_stats(self.bankroll); s24 = self.stats.daily_stats(self.bankroll)
-        self.stats.mark_sent(self.bankroll)
-        text = "📊 <b>ESTADÍSTICAS DC</b>\n\n"
-        if s20: text += f"👉🏼 <b>ÚLTIMAS {s20['n']}</b> | 📈 E:{s20['eff']}% | 💰 {s20['bk']:+.2f} usd\n\n"
-        if s24 and s24['n'] > 0: text += f"👉🏼 <b>24H</b> | 📈 E:{s24['eff']}% | 💰 {s24['bk']:+.2f} usd"
-        tg_send(text)
-
-    def _check_daily_report(self):
-        tz_ar = timezone(timedelta(hours=-3)); now_ar = datetime.now(tz_ar)
-        if now_ar.hour < 12: return
-        today = now_ar.strftime("%Y-%m-%d")
-        if self.stats.last_daily_date == today: return
-        sd = self.stats.daily_stats(self.bankroll)
-        if sd["n"] == 0: self.stats.reset_daily(today, self.bankroll); return
-        tg_send(f"📅 <b>REPORTE DIARIO</b>\n🕛 12:00 AR\n\n🈯️ Total: {sd['n']}\n📈 Efic: {sd['eff']}%\n💰 Balance: {sd['bk']:+.2f} usd")
-        self.stats.reset_daily(today, self.bankroll)
-
-    # ── WebSocket ─────────────────────────────────────────────────────────────
     async def run_ws(self):
         reconnect_delay = 5
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
-                    await ws.send(json.dumps({"type":"subscribe","key":WS_KEY,"casinoId":CASINO_ID}))
-                    logger.info(f"[RussianDC] ✅ WS conectado key={WS_KEY}"); reconnect_delay = 5
+                    await ws.send(json.dumps({"type": "subscribe", "key": WS_KEY, "casinoId": CASINO_ID}))
+                    logger.info(f"[AzureDC] ✅ WS conectado — Azure Roulette key={WS_KEY}")
+                    reconnect_delay = 5
                     async for raw in ws:
                         try: data = json.loads(raw)
                         except: continue
                         if not isinstance(data, dict): continue
                         results = data.get("last20Results")
                         if results and isinstance(results, list):
-                            latest = results[0]; game_id = str(latest.get("gameId",""))
-                            if game_id == self.last_game_id: continue
-                            self.last_game_id = game_id
-                            try: number = int(latest.get("result",""))
+                            latest = results[0]
+                            gid = str(latest.get("gameId", ""))
+                            if gid == self.last_game_id: continue
+                            self.last_game_id = gid
+                            try: n = int(latest.get("result", ""))
                             except: continue
-                            if 0 <= number <= 36: self.process_number(number)
+                            if 0 <= n <= 36: self.process_number(n)
                             continue
-                        for key in ("result","number","outcome","winningNumber"):
+                        for key in ("result", "number", "outcome", "winningNumber"):
                             if key in data:
                                 try:
                                     n = int(data[key])
                                     if 0 <= n <= 36: self.process_number(n)
-                                except: pass; break
+                                except: pass
+                                break
             except Exception as e:
-                logger.warning(f"[RussianDC] WS desconectado: {e}. Recon en {reconnect_delay}s")
-                await asyncio.sleep(reconnect_delay); reconnect_delay = min(reconnect_delay*2, 60)
+                logger.warning(f"[AzureDC] WS desconectado: {e}. Recon en {reconnect_delay}s")
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60)
 
-# ─── FLASK & SELF-PING ───────────────────────────────────────────────────────
-app = Flask(__name__); engine: Optional[RussianRouletteEngine] = None
+# ─── FLASK ────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+engine: Optional[AzureRouletteEngine] = None
+
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Russian DC PF+PH+ML Cross"})
+def home(): return jsonify({"status": "ok", "bot": "Azure DC", "key": WS_KEY})
 @app.route("/ping")
-def ping(): return jsonify({"status":"pong","ts":time.time()})
+def ping(): return jsonify({"status": "pong", "ts": time.time()})
 @app.route("/health")
-def health(): return jsonify({"status":"healthy","warmup": engine.warmup_done if engine else False, "spins": len(engine.spin_history) if engine else 0})
+def health(): return jsonify({"warmup": engine.warmup_done if engine else False, "spins": len(engine.spin_history) if engine else 0, "balance": engine.bankroll if engine else 0})
 
 async def self_ping_loop():
-    url = os.environ.get("RENDER_EXTERNAL_URL","").rstrip("/")
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not url: return
-    ping_url = f"{url}/ping"; await asyncio.sleep(30)
+    await asyncio.sleep(30)
     while True:
-        try: urllib.request.urlopen(ping_url, timeout=15)
+        try: urllib.request.urlopen(f"{url}/ping", timeout=15)
         except: pass
         await asyncio.sleep(240)
 
-@bot.message_handler(commands=['start','help'])
-def cmd_start(message):
-    bot.reply_to(message, "<b>🎰 Russian DC Bot (PF+PH+ML)</b>\n\nPF: Últimos 5 (65%)\nPH: Histórico últ nº (35%)\nML: Cross(D+C)+Markov+AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
+@bot.message_handler(commands=['start', 'help'])
+def cmd_start(m): bot.reply_to(m, "<b>🎰 Azure Roulette DC</b>\n\nApuesta: 0.50 por D/C\nCapital: 0\nKey WS: 227\n\n/status /stats /reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
-def cmd_status(message):
+def cmd_status(m):
     if not engine: return
-    st = f"🟢 Señal activa: {engine.active_pair}" if engine.signal_active else "⚪ Idle"
-    bot.reply_to(message, f"<b>📊 ESTADO</b>\n\nEstado: {st}\nGiros: {len(engine.spin_history)}\nNivel: {engine.bet_level}/6\nBankroll: {engine.bankroll:.2f} usd", parse_mode="HTML")
+    st = f"🟢 {engine.active_pair}" if engine.signal_active else "⚪ Idle"
+    bot.reply_to(m, f"<b>Estado:</b> {st}\n<b>Giros:</b> {len(engine.spin_history)}\n<b>Balance:</b> {engine.bankroll:.2f}", parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
-def cmd_stats(message):
+def cmd_stats(m):
     if not engine: return
-    sd = engine.stats.daily_stats(engine.bankroll)
-    bot.reply_to(message, f"📊 <b>ESTADÍSTICAS HOY</b>\n\n🈯️ T:{sd['n']} 📈 E:{sd['eff']}%\n💰 {sd['bk']:+.2f} usd", parse_mode="HTML")
+    bot.reply_to(m, engine.stats.get_stats_text(engine.bankroll), parse_mode="HTML")
 
 @bot.message_handler(commands=['reset'])
-def cmd_reset(message):
-    if engine: engine.stats = DetailedStats(); engine.bet_level = 1; engine.cum_loss = 0.0
-    bot.reply_to(message,"🔄 <b>Resetado</b>",parse_mode="HTML")
+def cmd_reset(m):
+    if engine: engine.stats = DetailedStats(); engine.bankroll = 0.0
+    bot.reply_to(m, "🔄 <b>Resetado — Balance: 0.00</b>", parse_mode="HTML")
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10001)), debug=False, use_reloader=False)
 
 async def main():
     global engine
-    engine = RussianRouletteEngine()
-    tasks = [asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop())]
-    def _poll(): bot.polling(none_stop=True, interval=1, timeout=30)
-    threading.Thread(target=_poll, daemon=True).start()
-    logger.info("[RussianDC] 🎰 Bot iniciado — Esperando conexión WS...")
-    await asyncio.gather(*tasks)
+    engine = AzureRouletteEngine()
+    threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
+    logger.info("[AzureDC] 🎰 Bot Azure iniciado — key=227")
+    await asyncio.gather(asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop()))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
