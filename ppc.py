@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Russian Roulette — Bot de señales para Docenas y Columnas exclusivamente
-Sistema PF + PH + ML
-  - PF (Frecuencia últimos 5): Peso 65% - Define las 2 más probables del bloque actual
-  - PH (Probabilidad Histórica): Peso 35% - Define las 2 más probables tras el último nº
-  - ML (Markov + NB + SGD + AMX): Predice probabilidad del par ausente
-  - Fusión PF+PH+ML. Umbral: 80%
+Sistema PF + PH + ML (Optimizado Anti-Ruido)
+  - PF (Frecuencia últimos 5): Peso 65% - Solo si hay EXACTAMENTE 2 D/C
+  - PH (Probabilidad Histórica últimos 2 números): Peso 35% - Ignora el 0
+  - ML (Markov + NB + SGD + AMX): Entrena cada 100 giros para reducir ruido
+  - Umbral final: 80%
 """
 
 import asyncio
@@ -62,6 +62,7 @@ BASE_BET     = 0.50
 MAX_ATTEMPTS = 2
 WARMUP_SPINS = 25
 MIN_PROB     = 0.80
+TRAIN_INTERVAL = 100 # Entrenar ML cada 100 giros
 
 REAL_COLOR_MAP: dict[int, str] = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
@@ -135,7 +136,7 @@ def ema_signal(levels: list, mode: str = "moderado") -> bool:
         if len(levels) >= 3: a, b, c = levels[-3], levels[-2], levels[-1]; v_pattern = (b < a) and (b < c) and (c > a)
         return ((pe4 <= pe8 and ce4 > ce8) or (pe8 <= pe20 and ce8 > ce20) or (cur > ce4 and cur > ce8) or v_pattern)
 
-# ─── MARKOV SUAVIZADO ─────────────────────────────────────────────────────────
+# ─── MARKOV SUAVIZADO (Anti-Ruido Alpha=2.0) ─────────────────────────────────
 class SmoothedMarkovPredictor:
     def __init__(self, window: int = 60, order: int = 2):
         self.window = window; self.order = order; self.transition_counts: dict = {}
@@ -151,20 +152,21 @@ class SmoothedMarkovPredictor:
     def predict(self, sequence: list) -> Optional[dict]:
         if len(sequence) < self.order: return None
         state = tuple(sequence[-self.order:]); counts = dict(self.transition_counts.get(state, {})); total = sum(counts.values())
-        if total < 5: return None
-        alpha = 1.0; vocab_size = 3
+        if total < 10: return None # Umbral más alto para reducir ruido
+        alpha = 2.0; vocab_size = 3 # Suavizado fuerte
         probs = {k: (v + alpha) / (total + alpha * vocab_size) for k,v in counts.items()}
         for c in [1,2,3]:
             if c not in probs: probs[c] = alpha / (total + alpha * vocab_size)
         return probs
 
-# ─── ENSEMBLE ML ──────────────────────────────────────────────────────────────
+# ─── ENSEMBLE ML (Anti-Ruido) ────────────────────────────────────────────────
 class OnlineEnsemblePredictor:
     WINDOW = 5; CLASSES = [1, 2, 3]
 
     def __init__(self):
-        self.mnb = MultinomialNB(alpha=1.0, class_prior=[0.333, 0.333, 0.333])
-        self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2')
+        # Alpha alto en NB para evitar ruido; L2 fuerte y epsilon alto en SGD
+        self.mnb = MultinomialNB(alpha=2.0, class_prior=[0.333, 0.333, 0.333])
+        self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.005, penalty='l2', alpha=0.01, epsilon=0.2)
         self.trained = False; self.sample_count = 0
 
     def _extract_features(self, history: list) -> Optional[list]:
@@ -250,9 +252,12 @@ class RussianRouletteEngine:
         self.ensemble_d = OnlineEnsemblePredictor()
         self.ensemble_c = OnlineEnsemblePredictor()
 
-        # PH: Probabilidad Histórica (Número -> D/C que le siguieron)
-        self.after_number_dozen: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        self.after_number_column: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        # PH: Probabilidad Histórica (Combinación de 2 números -> D/C que le siguieron)
+        self.after_pair_dozen: dict[tuple, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.after_pair_column: dict[tuple, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+        # Control Entrenamiento
+        self.spins_since_train: int = 0
 
         # Estado y Martingala
         self.signal_active: bool = False; self.active_type: Optional[str] = None
@@ -287,7 +292,9 @@ class RussianRouletteEngine:
                     if m: spins.append(int(m.group(1)))
         except: return 0
         if not spins: return 0
-        for n in spins: self._update_state(n, persist=False)
+        for n in spins: self._update_state(n, persist=False, train_model=False)
+        # Entrenar una vez al final del preentrenamiento
+        self._train_models()
         logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros")
         return len(spins)
 
@@ -295,7 +302,8 @@ class RussianRouletteEngine:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
         if not rows: return 0
-        for (n,) in rows: self._update_state(n, persist=False)
+        for (n,) in rows: self._update_state(n, persist=False, train_model=False)
+        self._train_models()
         logger.info(f"[RussianDC] ✅ {len(rows)} giros en vivo cargados")
         return len(rows)
 
@@ -303,26 +311,30 @@ class RussianRouletteEngine:
         try: self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (number, int(time.time()))); self._db.commit()
         except: pass
 
-    def _update_state(self, number: int, persist: bool = True):
+    def _train_models(self):
+        self.markov_d.update(self.dozen_seq); self.markov_c.update(self.column_seq)
+        # Ensemble se entrena online incrementalmente, no hace falta batch aquí
+
+    def _update_state(self, number: int, persist: bool = True, train_model: bool = True):
         color = REAL_COLOR_MAP.get(number, "VERDE"); d = get_dozen(number); c = get_column(number)
         
-        # 1. Actualizar PH
-        if len(self.spin_history) >= 1:
-            prev_num = self.spin_history[-1]["number"]
-            if prev_num != 0 and number != 0:
-                self.after_number_dozen[prev_num][d] += 1
-                self.after_number_column[prev_num][c] += 1
+        # 1. Actualizar PH (Combinación de los 2 últimos números no-cero)
+        if number != 0:
+            nonzero_nums = [s["number"] for s in self.spin_history[-10:] if s["number"] != 0]
+            if len(nonzero_nums) >= 2:
+                pair_state = (nonzero_nums[-2], nonzero_nums[-1])
+                self.after_pair_dozen[pair_state][d] += 1
+                self.after_pair_column[pair_state][c] += 1
                 
         self.spin_history.append({"number":number,"color":color})
         
-        # 2. Actualizar Modelos ML
+        # 2. Actualizar Secuencias y Niveles EMA
         if d != 0:
             self.dozen_seq.append(d)
             for dd in (1,2,3):
                 delta = 1 if d == dd else -1; prev = self.d_levels[dd][-1] if self.d_levels[dd] else 0
                 self.d_levels[dd].append(prev + delta)
             self.ensemble_d.partial_train(self.dozen_seq, d)
-            self.markov_d.update(self.dozen_seq)
 
         if c != 0:
             self.column_seq.append(c)
@@ -330,57 +342,68 @@ class RussianRouletteEngine:
                 delta = 1 if c == cc else -1; prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0
                 self.c_levels[cc].append(prev + delta)
             self.ensemble_c.partial_train(self.column_seq, c)
-            self.markov_c.update(self.column_seq)
+
+        # 3. Control de Entrenamiento Periódico (Cada 100 giros)
+        if train_model:
+            self.spins_since_train += 1
+            if self.spins_since_train >= TRAIN_INTERVAL:
+                self._train_models()
+                self.spins_since_train = 0
+                logger.info(f"[RussianDC] 🧠 Modelos re-entrenados (Intervalo {TRAIN_INTERVAL} giros)")
 
         if persist: self._persist(number)
 
-    # ── PF: Top 2 Frecuencia en últimos 5 giros ──────────────────────────────
+    # ── PF: Exactamente 2 Docenas/Columnas en últimos 5 ──────────────────────
     def _calculate_pf(self) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
         last5 = self.spin_history[-5:]
         
         d_counts = {1:0, 2:0, 3:0}; c_counts = {1:0, 2:0, 3:0}
-        valid_spins = 0
         for s in last5:
             n = s["number"]
             if n != 0:
-                d_counts[get_dozen(n)] += 1; c_counts[get_column(n)] += 1; valid_spins += 1
+                d_counts[get_dozen(n)] += 1; c_counts[get_column(n)] += 1
                 
-        if valid_spins < 3: return None # Muy pocos números válidos
+        res = {"dozen": None, "column": None}
         
-        d_sorted = sorted(d_counts.items(), key=lambda x: x[1], reverse=True)
-        c_sorted = sorted(c_counts.items(), key=lambda x: x[1], reverse=True)
-        
-        return {
-            "dozen": {
-                "pair": (d_sorted[0][0], d_sorted[1][0]), 
-                "missing": d_sorted[2][0], 
-                "prob": (d_sorted[0][1] + d_sorted[1][1]) / 5.0
-            },
-            "column": {
-                "pair": (c_sorted[0][0], c_sorted[1][0]), 
-                "missing": c_sorted[2][0], 
-                "prob": (c_sorted[0][1] + c_sorted[1][1]) / 5.0
-            }
-        }
+        # Docenas: Exactamente 2 presentes
+        active_d = [k for k,v in d_counts.items() if v > 0]
+        if len(active_d) == 2:
+            missing_d = list({1,2,3} - set(active_d))[0]
+            prob_d = (d_counts[active_d[0]] + d_counts[active_d[1]]) / 5.0
+            res["dozen"] = {"pair": tuple(sorted(active_d)), "missing": missing_d, "prob": prob_d}
+            
+        # Columnas: Exactamente 2 presentes
+        active_c = [k for k,v in c_counts.items() if v > 0]
+        if len(active_c) == 2:
+            missing_c = list({1,2,3} - set(active_c))[0]
+            prob_c = (c_counts[active_c[0]] + c_counts[active_c[1]]) / 5.0
+            res["column"] = {"pair": tuple(sorted(active_c)), "missing": missing_c, "prob": prob_c}
+            
+        if not res["dozen"] and not res["column"]: return None
+        return res
 
-    # ── PH: Top 2 Histórico tras último número ───────────────────────────────
-    def _calculate_ph(self, last_num: int, cat_type: str) -> Optional[Dict]:
-        counts = self.after_number_dozen.get(last_num, {}) if cat_type == "DOCENA" else self.after_number_column.get(last_num, {})
+    # ── PH: Top 2 Histórico tras combinación de últimos 2 números ─────────────
+    def _calculate_ph(self, cat_type: str) -> Optional[Dict]:
+        nonzero_nums = [s["number"] for s in self.spin_history[-10:] if s["number"] != 0]
+        if len(nonzero_nums) < 2: return None
+        
+        pair_state = (nonzero_nums[-2], nonzero_nums[-1])
+        counts = self.after_pair_dozen.get(pair_state, {}) if cat_type == "DOCENA" else self.after_pair_column.get(pair_state, {})
         total = sum(counts.values())
         if total < 10: return None
         
         sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
         if len(sorted_counts) < 2: return None
         
-        missing = sorted_counts[2][0] if len(sorted_counts) > 2 else 0
+        missing = list({1,2,3} - set([sorted_counts[0][0], sorted_counts[1][0]]))[0]
         return {
-            "pair": (sorted_counts[0][0], sorted_counts[1][0]),
+            "pair": tuple(sorted([sorted_counts[0][0], sorted_counts[1][0]])),
             "missing": missing,
             "prob": (sorted_counts[0][1] + sorted_counts[1][1]) / total
         }
 
-    # ── ML: Probabilidad del Par según Markov + Ensemble + AMX ───────────────
+    # ── ML: Probabilidad del Par (Markov + Ensemble + AMX) ──────────────────
     def _predict_pair_ml(self, cat_type: str, missing_num: int) -> float:
         mk = self.markov_d if cat_type == "DOCENA" else self.markov_c
         ens = self.ensemble_d if cat_type == "DOCENA" else self.ensemble_c
@@ -393,67 +416,64 @@ class RussianRouletteEngine:
         
         ml_prob_missing = 0.5 * m_p_miss + 0.5 * ens_p_miss
         
-        # Ajuste AMX: Si la tendencia es en contra del ausente, baja su probabilidad
+        # Ajuste AMX: Si la tendencia es en contra del ausente, baja su probabilidad (sube la del par)
         if len(levels) >= 20:
-            if ema_signal(levels, "tendencia"): ml_prob_missing *= 0.90
-            elif ema_signal(levels, "moderado"): ml_prob_missing *= 0.95
+            if ema_signal(levels, "tendencia"): ml_prob_missing *= 0.85
+            elif ema_signal(levels, "moderado"): ml_prob_missing *= 0.92
             
         # Probabilidad del Par = 1 - Probabilidad del Ausente
-        pair_prob = 1.0 - ml_prob_missing
-        return pair_prob
+        return 1.0 - ml_prob_missing
 
-    # ── Detección de señal (PF + PH + ML) ────────────────────────────────────
+    # ── Detección de señal (PF 65% + PH 35% + ML Boost) ─────────────────────
     def _detect_signal(self) -> Optional[dict]:
         pf_data = self._calculate_pf()
         if not pf_data: return None
         
-        last_num = self.spin_history[-1]["number"]
-        if last_num == 0: return None
-        
         candidates = []
 
         # Evaluar Docenas
-        pf_d = pf_data["dozen"]
-        ph_d = self._calculate_ph(last_num, "DOCENA")
-        
-        if ph_d and set(pf_d["pair"]) == set(ph_d["pair"]):
-            # Coincidencia PF y PH!
-            base_prob = (0.65 * pf_d["prob"]) + (0.35 * ph_d["prob"])
-            ml_pair_prob = self._predict_pair_ml("DOCENA", pf_d["missing"])
+        if pf_data["dozen"]:
+            pf_d = pf_data["dozen"]
+            ph_d = self._calculate_ph("DOCENA")
             
-            # Fusión Final (50% Base Estadística + 50% Predicción ML)
-            final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
-            
-            prefix = "D"
-            logger.info(f"[RussianDC] D PF:{set(pf_d['pair'])}({pf_d['prob']:.0%}) PH:{set(ph_d['pair'])}({ph_d['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Final:{final_prob:.0%}")
-            
-            if final_prob >= MIN_PROB:
-                candidates.append({
-                    "type":"DOCENA", 
-                    "pair":tuple(f"{prefix}{x}" for x in sorted(pf_d["pair"])), 
-                    "missing":f"{prefix}{pf_d['missing']}", 
-                    "prob":final_prob
-                })
+            ph_match = bool(ph_d and set(pf_d["pair"]) == set(ph_d["pair"]))
+            if ph_match:
+                base_prob = (0.65 * pf_d["prob"]) + (0.35 * ph_d["prob"])
+                ml_pair_prob = self._predict_pair_ml("DOCENA", pf_d["missing"])
+                
+                # Si ML refuerza, sube probabilidad. Si debilita, baja.
+                final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
+                
+                logger.info(f"[RussianDC] D PF:{set(pf_d['pair'])}({pf_d['prob']:.0%}) PH:{set(ph_d['pair'])}({ph_d['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Final:{final_prob:.0%}")
+                
+                if final_prob >= MIN_PROB:
+                    candidates.append({
+                        "type":"DOCENA", 
+                        "pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])), 
+                        "missing":f"D{pf_d['missing']}", 
+                        "prob":final_prob
+                    })
 
         # Evaluar Columnas
-        pf_c = pf_data["column"]
-        ph_c = self._calculate_ph(last_num, "COLUMNA")
-        
-        if ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
-            base_prob = (0.65 * pf_c["prob"]) + (0.35 * ph_c["prob"])
-            ml_pair_prob = self._predict_pair_ml("COLUMNA", pf_c["missing"])
-            final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
+        if pf_data["column"]:
+            pf_c = pf_data["column"]
+            ph_c = self._calculate_ph("COLUMNA")
             
-            prefix = "C"
-            logger.info(f"[RussianDC] C PF:{set(pf_c['pair'])}({pf_c['prob']:.0%}) PH:{set(ph_c['pair'])}({ph_c['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Final:{final_prob:.0%}")
-            
-            if final_prob >= MIN_PROB:
-                candidates.append({
-                    "type":"COLUMNA", 
-                    "pair":tuple(f"{prefix}{x}" for x in sorted(pf_c["pair"])), 
-                    "missing":f"{prefix}{pf_c['missing']}", 
-                    "prob":final_prob
-                })
+            ph_match = bool(ph_c and set(pf_c["pair"]) == set(ph_c["pair"]))
+            if ph_match:
+                base_prob = (0.65 * pf_c["prob"]) + (0.35 * ph_c["prob"])
+                ml_pair_prob = self._predict_pair_ml("COLUMNA", pf_c["missing"])
+                final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
+                
+                logger.info(f"[RussianDC] C PF:{set(pf_c['pair'])}({pf_c['prob']:.0%}) PH:{set(ph_c['pair'])}({ph_c['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Final:{final_prob:.0%}")
+                
+                if final_prob >= MIN_PROB:
+                    candidates.append({
+                        "type":"COLUMNA", 
+                        "pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])), 
+                        "missing":f"C{pf_c['missing']}", 
+                        "prob":final_prob
+                    })
 
         if not candidates: return None
         return max(candidates, key=lambda x: x["prob"])
@@ -591,7 +611,7 @@ class RussianRouletteEngine:
 # ─── FLASK & SELF-PING ───────────────────────────────────────────────────────
 app = Flask(__name__); engine: Optional[RussianRouletteEngine] = None
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Russian DC PF+PH+ML"})
+def home(): return jsonify({"status": "ok", "bot": "Russian DC PF+PH+ML AntiRuido"})
 @app.route("/ping")
 def ping(): return jsonify({"status":"pong","ts":time.time()})
 @app.route("/health")
@@ -609,7 +629,7 @@ async def self_ping_loop():
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start','help'])
 def cmd_start(message):
-    bot.reply_to(message, "<b>🎰 Russian DC Bot (PF+PH+ML)</b>\n\nPF: Últimos 5 (65%)\nPH: Histórico último nº (35%)\nML: Markov+NB+SGD+AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
+    bot.reply_to(message, "<b>🎰 Russian DC Bot (PF+PH+ML)</b>\n\nPF: Últimos 5 (65%)\nPH: Histórico últ. 2 nº (35%)\nML: Markov+NB+SGD+AMX\nEntreno: C/100 giros\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
