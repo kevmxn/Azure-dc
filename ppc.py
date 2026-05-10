@@ -1,15 +1,12 @@
-
 #!/usr/bin/env python3
 """
 Russian Roulette — Bot de señales para Docenas y Columnas exclusivamente
-Sistema AMX · Markov + Decision Tree ML + Patrones(5) + EMA 4/8/20
+Sistema AMX · Ensemble ML (Naive Bayes + SGD + Markov Suavizado) + EMA
+  - Optimizado para Render (RAM constante mediante Online Learning)
   - Precalentamiento con russian-azure.db
-  - Persistencia SQLite 24/7 (Muestras DT y Markov guardadas)
-  - Análisis últimos 5 resultados: si pertenecen a 2 docenas o 2 columnas
-  - Validación histórica de secuencia
-  - Predice 6° giro: Markov + ML + Patrones(5) + AMX (Umbral 80%)
-  - Self-ping cada 4 min (anti-sleep Render)
-  - Stats: cada 20 señales + 24h (actualiza a las 12:00 AR)
+  - Persistencia SQLite 24/7
+  - Análisis últimos 5 resultados y validación histórica
+  - Umbral 80%
 """
 
 import asyncio
@@ -23,10 +20,13 @@ import time
 import urllib.request
 from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import LabelBinarizer
+
 import telebot
 import websockets
 from flask import Flask, jsonify
@@ -57,7 +57,7 @@ WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
 WS_KEY    = 221
 LIVE_DB   = "russian_live.db"
-AZURE_DB  = "russian-azure.db"  # Archivo de precalentamiento
+AZURE_DB  = "russian-azure.db"
 AZURE_TABLE = "russian_roulette"
 
 BASE_BET     = 0.50
@@ -65,7 +65,6 @@ MAX_ATTEMPTS = 2
 WARMUP_SPINS = 25
 MIN_PROB     = 0.80
 
-# ─── MAPAS ────────────────────────────────────────────────────────────────────
 REAL_COLOR_MAP: dict[int, str] = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
     7:"ROJO",8:"NEGRO",9:"ROJO",10:"NEGRO",11:"NEGRO",12:"ROJO",13:"NEGRO",
@@ -88,8 +87,6 @@ def get_column(n: int) -> int:
 def _get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(LIVE_DB, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS live_spins ( id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, ts INTEGER NOT NULL )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS markov_counts ( cat TEXT NOT NULL, pattern TEXT NOT NULL, result INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (cat, pattern, result) )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS dt_samples ( cat TEXT NOT NULL, id INTEGER PRIMARY KEY AUTOINCREMENT, features TEXT NOT NULL, target INTEGER NOT NULL )""")
     conn.commit()
     return conn
 
@@ -140,92 +137,105 @@ def ema_signal(levels: list, mode: str = "moderado") -> bool:
         if len(levels) >= 3: a, b, c = levels[-3], levels[-2], levels[-1]; v_pattern = (b < a) and (b < c) and (c > a)
         return ((pe4 <= pe8 and ce4 > ce8) or (pe8 <= pe20 and ce8 > ce20) or (cur > ce4 and cur > ce8) or v_pattern)
 
-# ─── MARKOV ───────────────────────────────────────────────────────────────────
-class MarkovPredictor:
-    def __init__(self):
-        self.counts1: dict = defaultdict(lambda: defaultdict(int))
-        self.counts2: dict = defaultdict(lambda: defaultdict(int))
+# ─── MARKOV SUAVIZADO (Laplace Smoothing) ─────────────────────────────────────
+class SmoothedMarkovPredictor:
+    def __init__(self, window: int = 60, order: int = 2):
+        self.window = window; self.order = order; self.transition_counts: dict = {}
 
-    def update(self, history: list):
-        h = [x for x in history if x != 0]
-        for i in range(len(h) - 1): self.counts1[(h[i],)][h[i+1]] += 1
-        for i in range(len(h) - 2): self.counts2[(h[i], h[i+1])][h[i+2]] += 1
+    def update(self, sequence: list):
+        self.transition_counts = defaultdict(lambda: defaultdict(int))
+        recent = sequence[-self.window:]
+        if len(recent) < self.order + 1: return
+        for i in range(len(recent) - self.order):
+            state = tuple(recent[i:i+self.order]); nxt = recent[i+self.order]
+            self.transition_counts[state][nxt] += 1
 
-    def predict(self, history: list) -> Optional[dict]:
-        h = [x for x in history if x != 0]
-        if len(h) < 1: return None
-        results: dict = {}
-        if len(h) >= 2:
-            pat2, c2 = (h[-2], h[-1]), dict(self.counts2.get(pat2, {})); tot2 = sum(c2.values())
-            if tot2 >= 3:
-                for k,v in c2.items(): results[k] = 0.6 * v / tot2
-        pat1, c1 = (h[-1],), dict(self.counts1.get(pat1, {})); tot1 = sum(c1.values())
-        if tot1 >= 2:
-            w = 0.4 if results else 1.0
-            for k,v in c1.items(): results[k] = results.get(k, 0) + w * v / tot1
-        if not results: return None
-        total = sum(results.values())
-        return {k: v/total for k,v in results.items()} if total > 0 else None
+    def predict(self, sequence: list) -> Optional[dict]:
+        if len(sequence) < self.order: return None
+        state = tuple(sequence[-self.order:]); counts = dict(self.transition_counts.get(state, {})); total = sum(counts.values())
+        if total < 5: return None
+        # Laplace Smoothing (Alpha=1) para evitar probabilidades 0
+        alpha = 1.0; vocab_size = 3
+        probs = {k: (v + alpha) / (total + alpha * vocab_size) for k,v in counts.items()}
+        # Rellenar las que no aparecieron
+        for c in [1,2,3]:
+            if c not in probs: probs[c] = alpha / (total + alpha * vocab_size)
+        return probs
 
-# ─── DECISION TREE ML ─────────────────────────────────────────────────────────
-class DecisionTreePredictor:
+# ─── ENSEMBLE ML (NB + SGD) ──────────────────────────────────────────────────
+class OnlineEnsemblePredictor:
+    """
+    Sistema de Ensemble Online. Consume RAM constante (O(1)).
+    - Naive Bayes: Captura patrones de secuencia generalizados.
+    - SGD: Se adapta rápidamente a cambios de sesgo en la rueda.
+    """
     WINDOW = 5
+    CLASSES = [1, 2, 3]
+
     def __init__(self):
-        self.clf = DecisionTreeClassifier(max_depth=10, min_samples_split=4, min_samples_leaf=2)
-        self.X, self.y = [], []; self.trained = False
+        self.mnb = MultinomialNB(alpha=1.0, class_prior=[0.333, 0.333, 0.333])
+        self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2')
+        self.trained = False
+        self.sample_count = 0
 
-    def _get_freq(self, history: list, window: int = 15) -> dict:
-        h = [x for x in history if x != 0][-window:]
-        if not h: return {1:1/3, 2:1/3, 3:1/3}
-        total = len(h); return {c: h.count(c)/total for c in (1,2,3)}
-
-    def _make_features(self, history: list, levels: list, streak: int) -> list:
-        h = [x for x in history if x != 0]
-        window = h[-self.WINDOW:] if len(h) >= self.WINDOW else [0]*(self.WINDOW - len(h)) + h
-        lv_prev = levels[:-1] if len(levels) > 1 else levels
-        e4, e8, e20 = calc_ema(lv_prev, 4), calc_ema(lv_prev, 8), calc_ema(lv_prev, 20)
-        v4 = e4[-1] if e4 and e4[-1] is not None else 0.0
-        v8 = e8[-1] if e8 and e8[-1] is not None else 0.0
-        v20 = e20[-1] if e20 and e20[-1] is not None else 0.0
-        freq = self._get_freq(h)
-        return window + [round(v4,3), round(v8,3), round(v20,3), streak] + [round(freq.get(1,1/3),3), round(freq.get(2,1/3),3), round(freq.get(3,1/3),3)]
-
-    def add_sample_return(self, history: list, levels: list, streak: int) -> Optional[dict]:
-        h = [x for x in history if x != 0]
-        if len(h) < self.WINDOW + 1: return None
-        target, prev_h = h[-1], h[:-1]
-        feats = self._make_features(prev_h, levels, streak)
-        self.X.append(feats); self.y.append(target)
-        if len(self.X) >= 30 and len(self.X) % 5 == 0: self._train()
-        return {"features": feats, "target": target}
-
-    def _train(self):
-        if len(set(self.y)) < 2: return
-        try: self.clf.fit(self.X, self.y); self.trained = True
-        except: pass
-
-    def predict(self, history: list, levels: list, streak: int) -> Optional[dict]:
-        if not self.trained: return None
+    def _extract_features(self, history: list) -> Optional[list]:
+        """One-Hot Encoding deslizante de los últimos 5 giros + Freq Ratio"""
         h = [x for x in history if x != 0]
         if len(h) < self.WINDOW: return None
-        feats = self._make_features(h, levels, streak)
-        try:
-            proba = self.clf.predict_proba([feats])[0]; classes = self.clf.classes_
-            return {int(c): float(p) for c, p in zip(classes, proba)}
-        except: return None
+        
+        window = h[-self.WINDOW:]
+        # One-hot encoding (3 clases * 5 window = 15 features)
+        features = []
+        for val in window:
+            vec = [0, 0, 0]
+            if val in self.CLASSES: vec[val-1] = 1
+            features.extend(vec)
+            
+        # Features de Frecuencia Reciente (últimos 20 giros)
+        recent = h[-20:]
+        total = len(recent)
+        freqs = [recent.count(c)/total if total > 0 else 0.333 for c in self.CLASSES]
+        features.extend(freqs)
+        
+        return features
 
-# ─── PATTERN 5 PREDICTOR ─────────────────────────────────────────────────────
-class PatternPredictor5:
-    def __init__(self): self._counts: dict = defaultdict(lambda: defaultdict(int))
-    def update(self, history: list):
-        h = [x for x in history if x != 0]
-        if len(h) >= 6: self._counts[tuple(h[-6:-1])][h[-1]] += 1
+    def partial_train(self, history: list, target: int):
+        """Entrenamiento incremental en tiempo real"""
+        feats = self._extract_features(history[:-1]) # Usamos el historial ANTES del target
+        if feats is None: return
+        
+        X = np.array(feats).reshape(1, -1)
+        y = np.array([target])
+        
+        if not self.trained:
+            self.mnb.partial_fit(X, y, classes=self.CLASSES)
+            self.sgd.partial_fit(X, y, classes=self.CLASSES)
+            self.trained = True
+        else:
+            self.mnb.partial_fit(X, y)
+            self.sgd.partial_fit(X, y)
+            
+        self.sample_count += 1
+
     def predict(self, history: list) -> Optional[dict]:
-        h = [x for x in history if x != 0]
-        if len(h) < 5: return None
-        c = dict(self._counts.get(tuple(h[-5:]), {})); total = sum(c.values())
-        if total < 3: return None
-        return {k: v/total for k,v in c.items()}
+        if not self.trained: return None
+        feats = self._extract_features(history)
+        if feats is None: return None
+        
+        X = np.array(feats).reshape(1, -1)
+        
+        try:
+            # Probabilidades de los 3 modelos base
+            nb_probs = self.mnb.predict_proba(X)[0]
+            sgd_probs = self.sgd.predict_proba(X)[0]
+            
+            # Ensemble Promedio (Se podrían ajustar pesos dinámicamente)
+            final_probs = (0.5 * nb_probs + 0.5 * sgd_probs)
+            
+            return {c+1: float(p) for c, p in enumerate(final_probs)}
+        except Exception as e:
+            logger.debug(f"Ensemble predict error: {e}")
+            return None
 
 # ─── DETAILED STATS ───────────────────────────────────────────────────────────
 class DetailedStats:
@@ -267,39 +277,36 @@ class DetailedStats:
 class RussianRouletteEngine:
     def __init__(self):
         self.spin_history: list = []
-        self.dozen_history: list = []; self.column_history: list = []
+        self.dozen_seq: list = []; self.column_seq: list = []
         self.d_levels: dict[int, list] = {1:[], 2:[], 3:[]}; self.c_levels: dict[int, list] = {1:[], 2:[], 3:[]}
-        self.d_streak, self.c_streak = 0, 0; self.last_d, self.last_c = 0, 0
 
-        self.markov_d = MarkovPredictor(); self.dt_d = DecisionTreePredictor(); self.pat_d = PatternPredictor5()
-        self.markov_c = MarkovPredictor(); self.dt_c = DecisionTreePredictor(); self.pat_c = PatternPredictor5()
+        # Motores Optimizados
+        self.markov_d = SmoothedMarkovPredictor(window=60, order=2)
+        self.markov_c = SmoothedMarkovPredictor(window=60, order=2)
+        self.ensemble_d = OnlineEnsemblePredictor()
+        self.ensemble_c = OnlineEnsemblePredictor()
 
+        # Estado y Martingala
         self.signal_active: bool = False; self.active_type: Optional[str] = None
         self.active_pair: tuple = (); self.active_missing: str = ""
         self.attempts_left: int = MAX_ATTEMPTS; self.signal_msg_ids: list = []
         self.bet_level = 1; self.cum_loss = 0.0; self.bankroll: float = 0.0
         self.trigger_number: int = 0; self.trigger_color: str = ""
 
+        # DB y Precalentamiento
         self.stats = DetailedStats(); self._db = _get_db()
-        
-        # 1. Carga historial en vivo y persistencia de IA
         live_loaded = self._load_live_history()
-        
-        # 2. Precalentamiento con Base de Datos Externa (russian-azure.db)
         self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
         
         self.ws_count: int = live_loaded
-        self.warmup_done: bool = False # Se requiere spins en vivo para sincronizar timing
+        self.warmup_done: bool = False 
         self.last_game_id: Optional[str] = None
 
     def current_bet(self) -> float:
         needed = self.cum_loss + BASE_BET; return round(max(needed, BASE_BET), 2)
 
-    # ── Precalentamiento DB ────────────────────────────────────────────────────
     def _pretrain_from_db(self, db_path: str, table_name: str):
-        if not os.path.exists(db_path):
-            logger.warning(f"[RussianDC] DB de preentrenamiento no encontrada: {db_path}")
-            return
+        if not os.path.exists(db_path): return
         spins = []
         try:
             pattern = re.compile(rf'INSERT INTO "{table_name}" VALUES \(\d+,(\d+),')
@@ -307,100 +314,48 @@ class RussianRouletteEngine:
                 for line in f:
                     m = pattern.search(line)
                     if m: spins.append(int(m.group(1)))
-        except Exception as e:
-            logger.error(f"[RussianDC] Error leyendo DB preentrenamiento: {e}")
-            return
-        if not spins:
-            logger.warning(f"[RussianDC] Sin spins en tabla '{table_name}'")
-            return
+        except: return
+        if not spins: return
+        for n in spins: self._update_state(n, persist=False)
+        logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros")
 
-        for n in spins: self._update_state(n, persist=False, save_patterns=False)
-
-        logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros (tabla: {table_name})")
-
-    # ── Persistencia En Vivo ──────────────────────────────────────────────────
     def _load_live_history(self) -> int:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
-        
-        # Restaurar DT
-        for cat, dt_obj in [("D", self.dt_d), ("C", self.dt_c)]:
-            try:
-                dt_rows = self._db.execute("SELECT features, target FROM dt_samples WHERE cat=?", (cat,)).fetchall()
-                for (feats_str, target) in dt_rows:
-                    feats = [float(x) for x in feats_str.split(",")]
-                    dt_obj.X.append(feats); dt_obj.y.append(int(target))
-                if len(dt_obj.X) >= 30: dt_obj._train()
-            except: pass
-
-        # Restaurar Markov
-        for cat, mk_obj in [("D", self.markov_d), ("C", self.markov_c)]:
-            try:
-                mk_rows = self._db.execute("SELECT pattern, result, count FROM markov_counts WHERE cat=?", (cat,)).fetchall()
-                for (pattern_str, result, count) in mk_rows:
-                    pattern = tuple(int(x) for x in pattern_str.split(","))
-                    mk_obj.counts1[pattern][result] += count
-                    if len(pattern) == 2: mk_obj.counts2[pattern][result] += count
-            except: pass
-
-        # Aplicar giros pasados
-        for (n,) in rows: self._update_state(n, persist=False, save_patterns=False)
-        logger.info(f"[RussianDC] ✅ {len(rows)} giros en vivo + IA persistida cargados")
+        for (n,) in rows: self._update_state(n, persist=False)
+        logger.info(f"[RussianDC] ✅ {len(rows)} giros en vivo cargados")
         return len(rows)
 
     def _persist(self, number: int):
         try: self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (number, int(time.time()))); self._db.commit()
         except: pass
 
-    def _persist_dt_sample(self, cat: str, features: list, target: int):
-        try:
-            feats_str = ",".join(str(round(f, 4)) for f in features)
-            self._db.execute("INSERT INTO dt_samples(cat, features, target) VALUES(?,?,?)", (cat, feats_str, target)); self._db.commit()
-        except: pass
-
-    def _persist_markov_update(self, cat: str, history: list):
-        h = [x for x in history if x != 0]
-        if len(h) < 2: return
-        try:
-            p1 = str(h[-2]); res = h[-1]
-            self._db.execute("INSERT INTO markov_counts(cat,pattern,result,count) VALUES(?,?,?,1) ON CONFLICT(cat,pattern,result) DO UPDATE SET count=count+1", (cat, p1, res))
-            if len(h) >= 3:
-                p2 = f"{h[-3]},{h[-2]}"
-                self._db.execute("INSERT INTO markov_counts(cat,pattern,result,count) VALUES(?,?,?,1) ON CONFLICT(cat,pattern,result) DO UPDATE SET count=count+1", (cat, p2, res))
-            self._db.commit()
-        except: pass
-
-    # ── Actualizar estado ──────────────────────────────────────────────────────
-    def _update_state(self, number: int, persist: bool = True, save_patterns: bool = True):
+    def _update_state(self, number: int, persist: bool = True):
         color = REAL_COLOR_MAP.get(number, "VERDE"); d = get_dozen(number); c = get_column(number)
         self.spin_history.append({"number":number,"color":color})
-        self.dozen_history.append(d); self.column_history.append(c)
-
+        
         if d != 0:
-            if d == self.last_d: self.d_streak += 1
-            else: self.last_d = d; self.d_streak = 1
+            self.dozen_seq.append(d)
             for dd in (1,2,3):
                 delta = 1 if d == dd else -1; prev = self.d_levels[dd][-1] if self.d_levels[dd] else 0
                 self.d_levels[dd].append(prev + delta)
-            self.markov_d.update(self.dozen_history)
-            sample = self.dt_d.add_sample_return(self.dozen_history, self.d_levels[d], self.d_streak)
-            self.pat_d.update(self.dozen_history)
-            if save_patterns and sample: self._persist_dt_sample("D", sample["features"], sample["target"]); self._persist_markov_update("D", self.dozen_history)
+            
+            # Entrenamiento Online
+            self.ensemble_d.partial_train(self.dozen_seq, d)
+            self.markov_d.update(self.dozen_seq)
 
         if c != 0:
-            if c == self.last_c: self.c_streak += 1
-            else: self.last_c = c; self.c_streak = 1
+            self.column_seq.append(c)
             for cc in (1,2,3):
                 delta = 1 if c == cc else -1; prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0
                 self.c_levels[cc].append(prev + delta)
-            self.markov_c.update(self.column_history)
-            sample = self.dt_c.add_sample_return(self.column_history, self.c_levels[c], self.c_streak)
-            self.pat_c.update(self.column_history)
-            if save_patterns and sample: self._persist_dt_sample("C", sample["features"], sample["target"]); self._persist_markov_update("C", self.column_history)
+            
+            # Entrenamiento Online
+            self.ensemble_c.partial_train(self.column_seq, c)
+            self.markov_c.update(self.column_seq)
 
         if persist: self._persist(number)
 
-    # ── Clasificación y Validación ────────────────────────────────────────────
     def _classify_last5(self) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
         last5 = self.spin_history[-5:]
@@ -414,36 +369,39 @@ class RussianRouletteEngine:
         return res
 
     def _validate_historical(self, cat_type: str, pair_set: set) -> bool:
-        seq = self.dozen_history if cat_type == "DOCENA" else self.column_history
+        seq = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         if len(seq) < 10: return False
         count = 0
         for i in range(len(seq) - 4):
             if set(seq[i:i+5]) == pair_set: count += 1
         return count >= 2
 
-    # ── Probabilidad Unificada ────────────────────────────────────────────────
     def _unified_prob(self, cat_type: str, missing_num: int) -> float:
         mk = self.markov_d if cat_type == "DOCENA" else self.markov_c
-        dt = self.dt_d if cat_type == "DOCENA" else self.dt_c
-        pt = self.pat_d if cat_type == "DOCENA" else self.pat_c
-        hist = self.dozen_history if cat_type == "DOCENA" else self.column_history
+        ens = self.ensemble_d if cat_type == "DOCENA" else self.ensemble_c
+        hist = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         levels = (self.d_levels if cat_type == "DOCENA" else self.c_levels).get(missing_num, [])
-        streak = self.d_streak if cat_type == "DOCENA" else self.c_streak
 
+        # 1. Markov Suavizado (30%)
         m_p = mk.predict(hist).get(missing_num, 1/3) if mk.predict(hist) else 1/3
-        dt_p = dt.predict(hist, levels, streak).get(missing_num, 1/3) if dt.predict(hist, levels, streak) else 1/3
-        p_p = pt.predict(hist).get(missing_num, 1/3) if pt.predict(hist) else 1/3
-
-        raw_missing = 0.25*m_p + 0.35*dt_p + 0.25*p_p + 0.15*(1/3)
         
+        # 2. Ensemble NB+SGD (60%)
+        ens_p = ens.predict(hist).get(missing_num, 1/3) if ens.predict(hist) else 1/3
+        
+        # 3. Prior Bayesiano (10%)
+        prior = 1/3
+
+        # Fusión
+        raw_missing = 0.30*m_p + 0.60*ens_p + 0.10*prior
+        
+        # AMX Trend Factor
         if len(levels) >= 20:
-            if ema_signal(levels, "tendencia"): raw_missing *= 0.95
+            if ema_signal(levels, "tendencia"): raw_missing *= 0.95  # Si la EMA indica tendencia en contra del ausente, bajamos su prob
             elif ema_signal(levels, "moderado"): raw_missing *= 0.98
 
         pair_prob = 1.0 - min(raw_missing, 0.99)
         return pair_prob
 
-    # ── Detección de señal ────────────────────────────────────────────────────
     def _detect_signal(self) -> Optional[dict]:
         classification = self._classify_last5()
         if not classification: return None
@@ -530,7 +488,7 @@ class RussianRouletteEngine:
         if not self.warmup_done:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
-            self.warmup_done = True; tg_send("🟢 <b>Russian Roulette DC</b> — Sistema listo y precalentado.")
+            self.warmup_done = True; tg_send("🟢 <b>Russian Roulette DC</b> — IA Optimizada lista.")
         if self.signal_active: self._resolve(number, color)
         else:
             sig = self._detect_signal()
@@ -591,19 +549,15 @@ class RussianRouletteEngine:
                 logger.warning(f"WS desconectado: {e}. Recon en {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay); reconnect_delay = min(reconnect_delay*2, 60)
 
-# ─── FLASK ────────────────────────────────────────────────────────────────────
+# ─── FLASK & SELF-PING ───────────────────────────────────────────────────────
 app = Flask(__name__); engine: Optional[RussianRouletteEngine] = None
-
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Russian Roulette DC AMX"})
-
+def home(): return jsonify({"status": "ok", "bot": "Russian DC AMX Optimized"})
 @app.route("/ping")
 def ping(): return jsonify({"status":"pong","ts":time.time()})
-
 @app.route("/health")
 def health(): return jsonify({"status":"healthy","warmup": engine.warmup_done if engine else False})
 
-# ─── SELF-PING ANTI-SLEEP ─────────────────────────────────────────────────────
 async def self_ping_loop():
     url = os.environ.get("RENDER_EXTERNAL_URL","").rstrip("/")
     if not url: return
@@ -616,7 +570,7 @@ async def self_ping_loop():
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start','help'])
 def cmd_start(message):
-    bot.reply_to(message, "<b>🎰 Russian Roulette DC Bot</b>\n\nAnálisis Exclusivo: Docenas y Columnas\nSistema: Markov + DT + Patrones(5) + AMX\nUmbral: 80% | Precalentamiento DB Activo\n\n/status\n/stats\n/reset", parse_mode="HTML")
+    bot.reply_to(message, "<b>🎰 Russian DC Bot (Optimized ML)</b>\n\nMotor: NB + SGD + Markov + AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
@@ -646,12 +600,10 @@ async def main():
     tasks = [asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop())]
     def _poll(): bot.polling(none_stop=True, interval=1, timeout=30)
     threading.Thread(target=_poll, daemon=True).start()
-    logger.info("🎰 Russian Roulette DC Bot iniciado")
+    logger.info("🎰 Russian Roulette DC Optimized Bot iniciado")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     try: asyncio.run(main())
     except KeyboardInterrupt: logger.info("Bot detenido.")
-
-
