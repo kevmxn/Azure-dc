@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Roulette Telegram Signal Bot — Docenas y Columnas Exclusivamente
-  · Analiza últimos 5 resultados: clasifica si pertenecen a 2 docenas o 2 columnas
-  · Valida que la secuencia de 2 docenas/2 columnas se haya repetido antes en el historial
+  · Analiza últimos 5 resultados: si pertenecen a 2 docenas o 2 columnas
+  · Valida que la secuencia se haya repetido históricamente
   · Predice 6° giro: Markov + ML + Patrones(longitud 5) + AMX
-  · Las 2 más probables deben coincidir con el flujo de los últimos 5
-  · Umbral mínimo de emisión: 80%
-  · Formato de señal específico para docenas y columnas
+  · Las 2 más probables deben coincidir con el flujo y superar 80%
+  · Compatible con Render (Flask silenciado)
 """
 
 import asyncio
@@ -18,7 +17,7 @@ import sqlite3
 import threading
 import time
 from collections import deque, defaultdict
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import telebot
@@ -29,11 +28,18 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Evitar reloader y banners de Flask
+os.environ['WERKZEUG_RUN_MAIN'] = 'true'
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s')
 logger = logging.getLogger("RouletteBotDC")
+
+# Silenciar Flask y Werkzeug
+for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
+    logging.getLogger(_ln).setLevel(logging.ERROR)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM & NETWORK
@@ -41,12 +47,14 @@ logger = logging.getLogger("RouletteBotDC")
 TOKEN = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
 
 _session = requests.Session()
-_retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429,500,502,503,504],
-               allowed_methods=["GET","POST"], raise_on_status=False)
+_retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
+               allowed_methods=["GET", "POST"], raise_on_status=False)
 _adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
-_session.mount("https://", _adapter); _session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
-bot = telebot.TeleBot(TOKEN, threaded=False); bot.session = _session
+bot = telebot.TeleBot(TOKEN, threaded=False)
+bot.session = _session
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -60,7 +68,8 @@ def _get_live_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL,
         number INTEGER NOT NULL, ts INTEGER NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_table ON live_spins(table_name, id)")
-    conn.commit(); return conn
+    conn.commit()
+    return conn
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS & CONFIG
@@ -71,18 +80,18 @@ REAL_COLOR_MAP = {
     14:"ROJO",15:"NEGRO",16:"ROJO",17:"NEGRO",18:"ROJO",19:"ROJO",20:"NEGRO",
     21:"ROJO",22:"NEGRO",23:"ROJO",24:"NEGRO",25:"ROJO",26:"NEGRO",27:"ROJO",
     28:"NEGRO",29:"NEGRO",30:"ROJO",31:"NEGRO",32:"ROJO",33:"NEGRO",34:"ROJO",
-    35:"NEGRO",36:"ROJO"}
-
+    35:"NEGRO",36:"ROJO"
+}
 COLOR_ICON = {"ROJO":"🔴", "NEGRO":"⚫️", "VERDE":"🟢"}
 
-def get_dozen(n:int)->int: return 0 if n==0 else (n-1)//12+1
-def get_column(n:int)->int: return 0 if n==0 else ((n-1)%3)+1
+def get_dozen(n: int) -> int: return 0 if n == 0 else (n - 1) // 12 + 1
+def get_column(n: int) -> int: return 0 if n == 0 else ((n - 1) % 3) + 1
 
 ROULETTE_CONFIGS = {
     "RUSSIAN ROULETTE": {
         "bot": bot, "ws_key": 221, "chat_id": -1003835197023,
         "thread_id": 8344, "db_table": "russian_roulette",
-        "min_prob_threshold": 0.80,
+        "min_prob_threshold": 0.80,  # 80% Mínimo umbral requerido
     },
 }
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
@@ -93,26 +102,24 @@ WARMUP_SPINS  = 21
 LOSS_COOLDOWN = 5
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MARTINGALE (Adaptado para 2 docenas/columnas)
+# MARTINGALE (Adaptado para 2 docenas/columnas - Pago 2 a 1)
 # ═══════════════════════════════════════════════════════════════════════════════
 class Martingale:
-    def __init__(self, base:float):
+    def __init__(self, base: float):
         self.base = base; self.level = 1; self.bankroll = 0.0
         self.cumulative_loss = 0.0; self.consecutive_losses = 0
 
-    def current_bet(self)->float:
+    def current_bet(self) -> float:
         needed = self.cumulative_loss + self.base
         return round(max(needed, self.base), 2)
 
-    def total_risk(self)->float: return round(self.current_bet() * 2, 2)
-
-    def win(self)->float:
+    def win(self) -> float:
         bet = self.current_bet()
         self.bankroll = round(self.bankroll + bet, 2)
         self.level = 1; self.cumulative_loss = 0.0; self.consecutive_losses = 0
         return bet
 
-    def loss(self)->float:
+    def loss(self) -> float:
         bet = self.current_bet()
         total_loss = round(bet * 2, 2)
         self.bankroll = round(self.bankroll - total_loss, 2)
@@ -128,10 +135,10 @@ class Martingale:
 # PREDICTORES
 # ═══════════════════════════════════════════════════════════════════════════════
 class MarkovChainPredictor:
-    def __init__(self, window:int=60, order:int=2):
+    def __init__(self, window: int = 60, order: int = 2):
         self.window = window; self.order = order; self.transition_counts: dict = {}
 
-    def update(self, sequence:list):
+    def update(self, sequence: list):
         self.transition_counts = defaultdict(lambda: defaultdict(int))
         recent = sequence[-self.window:]
         if len(recent) < self.order + 1: return
@@ -139,7 +146,7 @@ class MarkovChainPredictor:
             state = tuple(recent[i:i+self.order]); nxt = recent[i+self.order]
             self.transition_counts[state][nxt] += 1
 
-    def predict(self, sequence:list)->Optional[dict]:
+    def predict(self, sequence: list) -> Optional[dict]:
         if len(sequence) < self.order: return None
         state = tuple(sequence[-self.order:])
         counts = dict(self.transition_counts.get(state, {})); total = sum(counts.values())
@@ -148,11 +155,11 @@ class MarkovChainPredictor:
         return probs
 
 class MLPatternPredictor:
-    def __init__(self, pattern_length:int=3):
+    def __init__(self, pattern_length: int = 3):
         self.pattern_length = pattern_length
         self.pattern_counts: dict = defaultdict(lambda: defaultdict(int)); self._known_len: int = 0
 
-    def add_spin(self, sequence:list):
+    def add_spin(self, sequence: list):
         clen = len(sequence)
         if clen <= self._known_len: return
         self._known_len = clen
@@ -161,7 +168,7 @@ class MLPatternPredictor:
         pattern = tuple(sequence[i:i+self.pattern_length]); nxt = sequence[i+self.pattern_length]
         self.pattern_counts[pattern][nxt] += 1
 
-    def predict(self, sequence:list)->Optional[dict]:
+    def predict(self, sequence: list) -> Optional[dict]:
         if len(sequence) < self.pattern_length: return None
         pattern = tuple(sequence[-self.pattern_length:])
         counts = dict(self.pattern_counts.get(pattern, {})); total = sum(counts.values())
@@ -170,7 +177,7 @@ class MLPatternPredictor:
         return probs
 
 class CategoryPredictorDC:
-    """Patrones de 5 últimos números para docenas y columnas"""
+    """Patrones de 5 últimos números exclusivamente para D y C"""
     PATTERN_LEN = 5
     def __init__(self):
         self._hist: dict = {"DOCENA": [], "COLUMNA": []}
@@ -179,7 +186,7 @@ class CategoryPredictorDC:
             "COLUMNA": defaultdict(lambda: defaultdict(int)),
         }
 
-    def add_spin(self, number:int):
+    def add_spin(self, number: int):
         if number == 0: return
         d = f"D{get_dozen(number)}"; c = f"C{get_column(number)}"
         for cat, val in [("DOCENA", d), ("COLUMNA", c)]:
@@ -189,7 +196,7 @@ class CategoryPredictorDC:
                 self._counts[cat][pattern][val] += 1
             hist.append(val)
 
-    def predict_category(self, category:str)->Optional[dict]:
+    def predict_category(self, category: str) -> Optional[dict]:
         hist = self._hist.get(category, []); counts = self._counts.get(category, {})
         if len(hist) < self.PATTERN_LEN: return None
         pattern = tuple(hist[-self.PATTERN_LEN:])
@@ -200,14 +207,14 @@ class CategoryPredictorDC:
 
 class AMXSignalSystemDC:
     @staticmethod
-    def _ema(data:list, period:int)->list:
+    def _ema(data: list, period: int) -> list:
         if len(data) < period: return [None]*len(data)
         mult = 2/(period+1); ema = [None]*(period-1)
         prev = sum(data[:period])/period; ema.append(prev)
         for i in range(period, len(data)): prev = (data[i]*mult)+(prev*(1-mult)); ema.append(prev)
         return ema
 
-    def check_signal(self, pair_levels:list, missing_levels:list)->Optional[dict]:
+    def check_signal(self, pair_levels: list, missing_levels: list) -> Optional[dict]:
         if len(pair_levels) < 20: return None
         ema4 = self._ema(pair_levels, 4); ema8 = self._ema(pair_levels, 8); ema20 = self._ema(pair_levels, 20)
         if any(v is None for v in [ema4[-1], ema8[-1], ema20[-1], ema4[-2], ema8[-2], ema20[-2]]): return None
@@ -241,14 +248,14 @@ class AMXSignalSystemDC:
 # ═══════════════════════════════════════════════════════════════════════════════
 class DetailedStats:
     def __init__(self): self.signal_history: deque = deque(maxlen=50); self.wins_1 = 0; self.wins_2 = 0; self.losses = 0; self.total_signals = 0
-    def record(self, attempt_won:int, final_result:bool, bet:float, bankroll:float, category:str, pair:str):
+    def record(self, attempt_won: int, final_result: bool, bet: float, bankroll: float, category: str, pair: str):
         self.signal_history.append({"attempt_won": attempt_won, "won": final_result, "bet": bet, "bankroll": bankroll, "timestamp": time.time(), "category": category, "pair": pair})
         self.total_signals += 1
         if final_result:
             if attempt_won == 1: self.wins_1 += 1
             else: self.wins_2 += 1
         else: self.losses += 1
-    def summary(self, bankroll:float)->str:
+    def summary(self, bankroll: float) -> str:
         w = self.wins_1 + self.wins_2; t = w + self.losses; eff = round(w/t*100,1) if t else 0
         return (f"📊 <b>ESTADÍSTICAS</b>\n\n✅ W1: {self.wins_1} | ✅ W2: {self.wins_2}\n❌ Losses: {self.losses}\n📈 Eff: {eff}%\n💰 Bankroll: {bankroll:.2f} usd")
 
@@ -266,7 +273,7 @@ def _tg_call(fn, *args, **kwargs):
             if attempt < _TG_MAX_RETRIES: time.sleep(delay); delay = min(delay*2, 60)
             else: return None
 
-def tg_send(bot_inst, chat_id, thread_id, text)->Optional[int]:
+def tg_send(bot_inst, chat_id, thread_id, text) -> Optional[int]:
     msg = _tg_call(bot_inst.send_message, chat_id=chat_id, text=text, parse_mode="HTML", message_thread_id=thread_id)
     return msg.message_id if msg else None
 
@@ -276,7 +283,7 @@ def tg_delete(bot_inst, chat_id, msg_id): _tg_call(bot_inst.delete_message, chat
 # ROULETTE ENGINE — LÓGICA EXCLUSIVA DOCENAS Y COLUMNAS
 # ═══════════════════════════════════════════════════════════════════════════════
 class RouletteEngine:
-    def __init__(self, name:str, cfg:dict):
+    def __init__(self, name: str, cfg: dict):
         self.name = name; self.bot = cfg["bot"]; self.ws_key = cfg["ws_key"]
         self.chat_id = cfg["chat_id"]; self.thread_id = cfg["thread_id"]; self.db_table = cfg["db_table"]
         self.min_prob_threshold = cfg.get("min_prob_threshold", 0.80)
@@ -300,7 +307,7 @@ class RouletteEngine:
         live_loaded = self._load_live_history()
         self.ws_spins_count: int = live_loaded; self.warmup_done: bool = live_loaded >= WARMUP_SPINS
 
-    def _pretrain_from_db(self, db_path:str, table_name:str):
+    def _pretrain_from_db(self, db_path: str, table_name: str):
         if not os.path.exists(db_path): return
         spins = []
         try:
@@ -313,7 +320,7 @@ class RouletteEngine:
         if not spins: return
         for n in spins: self._process_spin_internal(n, from_pretrain=True)
 
-    def _load_live_history(self)->int:
+    def _load_live_history(self) -> int:
         try:
             cutoff = int(time.time()) - 7*86400
             cur = self._live_conn.execute("SELECT number FROM live_spins WHERE table_name=? AND ts>=? ORDER BY id ASC", (self.db_table, cutoff))
@@ -323,7 +330,7 @@ class RouletteEngine:
         for (n,) in rows: self._process_spin_internal(n, from_pretrain=True)
         return len(rows)
 
-    def _process_spin_internal(self, number:int, from_pretrain:bool=False):
+    def _process_spin_internal(self, number: int, from_pretrain: bool = False):
         real = REAL_COLOR_MAP.get(number, "VERDE"); self.spin_history.append({"number": number, "real": real})
         if number == 0:
             for d in (1,2,3):
@@ -343,7 +350,7 @@ class RouletteEngine:
         for cc in (1,2,3):
             prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0; inc = 1.0 if cc == c else -0.5; self.c_levels[cc].append(prev + inc)
 
-    def _persist_spin(self, number:int):
+    def _persist_spin(self, number: int):
         try:
             self._live_conn.execute("INSERT INTO live_spins (table_name, number, ts) VALUES (?,?,?)", (self.db_table, number, int(time.time()))); self._live_conn.commit()
         except Exception:
@@ -354,24 +361,18 @@ class RouletteEngine:
     # ══════════════════════════════════════════════════════════════════
     # 1. CLASIFICACIÓN ÚLTIMOS 5 RESULTADOS
     # ══════════════════════════════════════════════════════════════════
-    def _classify_last5(self)->Optional[Dict]:
+    def _classify_last5(self) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
         last5 = self.spin_history[-5:]
-        
-        # Si hay un cero en los últimos 5, no pertenece a 2D o 2C estrictamente
         if any(s["number"] == 0 for s in last5): return None
         
         dozens_set = set(f"D{get_dozen(s['number'])}" for s in last5)
         columns_set = set(f"C{get_column(s['number'])}" for s in last5)
         
         result = {"dozen_pattern": None, "column_pattern": None}
-        
-        # Patrón de 2 docenas
         if len(dozens_set) == 2:
             missing_d = ({"D1","D2","D3"} - dozens_set).pop()
             result["dozen_pattern"] = {"present": list(dozens_set), "missing": missing_d}
-            
-        # Patrón de 2 columnas
         if len(columns_set) == 2:
             missing_c = ({"C1","C2","C3"} - columns_set).pop()
             result["column_pattern"] = {"present": list(columns_set), "missing": missing_c}
@@ -382,18 +383,18 @@ class RouletteEngine:
     # ══════════════════════════════════════════════════════════════════
     # 2. VALIDACIÓN HISTÓRICA DE SECUENCIA
     # ══════════════════════════════════════════════════════════════════
-    def _validate_historical_pair(self, cat_type:str, pair_set:set)->bool:
+    def _validate_historical_pair(self, cat_type: str, pair_set: set) -> bool:
         seq = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         if len(seq) < 10: return False
         count = 0
         for i in range(len(seq) - 4):
             if set(seq[i:i+5]) == pair_set: count += 1
-        return count >= 2  # Al menos 1 previa + la actual
+        return count >= 2  # La actual + al menos 1 previa
 
     # ══════════════════════════════════════════════════════════════════
     # 3. PREDICCIÓN MARKOV + ML + PATRONES(5) + AMX
     # ══════════════════════════════════════════════════════════════════
-    def _predict_top_2(self, cat_type:str)->Tuple[list, float]:
+    def _predict_top_2(self, cat_type: str) -> Tuple[list, float]:
         all_vals = ["D1","D2","D3"] if cat_type == "DOCENA" else ["C1","C2","C3"]
         markov_probs = {v:0.0 for v in all_vals}; ml_probs = {v:0.0 for v in all_vals}; pattern_probs = {v:0.0 for v in all_vals}
         
@@ -445,17 +446,13 @@ class RouletteEngine:
         if classification is None: return
         
         candidates = []
-        
-        # Evaluar Docenas
         if classification["dozen_pattern"]:
             dp = classification["dozen_pattern"]; pair_set = set(dp["present"])
             if self._validate_historical_pair("DOCENA", pair_set):
                 top2, prob = self._predict_top_2("DOCENA")
-                # Si las 2 más probables coinciden con el flujo (las 2 presentes)
                 if set(top2) == pair_set and prob >= self.min_prob_threshold:
                     candidates.append({"type": "DOCENA", "pair": top2, "missing": dp["missing"], "prob": prob})
                     
-        # Evaluar Columnas
         if classification["column_pattern"]:
             cp = classification["column_pattern"]; pair_set = set(cp["present"])
             if self._validate_historical_pair("COLUMNA", pair_set):
@@ -464,22 +461,20 @@ class RouletteEngine:
                     candidates.append({"type": "COLUMNA", "pair": top2, "missing": cp["missing"], "prob": prob})
                     
         if not candidates: return
-        
-        # Tomar la de mayor probabilidad si ambas se cumplen
         best = max(candidates, key=lambda x: x["prob"])
         self._emit_signal(best)
 
-    def _format_pair_display(self, pair:Tuple)->str:
+    def _format_pair_display(self, pair: Tuple) -> str:
         nums = sorted([p[1:].zfill(2) for p in pair])
         return f"{nums[0]} y {nums[1]}"
 
-    def _emit_signal(self, signal_data:dict):
+    def _emit_signal(self, signal_data: dict):
         self.signal_active = True; self.attempts_left = MAX_ATTEMPTS
         self.active_type = signal_data["type"]; self.active_pair = signal_data["pair"]; self.active_missing = signal_data["missing"]
         self.trigger_number = self.spin_history[-1]["number"] if self.spin_history else 0
         self._send_signal_message(1, signal_data["prob"])
 
-    def _send_signal_message(self, attempt:int, prob:float):
+    def _send_signal_message(self, attempt: int, prob: float):
         for mid in self.signal_msg_ids: tg_delete(self.bot, self.chat_id, mid)
         self.signal_msg_ids = []
         
@@ -506,7 +501,7 @@ class RouletteEngine:
         logger.info(f"[{self.name}] 🎯 SEÑAL {self.active_type}: {self.active_pair} (Prob: {prob:.0%})")
 
     # ── Verificar resultado y 2° Intento ──────────────────────────────
-    def _check_signal_result(self, number:int, real_color:str):
+    def _check_signal_result(self, number: int, real_color: str):
         won = False
         if number != 0:
             if self.active_type == "DOCENA": result = f"D{get_dozen(number)}"; won = result in self.active_pair
@@ -523,7 +518,6 @@ class RouletteEngine:
                 self.stats.record(MAX_ATTEMPTS, False, loss_amount, self.bet_sys.bankroll, self.active_type, f"{self.active_pair[0]}+{self.active_pair[1]}")
                 self._deactivate_signal(loss=True)
             else:
-                # Reevalúa las 2 más probables para el 2° intento
                 self._reevaluate_2nd_attempt()
 
     def _reevaluate_2nd_attempt(self):
@@ -532,11 +526,11 @@ class RouletteEngine:
         self.active_missing = list(({"D1","D2","D3"} if self.active_type == "DOCENA" else {"C1","C2","C3"}) - set(top2))[0]
         self._send_signal_message(2, prob)
 
-    def _deactivate_signal(self, loss:bool=False):
+    def _deactivate_signal(self, loss: bool = False):
         self.signal_active = False; self.active_type = None; self.active_pair = (); self.active_missing = ""
         if loss: self.spins_since_loss = 0
 
-    def _send_result_message(self, number:int, real:str, won:bool, amount:float, attempt_num:int):
+    def _send_result_message(self, number: int, real: str, won: bool, amount: float, attempt_num: int):
         for mid in self.signal_msg_ids: tg_delete(self.bot, self.chat_id, mid)
         self.signal_msg_ids = []
         
@@ -558,7 +552,7 @@ class RouletteEngine:
     # ══════════════════════════════════════════════════════════════════
     # MAIN SPIN PROCESSOR
     # ══════════════════════════════════════════════════════════════════
-    def process_spin(self, number:int):
+    def process_spin(self, number: int):
         real = REAL_COLOR_MAP.get(number, "VERDE"); self._process_spin_internal(number); self._persist_spin(number)
         if not self.warmup_done:
             self.ws_spins_count += 1
@@ -583,7 +577,7 @@ class RouletteEngine:
             except Exception as e:
                 logger.error(f"[{self.name}] WS error: {e}"); await asyncio.sleep(5)
 
-    def _extract_number(self, msg:dict)->Optional[int]:
+    def _extract_number(self, msg: dict) -> Optional[int]:
         try:
             for src in [msg.get("params",{}), msg.get("data",{})]:
                 if "result" in src:
@@ -599,14 +593,23 @@ class RouletteEngine:
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FLASK & BOT COMMANDS
+# FLASK HEALTH CHECK — SILENCIOSO PARA RENDER
 # ═══════════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
+
 @app.route("/health")
-def health(): return jsonify({"status": "ok"})
+def health():
+    return jsonify({"status": "ok", "time": time.time()})
 
-def _run_flask(): app.run(host="0.0.0.0", port=5002, debug=False)
+def _run_flask():
+    import logging as _log
+    _log.getLogger('werkzeug').setLevel(_log.ERROR)
+    _log.getLogger('flask.app').setLevel(_log.ERROR)
+    app.run(host="0.0.0.0", port=5002, debug=False, use_reloader=False, threaded=True)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM BOT COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 engines: dict = {}
 
 @bot.message_handler(commands=["start"])
@@ -638,12 +641,25 @@ def cmd_status(msg):
                 f"⏳ Cooldown: {eng.spins_since_loss}/{LOSS_COOLDOWN}")
         _tg_call(bot.send_message, chat_id=msg.chat.id, text=text, parse_mode="HTML")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 def main():
     global engines
     for name, cfg in ROULETTE_CONFIGS.items(): engines[name] = RouletteEngine(name, cfg)
-    threading.Thread(target=_run_flask, daemon=True).start()
-    threading.Thread(target=lambda: bot.infinity_polling(timeout=10, long_polling_timeout=5), daemon=True).start()
     
+    # Flask silencioso en Render
+    threading.Thread(target=_run_flask, daemon=True).start()
+    
+    # Telegram bot polling
+    def _poll_bot():
+        while True:
+            try: bot.infinity_polling(timeout=10, long_polling_timeout=5)
+            except Exception as e:
+                logger.error(f"Bot polling error: {e}"); time.sleep(5)
+    threading.Thread(target=_poll_bot, daemon=True).start()
+    
+    # WebSocket loops en asyncio
     loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     tasks = [asyncio.ensure_future(eng.ws_loop()) for eng in engines.values()]
     try: loop.run_until_complete(asyncio.gather(*tasks))
