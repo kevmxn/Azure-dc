@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Russian Roulette — Bot de señales para Docenas y Columnas exclusivamente
-Sistema AMX · Ensemble ML (Naive Bayes + SGD + Markov Suavizado) + EMA
-  - Optimizado para Render (RAM constante mediante Online Learning)
-  - Precalentamiento con russian-azure.db
-  - Persistencia SQLite 24/7
-  - Análisis últimos 5 resultados y validación histórica
-  - Umbral 80%
+Sistema AMX · Ensemble ML (NB + SGD) + Markov Suavizado
+  - PF (Frecuencia últimos 5): Determina el par actual
+  - PH (Probabilidad Histórica): Determina el par más frecuente tras el último número
+  - Validación: PF debe coincidir con PH para confirmar
+  - Markov + ML + AMX predicen el 6° giro (Umbral 80%)
 """
 
 import asyncio
@@ -25,7 +24,6 @@ from typing import Optional, Dict, Tuple
 import numpy as np
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import LabelBinarizer
 
 import telebot
 import websockets
@@ -86,7 +84,7 @@ def get_column(n: int) -> int:
 # ─── SQLITE ───────────────────────────────────────────────────────────────────
 def _get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(LIVE_DB, check_same_thread=False)
-    conn.execute("""CREATE TABLE IF NOT EXISTS live_spins ( id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, ts INTEGER NOT NULL )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS live_spins ( id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, ts INTEGER NOT NULL)""")
     conn.commit()
     return conn
 
@@ -137,7 +135,7 @@ def ema_signal(levels: list, mode: str = "moderado") -> bool:
         if len(levels) >= 3: a, b, c = levels[-3], levels[-2], levels[-1]; v_pattern = (b < a) and (b < c) and (c > a)
         return ((pe4 <= pe8 and ce4 > ce8) or (pe8 <= pe20 and ce8 > ce20) or (cur > ce4 and cur > ce8) or v_pattern)
 
-# ─── MARKOV SUAVIZADO (Laplace Smoothing) ─────────────────────────────────────
+# ─── MARKOV SUAVIZADO ─────────────────────────────────────────────────────────
 class SmoothedMarkovPredictor:
     def __init__(self, window: int = 60, order: int = 2):
         self.window = window; self.order = order; self.transition_counts: dict = {}
@@ -154,88 +152,54 @@ class SmoothedMarkovPredictor:
         if len(sequence) < self.order: return None
         state = tuple(sequence[-self.order:]); counts = dict(self.transition_counts.get(state, {})); total = sum(counts.values())
         if total < 5: return None
-        # Laplace Smoothing (Alpha=1) para evitar probabilidades 0
         alpha = 1.0; vocab_size = 3
         probs = {k: (v + alpha) / (total + alpha * vocab_size) for k,v in counts.items()}
-        # Rellenar las que no aparecieron
         for c in [1,2,3]:
             if c not in probs: probs[c] = alpha / (total + alpha * vocab_size)
         return probs
 
-# ─── ENSEMBLE ML (NB + SGD) ──────────────────────────────────────────────────
+# ─── ENSEMBLE ML ──────────────────────────────────────────────────────────────
 class OnlineEnsemblePredictor:
-    """
-    Sistema de Ensemble Online. Consume RAM constante (O(1)).
-    - Naive Bayes: Captura patrones de secuencia generalizados.
-    - SGD: Se adapta rápidamente a cambios de sesgo en la rueda.
-    """
-    WINDOW = 5
-    CLASSES = [1, 2, 3]
+    WINDOW = 5; CLASSES = [1, 2, 3]
 
     def __init__(self):
         self.mnb = MultinomialNB(alpha=1.0, class_prior=[0.333, 0.333, 0.333])
         self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2')
-        self.trained = False
-        self.sample_count = 0
+        self.trained = False; self.sample_count = 0
 
     def _extract_features(self, history: list) -> Optional[list]:
-        """One-Hot Encoding deslizante de los últimos 5 giros + Freq Ratio"""
         h = [x for x in history if x != 0]
         if len(h) < self.WINDOW: return None
-        
-        window = h[-self.WINDOW:]
-        # One-hot encoding (3 clases * 5 window = 15 features)
-        features = []
+        window = h[-self.WINDOW:]; features = []
         for val in window:
             vec = [0, 0, 0]
             if val in self.CLASSES: vec[val-1] = 1
             features.extend(vec)
-            
-        # Features de Frecuencia Reciente (últimos 20 giros)
-        recent = h[-20:]
-        total = len(recent)
+        recent = h[-20:]; total = len(recent)
         freqs = [recent.count(c)/total if total > 0 else 0.333 for c in self.CLASSES]
         features.extend(freqs)
-        
         return features
 
     def partial_train(self, history: list, target: int):
-        """Entrenamiento incremental en tiempo real"""
-        feats = self._extract_features(history[:-1]) # Usamos el historial ANTES del target
+        feats = self._extract_features(history[:-1])
         if feats is None: return
-        
-        X = np.array(feats).reshape(1, -1)
-        y = np.array([target])
-        
+        X = np.array(feats).reshape(1, -1); y = np.array([target])
         if not self.trained:
-            self.mnb.partial_fit(X, y, classes=self.CLASSES)
-            self.sgd.partial_fit(X, y, classes=self.CLASSES)
-            self.trained = True
+            self.mnb.partial_fit(X, y, classes=self.CLASSES); self.sgd.partial_fit(X, y, classes=self.CLASSES); self.trained = True
         else:
-            self.mnb.partial_fit(X, y)
-            self.sgd.partial_fit(X, y)
-            
+            self.mnb.partial_fit(X, y); self.sgd.partial_fit(X, y)
         self.sample_count += 1
 
     def predict(self, history: list) -> Optional[dict]:
         if not self.trained: return None
         feats = self._extract_features(history)
         if feats is None: return None
-        
         X = np.array(feats).reshape(1, -1)
-        
         try:
-            # Probabilidades de los 3 modelos base
-            nb_probs = self.mnb.predict_proba(X)[0]
-            sgd_probs = self.sgd.predict_proba(X)[0]
-            
-            # Ensemble Promedio (Se podrían ajustar pesos dinámicamente)
+            nb_probs = self.mnb.predict_proba(X)[0]; sgd_probs = self.sgd.predict_proba(X)[0]
             final_probs = (0.5 * nb_probs + 0.5 * sgd_probs)
-            
             return {c+1: float(p) for c, p in enumerate(final_probs)}
-        except Exception as e:
-            logger.debug(f"Ensemble predict error: {e}")
-            return None
+        except: return None
 
 # ─── DETAILED STATS ───────────────────────────────────────────────────────────
 class DetailedStats:
@@ -286,6 +250,10 @@ class RussianRouletteEngine:
         self.ensemble_d = OnlineEnsemblePredictor()
         self.ensemble_c = OnlineEnsemblePredictor()
 
+        # PH: Probabilidad Histórica (Número -> D/C que le siguieron)
+        self.after_number_dozen: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.after_number_column: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
         # Estado y Martingala
         self.signal_active: bool = False; self.active_type: Optional[str] = None
         self.active_pair: tuple = (); self.active_missing: str = ""
@@ -296,17 +264,20 @@ class RussianRouletteEngine:
         # DB y Precalentamiento
         self.stats = DetailedStats(); self._db = _get_db()
         live_loaded = self._load_live_history()
-        self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
+        azure_loaded = self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
         
-        self.ws_count: int = live_loaded
-        self.warmup_done: bool = False 
+        total_preloaded = live_loaded + azure_loaded
+        self.ws_count: int = total_preloaded; self.warmup_done: bool = total_preloaded >= WARMUP_SPINS
         self.last_game_id: Optional[str] = None
+        
+        logger.info(f"[RussianDC] 📦 Pre-cargados: {live_loaded} live + {azure_loaded} azure = {total_preloaded} total")
+        logger.info(f"[RussianDC] 🔥 Warmup: {'✅ COMPLETADO' if self.warmup_done else f'⏳ Faltan {WARMUP_SPINS - total_preloaded} giros'}")
 
     def current_bet(self) -> float:
         needed = self.cum_loss + BASE_BET; return round(max(needed, BASE_BET), 2)
 
-    def _pretrain_from_db(self, db_path: str, table_name: str):
-        if not os.path.exists(db_path): return
+    def _pretrain_from_db(self, db_path: str, table_name: str) -> int:
+        if not os.path.exists(db_path): return 0
         spins = []
         try:
             pattern = re.compile(rf'INSERT INTO "{table_name}" VALUES \(\d+,(\d+),')
@@ -314,14 +285,16 @@ class RussianRouletteEngine:
                 for line in f:
                     m = pattern.search(line)
                     if m: spins.append(int(m.group(1)))
-        except: return
-        if not spins: return
+        except: return 0
+        if not spins: return 0
         for n in spins: self._update_state(n, persist=False)
-        logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros")
+        logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros de {db_path}")
+        return len(spins)
 
     def _load_live_history(self) -> int:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
+        if not rows: return 0
         for (n,) in rows: self._update_state(n, persist=False)
         logger.info(f"[RussianDC] ✅ {len(rows)} giros en vivo cargados")
         return len(rows)
@@ -332,15 +305,22 @@ class RussianRouletteEngine:
 
     def _update_state(self, number: int, persist: bool = True):
         color = REAL_COLOR_MAP.get(number, "VERDE"); d = get_dozen(number); c = get_column(number)
+        
+        # 1. Actualizar PH (Histórico del número anterior)
+        if len(self.spin_history) >= 1:
+            prev_num = self.spin_history[-1]["number"]
+            if prev_num != 0 and number != 0:
+                self.after_number_dozen[prev_num][d] += 1
+                self.after_number_column[prev_num][c] += 1
+                
         self.spin_history.append({"number":number,"color":color})
         
+        # 2. Actualizar Modelos Markov y ML (Para PF y predicción 6°)
         if d != 0:
             self.dozen_seq.append(d)
             for dd in (1,2,3):
                 delta = 1 if d == dd else -1; prev = self.d_levels[dd][-1] if self.d_levels[dd] else 0
                 self.d_levels[dd].append(prev + delta)
-            
-            # Entrenamiento Online
             self.ensemble_d.partial_train(self.dozen_seq, d)
             self.markov_d.update(self.dozen_seq)
 
@@ -349,81 +329,108 @@ class RussianRouletteEngine:
             for cc in (1,2,3):
                 delta = 1 if c == cc else -1; prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0
                 self.c_levels[cc].append(prev + delta)
-            
-            # Entrenamiento Online
             self.ensemble_c.partial_train(self.column_seq, c)
             self.markov_c.update(self.column_seq)
 
         if persist: self._persist(number)
 
-    def _classify_last5(self) -> Optional[Dict]:
+    # ── PF: Clasificación Frecuencia últimos 5 ────────────────────────────────
+    def _calculate_pf(self) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
         last5 = self.spin_history[-5:]
         if any(s["number"] == 0 for s in last5): return None
+        
         d_set = set(f"D{get_dozen(s['number'])}" for s in last5)
         c_set = set(f"C{get_column(s['number'])}" for s in last5)
-        res = {"dozen_pattern": None, "column_pattern": None}
-        if len(d_set) == 2: missing_d = ({"D1","D2","D3"} - d_set).pop(); res["dozen_pattern"] = {"present": list(d_set), "missing": missing_d}
-        if len(c_set) == 2: missing_c = ({"C1","C2","C3"} - c_set).pop(); res["column_pattern"] = {"present": list(c_set), "missing": missing_c}
-        if not res["dozen_pattern"] and not res["column_pattern"]: return None
+        res = {"dozen_pf": None, "column_pf": None}
+        
+        if len(d_set) == 2: 
+            missing_d = ({"D1","D2","D3"} - d_set).pop()
+            res["dozen_pf"] = {"pair": list(d_set), "missing": missing_d}
+        if len(c_set) == 2: 
+            missing_c = ({"C1","C2","C3"} - c_set).pop()
+            res["column_pf"] = {"pair": list(c_set), "missing": missing_c}
+            
+        if not res["dozen_pf"] and not res["column_pf"]: return None
         return res
 
-    def _validate_historical(self, cat_type: str, pair_set: set) -> bool:
-        seq = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
-        if len(seq) < 10: return False
-        count = 0
-        for i in range(len(seq) - 4):
-            if set(seq[i:i+5]) == pair_set: count += 1
-        return count >= 2
+    # ── PH: Probabilidad Histórica tras último número ─────────────────────────
+    def _get_ph_pair(self, last_number: int, cat_type: str) -> Optional[set]:
+        counts = self.after_number_dozen.get(last_number, {}) if cat_type == "DOCENA" else self.after_number_column.get(last_number, {})
+        if not counts: return None
+        
+        sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        prefix = "D" if cat_type == "DOCENA" else "C"
+        
+        if len(sorted_counts) >= 2:
+            return set([f"{prefix}{sorted_counts[0][0]}", f"{prefix}{sorted_counts[1][0]}"])
+        elif len(sorted_counts) == 1:
+            return set([f"{prefix}{sorted_counts[0][0]}"])
+        return None
 
-    def _unified_prob(self, cat_type: str, missing_num: int) -> float:
+    # ── Probabilidad Unificada (Markov + ML + AMX) ────────────────────────────
+    def _unified_prob(self, cat_type: str, missing_num: int, ph_match: bool) -> float:
         mk = self.markov_d if cat_type == "DOCENA" else self.markov_c
         ens = self.ensemble_d if cat_type == "DOCENA" else self.ensemble_c
         hist = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         levels = (self.d_levels if cat_type == "DOCENA" else self.c_levels).get(missing_num, [])
 
-        # 1. Markov Suavizado (30%)
         m_p = mk.predict(hist).get(missing_num, 1/3) if mk.predict(hist) else 1/3
-        
-        # 2. Ensemble NB+SGD (60%)
         ens_p = ens.predict(hist).get(missing_num, 1/3) if ens.predict(hist) else 1/3
-        
-        # 3. Prior Bayesiano (10%)
         prior = 1/3
 
-        # Fusión
         raw_missing = 0.30*m_p + 0.60*ens_p + 0.10*prior
         
         # AMX Trend Factor
         if len(levels) >= 20:
-            if ema_signal(levels, "tendencia"): raw_missing *= 0.95  # Si la EMA indica tendencia en contra del ausente, bajamos su prob
+            if ema_signal(levels, "tendencia"): raw_missing *= 0.95
             elif ema_signal(levels, "moderado"): raw_missing *= 0.98
+
+        # Boost por confirmación PH
+        if ph_match: raw_missing *= 0.92  # Reduce la probabilidad del ausente, sube la del par
 
         pair_prob = 1.0 - min(raw_missing, 0.99)
         return pair_prob
 
+    # ── Detección de señal (PF + PH + ML) ────────────────────────────────────
     def _detect_signal(self) -> Optional[dict]:
-        classification = self._classify_last5()
-        if not classification: return None
+        pf_data = self._calculate_pf()
+        if not pf_data: return None
+        
+        last_num = self.spin_history[-1]["number"]
+        if last_num == 0: return None
+        
         candidates = []
 
-        if classification["dozen_pattern"]:
-            dp = classification["dozen_pattern"]; pair_set = set(dp["present"])
-            if self._validate_historical("DOCENA", pair_set):
-                missing_num = int(dp["missing"][1])
-                pp = self._unified_prob("DOCENA", missing_num)
-                top2 = sorted([1,2,3], key=lambda x: self._unified_prob("DOCENA", x), reverse=True)[:2]
-                if set([f"D{top2[0]}", f"D{top2[1]}"]) == pair_set and pp >= MIN_PROB:
-                    candidates.append({"type":"DOCENA", "pair":(f"D{top2[0]}", f"D{top2[1]}"), "missing":dp["missing"], "prob":pp})
+        # Evaluar Docenas
+        if pf_data["dozen_pf"]:
+            pf_pair = set(pf_data["dozen_pf"]["pair"])
+            ph_pair = self._get_ph_pair(last_num, "DOCENA")
+            
+            ph_match = bool(ph_pair and pf_pair == ph_pair)
+            
+            logger.info(f"[RussianDC] D PF:{pf_pair} | PH:{ph_pair} | Match:{ph_match}")
+            
+            if ph_match:  # Solo proceder si PF y PH coinciden
+                missing_num = int(pf_data["dozen_pf"]["missing"][1])
+                prob = self._unified_prob("DOCENA", missing_num, True)
+                if prob >= MIN_PROB:
+                    candidates.append({"type":"DOCENA", "pair":tuple(sorted(pf_pair)), "missing":pf_data["dozen_pf"]["missing"], "prob":prob})
 
-        if classification["column_pattern"]:
-            cp = classification["column_pattern"]; pair_set = set(cp["present"])
-            if self._validate_historical("COLUMNA", pair_set):
-                missing_num = int(cp["missing"][1])
-                pp = self._unified_prob("COLUMNA", missing_num)
-                top2 = sorted([1,2,3], key=lambda x: self._unified_prob("COLUMNA", x), reverse=True)[:2]
-                if set([f"C{top2[0]}", f"C{top2[1]}"]) == pair_set and pp >= MIN_PROB:
-                    candidates.append({"type":"COLUMNA", "pair":(f"C{top2[0]}", f"C{top2[1]}"), "missing":cp["missing"], "prob":pp})
+        # Evaluar Columnas
+        if pf_data["column_pf"]:
+            pf_pair = set(pf_data["column_pf"]["pair"])
+            ph_pair = self._get_ph_pair(last_num, "COLUMNA")
+            
+            ph_match = bool(ph_pair and pf_pair == ph_pair)
+            
+            logger.info(f"[RussianDC] C PF:{pf_pair} | PH:{ph_pair} | Match:{ph_match}")
+            
+            if ph_match:
+                missing_num = int(pf_data["column_pf"]["missing"][1])
+                prob = self._unified_prob("COLUMNA", missing_num, True)
+                if prob >= MIN_PROB:
+                    candidates.append({"type":"COLUMNA", "pair":tuple(sorted(pf_pair)), "missing":pf_data["column_pf"]["missing"], "prob":prob})
 
         if not candidates: return None
         return max(candidates, key=lambda x: x["prob"])
@@ -484,12 +491,20 @@ class RussianRouletteEngine:
 
     def _process_inner(self, number: int):
         color = REAL_COLOR_MAP.get(number, "VERDE")
+        d = get_dozen(number); c = get_column(number)
+        logger.info(f"[RussianDC] 🎰 #{len(self.spin_history)+1}: {number} {color} | D{d} C{c}")
+        
         self._update_state(number)
+        
         if not self.warmup_done:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
-            self.warmup_done = True; tg_send("🟢 <b>Russian Roulette DC</b> — IA Optimizada lista.")
-        if self.signal_active: self._resolve(number, color)
+            self.warmup_done = True
+            tg_send("🟢 <b>Russian Roulette DC</b> — Sistema PF+PH Listo.")
+            logger.info("[RussianDC] ✅ WARMUP COMPLETADO")
+            
+        if self.signal_active:
+            self._resolve(number, color)
         else:
             sig = self._detect_signal()
             if sig:
@@ -497,6 +512,7 @@ class RussianRouletteEngine:
                 self.active_pair = sig["pair"]; self.active_missing = sig["missing"]
                 self.attempts_left = MAX_ATTEMPTS; self.trigger_number = number; self.trigger_color = color
                 self._send_signal(1, sig["prob"])
+                logger.info(f"[RussianDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} (Prob: {sig['prob']:.0%})")
 
     # ── Stats y Reportes ──────────────────────────────────────────────────────
     def _check_stats(self):
@@ -525,7 +541,7 @@ class RussianRouletteEngine:
             try:
                 async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
                     await ws.send(json.dumps({"type":"subscribe","key":WS_KEY,"casinoId":CASINO_ID}))
-                    logger.info(f"✅ WS conectado key={WS_KEY}"); reconnect_delay = 5
+                    logger.info(f"[RussianDC] ✅ WS conectado key={WS_KEY}"); reconnect_delay = 5
                     async for raw in ws:
                         try: data = json.loads(raw)
                         except: continue
@@ -546,17 +562,17 @@ class RussianRouletteEngine:
                                     if 0 <= n <= 36: self.process_number(n)
                                 except: pass; break
             except Exception as e:
-                logger.warning(f"WS desconectado: {e}. Recon en {reconnect_delay}s")
+                logger.warning(f"[RussianDC] WS desconectado: {e}. Recon en {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay); reconnect_delay = min(reconnect_delay*2, 60)
 
 # ─── FLASK & SELF-PING ───────────────────────────────────────────────────────
 app = Flask(__name__); engine: Optional[RussianRouletteEngine] = None
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Russian DC AMX Optimized"})
+def home(): return jsonify({"status": "ok", "bot": "Russian DC AMX PF+PH"})
 @app.route("/ping")
 def ping(): return jsonify({"status":"pong","ts":time.time()})
 @app.route("/health")
-def health(): return jsonify({"status":"healthy","warmup": engine.warmup_done if engine else False})
+def health(): return jsonify({"status":"healthy","warmup": engine.warmup_done if engine else False, "spins": len(engine.spin_history) if engine else 0})
 
 async def self_ping_loop():
     url = os.environ.get("RENDER_EXTERNAL_URL","").rstrip("/")
@@ -570,7 +586,7 @@ async def self_ping_loop():
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start','help'])
 def cmd_start(message):
-    bot.reply_to(message, "<b>🎰 Russian DC Bot (Optimized ML)</b>\n\nMotor: NB + SGD + Markov + AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
+    bot.reply_to(message, "<b>🎰 Russian DC Bot (PF+PH)</b>\n\nPF: Últimos 5 giros\nPH: Histórico último nº\nMotor: NB + SGD + Markov + AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
@@ -600,7 +616,7 @@ async def main():
     tasks = [asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop())]
     def _poll(): bot.polling(none_stop=True, interval=1, timeout=30)
     threading.Thread(target=_poll, daemon=True).start()
-    logger.info("🎰 Russian Roulette DC Optimized Bot iniciado")
+    logger.info("[RussianDC] 🎰 Bot iniciado — Esperando conexión WS...")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
