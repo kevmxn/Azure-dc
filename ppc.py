@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Russian Roulette — Bot de señales para Docenas y Columnas exclusivamente
-Sistema AMX · Ensemble ML (NB + SGD) + Markov Suavizado
-  - PF (Frecuencia últimos 5): Determina el par actual
-  - PH (Probabilidad Histórica): Determina el par más frecuente tras el último número
-  - Validación: PF debe coincidir con PH para confirmar
-  - Markov + ML + AMX predicen el 6° giro (Umbral 80%)
+Sistema PF + PH + ML
+  - PF (Frecuencia últimos 5): Peso 65% - Define las 2 más probables del bloque actual
+  - PH (Probabilidad Histórica): Peso 35% - Define las 2 más probables tras el último nº
+  - ML (Markov + NB + SGD + AMX): Predice probabilidad del par ausente
+  - Fusión PF+PH+ML. Umbral: 80%
 """
 
 import asyncio
@@ -244,7 +244,7 @@ class RussianRouletteEngine:
         self.dozen_seq: list = []; self.column_seq: list = []
         self.d_levels: dict[int, list] = {1:[], 2:[], 3:[]}; self.c_levels: dict[int, list] = {1:[], 2:[], 3:[]}
 
-        # Motores Optimizados
+        # Motores ML
         self.markov_d = SmoothedMarkovPredictor(window=60, order=2)
         self.markov_c = SmoothedMarkovPredictor(window=60, order=2)
         self.ensemble_d = OnlineEnsemblePredictor()
@@ -271,7 +271,7 @@ class RussianRouletteEngine:
         self.last_game_id: Optional[str] = None
         
         logger.info(f"[RussianDC] 📦 Pre-cargados: {live_loaded} live + {azure_loaded} azure = {total_preloaded} total")
-        logger.info(f"[RussianDC] 🔥 Warmup: {'✅ COMPLETADO' if self.warmup_done else f'⏳ Faltan {WARMUP_SPINS - total_preloaded} giros'}")
+        logger.info(f"[RussianDC] 🔥 Warmup: {'✅ COMPLETADO' if self.warmup_done else f'⏳ Faltan {WARMUP_SPINS - total_preloaded}'}")
 
     def current_bet(self) -> float:
         needed = self.cum_loss + BASE_BET; return round(max(needed, BASE_BET), 2)
@@ -288,7 +288,7 @@ class RussianRouletteEngine:
         except: return 0
         if not spins: return 0
         for n in spins: self._update_state(n, persist=False)
-        logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros de {db_path}")
+        logger.info(f"[RussianDC] 🔥 Pre-entrenado con {len(spins)} giros")
         return len(spins)
 
     def _load_live_history(self) -> int:
@@ -306,7 +306,7 @@ class RussianRouletteEngine:
     def _update_state(self, number: int, persist: bool = True):
         color = REAL_COLOR_MAP.get(number, "VERDE"); d = get_dozen(number); c = get_column(number)
         
-        # 1. Actualizar PH (Histórico del número anterior)
+        # 1. Actualizar PH
         if len(self.spin_history) >= 1:
             prev_num = self.spin_history[-1]["number"]
             if prev_num != 0 and number != 0:
@@ -315,7 +315,7 @@ class RussianRouletteEngine:
                 
         self.spin_history.append({"number":number,"color":color})
         
-        # 2. Actualizar Modelos Markov y ML (Para PF y predicción 6°)
+        # 2. Actualizar Modelos ML
         if d != 0:
             self.dozen_seq.append(d)
             for dd in (1,2,3):
@@ -334,62 +334,72 @@ class RussianRouletteEngine:
 
         if persist: self._persist(number)
 
-    # ── PF: Clasificación Frecuencia últimos 5 ────────────────────────────────
+    # ── PF: Top 2 Frecuencia en últimos 5 giros ──────────────────────────────
     def _calculate_pf(self) -> Optional[Dict]:
         if len(self.spin_history) < 5: return None
         last5 = self.spin_history[-5:]
-        if any(s["number"] == 0 for s in last5): return None
         
-        d_set = set(f"D{get_dozen(s['number'])}" for s in last5)
-        c_set = set(f"C{get_column(s['number'])}" for s in last5)
-        res = {"dozen_pf": None, "column_pf": None}
+        d_counts = {1:0, 2:0, 3:0}; c_counts = {1:0, 2:0, 3:0}
+        valid_spins = 0
+        for s in last5:
+            n = s["number"]
+            if n != 0:
+                d_counts[get_dozen(n)] += 1; c_counts[get_column(n)] += 1; valid_spins += 1
+                
+        if valid_spins < 3: return None # Muy pocos números válidos
         
-        if len(d_set) == 2: 
-            missing_d = ({"D1","D2","D3"} - d_set).pop()
-            res["dozen_pf"] = {"pair": list(d_set), "missing": missing_d}
-        if len(c_set) == 2: 
-            missing_c = ({"C1","C2","C3"} - c_set).pop()
-            res["column_pf"] = {"pair": list(c_set), "missing": missing_c}
-            
-        if not res["dozen_pf"] and not res["column_pf"]: return None
-        return res
+        d_sorted = sorted(d_counts.items(), key=lambda x: x[1], reverse=True)
+        c_sorted = sorted(c_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        return {
+            "dozen": {
+                "pair": (d_sorted[0][0], d_sorted[1][0]), 
+                "missing": d_sorted[2][0], 
+                "prob": (d_sorted[0][1] + d_sorted[1][1]) / 5.0
+            },
+            "column": {
+                "pair": (c_sorted[0][0], c_sorted[1][0]), 
+                "missing": c_sorted[2][0], 
+                "prob": (c_sorted[0][1] + c_sorted[1][1]) / 5.0
+            }
+        }
 
-    # ── PH: Probabilidad Histórica tras último número ─────────────────────────
-    def _get_ph_pair(self, last_number: int, cat_type: str) -> Optional[set]:
-        counts = self.after_number_dozen.get(last_number, {}) if cat_type == "DOCENA" else self.after_number_column.get(last_number, {})
-        if not counts: return None
+    # ── PH: Top 2 Histórico tras último número ───────────────────────────────
+    def _calculate_ph(self, last_num: int, cat_type: str) -> Optional[Dict]:
+        counts = self.after_number_dozen.get(last_num, {}) if cat_type == "DOCENA" else self.after_number_column.get(last_num, {})
+        total = sum(counts.values())
+        if total < 10: return None
         
         sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-        prefix = "D" if cat_type == "DOCENA" else "C"
+        if len(sorted_counts) < 2: return None
         
-        if len(sorted_counts) >= 2:
-            return set([f"{prefix}{sorted_counts[0][0]}", f"{prefix}{sorted_counts[1][0]}"])
-        elif len(sorted_counts) == 1:
-            return set([f"{prefix}{sorted_counts[0][0]}"])
-        return None
+        missing = sorted_counts[2][0] if len(sorted_counts) > 2 else 0
+        return {
+            "pair": (sorted_counts[0][0], sorted_counts[1][0]),
+            "missing": missing,
+            "prob": (sorted_counts[0][1] + sorted_counts[1][1]) / total
+        }
 
-    # ── Probabilidad Unificada (Markov + ML + AMX) ────────────────────────────
-    def _unified_prob(self, cat_type: str, missing_num: int, ph_match: bool) -> float:
+    # ── ML: Probabilidad del Par según Markov + Ensemble + AMX ───────────────
+    def _predict_pair_ml(self, cat_type: str, missing_num: int) -> float:
         mk = self.markov_d if cat_type == "DOCENA" else self.markov_c
         ens = self.ensemble_d if cat_type == "DOCENA" else self.ensemble_c
         hist = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
         levels = (self.d_levels if cat_type == "DOCENA" else self.c_levels).get(missing_num, [])
 
-        m_p = mk.predict(hist).get(missing_num, 1/3) if mk.predict(hist) else 1/3
-        ens_p = ens.predict(hist).get(missing_num, 1/3) if ens.predict(hist) else 1/3
-        prior = 1/3
-
-        raw_missing = 0.30*m_p + 0.60*ens_p + 0.10*prior
+        # Probabilidad de que salga la 'missing' (la que NO queremos)
+        m_p_miss = mk.predict(hist).get(missing_num, 1/3) if mk.predict(hist) else 1/3
+        ens_p_miss = ens.predict(hist).get(missing_num, 1/3) if ens.predict(hist) else 1/3
         
-        # AMX Trend Factor
+        ml_prob_missing = 0.5 * m_p_miss + 0.5 * ens_p_miss
+        
+        # Ajuste AMX: Si la tendencia es en contra del ausente, baja su probabilidad
         if len(levels) >= 20:
-            if ema_signal(levels, "tendencia"): raw_missing *= 0.95
-            elif ema_signal(levels, "moderado"): raw_missing *= 0.98
-
-        # Boost por confirmación PH
-        if ph_match: raw_missing *= 0.92  # Reduce la probabilidad del ausente, sube la del par
-
-        pair_prob = 1.0 - min(raw_missing, 0.99)
+            if ema_signal(levels, "tendencia"): ml_prob_missing *= 0.90
+            elif ema_signal(levels, "moderado"): ml_prob_missing *= 0.95
+            
+        # Probabilidad del Par = 1 - Probabilidad del Ausente
+        pair_prob = 1.0 - ml_prob_missing
         return pair_prob
 
     # ── Detección de señal (PF + PH + ML) ────────────────────────────────────
@@ -403,34 +413,47 @@ class RussianRouletteEngine:
         candidates = []
 
         # Evaluar Docenas
-        if pf_data["dozen_pf"]:
-            pf_pair = set(pf_data["dozen_pf"]["pair"])
-            ph_pair = self._get_ph_pair(last_num, "DOCENA")
+        pf_d = pf_data["dozen"]
+        ph_d = self._calculate_ph(last_num, "DOCENA")
+        
+        if ph_d and set(pf_d["pair"]) == set(ph_d["pair"]):
+            # Coincidencia PF y PH!
+            base_prob = (0.65 * pf_d["prob"]) + (0.35 * ph_d["prob"])
+            ml_pair_prob = self._predict_pair_ml("DOCENA", pf_d["missing"])
             
-            ph_match = bool(ph_pair and pf_pair == ph_pair)
+            # Fusión Final (50% Base Estadística + 50% Predicción ML)
+            final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
             
-            logger.info(f"[RussianDC] D PF:{pf_pair} | PH:{ph_pair} | Match:{ph_match}")
+            prefix = "D"
+            logger.info(f"[RussianDC] D PF:{set(pf_d['pair'])}({pf_d['prob']:.0%}) PH:{set(ph_d['pair'])}({ph_d['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Final:{final_prob:.0%}")
             
-            if ph_match:  # Solo proceder si PF y PH coinciden
-                missing_num = int(pf_data["dozen_pf"]["missing"][1])
-                prob = self._unified_prob("DOCENA", missing_num, True)
-                if prob >= MIN_PROB:
-                    candidates.append({"type":"DOCENA", "pair":tuple(sorted(pf_pair)), "missing":pf_data["dozen_pf"]["missing"], "prob":prob})
+            if final_prob >= MIN_PROB:
+                candidates.append({
+                    "type":"DOCENA", 
+                    "pair":tuple(f"{prefix}{x}" for x in sorted(pf_d["pair"])), 
+                    "missing":f"{prefix}{pf_d['missing']}", 
+                    "prob":final_prob
+                })
 
         # Evaluar Columnas
-        if pf_data["column_pf"]:
-            pf_pair = set(pf_data["column_pf"]["pair"])
-            ph_pair = self._get_ph_pair(last_num, "COLUMNA")
+        pf_c = pf_data["column"]
+        ph_c = self._calculate_ph(last_num, "COLUMNA")
+        
+        if ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
+            base_prob = (0.65 * pf_c["prob"]) + (0.35 * ph_c["prob"])
+            ml_pair_prob = self._predict_pair_ml("COLUMNA", pf_c["missing"])
+            final_prob = (0.5 * base_prob) + (0.5 * ml_pair_prob)
             
-            ph_match = bool(ph_pair and pf_pair == ph_pair)
+            prefix = "C"
+            logger.info(f"[RussianDC] C PF:{set(pf_c['pair'])}({pf_c['prob']:.0%}) PH:{set(ph_c['pair'])}({ph_c['prob']:.0%}) Base:{base_prob:.0%} ML:{ml_pair_prob:.0%} Final:{final_prob:.0%}")
             
-            logger.info(f"[RussianDC] C PF:{pf_pair} | PH:{ph_pair} | Match:{ph_match}")
-            
-            if ph_match:
-                missing_num = int(pf_data["column_pf"]["missing"][1])
-                prob = self._unified_prob("COLUMNA", missing_num, True)
-                if prob >= MIN_PROB:
-                    candidates.append({"type":"COLUMNA", "pair":tuple(sorted(pf_pair)), "missing":pf_data["column_pf"]["missing"], "prob":prob})
+            if final_prob >= MIN_PROB:
+                candidates.append({
+                    "type":"COLUMNA", 
+                    "pair":tuple(f"{prefix}{x}" for x in sorted(pf_c["pair"])), 
+                    "missing":f"{prefix}{pf_c['missing']}", 
+                    "prob":final_prob
+                })
 
         if not candidates: return None
         return max(candidates, key=lambda x: x["prob"])
@@ -500,7 +523,7 @@ class RussianRouletteEngine:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
             self.warmup_done = True
-            tg_send("🟢 <b>Russian Roulette DC</b> — Sistema PF+PH Listo.")
+            tg_send("🟢 <b>Russian Roulette DC</b> — Sistema PF+PH+ML Listo.")
             logger.info("[RussianDC] ✅ WARMUP COMPLETADO")
             
         if self.signal_active:
@@ -568,7 +591,7 @@ class RussianRouletteEngine:
 # ─── FLASK & SELF-PING ───────────────────────────────────────────────────────
 app = Flask(__name__); engine: Optional[RussianRouletteEngine] = None
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Russian DC AMX PF+PH"})
+def home(): return jsonify({"status": "ok", "bot": "Russian DC PF+PH+ML"})
 @app.route("/ping")
 def ping(): return jsonify({"status":"pong","ts":time.time()})
 @app.route("/health")
@@ -586,7 +609,7 @@ async def self_ping_loop():
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start','help'])
 def cmd_start(message):
-    bot.reply_to(message, "<b>🎰 Russian DC Bot (PF+PH)</b>\n\nPF: Últimos 5 giros\nPH: Histórico último nº\nMotor: NB + SGD + Markov + AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
+    bot.reply_to(message, "<b>🎰 Russian DC Bot (PF+PH+ML)</b>\n\nPF: Últimos 5 (65%)\nPH: Histórico último nº (35%)\nML: Markov+NB+SGD+AMX\nUmbral: 80%\n\n/status\n/stats\n/reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
