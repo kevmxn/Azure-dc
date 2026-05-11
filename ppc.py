@@ -7,8 +7,8 @@ Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
   - Apuesta base: 0.50 por docena/columna
   - Gestión: 6 niveles con 2 oportunidades (Gale #0 y Gale #1) por señal.
       · Gale #0 → apuesta = nivel × BASE_BET
-      · Gale #1 → apuesta = déficit hasta objetivo + BASE_BET
-  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel. Usa ficha base del nivel.
+      · Gale #1 → apuesta = 3 × (nivel × BASE_BET)  [Gestión conservadora x3]
+  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel.
   - EMPATE (cero): termina la señal, sin cambio de bankroll.
   - Pre-entrenamiento: tabla roulette_1 (russian-azure.db) — 16.597 giros
   - WS Key: 227
@@ -226,8 +226,15 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── GESTOR DOCENAS (CON GESTIÓN DE DEUDAS INTERNA) ──────────────────────────
+# ─── GESTOR DOCENAS (GESTIÓN X3 CONSERVADORA) ────────────────────────────────
 class GestorDocenas:
+    """
+    Gestión conservadora: 2° oportunidad siempre apuesta x3 del nivel.
+    Nivel 1: 1° 0.50, 2° 1.50
+    Nivel 2: 1° 1.00, 2° 3.00
+    Nivel 3: 1° 1.50, 2° 4.50 ... etc.
+    Si gana en 2° oportunidad, recupera lo perdido + beneficio del nivel.
+    """
     def __init__(self):
         self.nivel = 1
         self.oportunidad = 1
@@ -248,12 +255,8 @@ class GestorDocenas:
         if self.oportunidad == 1:
             return self.nivel * BASE_BET
         else:
-            target = self.get_target()
-            deficit = target - balance_actual
-            if deficit <= 0:
-                return BASE_BET
-            apuesta = max(BASE_BET, math.ceil(deficit / BASE_BET) * BASE_BET)
-            return apuesta
+            # NUEVA LÓGICA: 2° oportunidad siempre es x3 la ficha base del nivel
+            return 3 * self.nivel * BASE_BET
 
     def registrar_perdida_senal(self):
         self.debt_stack.append(self.b0)
@@ -301,7 +304,6 @@ class DetailedStats:
 
     def get_stats_text(self, bankroll: float) -> str:
         total = self.wins + self.zeros + self.losses
-        # Los empates (zeros) cuentan como aciertos para la Assertividade
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
         text  = "📊 RESUMEN DE SEÑALES 📊\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
@@ -488,7 +490,7 @@ class AzureRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
+        return (f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
                 f"🕹️ Roulette Azure\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
