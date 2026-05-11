@@ -117,7 +117,6 @@ def tg_send(text: str) -> Optional[int]:
     return msg.message_id if msg else None
 
 def tg_delete(chat_id: int, message_id: int):
-    """Intenta borrar un mensaje de Telegram silenciosamente."""
     try:
         _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
     except:
@@ -229,16 +228,12 @@ class OnlineEnsemblePredictor:
 
 # ─── GESTOR DOCENAS (CON GESTIÓN DE DEUDAS INTERNA) ──────────────────────────
 class GestorDocenas:
-    """
-    Gestor de apuestas a 2 docenas/columnas (pago neto: 1x apuesta por docena)
-    con recuperación progresiva en 6 niveles.
-    """
     def __init__(self):
         self.nivel = 1
-        self.oportunidad = 1  # 1 = Gale #0, 2 = Gale #1
+        self.oportunidad = 1
         self.max_nivel = MAX_NIVEL
         self.b0 = 0.0
-        self.debt_stack: list[float] = []  # Pila de B0 (balances antes de perder señal completa)
+        self.debt_stack: list[float] = []
 
     def iniciar_senal(self, balance_actual: float):
         self.b0 = balance_actual
@@ -306,7 +301,8 @@ class DetailedStats:
 
     def get_stats_text(self, bankroll: float) -> str:
         total = self.wins + self.zeros + self.losses
-        eff = (self.wins / total * 100) if total > 0 else 0.0
+        # Los empates (zeros) cuentan como aciertos para la Assertividade
+        eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
         text  = "📊 RESUMEN DE SEÑALES 📊\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
@@ -349,7 +345,7 @@ class AzureRouletteEngine:
         self._db = _get_db()
         self.spins_since_train = 0
         self.last_game_id = None
-        self.active_signal_msg_id = None  # ID del mensaje de Telegram para borrar si pierde Gale #0
+        self.active_signal_msg_id = None
 
         live_loaded  = self._load_live_history()
         azure_loaded = self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
@@ -492,11 +488,11 @@ class AzureRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"🎰 ENTRADA CONFIRMADA 🎰\n\n"
-                f"🎮 Roulette Azure\n"
+        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
+                f"🕹️ Roulette Azure\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
-                f"💸 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
+                f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
                 f"⚔️ Cubrir el CERO 🟢\n"
                 f"🛟 Max: 1 Gales")
 
@@ -509,11 +505,10 @@ class AzureRouletteEngine:
         d, c = get_dozen(number), get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
-        gale_num = self.gestor.oportunidad - 1  # 0 para Gale #0, 1 para Gale #1
+        gale_num = self.gestor.oportunidad - 1
 
         bet = self.gestor.apostar_por_docena(self.bankroll)
 
-        # ── EMPATE (CERO) ──────────────────────────────────────────────────
         if number == 0:
             tg_send(f"🟠 EMPATE {number} — ZERO — 🔄 GALE #{gale_num}\n"
                     f"🉑 Para la próxima ganaremos 0.00 🉑\n"
@@ -525,12 +520,9 @@ class AzureRouletteEngine:
         won = (type_str == "DOCENA" and d != 0 and f"D{d}" in self.active_pair) or \
               (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
 
-        # ── WIN ────────────────────────────────────────────────────────────
         if won:
             profit = bet
             self.bankroll = round(self.bankroll + profit, 2)
-            
-            # Verificar recuperación de deudas interna (silenciosa)
             self.gestor.verificar_recuperacion(self.bankroll)
 
             tg_send(f"✅ WIN {number} — {type_str} {val_num} — 🔄 GALE #{gale_num}\n"
@@ -540,31 +532,24 @@ class AzureRouletteEngine:
             self.stats.record('WIN', gale_num, number, val_num, type_str, self.bankroll)
             self._check_stats()
             self._reset_signal()
-            
-        # ── LOSS ───────────────────────────────────────────────────────────
         else:
             loss = bet * 2
             self.bankroll = round(self.bankroll - loss, 2)
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
-            if gale_num == 0:  # Perdió Gale #0
-                # Borrar el mensaje original de la 1° oportunidad en Telegram
+            if gale_num == 0:
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
                 
-                # Pasar a Gale #1 y enviar la señal actualizada (sin notificar la pérdida anterior)
                 self.gestor.oportunidad = 2
                 self._send_signal()
-                
-            else:  # Perdió Gale #1
+            else:
                 tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #1\n"
                         f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
                         f"💰 Balance actual: {self.bankroll:.2f}")
                 
                 self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll) 
-                
-                # Registrar deuda interna y subir de nivel silenciosamente
                 self.gestor.registrar_perdida_senal()
                     
                 self._check_stats()
