@@ -5,7 +5,7 @@ Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
   - Evaluación continua de las 6 señales pero SOLO envía si coincide con la Secuencia Fija.
   - Filtro de IA (Markov + Ensemble ML + AMX + Resonancia/Ruptura): Confianza >= 65%.
-  - Gestión Labouchere (Eliminación de extremos): Secuencia inicial [1, 2, 1].
+  - Gestión Labouchere (Eliminación de extremos): Secuencia inicial [$250, $500, $250].
   - 3 intentos máximos por ciclo de señal. Señal se actualiza dinámicamente.
   - Operación continua SIN sesiones ni límites de tiempo.
 """
@@ -146,6 +146,10 @@ def tg_delete(chat_id: int, message_id: int):
     try: _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
     except: pass
 
+# Función de formato monetario
+def fmt_money(val) -> str:
+    return f"${val:,.2f}"
+
 class SmoothedMarkovPredictor:
     def __init__(self, window: int = 60, order: int = 2):
         self.window = window; self.order = order
@@ -235,7 +239,6 @@ class AMXAnalyzer:
         cross_boost = 0.0
         target_cat = "COLOR" if target in ["ROJO", "NEGRO"] else ("PARIDAD" if target in ["PAR", "IMPAR"] else "ZONA")
         
-        # 1. Impulsos Cruzados (Correlaciones entre categorías)
         if target_cat == "COLOR":
             p_par = predictions.get("PARIDAD", {}).get("PAR", 0.5)
             p_may = predictions.get("ZONA", {}).get("MAYOR", 0.5)
@@ -252,8 +255,6 @@ class AMXAnalyzer:
             if target == "MENOR" and p_par > 0.55: cross_boost += 0.02
             if target == "MAYOR" and p_rojo > 0.55: cross_boost += 0.02
             
-        # 2. NUEVO: Resonancia de Secuencia (Sincronización de patrones)
-        # Verificamos si los últimos giros coincidieron con los pasos previos de la secuencia
         matches = 0
         check_depth = min(3, len(recent_hist), seq_state.idx)
         for i in range(1, check_depth + 1):
@@ -263,29 +264,27 @@ class AMXAnalyzer:
             if hist_val == seq_val:
                 matches += 1
             else:
-                break # Se rompió la sincronía
+                break
                 
         if matches == 1: cross_boost += 0.03
         elif matches == 2: cross_boost += 0.07
-        elif matches >= 3: cross_boost += 0.12 # Alta probabilidad de cambio direccional o continuidad confirmada
+        elif matches >= 3: cross_boost += 0.12 
         
-        # 3. NUEVO: Impulso de Ruptura (Cambio de Dirección)
-        # Si hay racha de 2 y la secuencia espera el opuesto (ruptura)
         if len(recent_hist) >= 2:
             last1 = recent_hist[-1]
             last2 = recent_hist[-2]
             if last1 == last2 and last1 != "CERO" and last1 != target:
-                cross_boost += 0.04 # La secuencia está diseñada para atrapar la ruptura
+                cross_boost += 0.04 
                 
         return min(1.0, base_prob + cross_boost)
 
 class Labouchere:
     def __init__(self):
-        self.base_seq = [1, 2, 1]
+        self.base_seq = [250, 500, 250]  # Cantidades en dólares ($250 base)
         self.seq = list(self.base_seq)
         
     def get_bet(self) -> int:
-        if not self.seq: return 1
+        if not self.seq: return 250
         if len(self.seq) == 1: return self.seq[0]
         return self.seq[0] + self.seq[-1]
         
@@ -330,7 +329,7 @@ class GlobalStats:
         self.consecutive = 0
         self.last_20 = deque(maxlen=20)
         self.signals_processed = 0
-        self.global_chips: int = 0
+        self.global_chips: int = 0  # Ahora representa dólares
         self.last_report_signals = 0
 
     def record(self, result_type: str, attempt: int, number: int, val, type_str: str, roulette_name: str):
@@ -361,12 +360,12 @@ class GlobalStats:
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Bankroll Global: 🪙 {self.global_chips}\n"
+        text += f"► Bankroll Global: 🪙 {fmt_money(self.global_chips)}\n"
         text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 INTENTO #{s['attempt']}"
-            b_str = f"🪙 +{s['val']} FICHAS" if s['result'] == 'WIN' else f"🪙 -{s['val']} FICHAS"
+            b_str = f"🪙 +{fmt_money(s['val'])}" if s['result'] == 'WIN' else f"🪙 -{fmt_money(s['val'])}"
             if s['result'] == 'WIN':
                 text += f"✅ WIN #{s['number']} {s['type']} | {a_str} | {b_str}\n"
             elif s['result'] == 'EMPATE':
@@ -503,7 +502,6 @@ class RouletteEngine:
             base_prob = predictions[cat].get(seq_target, 0)
             hist = getattr(self, f"hist_{cat.lower()}")
             
-            # Pasamos el historial y el estado de la secuencia al analizador AMX mejorado
             final_prob = self.amx.adjust_probability(base_prob, seq_target, predictions, hist, self.seq_states[cat])
             
             if final_prob >= MIN_PROB:
@@ -543,11 +541,12 @@ class RouletteEngine:
             f"✅ SEÑAL CONFIRMADA — {target_display} ✅\n\n"
             f"🎰 {self.name}\n"
             f"👉 INGRESAR DESPUÉS DE: {last_num}\n"
-            f"♦️ ENTRAR EN: {target_display}\n"
-            f"🔸 APUESTA: {self.active_chips} — FICHAS\n"
-            f"🔹 Intento: {self.attempt}/3\n\n"
-            f"💡 Probabilidad de Patrón — {self._last_signal_prob:.1f}%\n"
-            f"🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
+            f"♦️ ENTRAR EN: {target_display}\n\n"
+            f"🔸 APUESTA: {fmt_money(self.active_chips)}\n"
+            f"🔹 INTENTO: {self.attempt} de 3\n"
+            f"💰 Secuencia Labouchere: {[fmt_money(x) for x in self.labouchere.seq]}\n\n"
+            f"💡 Probabilidad: {self._last_signal_prob:.1f}%\n"
+            f"📈 Ganancias Globales: 🪙 {fmt_money(GLOBAL_STATS.global_chips)}"
         )
 
     def send_signal(self):
@@ -588,7 +587,7 @@ class RouletteEngine:
         if won:
             seq_completed = self.labouchere.win()
             GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
-            msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {current_bet} fichas!\n🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
+            msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_money(current_bet)}!\n📈 Ganancias Globales: 🪙 {fmt_money(GLOBAL_STATS.global_chips)}"
             if seq_completed:
                 msg += "\n🏆 Secuencia Labouchere completada. Reiniciando..."
             tg_send(msg)
@@ -607,9 +606,9 @@ class RouletteEngine:
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 if is_zero:
-                    msg = f"🟠 EMPATE 0 — ZERO — {self.active_type}\n🚨 Cero caído. Pérdida de {current_bet} fichas.\n🚨 Racha de 3 intentos perdida.\n🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
+                    msg = f"🟠 EMPATE 0 — ZERO — {self.active_type}\n🚨 Cero caído. Pérdida de {fmt_money(current_bet)}.\n🚨 Racha de 3 intentos perdida.\n📈 Ganancias Globales: 🪙 {fmt_money(GLOBAL_STATS.global_chips)}"
                 else:
-                    msg = f"❌ LOSS TOTAL {number} — {self.active_type}\n🚨 Racha de 3 intentos perdida.\n🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
+                    msg = f"❌ LOSS TOTAL {number} — {self.active_type}\n🚨 Racha de 3 intentos perdida.\n📈 Ganancias Globales: 🪙 {fmt_money(GLOBAL_STATS.global_chips)}"
                 tg_send(msg)
                 self.attempt = 1
                 self._check_stats()
@@ -653,7 +652,7 @@ class RouletteEngine:
 
             logger.info(
                 f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {c[:3]} {p[:3]} {z[:3]} "
-                f"| {warmup_tag} | 🪙{GLOBAL_STATS.global_chips}"
+                f"| {warmup_tag} | 🪙{fmt_money(GLOBAL_STATS.global_chips)}"
             )
         except Exception as e:
             logger.error(f"[{self.name}] Error en feed_number: {e}", exc_info=True)
@@ -856,13 +855,13 @@ async def daily_stats_loop():
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nSecuencias Fijas + IA >= 65% (Resonancia/Ruptura)\nLabouchere [1, 2, 1] (3 intentos dinámicos)\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nSecuencias Fijas + IA >= 65% (Resonancia/Ruptura)\nLabouchere [$250, $500, $250] (3 intentos dinámicos)\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
     if not engines_global: return
     engine = engines_global[0]
-    bot.reply_to(m, f"<b>Ruleta:</b> {engine.name}\n<b>Señal activa:</b> {'🟢 Sí' if engine.signal_active else '⚪ No'}\n<b>Bankroll Global:</b> 🪙 {GLOBAL_STATS.global_chips}\n<b>Secuencia Labouchere:</b> {engine.labouchere.seq}\n<b>Intento actual:</b> {engine.attempt}/3", parse_mode="HTML")
+    bot.reply_to(m, f"<b>Ruleta:</b> {engine.name}\n<b>Señal activa:</b> {'🟢 Sí' if engine.signal_active else '⚪ No'}\n<b>Bankroll Global:</b> 🪙 {fmt_money(GLOBAL_STATS.global_chips)}\n<b>Secuencia Labouchere:</b> {[fmt_money(x) for x in engine.labouchere.seq]}\n<b>Intento actual:</b> {engine.attempt}/3", parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(m):
