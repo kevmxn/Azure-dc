@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-Speed Roulette 2 — Bot de señales Híbrido (Secuencias + ML + AMX)
+Speed Roulette 2 — Bot de señales Híbrido (ML + AMX + Labouchere)
 Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
-  - Secuencia fija de 15 pasos AVANZANDO EN CADA GIRO (Inicio: Paridad=PAR, Zona=MENOR).
-  - Inicialización inteligente desde historial (Último NEGRO, IMPAR, MAYOR).
+  - Evaluación continua de las 6 señales (ROJO, NEGRO, PAR, IMPAR, MENOR, MAYOR).
   - Filtro de IA (Markov + Ensemble ML + AMX): Solo apuesta si la confianza >= 60%.
-  - Mensaje de Análisis en pérdidas (se elimina al detectar nueva señal).
-  - Gestión D'Alembert: Win: -1 ficha (mín 5). Loss/Zero: +1 ficha (máx 20).
-  - 5 intentos máximos por racha.
-  - Meta por sesión: Llegar a +5 fichas de profit.
-  - SIN LÍMITE de señales hasta llegar a la meta.
-  - Sesiones estrictamente sincronizadas al reloj: Cierre en :25/:55, Inicio en :00/:30.
-  - Cada sesión rota la categoría (Color -> Paridad -> Zona -> Color...).
+  - Gestión Labouchere (Eliminación de extremos): Secuencia inicial [5, 10, 5].
+  - 3 intentos máximos por ciclo de señal.
+  - Mensaje de Análisis al ganar señal, perder ciclo o esperar nueva señal.
+  - Operación continua SIN sesiones ni límites de tiempo.
 """
 
 import asyncio
@@ -87,17 +83,10 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL              = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID           = "ppcjd00000007254"
-SESSION_ACTIVE_MINS = 25
 WARMUP_SPINS        = 25
 MIN_PROB            = 0.60
 TRAIN_INTERVAL      = 50
-SIGNAL_WAIT_TIMEOUT = 120
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
-TARGET_PROFIT       = 5
-
-SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
-SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
-SEQUENCE_ZONA    = ["MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR"]
 
 EMOJI_MAP = {
     "ROJO": "🔴", "NEGRO": "⚫️", 
@@ -117,8 +106,6 @@ COLOR_MAP: dict = {
 
 PARIDAD_MAP: dict = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
 ZONA_MAP: dict = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
-
-CATEGORIES = ["COLOR", "PARIDAD", "ZONA"]
 
 _ws_clients: Set[asyncio.Queue] = set()
 
@@ -154,12 +141,6 @@ def tg_send_stats(text: str) -> Optional[int]:
 
 def tg_delete(chat_id: int, message_id: int):
     try: _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
-    except: pass
-
-def tg_edit(chat_id: int, message_id: int, text: str):
-    try:
-        _tg_call(bot.edit_message_text, text=text, chat_id=chat_id,
-                 message_id=message_id, parse_mode="HTML")
     except: pass
 
 class SmoothedMarkovPredictor:
@@ -267,38 +248,30 @@ class AMXAnalyzer:
             if target == "MAYOR" and p_rojo > 0.55: cross_boost += 0.02
         return min(1.0, base_prob + cross_boost)
 
-class SequenceState:
-    def __init__(self, category: str):
-        self.category = category
-        self.sequence = SEQUENCE_COLOR if category == "COLOR" else (SEQUENCE_PARIDAD if category == "PARIDAD" else SEQUENCE_ZONA)
-        self.idx = 0
-        self.attempt = 1
-        self.chips = 5
-
-    def advance(self):
-        self.idx = (self.idx + 1) % len(self.sequence)
-
-    def expected(self) -> str:
-        return self.sequence[self.idx]
-
-    def initialize_from_last_value(self, last_val: str):
-        try:
-            idx = self.sequence.index(last_val)
-            self.idx = (idx + 1) % len(self.sequence)
-            logger.info(f"[SeqInit] {self.category}: Último {last_val} encontrado. Índice establecido a {self.idx} (Próximo: {self.expected()})")
-        except ValueError:
-            self.idx = 0
-
-    def win(self):
-        self.chips = max(5, self.chips - 1)
-        self.attempt = 1
-
-    def loss(self):
-        self.chips = min(20, self.chips + 1)
-        if self.attempt >= 5:
-            self.attempt = 1
-        else:
-            self.attempt += 1
+class Labouchere:
+    def __init__(self):
+        self.base_seq = [5, 10, 5]
+        self.seq = list(self.base_seq)
+        
+    def get_bet(self) -> int:
+        if not self.seq: return 5
+        if len(self.seq) == 1: return self.seq[0]
+        return self.seq[0] + self.seq[-1]
+        
+    def win(self) -> bool:
+        if len(self.seq) >= 2:
+            self.seq.pop(0)
+            self.seq.pop(-1)
+        elif len(self.seq) == 1:
+            self.seq.pop(0)
+            
+        if not self.seq:
+            self.seq = list(self.base_seq)
+            return True
+        return False
+        
+    def loss(self, bet: int):
+        self.seq.append(bet)
 
 class GlobalStats:
     def __init__(self):
@@ -364,22 +337,21 @@ class RouletteEngine:
         self.spin_history: list = []
         self.hist_color: list = []; self.hist_paridad: list = []; self.hist_zona: list = []
         
-        self.seq_states = {cat: SequenceState(cat) for cat in CATEGORIES}
-        self.active_category_idx = 0
-        self.session_start_chips = 0
+        self.labouchere = Labouchere()
+        self.attempt = 1
+        self.analyzing_msg_id = None
 
-        self.markov = {cat: SmoothedMarkovPredictor() for cat in CATEGORIES}
+        self.markov = {cat: SmoothedMarkovPredictor() for cat in ["COLOR", "PARIDAD", "ZONA"]}
         self.ensemble = OnlineEnsemblePredictor()
         self.amx = AMXAnalyzer()
         
         self.signal_active     = False
         self.active_type       = None
         self.active_target     = ""
+        self.active_chips      = 0
         self._last_signal_prob = 0.0
         self.active_signal_msg_id = None
-        self.analyzing_msg_id  = None
         self.spins_since_train = 0
-        self.last_game_id      = None
         self.ws_count          = 0
         self.warmup_done       = False
 
@@ -388,13 +360,6 @@ class RouletteEngine:
         self.ws_count    = live
         self.warmup_done = live >= WARMUP_SPINS
         logger.info(f"[{name}] Pre-cargados: {live} giros | Warmup: {'✅' if self.warmup_done else '⏳'}")
-
-    @property
-    def current_category(self) -> str:
-        return CATEGORIES[self.active_category_idx]
-
-    def rotate_category(self):
-        self.active_category_idx = (self.active_category_idx + 1) % len(CATEGORIES)
 
     def _get_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -417,26 +382,11 @@ class RouletteEngine:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
         for (n,) in rows: self._update_state(n, persist=False, train_model=False)
-        if rows: 
-            self._train_models()
-            self.initialize_sequences_from_history()
+        if rows: self._train_models()
         return len(rows)
 
-    def initialize_sequences_from_history(self):
-        last_negro = next((s for s in reversed(self.spin_history) if s["color"] == "NEGRO"), None)
-        if last_negro:
-            self.seq_states["COLOR"].initialize_from_last_value("NEGRO")
-            
-        last_impar = next((s for s in reversed(self.spin_history) if s["paridad"] == "IMPAR"), None)
-        if last_impar:
-            self.seq_states["PARIDAD"].initialize_from_last_value("IMPAR")
-            
-        last_mayor = next((s for s in reversed(self.spin_history) if s["zona"] == "MAYOR"), None)
-        if last_mayor:
-            self.seq_states["ZONA"].initialize_from_last_value("MAYOR")
-
     def _train_models(self):
-        for cat in CATEGORIES:
+        for cat in ["COLOR", "PARIDAD", "ZONA"]:
             hist = getattr(self, f"hist_{cat.lower()}")
             self.markov[cat].update(hist)
 
@@ -444,9 +394,6 @@ class RouletteEngine:
         c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
         self.spin_history.append({"number": number, "color": c, "paridad": p, "zona": z})
         self.hist_color.append(c); self.hist_paridad.append(p); self.hist_zona.append(z)
-        
-        for cat in CATEGORIES:
-            self.seq_states[cat].advance()
 
         if train_model and number != 0 and len(self.hist_color) > 5:
             self.ensemble.partial_train(self.hist_color, self.hist_paridad, self.hist_zona, c, p, z)
@@ -458,7 +405,7 @@ class RouletteEngine:
 
     def _get_predictions(self, cat: str) -> dict:
         hist = getattr(self, f"hist_{cat.lower()}")
-        classes = getattr(self.ensemble, f"CLASSES_{cat.upper()}")
+        classes = getattr(self, f"CLASSES_{cat.upper()}")
         mk_pred = self.markov[cat].predict(hist, classes)
         mk_probs = mk_pred if mk_pred else {c: 1/3 for c in classes}
         ens_probs = self.ensemble.predict(self.hist_color, self.hist_paridad, self.hist_zona, cat)
@@ -469,56 +416,76 @@ class RouletteEngine:
         return final_probs
 
     def detect_signal(self) -> Optional[dict]:
-        cat = self.current_category
-        state = self.seq_states[cat]
-        target = state.expected()
-        predictions = {c: self._get_predictions(c) for c in CATEGORIES}
-        base_prob = predictions[cat].get(target, 0)
-        final_prob = self.amx.adjust_probability(base_prob, target, predictions)
-        if final_prob >= MIN_PROB:
-            return {"type": cat, "target": target, "prob": final_prob, "chips": state.chips, "attempt": state.attempt}
+        predictions = {c: self._get_predictions(c) for c in ["COLOR", "PARIDAD", "ZONA"]}
+        all_preds = {}
+        
+        targets = {
+            "COLOR": ["ROJO", "NEGRO"],
+            "PARIDAD": ["PAR", "IMPAR"],
+            "ZONA": ["MENOR", "MAYOR"]
+        }
+        
+        for cat, tgts in targets.items():
+            for t in tgts:
+                base_prob = predictions[cat].get(t, 0)
+                final_prob = self.amx.adjust_probability(base_prob, t, predictions)
+                all_preds[t] = final_prob
+                
+        if not all_preds: return None
+        
+        best_target = max(all_preds, key=all_preds.get)
+        best_prob = all_preds[best_target]
+        
+        cat_map = {
+            "ROJO": "COLOR", "NEGRO": "COLOR",
+            "PAR": "PARIDAD", "IMPAR": "PARIDAD",
+            "MENOR": "ZONA", "MAYOR": "ZONA"
+        }
+        best_cat = cat_map[best_target]
+        
+        if best_prob >= MIN_PROB:
+            return {"type": best_cat, "target": best_target, "prob": best_prob, "chips": self.labouchere.get_bet()}
         return None
 
     def _build_signal_text(self) -> str:
         last_num = self.spin_history[-1]["number"] if self.spin_history else 0
-        cat = self.active_type
         target = self.active_target
-        state = self.seq_states[cat]
-        session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
-        
-        last_spin = self.spin_history[-1]
-        last_val = last_spin.get("color") if cat=="COLOR" else (last_spin.get("paridad") if cat=="PARIDAD" else last_spin.get("zona"))
-        last_emoji = EMOJI_MAP.get(last_val, "")
         target_emoji = EMOJI_MAP.get(target, "")
         
         target_display = target
-        if cat == "ZONA":
-            target_display = f"MENOR (1-18) {target_emoji}" if target == "MENOR" else f"MAYOR (19-36) {target_emoji}"
-        elif cat == "PARIDAD":
-            target_display = f"PARES {target_emoji}" if target == "PAR" else f"IMPARES {target_emoji}"
+        if target == "MENOR":
+            target_display = f"MENOR (1-18) {target_emoji}"
+        elif target == "MAYOR":
+            target_display = f"MAYOR (19-36) {target_emoji}"
+        elif target == "PAR":
+            target_display = f"PARES {target_emoji}"
+        elif target == "IMPAR":
+            target_display = f"IMPARES {target_emoji}"
         else:
             target_display = f"{target} {target_emoji}"
 
         return (
-            f"✅ SEÑAL CONFIRMADA — {cat} ✅\n\n"
+            f"✅ SEÑAL CONFIRMADA — {target_display} ✅\n\n"
             f"🎰 {self.name}\n"
-            f"👉 INGRESAR DESPUÉS DE: {last_num} {last_emoji}\n"
+            f"👉 INGRESAR DESPUÉS DE: {last_num}\n"
             f"♦️ ENTRAR EN: {target_display}\n"
-            f"🔸 APUESTA: {state.chips} — FICHAS\n\n"
+            f"🔸 APUESTA: {self.active_chips} — FICHAS\n"
+            f"🔹 Intento: {self.attempt}/3\n\n"
             f"💡 Probabilidad de Patrón — {self._last_signal_prob:.1f}%\n"
-            f"🪙 Balance sesión: {session_profit:+d} fichas"
+            f"🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
         )
 
     def send_signal(self):
+        if self.active_signal_msg_id:
+            tg_delete(CHAT_ID, self.active_signal_msg_id)
+            
         msg_id = tg_send(self._build_signal_text())
         if msg_id: self.active_signal_msg_id = msg_id
-        state = self.seq_states[self.active_type]
-        session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
         queue_broadcast({
             "type": "signal", "roulette": self.name, "signal_type": self.active_type,
             "target": self.active_target, "prob": round(self._last_signal_prob, 2),
-            "attempt": state.attempt, "chips": state.chips, "category": self.active_type,
-            "session_profit": session_profit
+            "attempt": self.attempt, "chips": self.active_chips, "category": self.active_type,
+            "bankroll": GLOBAL_STATS.global_chips
         })
 
     def iniciar_senal(self, sig: dict):
@@ -530,61 +497,68 @@ class RouletteEngine:
         self.active_type       = sig["type"]
         self.active_target     = sig["target"]
         self._last_signal_prob = sig["prob"] * 100
+        self.active_chips      = sig["chips"]
+        self.attempt           = 1
         self.send_signal()
         logger.info(f"[{self.name}] 🎯 SEÑAL {sig['type']} {sig['target']} ({sig['prob']:.0%})")
 
     def resolve(self, number: int) -> bool:
         c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
         actual_val = c if self.active_type == "COLOR" else (p if self.active_type == "PARIDAD" else z)
-        state = self.seq_states[self.active_type]
         
         won = (actual_val == self.active_target)
         is_zero = (number == 0)
-
-        current_bet = state.chips
+        current_bet = self.active_chips
 
         if is_zero:
-            state.loss() 
-            GLOBAL_STATS.record('EMPATE', state.attempt, number, current_bet, self.active_type, self.name)
-            session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
-            tg_send(f"🟠 EMPATE 0 — ZERO — {self.active_type}\n🚨 Cero caído. Pérdida de {current_bet} fichas.\n🪙 Balance sesión: {session_profit:+d} fichas")
+            self.labouchere.loss(current_bet)
+            GLOBAL_STATS.record('EMPATE', self.attempt, number, current_bet, self.active_type, self.name)
             
-            if session_profit < TARGET_PROFIT:
-                if self.analyzing_msg_id:
-                    tg_delete(CHAT_ID, self.analyzing_msg_id)
-                self.analyzing_msg_id = tg_send("🚨 ANALIZADO PATRONES EN CADA GIRO 🚨")
-
-            self._check_stats(); self._reset_signal()
-            return True
+            if self.attempt < 3:
+                self.attempt += 1
+                tg_send(f"🟠 EMPATE 0 — ZERO — {self.active_target}\n🚨 Cero caído. Pérdida de {current_bet} fichas. Intento #{self.attempt}/3")
+                return False
+            else:
+                tg_send(f"🟠 EMPATE 0 — ZERO — {self.active_target}\n🚨 Racha de 3 intentos perdida.")
+                self.attempt = 1
+                self._check_stats()
+                self._send_analyzing_msg()
+                self._reset_signal()
+                return True
 
         if won:
-            state.win() 
-            GLOBAL_STATS.record('WIN', state.attempt, number, current_bet, self.active_type, self.name)
-            session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
-            tg_send(f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {current_bet} fichas!\n🪙 Balance sesión: {session_profit:+d} fichas")
-            self._check_stats(); self._reset_signal()
+            seq_completed = self.labouchere.win()
+            GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
+            msg = f"✅ WIN {number} — {self.active_target}\n🎉 ¡Ganaste {current_bet} fichas! (Intento #{self.attempt}/3)"
+            if seq_completed:
+                msg += "\n🏆 Secuencia Labouchere completada. Reiniciando..."
+            tg_send(msg)
+            self.attempt = 1
+            self._check_stats()
+            self._send_analyzing_msg()
+            self._reset_signal()
             return True
         else:
-            state.loss()
-            attempt_for_record = state.attempt if state.attempt > 1 else 5
-            GLOBAL_STATS.record('LOSS', attempt_for_record, number, current_bet, self.active_type, self.name)
-            session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
-
-            if session_profit < TARGET_PROFIT:
-                if self.analyzing_msg_id:
-                    tg_delete(CHAT_ID, self.analyzing_msg_id)
-                self.analyzing_msg_id = tg_send("🚨 ANALIZADO PATRONES EN CADA GIRO 🚨")
-
-            if state.attempt == 1:
-                tg_send(f"❌ LOSS TOTAL {number} — {self.active_type}\n🚨 Racha de 5 intentos perdida.\n🪙 Balance sesión: {session_profit:+d} fichas")
-                self._check_stats(); self._reset_signal()
-                return True
-            else:
-                if self.active_signal_msg_id:
-                    tg_delete(CHAT_ID, self.active_signal_msg_id)
-                    self.active_signal_msg_id = None
-                self.signal_active = False 
+            self.labouchere.loss(current_bet)
+            
+            if self.attempt < 3:
+                self.attempt += 1
+                GLOBAL_STATS.record('LOSS', self.attempt, number, current_bet, self.active_type, self.name)
+                tg_send(f"❌ LOSS {number} — {self.active_target}\nIntento #{self.attempt - 1} fallido. Próximo intento...")
                 return False
+            else:
+                GLOBAL_STATS.record('LOSS', self.attempt, number, current_bet, self.active_type, self.name)
+                tg_send(f"❌ LOSS TOTAL {number} — {self.active_target}\n🚨 Racha de 3 intentos perdida.")
+                self.attempt = 1
+                self._check_stats()
+                self._send_analyzing_msg()
+                self._reset_signal()
+                return True
+
+    def _send_analyzing_msg(self):
+        if self.analyzing_msg_id:
+            tg_delete(CHAT_ID, self.analyzing_msg_id)
+        self.analyzing_msg_id = tg_send("🚨 ANALIZADO PATRONES EN CADA GIRO 🚨")
 
     def _check_stats(self):
         if not GLOBAL_STATS.should_send(): return
@@ -597,215 +571,48 @@ class RouletteEngine:
         self.active_target     = ""
         self.active_signal_msg_id = None
         self._last_signal_prob = 0.0
+        self.active_chips      = 0
 
-    def feed_number(self, number: int, active: bool = False):
+    def feed_number(self, number: int):
         try:
-            self._feed_inner(number, active)
+            c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
+            spin_n = len(self.spin_history) + 1
+            self._update_state(number)
+
+            if not self.warmup_done:
+                self.ws_count += 1
+                warmup_tag = f"⏳ warmup {self.ws_count}/{WARMUP_SPINS}"
+                if self.ws_count >= WARMUP_SPINS:
+                    self.warmup_done = True
+                    warmup_tag = "✅ WARMUP listo"
+                    tg_send("🟢 <b>Speed Roulette 2</b> — Sistema Híbrido Listo.")
+            else:
+                warmup_tag = "✔"
+
+            logger.info(
+                f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {c[:3]} {p[:3]} {z[:3]} "
+                f"| {warmup_tag} | 🪙{GLOBAL_STATS.global_chips}"
+            )
         except Exception as e:
             logger.error(f"[{self.name}] Error en feed_number: {e}", exc_info=True)
             self._reset_signal()
 
-    def _feed_inner(self, number: int, active: bool = False):
-        c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
-        tag = "🟢 ACTIVA" if active else "⚫ pasiva"
-        spin_n = len(self.spin_history) + 1
-        self._update_state(number)
-
-        if not self.warmup_done:
-            self.ws_count += 1
-            warmup_tag = f"⏳ warmup {self.ws_count}/{WARMUP_SPINS}"
-            if self.ws_count >= WARMUP_SPINS:
-                self.warmup_done = True
-                warmup_tag = "✅ WARMUP listo"
-                tg_send("🟢 <b>Speed Roulette 2</b> — Sistema Híbrido Listo.")
+    def process_spin(self, number: int):
+        self.feed_number(number)
+        
+        if self.signal_active:
+            finished_cycle = self.resolve(number)
+            if not finished_cycle:
+                self.active_chips = self.labouchere.get_bet()
+                self.send_signal()
         else:
-            warmup_tag = "✔"
-
-        session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
-        logger.info(
-            f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {c[:3]} {p[:3]} {z[:3]} "
-            f"| {tag} | {warmup_tag} | Cat: {self.current_category} | 🪙{session_profit:+d}"
-        )
-
-class SessionManager:
-    ARG_UTC_OFFSET = -3
-
-    def __init__(self):
-        self.engines: list[RouletteEngine] = [
-            RouletteEngine(r["key"], r["name"]) for r in ROULETTES
-        ]
-        self.current_idx          = 0
-        self.session_start        = 0.0
-        self.session_active       = False
-        self.signals_this_session = 0
-        self.session_start_chips  = 0
-
-        self.prev_start_msg_id: Optional[int] = None
-        self.prev_end_msg_id:   Optional[int] = None
-        logger.info("[SessionManager] Iniciado — Reloj Estricto (:00/:30 Inicio, :25/:55 Cierre)")
-
-    def _now_arg(self):
-        import datetime
-        return datetime.datetime.utcnow() + datetime.timedelta(hours=self.ARG_UTC_OFFSET)
-
-    def seconds_to_next_slot(self) -> float:
-        import datetime
-        now = self._now_arg()
-        if now.second <= 5 and now.minute in (0, 30):
-            return 0.0
-        if now.minute < 30:
-            target = now.replace(minute=30, second=0, microsecond=0)
-        else:
-            target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        return max(0.0, (target - now).total_seconds())
-
-    def _start_session(self):
-        import datetime
-        self.current_idx = (self.current_idx + 1) % len(self.engines)
-        self.session_start        = time.time()
-        self.session_active       = True
-        self.signals_this_session = 0
-        
-        engine  = self.engines[self.current_idx]
-        engine.rotate_category()
-        
-        self.session_start_chips = GLOBAL_STATS.global_chips
-        engine.session_start_chips = self.session_start_chips
-        
-        now_str = self._now_arg().strftime("%H:%M")
-        logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | Cat: {engine.current_category} | Bankroll Inicio: {self.session_start_chips}")
-
-        if self.prev_start_msg_id:
-            tg_delete(CHAT_ID, self.prev_start_msg_id)
-            self.prev_start_msg_id = None
-
-        msg_id = tg_send(
-            f"🔔 SESION INICIADA — {engine.current_category} 🔔\n"
-            f"🪙 Meta: Llegar a 5 fichas"
-        )
-        self.prev_start_msg_id = msg_id
-
-        queue_broadcast({
-            "type": "session", "status": "started", "roulette": engine.name,
-            "category": engine.current_category, "remaining": SESSION_ACTIVE_MINS * 60,
-            "signals_count": 0, "session_profit": 0,
-            "target_chips": self.session_start_chips + TARGET_PROFIT
-        })
-
-    def _end_session(self):
-        engine    = self.engines[self.current_idx]
-        next_idx  = (self.current_idx + 1) % len(self.engines)
-        next_name = self.engines[next_idx].name
-        
-        current_cat = engine.current_category
-        next_cat_idx = (engine.active_category_idx + 1) % len(CATEGORIES)
-        next_cat = CATEGORIES[next_cat_idx]
-        
-        logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name}")
-        self.session_active = False
-
-        if self.prev_end_msg_id:
-            tg_delete(CHAT_ID, self.prev_end_msg_id)
-            self.prev_end_msg_id = None
-
-        text = (
-            f"⏸ SESIÓN CERRADA — {current_cat}\n"
-            f"🎰 PRÓXIMA CATEGORIA — {next_cat} 🎰\n\n"
-            f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
-            f"1° Op. = 5 FICHAS MÍNIMO\n"
-            f"2° Op. = D'ALEMBERT (+1 FICHA)\n"
-            f"Máximo 5 intentos por racha\n\n"
-            f"🎯 FUNCIONAMIENTO DE LAS SEÑALES 🎯\n\n"
-            f"  • Se envían si IA confiable >= 60%\n"
-            f"  • Sesión se cierra → Ej: 12:25 o 12:55\n"
-            f"  • Meta por sesión: +5 FICHAS\n"
-            f"  • SIN LÍMITE de señales hasta llegar a la meta\n\n"
-            f"♦️ SE ESTA USANDO — {engine.name} ♦️"
-        )
-        msg_id = tg_send_with_button(text, next_name)
-        self.prev_end_msg_id = msg_id
-
-        queue_broadcast({
-            "type": "session", "status": "ended", "roulette": engine.name,
-            "next_roulette": next_name, "remaining": 0,
-            "signals_count": self.signals_this_session
-        })
-
-    async def session_watchdog(self):
-        wait = self.seconds_to_next_slot()
-        logger.info(f"[SessionManager] ⏳ Esperando {wait/60:.1f} min para el primer slot...")
-        await asyncio.sleep(wait)
-        self._start_session()
-
-        while True:
-            await asyncio.sleep(1)
-            now_arg = self._now_arg()
-            engine  = self.engines[self.current_idx]
-
-            if self.session_active:
-                force_close = (now_arg.minute == 25 or now_arg.minute == 55)
-                elapsed = time.time() - self.session_start
-                if elapsed >= (SESSION_ACTIVE_MINS * 60) + 5: 
-                    force_close = True
-
-                if force_close:
-                    if not engine.signal_active:
-                        self._end_session()
-
-            if not self.session_active:
-                wait = self.seconds_to_next_slot()
-                if wait > 2:
-                    await asyncio.sleep(wait - 1)
-                else:
-                    if now_arg.minute in (0, 30) and now_arg.second <= 1:
-                        self._start_session()
-
-    def tick_active(self, engine: RouletteEngine, number: int):
-        if engine.signal_active:
-            finished = engine.resolve(number)
-            if finished:
-                if GLOBAL_STATS.global_chips >= self.session_start_chips + TARGET_PROFIT:
-                    logger.info(f"[SessionManager] 🏆 Meta de +5 fichas alcanzada en {engine.name}. Cerrando sesión anticipadamente.")
-                    self._end_session()
-                    return
-
-        engine.feed_number(number, active=True)
-
-        if not self.session_active: return
-        
-        if engine.warmup_done and (GLOBAL_STATS.global_chips < self.session_start_chips + TARGET_PROFIT):
-            sig = engine.detect_signal()
-            if sig:
-                logger.info(f"[SessionManager] 🎯 Señal #{self.signals_this_session + 1} detectada en {engine.name}: {sig}")
-                engine.iniciar_senal(sig)
-                self.signals_this_session += 1
-
-    def tick_passive(self, engine: RouletteEngine, number: int):
-        engine.feed_number(number, active=False)
-
-    def on_number(self, ws_key: int, number: int):
-        for i, engine in enumerate(self.engines):
-            if engine.ws_key != ws_key: continue
-            if i == self.current_idx:
-                self.tick_active(engine, number)
-            else:
-                self.tick_passive(engine, number)
-
-            color = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
-            last20 = engine.spin_history[-20:]
-            session_profit = GLOBAL_STATS.global_chips - self.session_start_chips
-            queue_broadcast({
-                "type": "spin", "number": number, "color": color, "paridad": p, "zona": z,
-                "spin_count": len(engine.spin_history), "warmup_done": engine.warmup_done,
-                "last20": [{"number": s["number"], "color": s["color"], "paridad": s["paridad"], "zona": s["zona"]} for s in last20],
-                "signal_active": engine.signal_active, "category": engine.current_category,
-                "session_profit": session_profit,
-                "target_chips": self.session_start_chips + TARGET_PROFIT
-            })
-            break
+            if self.warmup_done:
+                sig = self.detect_signal()
+                if sig:
+                    self.iniciar_senal(sig)
 
 
-async def ws_reader(ws_key: int, session_mgr: SessionManager):
+async def ws_reader(ws_key: int, engine: RouletteEngine):
     reconnect_delay = 5
     initial_loaded  = False
     seen_ids: set       = set()
@@ -842,21 +649,18 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                         if results and isinstance(results, list):
                             if not initial_loaded:
                                 initial_loaded = True
-                                engine = next((e for e in session_mgr.engines if e.ws_key == ws_key), None)
-                                if engine:
-                                    for item in reversed(results):
-                                        gid_init = str(item.get("gameId", ""))
-                                        if gid_init:
-                                            if len(seen_ids_queue) == seen_ids_queue.maxlen: seen_ids.discard(seen_ids_queue[0])
-                                            seen_ids.add(gid_init); seen_ids_queue.append(gid_init)
-                                        try: n = int(item.get("result", ""))
-                                        except: continue
-                                        if 0 <= n <= 36: engine._update_state(n, persist=False, train_model=True)
-                                    engine._train_models()
-                                    engine.initialize_sequences_from_history()
-                                    if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
-                                        engine.warmup_done = True
-                                        engine.ws_count = len(engine.spin_history)
+                                for item in reversed(results):
+                                    gid_init = str(item.get("gameId", ""))
+                                    if gid_init:
+                                        if len(seen_ids_queue) == seen_ids_queue.maxlen: seen_ids.discard(seen_ids_queue[0])
+                                        seen_ids.add(gid_init); seen_ids_queue.append(gid_init)
+                                    try: n = int(item.get("result", ""))
+                                    except: continue
+                                    if 0 <= n <= 36: engine._update_state(n, persist=False, train_model=True)
+                                engine._train_models()
+                                if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
+                                    engine.warmup_done = True
+                                    engine.ws_count = len(engine.spin_history)
                                 continue
 
                             latest = results[0]
@@ -864,7 +668,7 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                             if not is_new_id(gid): continue
                             try: n = int(latest.get("result", ""))
                             except: continue
-                            if 0 <= n <= 36: session_mgr.on_number(ws_key, n)
+                            if 0 <= n <= 36: engine.process_spin(n)
                             continue
 
                         fallback_gid = str(data.get("gameId", "")).strip()
@@ -877,7 +681,7 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                             if key in data:
                                 try:
                                     n = int(data[key])
-                                    if 0 <= n <= 36: session_mgr.on_number(ws_key, n)
+                                    if 0 <= n <= 36: engine.process_spin(n)
                                 except: pass
                                 break
                 finally:
@@ -899,14 +703,13 @@ async def _ws_server_handler(websocket):
     _ws_clients.add(q)
     logger.info(f"[WS-Server] 📡 Cliente conectado | Total: {len(_ws_clients)}")
     try:
-        if session_mgr_global and session_mgr_global.engines:
-            engine = session_mgr_global.engines[0]
+        if engines_global:
+            engine = engines_global[0]
             last20 = engine.spin_history[-20:]
-            session_profit = GLOBAL_STATS.global_chips - session_mgr_global.session_start_chips
             init_msg = {
-                "type": "init", "roulette": engine.name, "category": engine.current_category,
+                "type": "init", "roulette": engine.name,
                 "spins": [{"number": s["number"], "color": s["color"], "paridad": s["paridad"], "zona": s["zona"]} for s in last20],
-                "session_profit": session_profit,
+                "bankroll": GLOBAL_STATS.global_chips,
                 "stats": {"wins": GLOBAL_STATS.wins, "losses": GLOBAL_STATS.losses, "empates": GLOBAL_STATS.zeros}
             }
             await websocket.send(json.dumps(init_msg))
@@ -919,10 +722,8 @@ async def _ws_server_handler(websocket):
 
         async def receiver():
             try:
-                async for msg in websocket:
-                    pass
-            except Exception:
-                pass
+                async for msg in websocket: pass
+            except Exception: pass
 
         sender_task = asyncio.create_task(sender())
         receiver_task = asyncio.create_task(receiver())
@@ -944,20 +745,19 @@ async def _ws_server_main():
         await asyncio.Future()
 
 app = Flask(__name__)
-session_mgr_global: Optional[SessionManager] = None
+engines_global: list[RouletteEngine] = []
 
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Speed Roulette 2 — Híbrido Secuencias + ML"})
+def home(): return jsonify({"status": "ok", "bot": "Speed Roulette 2 — Híbrido ML + Labouchere"})
 
 @app.route("/ping")
 def ping(): return jsonify({"status": "pong", "ts": time.time()})
 
 @app.route("/health")
 def health():
-    if not session_mgr_global: return jsonify({"status": "initializing"})
-    active = session_mgr_global.engines[session_mgr_global.current_idx]
-    session_profit = GLOBAL_STATS.global_chips - session_mgr_global.session_start_chips
-    return jsonify({"active_roulette": active.name, "category": active.current_category, "session_profit": session_profit, "global_chips": GLOBAL_STATS.global_chips, "signal_active": active.signal_active})
+    if not engines_global: return jsonify({"status": "initializing"})
+    engine = engines_global[0]
+    return jsonify({"active_roulette": engine.name, "bankroll": GLOBAL_STATS.global_chips, "signal_active": engine.signal_active, "labouchere_seq": engine.labouchere.seq})
 
 async def self_ping_loop():
     url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -977,42 +777,39 @@ async def daily_stats_loop():
         if now_arg >= target: target += datetime.timedelta(days=1)
         wait_secs = (target - now_arg).total_seconds()
         await asyncio.sleep(wait_secs)
-        if session_mgr_global: tg_send_stats(GLOBAL_STATS.get_stats_text())
+        if engines_global: tg_send_stats(GLOBAL_STATS.get_stats_text())
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nSecuencias + IA >= 60%\nD'Alembert (5 intentos) | Meta sesión: +5 fichas\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nEvaluación 6 Señales + IA >= 60%\nLabouchere [5, 10, 5] (3 intentos)\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
-    if not session_mgr_global: return
-    active = session_mgr_global.engines[session_mgr_global.current_idx]
-    state = active.seq_states[active.current_category]
-    session_profit = GLOBAL_STATS.global_chips - session_mgr_global.session_start_chips
-    bot.reply_to(m, f"<b>Ruleta:</b> {active.name}\n<b>Categoría:</b> {active.current_category}\n<b>Señal activa:</b> {'🟢 Sí' if active.signal_active else '⚪ No'}\n<b>Bankroll Global:</b> 🪙 {GLOBAL_STATS.global_chips}\n<b>Profit Sesión:</b> 🪙 {session_profit:+d} fichas\n<b>Nivel D'Alembert:</b> {state.chips} fichas\n<b>Intento actual:</b> {state.attempt}/5", parse_mode="HTML")
+    if not engines_global: return
+    engine = engines_global[0]
+    bot.reply_to(m, f"<b>Ruleta:</b> {engine.name}\n<b>Señal activa:</b> {'🟢 Sí' if engine.signal_active else '⚪ No'}\n<b>Bankroll Global:</b> 🪙 {GLOBAL_STATS.global_chips}\n<b>Secuencia Labouchere:</b> {engine.labouchere.seq}\n<b>Intento actual:</b> {engine.attempt}/3", parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(m):
-    if not session_mgr_global: return
     tg_send_stats(GLOBAL_STATS.get_stats_text())
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
-    if not session_mgr_global: return
     global GLOBAL_STATS
     GLOBAL_STATS = GlobalStats()
-    for e in session_mgr_global.engines:
-        for s in e.seq_states.values(): s.chips = 5; s.attempt = 1
-    session_mgr_global.session_start_chips = 0
-    bot.reply_to(m, "🔄 <b>Resetado — Stats y Bankroll a 0</b>", parse_mode="HTML")
+    for e in engines_global:
+        e.labouchere = Labouchere()
+        e.attempt = 1
+    bot.reply_to(m, "🔄 <b>Resetado — Stats, Bankroll y Labouchere</b>", parse_mode="HTML")
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 async def main():
-    global session_mgr_global
-    session_mgr_global = SessionManager()
+    global engines_global
+    
+    engines_global = [RouletteEngine(r["key"], r["name"]) for r in ROULETTES]
 
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
@@ -1020,13 +817,12 @@ async def main():
     await asyncio.sleep(5)
 
     tasks = [
-        asyncio.create_task(session_mgr_global.session_watchdog()),
         asyncio.create_task(daily_stats_loop()),
         asyncio.create_task(self_ping_loop()),
         asyncio.create_task(_ws_server_main()),
     ]
-    for r in ROULETTES:
-        tasks.append(asyncio.create_task(ws_reader(r["key"], session_mgr_global)))
+    for i, r in enumerate(ROULETTES):
+        tasks.append(asyncio.create_task(ws_reader(r["key"], engines_global[i])))
 
     logger.info(f"[Main] 🎰 Bot Híbrido iniciado — WS server puerto {WS_SERVER_PORT}")
     await asyncio.gather(*tasks)
