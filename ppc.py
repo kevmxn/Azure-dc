@@ -351,7 +351,7 @@ class GlobalStats:
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text  = "📊 RESUMEN DIARIO — SPEED ROULETTE 2 📊\"
+        text  = "📊 RESUMEN DIARIO — SPEED ROULETTE 2 📊\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
