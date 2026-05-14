@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Speed Roulette 2 — Bot de señales Híbrido (ML + AMX + Labouchere)
+Speed Roulette 2 — Bot de señales Híbrido (Secuencias + ML + AMX + Labouchere)
 Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
-  - Evaluación continua de las 6 señales (ROJO, NEGRO, PAR, IMPAR, MENOR, MAYOR).
-  - Filtro de IA (Markov + Ensemble ML + AMX): Solo apuesta si la confianza >= 60%.
-  - Gestión Labouchere (Eliminación de extremos): Secuencia inicial [5, 10, 5].
-  - 3 intentos máximos por ciclo de señal.
-  - Mensaje de Análisis al ganar señal, perder ciclo o esperar nueva señal.
+  - Evaluación continua de las 6 señales pero SOLO envía si coincide con la Secuencia Fija.
+  - Filtro de IA (Markov + Ensemble ML + AMX + Resonancia/Ruptura): Confianza >= 65%.
+  - Gestión Labouchere (Eliminación de extremos): Secuencia inicial [1, 2, 1].
+  - 3 intentos máximos por ciclo de señal. Señal se actualiza dinámicamente.
   - Operación continua SIN sesiones ni límites de tiempo.
 """
 
@@ -84,9 +83,13 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 WS_URL              = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID           = "ppcjd00000007254"
 WARMUP_SPINS        = 25
-MIN_PROB            = 0.60
+MIN_PROB            = 0.65
 TRAIN_INTERVAL      = 50
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
+
+SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
+SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
+SEQUENCE_ZONA    = ["MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR"]
 
 EMOJI_MAP = {
     "ROJO": "🔴", "NEGRO": "⚫️", 
@@ -228,9 +231,11 @@ class OnlineEnsemblePredictor:
         except: return None
 
 class AMXAnalyzer:
-    def adjust_probability(self, base_prob: float, target: str, predictions: dict) -> float:
+    def adjust_probability(self, base_prob: float, target: str, predictions: dict, recent_hist: list, seq_state) -> float:
         cross_boost = 0.0
         target_cat = "COLOR" if target in ["ROJO", "NEGRO"] else ("PARIDAD" if target in ["PAR", "IMPAR"] else "ZONA")
+        
+        # 1. Impulsos Cruzados (Correlaciones entre categorías)
         if target_cat == "COLOR":
             p_par = predictions.get("PARIDAD", {}).get("PAR", 0.5)
             p_may = predictions.get("ZONA", {}).get("MAYOR", 0.5)
@@ -246,15 +251,41 @@ class AMXAnalyzer:
             p_par = predictions.get("PARIDAD", {}).get("PAR", 0.5)
             if target == "MENOR" and p_par > 0.55: cross_boost += 0.02
             if target == "MAYOR" and p_rojo > 0.55: cross_boost += 0.02
+            
+        # 2. NUEVO: Resonancia de Secuencia (Sincronización de patrones)
+        # Verificamos si los últimos giros coincidieron con los pasos previos de la secuencia
+        matches = 0
+        check_depth = min(3, len(recent_hist), seq_state.idx)
+        for i in range(1, check_depth + 1):
+            hist_val = recent_hist[-i]
+            seq_idx = (seq_state.idx - i) % len(seq_state.sequence)
+            seq_val = seq_state.sequence[seq_idx]
+            if hist_val == seq_val:
+                matches += 1
+            else:
+                break # Se rompió la sincronía
+                
+        if matches == 1: cross_boost += 0.03
+        elif matches == 2: cross_boost += 0.07
+        elif matches >= 3: cross_boost += 0.12 # Alta probabilidad de cambio direccional o continuidad confirmada
+        
+        # 3. NUEVO: Impulso de Ruptura (Cambio de Dirección)
+        # Si hay racha de 2 y la secuencia espera el opuesto (ruptura)
+        if len(recent_hist) >= 2:
+            last1 = recent_hist[-1]
+            last2 = recent_hist[-2]
+            if last1 == last2 and last1 != "CERO" and last1 != target:
+                cross_boost += 0.04 # La secuencia está diseñada para atrapar la ruptura
+                
         return min(1.0, base_prob + cross_boost)
 
 class Labouchere:
     def __init__(self):
-        self.base_seq = [5, 10, 5]
+        self.base_seq = [1, 2, 1]
         self.seq = list(self.base_seq)
         
     def get_bet(self) -> int:
-        if not self.seq: return 5
+        if not self.seq: return 1
         if len(self.seq) == 1: return self.seq[0]
         return self.seq[0] + self.seq[-1]
         
@@ -272,6 +303,26 @@ class Labouchere:
         
     def loss(self, bet: int):
         self.seq.append(bet)
+
+class SequenceState:
+    def __init__(self, category: str):
+        self.category = category
+        self.sequence = SEQUENCE_COLOR if category == "COLOR" else (SEQUENCE_PARIDAD if category == "PARIDAD" else SEQUENCE_ZONA)
+        self.idx = 0
+
+    def advance(self):
+        self.idx = (self.idx + 1) % len(self.sequence)
+
+    def expected(self) -> str:
+        return self.sequence[self.idx]
+
+    def initialize_from_last_value(self, last_val: str):
+        try:
+            idx = self.sequence.index(last_val)
+            self.idx = (idx + 1) % len(self.sequence)
+            logger.info(f"[SeqInit] {self.category}: Último {last_val} encontrado. Índice establecido a {self.idx} (Próximo: {self.expected()})")
+        except ValueError:
+            self.idx = 0
 
 class GlobalStats:
     def __init__(self):
@@ -293,7 +344,7 @@ class GlobalStats:
         self.last_20.append({
             "result": result_type, "attempt": attempt,
             "number": number, "val": val, "type": type_str,
-            "roulette": roulette_name, "balance": self.global_chips
+            "roulette": roulette_name
         })
 
     def should_send(self) -> bool:
@@ -315,14 +366,13 @@ class GlobalStats:
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 INTENTO #{s['attempt']}"
-            b_str = f"🪙 {s['balance']}"
-            rl    = s['roulette'][:14]
+            b_str = f"🪙 +{s['val']} FICHAS" if s['result'] == 'WIN' else f"🪙 -{s['val']} FICHAS"
             if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} | {rl} | {a_str} | {b_str}\n"
+                text += f"✅ WIN #{s['number']} {s['type']} | {a_str} | {b_str}\n"
             elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {rl} | {a_str} | {b_str}\n"
+                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n"
             else:
-                text += f"🚫 LOSS #{s['number']} {s['type']} | {rl} | {a_str} | {b_str}\n"
+                text += f"❌ LOSS #{s['number']} {s['type']} | {a_str} | {b_str}\n"
         return text
 
 GLOBAL_STATS = GlobalStats()
@@ -337,12 +387,13 @@ class RouletteEngine:
         self.spin_history: list = []
         self.hist_color: list = []; self.hist_paridad: list = []; self.hist_zona: list = []
         
-        # Diccionario interno para evitar el error de atributos
         self.CLASSES = {
             "COLOR": ["ROJO", "NEGRO", "CERO"],
             "PARIDAD": ["PAR", "IMPAR", "CERO"],
             "ZONA": ["MENOR", "MAYOR", "CERO"]
         }
+        
+        self.seq_states = {cat: SequenceState(cat) for cat in ["COLOR", "PARIDAD", "ZONA"]}
         
         self.labouchere = Labouchere()
         self.attempt = 1
@@ -389,8 +440,23 @@ class RouletteEngine:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
         for (n,) in rows: self._update_state(n, persist=False, train_model=False)
-        if rows: self._train_models()
+        if rows: 
+            self._train_models()
+            self.initialize_sequences_from_history()
         return len(rows)
+
+    def initialize_sequences_from_history(self):
+        last_negro = next((s for s in reversed(self.spin_history) if s["color"] == "NEGRO"), None)
+        if last_negro:
+            self.seq_states["COLOR"].initialize_from_last_value("NEGRO")
+            
+        last_impar = next((s for s in reversed(self.spin_history) if s["paridad"] == "IMPAR"), None)
+        if last_impar:
+            self.seq_states["PARIDAD"].initialize_from_last_value("IMPAR")
+            
+        last_mayor = next((s for s in reversed(self.spin_history) if s["zona"] == "MAYOR"), None)
+        if last_mayor:
+            self.seq_states["ZONA"].initialize_from_last_value("MAYOR")
 
     def _train_models(self):
         for cat in ["COLOR", "PARIDAD", "ZONA"]:
@@ -401,6 +467,9 @@ class RouletteEngine:
         c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
         self.spin_history.append({"number": number, "color": c, "paridad": p, "zona": z})
         self.hist_color.append(c); self.hist_paridad.append(p); self.hist_zona.append(z)
+        
+        for cat in ["COLOR", "PARIDAD", "ZONA"]:
+            self.seq_states[cat].advance()
 
         if train_model and number != 0 and len(self.hist_color) > 5:
             self.ensemble.partial_train(self.hist_color, self.hist_paridad, self.hist_zona, c, p, z)
@@ -427,35 +496,31 @@ class RouletteEngine:
 
     def detect_signal(self) -> Optional[dict]:
         predictions = {c: self._get_predictions(c) for c in ["COLOR", "PARIDAD", "ZONA"]}
-        all_preds = {}
+        valid_signals = {}
         
-        targets = {
-            "COLOR": ["ROJO", "NEGRO"],
-            "PARIDAD": ["PAR", "IMPAR"],
-            "ZONA": ["MENOR", "MAYOR"]
-        }
-        
-        for cat, tgts in targets.items():
-            for t in tgts:
-                base_prob = predictions[cat].get(t, 0)
-                final_prob = self.amx.adjust_probability(base_prob, t, predictions)
-                all_preds[t] = final_prob
+        for cat in ["COLOR", "PARIDAD", "ZONA"]:
+            seq_target = self.seq_states[cat].expected()
+            base_prob = predictions[cat].get(seq_target, 0)
+            hist = getattr(self, f"hist_{cat.lower()}")
+            
+            # Pasamos el historial y el estado de la secuencia al analizador AMX mejorado
+            final_prob = self.amx.adjust_probability(base_prob, seq_target, predictions, hist, self.seq_states[cat])
+            
+            if final_prob >= MIN_PROB:
+                valid_signals[cat] = {"target": seq_target, "prob": final_prob}
                 
-        if not all_preds: return None
+        if not valid_signals:
+            return None
+            
+        best_cat = max(valid_signals, key=lambda k: valid_signals[k]["prob"])
+        best_sig = valid_signals[best_cat]
         
-        best_target = max(all_preds, key=all_preds.get)
-        best_prob = all_preds[best_target]
-        
-        cat_map = {
-            "ROJO": "COLOR", "NEGRO": "COLOR",
-            "PAR": "PARIDAD", "IMPAR": "PARIDAD",
-            "MENOR": "ZONA", "MAYOR": "ZONA"
+        return {
+            "type": best_cat, 
+            "target": best_sig["target"], 
+            "prob": best_sig["prob"], 
+            "chips": self.labouchere.get_bet()
         }
-        best_cat = cat_map[best_target]
-        
-        if best_prob >= MIN_PROB:
-            return {"type": best_cat, "target": best_target, "prob": best_prob, "chips": self.labouchere.get_bet()}
-        return None
 
     def _build_signal_text(self) -> str:
         last_num = self.spin_history[-1]["number"] if self.spin_history else 0
@@ -489,7 +554,7 @@ class RouletteEngine:
         if self.active_signal_msg_id:
             tg_delete(CHAT_ID, self.active_signal_msg_id)
             
-        msg_id = tg_send(self._build_signal_text())
+        msg_id = tg_send_with_button(self._build_signal_text(), self.name)
         if msg_id: self.active_signal_msg_id = msg_id
         queue_broadcast({
             "type": "signal", "roulette": self.name, "signal_type": self.active_type,
@@ -520,26 +585,10 @@ class RouletteEngine:
         is_zero = (number == 0)
         current_bet = self.active_chips
 
-        if is_zero:
-            self.labouchere.loss(current_bet)
-            GLOBAL_STATS.record('EMPATE', self.attempt, number, current_bet, self.active_type, self.name)
-            
-            if self.attempt < 3:
-                self.attempt += 1
-                tg_send(f"🟠 EMPATE 0 — ZERO — {self.active_target}\n🚨 Cero caído. Pérdida de {current_bet} fichas. Intento #{self.attempt}/3")
-                return False
-            else:
-                tg_send(f"🟠 EMPATE 0 — ZERO — {self.active_target}\n🚨 Racha de 3 intentos perdida.")
-                self.attempt = 1
-                self._check_stats()
-                self._send_analyzing_msg()
-                self._reset_signal()
-                return True
-
         if won:
             seq_completed = self.labouchere.win()
             GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
-            msg = f"✅ WIN {number} — {self.active_target}\n🎉 ¡Ganaste {current_bet} fichas! (Intento #{self.attempt}/3)"
+            msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {current_bet} fichas!\n🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
             if seq_completed:
                 msg += "\n🏆 Secuencia Labouchere completada. Reiniciando..."
             tg_send(msg)
@@ -548,17 +597,20 @@ class RouletteEngine:
             self._send_analyzing_msg()
             self._reset_signal()
             return True
+            
         else:
             self.labouchere.loss(current_bet)
             
             if self.attempt < 3:
                 self.attempt += 1
-                GLOBAL_STATS.record('LOSS', self.attempt, number, current_bet, self.active_type, self.name)
-                tg_send(f"❌ LOSS {number} — {self.active_target}\nIntento #{self.attempt - 1} fallido. Próximo intento...")
                 return False
             else:
-                GLOBAL_STATS.record('LOSS', self.attempt, number, current_bet, self.active_type, self.name)
-                tg_send(f"❌ LOSS TOTAL {number} — {self.active_target}\n🚨 Racha de 3 intentos perdida.")
+                GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
+                if is_zero:
+                    msg = f"🟠 EMPATE 0 — ZERO — {self.active_type}\n🚨 Cero caído. Pérdida de {current_bet} fichas.\n🚨 Racha de 3 intentos perdida.\n🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
+                else:
+                    msg = f"❌ LOSS TOTAL {number} — {self.active_type}\n🚨 Racha de 3 intentos perdida.\n🪙 Bankroll Global: {GLOBAL_STATS.global_chips}"
+                tg_send(msg)
                 self.attempt = 1
                 self._check_stats()
                 self._send_analyzing_msg()
@@ -614,8 +666,16 @@ class RouletteEngine:
             if self.signal_active:
                 finished_cycle = self.resolve(number)
                 if not finished_cycle:
-                    self.active_chips = self.labouchere.get_bet()
-                    self.send_signal()
+                    sig = self.detect_signal()
+                    if sig:
+                        self.active_type = sig["type"]
+                        self.active_target = sig["target"]
+                        self._last_signal_prob = sig["prob"] * 100
+                        self.active_chips = self.labouchere.get_bet()
+                        self.send_signal()
+                    else:
+                        self.signal_active = False
+                        self._send_analyzing_msg()
             else:
                 if self.warmup_done:
                     sig = self.detect_signal()
@@ -672,6 +732,7 @@ async def ws_reader(ws_key: int, engine: RouletteEngine):
                                     except: continue
                                     if 0 <= n <= 36: engine._update_state(n, persist=False, train_model=True)
                                 engine._train_models()
+                                engine.initialize_sequences_from_history()
                                 if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
                                     engine.warmup_done = True
                                     engine.ws_count = len(engine.spin_history)
@@ -762,7 +823,7 @@ app = Flask(__name__)
 engines_global: list[RouletteEngine] = []
 
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Speed Roulette 2 — Híbrido ML + Labouchere"})
+def home(): return jsonify({"status": "ok", "bot": "Speed Roulette 2 — Híbrido Secuencias + ML + Labouchere"})
 
 @app.route("/ping")
 def ping(): return jsonify({"status": "pong", "ts": time.time()})
@@ -795,7 +856,7 @@ async def daily_stats_loop():
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nEvaluación 6 Señales + IA >= 60%\nLabouchere [5, 10, 5] (3 intentos)\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nSecuencias Fijas + IA >= 65% (Resonancia/Ruptura)\nLabouchere [1, 2, 1] (3 intentos dinámicos)\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
