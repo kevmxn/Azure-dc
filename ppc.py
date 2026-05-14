@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Speed Roulette 2 — Bot de señales Híbrido (Secuencias + ML + AMX)
@@ -88,15 +87,14 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL              = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID           = "ppcjd00000007254"
-SESSION_ACTIVE_MINS = 25  # Duración máxima de la sesión en minutos
+SESSION_ACTIVE_MINS = 25
 WARMUP_SPINS        = 25
-MIN_PROB            = 0.60  # 60% de confianza IA
+MIN_PROB            = 0.60
 TRAIN_INTERVAL      = 50
 SIGNAL_WAIT_TIMEOUT = 120
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
-TARGET_PROFIT       = 5    # Meta de fichas por sesión
+TARGET_PROFIT       = 5
 
-# Secuencias y Mapeos (Paridad empieza PAR, Zona empieza MENOR)
 SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
 SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
 SEQUENCE_ZONA    = ["MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR"]
@@ -122,7 +120,6 @@ ZONA_MAP: dict = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CER
 
 CATEGORIES = ["COLOR", "PARIDAD", "ZONA"]
 
-# ─── COLA DE BROADCAST PARA HTML ──────────────────────────────────────────────
 _ws_clients: Set[asyncio.Queue] = set()
 
 def queue_broadcast(data: dict):
@@ -130,7 +127,6 @@ def queue_broadcast(data: dict):
         try: q.put_nowait(data)
         except: pass
 
-# ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_RETRIES = 12
 
 def _tg_call(fn, *a, **kw):
@@ -166,7 +162,6 @@ def tg_edit(chat_id: int, message_id: int, text: str):
                  message_id=message_id, parse_mode="HTML")
     except: pass
 
-# ─── MARKOV ───────────────────────────────────────────────────────────────────
 class SmoothedMarkovPredictor:
     def __init__(self, window: int = 60, order: int = 2):
         self.window = window; self.order = order
@@ -193,7 +188,6 @@ class SmoothedMarkovPredictor:
             if c not in probs: probs[c] = alpha / (total + alpha * vocab_size)
         return probs
 
-# ─── ENSEMBLE ML ──────────────────────────────────────────────────────────────
 class OnlineEnsemblePredictor:
     WINDOW = 5
     CLASSES_COLOR = ["ROJO", "NEGRO", "CERO"]
@@ -225,7 +219,6 @@ class OnlineEnsemblePredictor:
         feats = self._extract_features(hist_c, hist_p, hist_z)
         if feats is None: return
         X = np.array(feats).reshape(1, -1)
-        
         for cat, target, mnb, sgd in [
             ("COLOR", target_c, self.mnb_color, self.sgd_color),
             ("PARIDAD", target_p, self.mnb_paridad, self.sgd_paridad),
@@ -253,7 +246,6 @@ class OnlineEnsemblePredictor:
             return {classes[i]: float(p) for i, p in enumerate(final)}
         except: return None
 
-# ─── AMX (Análisis Matricial Cruzado) ────────────────────────────────────────
 class AMXAnalyzer:
     def adjust_probability(self, base_prob: float, target: str, predictions: dict) -> float:
         cross_boost = 0.0
@@ -275,7 +267,6 @@ class AMXAnalyzer:
             if target == "MAYOR" and p_rojo > 0.55: cross_boost += 0.02
         return min(1.0, base_prob + cross_boost)
 
-# ─── SECUENCIA Y D'ALEMBERT STATE ────────────────────────────────────────────
 class SequenceState:
     def __init__(self, category: str):
         self.category = category
@@ -309,7 +300,6 @@ class SequenceState:
         else:
             self.attempt += 1
 
-# ─── STATS GLOBAL ─────────────────────────────────────────────────────────────
 class GlobalStats:
     def __init__(self):
         self.wins = 0; self.zeros = 0; self.losses = 0
@@ -364,7 +354,6 @@ class GlobalStats:
 
 GLOBAL_STATS = GlobalStats()
 
-# ─── ENGINE ───────────────────────────────────────────────────────────────────
 class RouletteEngine:
 
     def __init__(self, ws_key: int, name: str):
@@ -388,7 +377,7 @@ class RouletteEngine:
         self.active_target     = ""
         self._last_signal_prob = 0.0
         self.active_signal_msg_id = None
-        self.analyzing_msg_id  = None  # ID del mensaje de análisis
+        self.analyzing_msg_id  = None
         self.spins_since_train = 0
         self.last_game_id      = None
         self.ws_count          = 0
@@ -434,7 +423,6 @@ class RouletteEngine:
         return len(rows)
 
     def initialize_sequences_from_history(self):
-        """Busca el último NEGRO, IMPAR y MAYOR para inicializar las secuencias."""
         last_negro = next((s for s in reversed(self.spin_history) if s["color"] == "NEGRO"), None)
         if last_negro:
             self.seq_states["COLOR"].initialize_from_last_value("NEGRO")
@@ -534,7 +522,6 @@ class RouletteEngine:
         })
 
     def iniciar_senal(self, sig: dict):
-        # Eliminar mensaje de análisis previo si existe
         if self.analyzing_msg_id:
             tg_delete(CHAT_ID, self.analyzing_msg_id)
             self.analyzing_msg_id = None
@@ -588,7 +575,7 @@ class RouletteEngine:
                     tg_delete(CHAT_ID, self.analyzing_msg_id)
                 self.analyzing_msg_id = tg_send("🚨 ANALIZADO PATRONES EN CADA GIRO 🚨")
 
-            if state.attempt == 1:  # Agotó los 5 intentos
+            if state.attempt == 1:
                 tg_send(f"❌ LOSS TOTAL {number} — {self.active_type}\n🚨 Racha de 5 intentos perdida.\n🪙 Balance sesión: {session_profit:+d} fichas")
                 self._check_stats(); self._reset_signal()
                 return True
@@ -640,7 +627,6 @@ class RouletteEngine:
             f"| {tag} | {warmup_tag} | Cat: {self.current_category} | 🪙{session_profit:+d}"
         )
 
-# ─── GESTOR DE SESIONES (Sincronizado estrictamente al Reloj) ─────────────────
 class SessionManager:
     ARG_UTC_OFFSET = -3
 
@@ -695,7 +681,6 @@ class SessionManager:
 
         msg_id = tg_send(
             f"🔔 SESION INICIADA — {engine.current_category} 🔔\n"
-            f"🎰 {engine.name}\n"
             f"🪙 Meta: Llegar a 5 fichas"
         )
         self.prev_start_msg_id = msg_id
@@ -820,7 +805,6 @@ class SessionManager:
             break
 
 
-# ─── WS READER ────────────────────────────────────────────────────────────────
 async def ws_reader(ws_key: int, session_mgr: SessionManager):
     reconnect_delay = 5
     initial_loaded  = False
@@ -869,7 +853,7 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                                         except: continue
                                         if 0 <= n <= 36: engine._update_state(n, persist=False, train_model=True)
                                     engine._train_models()
-                                    engine.initialize_sequences_from_history()  # Inicializar secuencias
+                                    engine.initialize_sequences_from_history()
                                     if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
                                         engine.warmup_done = True
                                         engine.ws_count = len(engine.spin_history)
@@ -906,7 +890,7 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
 
-# ─── WEBSOCKET SERVER PARA HTML ───────────────────────────────────────────────
+
 async def _http_filter(path, request_headers):
     if request_headers.get("Upgrade") is None: return (200, "OK", b"Server is alive")
 
@@ -934,8 +918,11 @@ async def _ws_server_handler(websocket):
                 except Exception: break
 
         async def receiver():
-            try: async for msg in websocket: pass
-            except Exception: pass
+            try:
+                async for msg in websocket:
+                    pass
+            except Exception:
+                pass
 
         sender_task = asyncio.create_task(sender())
         receiver_task = asyncio.create_task(receiver())
@@ -956,7 +943,6 @@ async def _ws_server_main():
     async with websockets.serve(_ws_server_handler, "0.0.0.0", WS_SERVER_PORT, ping_interval=20, ping_timeout=40, close_timeout=10, process_request=_http_filter):
         await asyncio.Future()
 
-# ─── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 session_mgr_global: Optional[SessionManager] = None
 
@@ -993,7 +979,6 @@ async def daily_stats_loop():
         await asyncio.sleep(wait_secs)
         if session_mgr_global: tg_send_stats(GLOBAL_STATS.get_stats_text())
 
-# ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
     bot.reply_to(m, "<b>🎰 Speed Roulette 2 — Híbrido</b>\n\nSecuencias + IA >= 60%\nD'Alembert (5 intentos) | Meta sesión: +5 fichas\n\n/status — Estado\n/stats — Estadísticas\n/reset — Resetear", parse_mode="HTML")
@@ -1025,7 +1010,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     global session_mgr_global
     session_mgr_global = SessionManager()
