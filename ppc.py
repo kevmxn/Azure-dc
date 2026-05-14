@@ -337,6 +337,13 @@ class RouletteEngine:
         self.spin_history: list = []
         self.hist_color: list = []; self.hist_paridad: list = []; self.hist_zona: list = []
         
+        # Diccionario interno para evitar el error de atributos
+        self.CLASSES = {
+            "COLOR": ["ROJO", "NEGRO", "CERO"],
+            "PARIDAD": ["PAR", "IMPAR", "CERO"],
+            "ZONA": ["MENOR", "MAYOR", "CERO"]
+        }
+        
         self.labouchere = Labouchere()
         self.attempt = 1
         self.analyzing_msg_id = None
@@ -405,11 +412,14 @@ class RouletteEngine:
 
     def _get_predictions(self, cat: str) -> dict:
         hist = getattr(self, f"hist_{cat.lower()}")
-        classes = getattr(self, f"CLASSES_{cat.upper()}")
+        classes = self.CLASSES[cat]
+        
         mk_pred = self.markov[cat].predict(hist, classes)
         mk_probs = mk_pred if mk_pred else {c: 1/3 for c in classes}
+        
         ens_probs = self.ensemble.predict(self.hist_color, self.hist_paridad, self.hist_zona, cat)
         if not ens_probs: ens_probs = {c: 1/3 for c in classes}
+        
         final_probs = {}
         for c in classes:
             final_probs[c] = 0.4 * mk_probs.get(c, 0) + 0.6 * ens_probs.get(c, 0)
@@ -598,18 +608,22 @@ class RouletteEngine:
             self._reset_signal()
 
     def process_spin(self, number: int):
-        self.feed_number(number)
-        
-        if self.signal_active:
-            finished_cycle = self.resolve(number)
-            if not finished_cycle:
-                self.active_chips = self.labouchere.get_bet()
-                self.send_signal()
-        else:
-            if self.warmup_done:
-                sig = self.detect_signal()
-                if sig:
-                    self.iniciar_senal(sig)
+        try:
+            self.feed_number(number)
+            
+            if self.signal_active:
+                finished_cycle = self.resolve(number)
+                if not finished_cycle:
+                    self.active_chips = self.labouchere.get_bet()
+                    self.send_signal()
+            else:
+                if self.warmup_done:
+                    sig = self.detect_signal()
+                    if sig:
+                        self.iniciar_senal(sig)
+        except Exception as e:
+            logger.error(f"[{self.name}] Error en process_spin: {e}", exc_info=True)
+            self._reset_signal()
 
 
 async def ws_reader(ws_key: int, engine: RouletteEngine):
