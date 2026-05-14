@@ -95,11 +95,12 @@ TRAIN_INTERVAL      = 50
 MAX_SIGNALS         = 3
 SIGNAL_WAIT_TIMEOUT = 120
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
+TARGET_PROFIT       = 5    # Meta de fichas por sesión
 
 # Secuencias y Mapeos
 SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
-SEQUENCE_PARITY  = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
-SEQUENCE_ZONE    = ["MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR"]
+SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
+SEQUENCE_ZONA    = ["MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR"]
 
 EMOJI_MAP = {
     "ROJO": "🔴", "NEGRO": "⚫️", 
@@ -117,8 +118,8 @@ COLOR_MAP: dict = {
     35:"NEGRO",36:"ROJO",
 }
 
-PARITY_MAP: dict = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
-ZONE_MAP: dict = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
+PARIDAD_MAP: dict = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
+ZONA_MAP: dict = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
 
 CATEGORIES = ["COLOR", "PARIDAD", "ZONA"]
 
@@ -195,13 +196,18 @@ class SmoothedMarkovPredictor:
 
 # ─── ENSEMBLE ML ──────────────────────────────────────────────────────────────
 class OnlineEnsemblePredictor:
-    WINDOW = 5; CLASSES_COLOR = ["ROJO", "NEGRO", "CERO"]
-    CLASSES_PARITY = ["PAR", "IMPAR", "CERO"]; CLASSES_ZONE = ["MENOR", "MAYOR", "CERO"]
+    WINDOW = 5
+    CLASSES_COLOR = ["ROJO", "NEGRO", "CERO"]
+    CLASSES_PARIDAD = ["PAR", "IMPAR", "CERO"]
+    CLASSES_ZONA = ["MENOR", "MAYOR", "CERO"]
 
     def __init__(self):
-        self.mnb_color = MultinomialNB(alpha=1.0); self.sgd_color = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
-        self.mnb_parity = MultinomialNB(alpha=1.0); self.sgd_parity = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
-        self.mnb_zone = MultinomialNB(alpha=1.0); self.sgd_zone = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
+        self.mnb_color = MultinomialNB(alpha=1.0)
+        self.sgd_color = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
+        self.mnb_paridad = MultinomialNB(alpha=1.0)
+        self.sgd_paridad = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
+        self.mnb_zona = MultinomialNB(alpha=1.0)
+        self.sgd_zona = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
         self.trained = {"COLOR": False, "PARIDAD": False, "ZONA": False}
         self.sample_count = 0
 
@@ -211,8 +217,8 @@ class OnlineEnsemblePredictor:
         for i in range(1, self.WINDOW + 1):
             c, p, z = hist_c[-i], hist_p[-i], hist_z[-i]
             vec_c = [1 if x==c else 0 for x in self.CLASSES_COLOR]
-            vec_p = [1 if x==p else 0 for x in self.CLASSES_PARITY]
-            vec_z = [1 if x==z else 0 for x in self.CLASSES_ZONE]
+            vec_p = [1 if x==p else 0 for x in self.CLASSES_PARIDAD]
+            vec_z = [1 if x==z else 0 for x in self.CLASSES_ZONA]
             features.extend(vec_c + vec_p + vec_z)
         return features
 
@@ -223,11 +229,11 @@ class OnlineEnsemblePredictor:
         
         for cat, target, mnb, sgd in [
             ("COLOR", target_c, self.mnb_color, self.sgd_color),
-            ("PARIDAD", target_p, self.mnb_parity, self.sgd_parity),
-            ("ZONA", target_z, self.mnb_zone, self.sgd_zone)
+            ("PARIDAD", target_p, self.mnb_paridad, self.sgd_paridad),
+            ("ZONA", target_z, self.mnb_zona, self.sgd_zona)
         ]:
             y = np.array([target])
-            classes = getattr(self, f"CLASSES_{cat.upper() if cat=='COLOR' else ('PARITY' if cat=='PARIDAD' else 'ZONE')}")
+            classes = getattr(self, f"CLASSES_{cat.upper()}")
             if not self.trained[cat]:
                 mnb.partial_fit(X, y, classes=classes); sgd.partial_fit(X, y, classes=classes)
                 self.trained[cat] = True
@@ -241,13 +247,10 @@ class OnlineEnsemblePredictor:
         if feats is None: return None
         X = np.array(feats).reshape(1, -1)
         try:
-            if cat == "COLOR": mnb, sgd = self.mnb_color, self.sgd_color
-            elif cat == "PARIDAD": mnb, sgd = self.mnb_parity, self.sgd_parity
-            else: mnb, sgd = self.mnb_zone, self.sgd_zone
-            
+            mnb, sgd = getattr(self, f"mnb_{cat.lower()}"), getattr(self, f"sgd_{cat.lower()}")
             nb_p = mnb.predict_proba(X)[0]; sg_p = sgd.predict_proba(X)[0]
             final = 0.5 * nb_p + 0.5 * sg_p
-            classes = getattr(self, f"CLASSES_{cat.upper() if cat=='COLOR' else ('PARITY' if cat=='PARIDAD' else 'ZONE')}")
+            classes = getattr(self, f"CLASSES_{cat.upper()}")
             return {classes[i]: float(p) for i, p in enumerate(final)}
         except: return None
 
@@ -259,11 +262,9 @@ class AMXAnalyzer:
         cross_boost = 0.0
         target_cat = "COLOR" if target in ["ROJO", "NEGRO"] else ("PARIDAD" if target in ["PAR", "IMPAR"] else "ZONA")
         
-        # Lógica de refuerzo cruzado básica
         if target_cat == "COLOR":
             p_par = predictions.get("PARIDAD", {}).get("PAR", 0.5)
             p_may = predictions.get("ZONA", {}).get("MAYOR", 0.5)
-            # Intersecciones favorables en la ruleta
             if target == "ROJO" and p_par > 0.55: cross_boost += 0.02
             if target == "NEGRO" and p_may > 0.55: cross_boost += 0.02
             
@@ -285,12 +286,12 @@ class AMXAnalyzer:
 class SequenceState:
     def __init__(self, category: str):
         self.category = category
-        self.sequence = SEQUENCE_COLOR if category == "COLOR" else (SEQUENCE_PARITY if category == "PARIDAD" else SEQUENCE_ZONE)
+        self.sequence = SEQUENCE_COLOR if category == "COLOR" else (SEQUENCE_PARIDAD if category == "PARIDAD" else SEQUENCE_ZONA)
         self.idx = 0
         self.attempt = 1
         self.chips = 5
         self.session_profit = 0
-        self.waiting_activation = True  # Espera primer opuesto para arrancar
+        self.waiting_activation = True
 
     def advance(self):
         self.idx = (self.idx + 1) % len(self.sequence)
@@ -306,7 +307,7 @@ class SequenceState:
     def loss(self):
         self.chips = min(20, self.chips + 1)
         if self.attempt >= 5:
-            self.attempt = 1  # Resetea intentos, la racha se rompió
+            self.attempt = 1
         else:
             self.attempt += 1
 
@@ -352,7 +353,7 @@ class GlobalStats:
         text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
-            a_str = f"🔄 GALE #{s['attempt']}"
+            a_str = f"🔄 INTENTO #{s['attempt']}"
             b_str = f"🪙 {s['balance']}"
             rl    = s['roulette'][:14]
             if s['result'] == 'WIN':
@@ -374,10 +375,10 @@ class RouletteEngine:
         self.db_path = f"main_roulette_{ws_key}.db"
 
         self.spin_history: list = []
-        self.hist_color: list = []; self.hist_parity: list = []; self.hist_zone: list = []
+        self.hist_color: list = []; self.hist_paridad: list = []; self.hist_zona: list = []
         
         self.seq_states = {cat: SequenceState(cat) for cat in CATEGORIES}
-        self.active_category_idx = 0  # Rota cada sesión
+        self.active_category_idx = 0
 
         self.markov = {cat: SmoothedMarkovPredictor() for cat in CATEGORIES}
         self.ensemble = OnlineEnsemblePredictor()
@@ -405,7 +406,6 @@ class RouletteEngine:
 
     def rotate_category(self):
         self.active_category_idx = (self.active_category_idx + 1) % len(CATEGORIES)
-        # Resetear profit de sesión al rotar
         for s in self.seq_states.values(): s.session_profit = 0
 
     def _get_db(self) -> sqlite3.Connection:
@@ -438,23 +438,22 @@ class RouletteEngine:
             self.markov[cat].update(hist)
 
     def _update_state(self, number: int, persist=True, train_model=True):
-        c = COLOR_MAP[number]; p = PARITY_MAP[number]; z = ZONE_MAP[number]
-        self.spin_history.append({"number": number, "color": c, "parity": p, "zone": z})
-        self.hist_color.append(c); self.hist_parity.append(p); self.hist_zone.append(z)
+        c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
+        self.spin_history.append({"number": number, "color": c, "paridad": p, "zona": z})
+        self.hist_color.append(c); self.hist_paridad.append(p); self.hist_zona.append(z)
         
-        # Avance de secuencias en 2º plano
         for cat in CATEGORIES:
             state = self.seq_states[cat]
             if state.waiting_activation:
-                # Activación: espera el opuesto al primer elemento para empezar
-                if state.expected() != getattr(self, f"hist_{cat.lower()}")[-1]:
+                hist = getattr(self, f"hist_{cat.lower()}")
+                if state.expected() != hist[-1]:
                     state.waiting_activation = False
             else:
                 state.advance()
 
         if train_model and number != 0 and len(self.hist_color) > 5:
             self.ensemble.partial_train(
-                self.hist_color, self.hist_parity, self.hist_zone,
+                self.hist_color, self.hist_paridad, self.hist_zona,
                 c, p, z
             )
             self.spins_since_train += 1
@@ -464,14 +463,13 @@ class RouletteEngine:
         if persist: self._persist(number)
 
     def _get_predictions(self, cat: str) -> dict:
-        """Obtiene predicciones de Markov y ML para una categoría."""
         hist = getattr(self, f"hist_{cat.lower()}")
-        classes = OnlineEnsemblePredictor.CLASSES_COLOR if cat=="COLOR" else (OnlineEnsemblePredictor.CLASSES_PARITY if cat=="PARIDAD" else OnlineEnsemblePredictor.CLASSES_ZONE)
+        classes = getattr(self.ensemble, f"CLASSES_{cat.upper()}")
         
         mk_pred = self.markov[cat].predict(hist, classes)
         mk_probs = mk_pred if mk_pred else {c: 1/3 for c in classes}
         
-        ens_probs = self.ensemble.predict(self.hist_color, self.hist_parity, self.hist_zone, cat)
+        ens_probs = self.ensemble.predict(self.hist_color, self.hist_paridad, self.hist_zona, cat)
         if not ens_probs: ens_probs = {c: 1/3 for c in classes}
         
         final_probs = {}
@@ -484,14 +482,13 @@ class RouletteEngine:
         cat = self.current_category
         state = self.seq_states[cat]
         
-        if state.waiting_activation or state.session_profit >= 5:
+        if state.waiting_activation or state.session_profit >= TARGET_PROFIT:
             return None
             
         target = state.expected()
         predictions = {c: self._get_predictions(c) for c in CATEGORIES}
         base_prob = predictions[cat].get(target, 0)
         
-        # AMX Filter
         final_prob = self.amx.adjust_probability(base_prob, target, predictions)
         
         if final_prob >= MIN_PROB:
@@ -504,8 +501,8 @@ class RouletteEngine:
         target = self.active_target
         state = self.seq_states[cat]
         
-        # Emoji del último número basado en la categoría de la señal
-        last_val = COLOR_MAP[last_num] if cat=="COLOR" else (PARITY_MAP[last_num] if cat=="PARIDAD" else ZONE_MAP[last_num])
+        last_spin = self.spin_history[-1]
+        last_val = last_spin.get("color") if cat=="COLOR" else (last_spin.get("paridad") if cat=="PARIDAD" else last_spin.get("zona"))
         last_emoji = EMOJI_MAP.get(last_val, "")
         target_emoji = EMOJI_MAP.get(target, "")
         
@@ -547,7 +544,7 @@ class RouletteEngine:
         logger.info(f"[{self.name}] 🎯 SEÑAL {sig['type']} {sig['target']} ({sig['prob']:.0%})")
 
     def resolve(self, number: int) -> bool:
-        c = COLOR_MAP[number]; p = PARITY_MAP[number]; z = ZONE_MAP[number]
+        c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
         actual_val = c if self.active_type == "COLOR" else (p if self.active_type == "PARIDAD" else z)
         state = self.seq_states[self.active_type]
         
@@ -555,7 +552,6 @@ class RouletteEngine:
         is_zero = (number == 0)
 
         if is_zero:
-            # CERO = Pérdida total de la ficha apostada
             state.loss()
             GLOBAL_STATS.record('EMPATE', state.attempt, number, state.chips, self.active_type, self.name)
             tg_send(
@@ -574,18 +570,18 @@ class RouletteEngine:
                 f"🎉 ¡Ganaste {state.chips} fichas!\n"
                 f"🪙 Balance sesión: {state.session_profit} fichas"
             )
-            if state.session_profit >= 5:
+            if state.session_profit >= TARGET_PROFIT:
                 tg_send("🏆 META DE SESIÓN ALCANZADA (+5 Fichas) 🏆")
             self._check_stats(); self._reset_signal()
             return True
         else:
             chips_lost = state.chips
             state.loss()
-            if state.attempt == 1:  # Acaba de resetear, significan que perdieron 5 veces
+            if state.attempt == 1:
                 GLOBAL_STATS.record('LOSS', 5, number, chips_lost, self.active_type, self.name)
                 tg_send(
                     f"❌ LOSS TOTAL {number} — {self.active_type}\n"
-                    f"🚨 Racha de 5 intentos perdida. Pérdida total acumulada.\n"
+                    f"🚨 Racha de 5 intentos perdida.\n"
                     f"🪙 Balance sesión: {state.session_profit} fichas"
                 )
                 self._check_stats(); self._reset_signal()
@@ -595,7 +591,6 @@ class RouletteEngine:
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-                # No cerramos señal, esperamos próximo filtro
                 self.signal_active = False 
                 return False
 
@@ -606,7 +601,6 @@ class RouletteEngine:
 
     def _reset_signal(self):
         self.signal_active     = False
-        self.active_pair       = ()
         self.active_type       = None
         self.active_target     = ""
         self.active_signal_msg_id = None
@@ -620,7 +614,7 @@ class RouletteEngine:
             self._reset_signal()
 
     def _feed_inner(self, number: int, active: bool = False):
-        c = COLOR_MAP[number]; p = PARITY_MAP[number]; z = ZONE_MAP[number]
+        c = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
         tag = "🟢 ACTIVA" if active else "⚫ pasiva"
         spin_n = len(self.spin_history) + 1
 
@@ -692,7 +686,7 @@ class SessionManager:
         self.signals_this_session = 0
         
         engine  = self.engines[self.current_idx]
-        engine.rotate_category() # Cambia de categoría cada sesión
+        engine.rotate_category()
         
         now_str = self._now_arg().strftime("%H:%M")
         end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
@@ -719,6 +713,11 @@ class SessionManager:
         engine    = self.engines[self.current_idx]
         next_idx  = (self.current_idx + 1) % len(self.engines)
         next_name = self.engines[next_idx].name
+        
+        current_cat = engine.current_category
+        next_cat_idx = (engine.active_category_idx + 1) % len(CATEGORIES)
+        next_cat = CATEGORIES[next_cat_idx]
+        
         logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} → siguiente: {next_name}")
         self.session_active = False
 
@@ -727,8 +726,8 @@ class SessionManager:
             self.prev_end_msg_id = None
 
         text = (
-            f"⏸ SESIÓN CERRADA — {engine.name} ({engine.current_category})\n"
-            f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
+            f"⏸ SESIÓN CERRADA — {current_cat}\n"
+            f"🎰 PRÓXIMA CATEGORIA — {next_cat} 🎰\n\n"
             f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
             f"1° Op. = 5 FICHAS MÍNIMO\n"
             f"2° Op. = D'ALEMBERT (+1 FICHA)\n"
@@ -737,7 +736,7 @@ class SessionManager:
             f"  • Se envían si IA confiable >= 60%\n"
             f"  • Sesión se cierra → Ej: 12:25 o 12:55\n"
             f"  • Meta por sesión: +5 FICHAS\n\n"
-            f"♦️ POR SESION SE ENVÍAN 3 SEÑALES MÁXIMAS ♦️"
+            f"♦️ SE ESTA USANDO — {engine.name} ♦️"
         )
         msg_id = tg_send_with_button(text, next_name)
         self.prev_end_msg_id = msg_id
@@ -797,11 +796,9 @@ class SessionManager:
         if engine.signal_active:
             finished = engine.resolve(number)
             if finished:
-                # Chequear meta de +5 fichas
-                if engine.seq_states[engine.current_category].session_profit >= 5:
+                if engine.seq_states[engine.current_category].session_profit >= TARGET_PROFIT:
                     logger.info(f"[SessionManager] 🏆 Meta de +5 fichas alcanzada en {engine.name}. Cerrando sesión anticipadamente.")
                     self._end_session()
-                    # Forzar pausa hasta el próximo ciclo
                     pause_remaining = SESSION_TOTAL - (time.time() - self.session_start)
                     if pause_remaining > 0:
                         threading.Timer(pause_remaining, self._start_session).start()
@@ -809,7 +806,7 @@ class SessionManager:
             return
 
         state = engine.seq_states[engine.current_category]
-        if self.signals_this_session < MAX_SIGNALS and engine.warmup_done and state.session_profit < 5:
+        if self.signals_this_session < MAX_SIGNALS and engine.warmup_done and state.session_profit < TARGET_PROFIT:
             sig = engine.detect_signal()
             if sig:
                 logger.info(f"[SessionManager] 🎯 Señal #{self.signals_this_session + 1} detectada en {engine.name}: {sig}")
@@ -827,12 +824,12 @@ class SessionManager:
             else:
                 self.tick_passive(engine, number)
 
-            color = COLOR_MAP[number]; p = PARITY_MAP[number]; z = ZONE_MAP[number]
+            color = COLOR_MAP[number]; p = PARIDAD_MAP[number]; z = ZONA_MAP[number]
             last20 = engine.spin_history[-20:]
             queue_broadcast({
-                "type": "spin", "number": number, "color": color, "parity": p, "zone": z,
+                "type": "spin", "number": number, "color": color, "paridad": p, "zona": z,
                 "spin_count": len(engine.spin_history), "warmup_done": engine.warmup_done,
-                "last20": [{"number": s["number"], "color": s["color"], "parity": s["parity"], "zone": s["zone"]} for s in last20],
+                "last20": [{"number": s["number"], "color": s["color"], "paridad": s["paridad"], "zona": s["zona"]} for s in last20],
                 "signal_active": engine.signal_active, "category": engine.current_category,
                 "session_profit": engine.seq_states[engine.current_category].session_profit
             })
@@ -952,6 +949,10 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
             reconnect_delay = min(reconnect_delay * 2, 60)
 
 # ─── WEBSOCKET SERVER PARA HTML ───────────────────────────────────────────────
+async def _http_filter(path, request_headers):
+    if request_headers.get("Upgrade") is None:
+        return (200, "OK", b"Server is alive")
+
 async def _ws_server_handler(websocket):
     q = asyncio.Queue(maxsize=200)
     _ws_clients.add(q)
@@ -963,8 +964,11 @@ async def _ws_server_handler(websocket):
             last20 = engine.spin_history[-20:]
             init_msg = {
                 "type": "init", "roulette": engine.name, "category": engine.current_category,
-                "spins": last20, "session_profit": engine.seq_states[engine.current_category].session_profit,
-                "stats": {"wins": GLOBAL_STATS.wins, "losses": GLOBAL_STATS.losses, "empates": GLOBAL_STATS.zeros}
+                "spins": [{"number": s["number"], "color": s["color"], 
+                           "paridad": s["paridad"], "zona": s["zona"]} for s in last20],
+                "session_profit": engine.seq_states[engine.current_category].session_profit,
+                "stats": {"wins": GLOBAL_STATS.wins, "losses": GLOBAL_STATS.losses, 
+                          "empates": GLOBAL_STATS.zeros}
             }
             await websocket.send(json.dumps(init_msg))
 
@@ -975,25 +979,37 @@ async def _ws_server_handler(websocket):
                 except Exception: break
 
         async def receiver():
-            async for msg in websocket: pass
+            try:
+                async for msg in websocket: pass
+            except Exception: pass
 
         sender_task = asyncio.create_task(sender())
         receiver_task = asyncio.create_task(receiver())
-        try: await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
+        try:
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
         finally:
             sender_task.cancel(); receiver_task.cancel()
             try: await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
             except Exception: pass
 
     except websockets.exceptions.ConnectionClosed: pass
-    except Exception as e: logger.debug(f"[WS-Server] Error: {e}")
+    except Exception: pass
     finally:
         _ws_clients.discard(q)
         logger.info(f"[WS-Server] 📡 Cliente desconectado | Total: {len(_ws_clients)}")
 
 async def _ws_server_main():
+    for name in ['websockets', 'websockets.server', 'websockets.client',
+                  'websockets.protocol', 'websockets.http11',
+                  'websockets.asyncio', 'websockets.asyncio.server']:
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+        
     logger.info(f"[WS-Server] 🌐 Iniciando WebSocket server en 0.0.0.0:{WS_SERVER_PORT}")
-    async with websockets.serve(_ws_server_handler, "0.0.0.0", WS_SERVER_PORT, ping_interval=20, ping_timeout=40, close_timeout=10):
+    async with websockets.serve(
+        _ws_server_handler, "0.0.0.0", WS_SERVER_PORT,
+        ping_interval=20, ping_timeout=40, close_timeout=10,
+        process_request=_http_filter
+    ):
         await asyncio.Future()
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
