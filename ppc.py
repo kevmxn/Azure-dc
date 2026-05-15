@@ -36,8 +36,13 @@ from urllib3.util.retry import Retry
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [AutoRoulette] %(levelname)s %(message)s')
 logger = logging.getLogger("AutoRoulette")
+
+# Silenciar logs molestos de librerías y el error de HEAD request en el WS Server
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
+logging.getLogger('websockets').setLevel(logging.CRITICAL)
+logging.getLogger('websockets.server').setLevel(logging.CRITICAL)
+logging.getLogger('websockets.http11').setLevel(logging.CRITICAL)
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN           = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
@@ -99,13 +104,14 @@ COLOR_MAP: dict = {0:"CERO",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NE
 PARIDAD_MAP: dict = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
 ZONA_MAP: dict = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
 
+# ─── WS CLIENTS (PARA HTML EXTERNO) ──────────────────────────────────────────
 _ws_clients: Set[asyncio.Queue] = set()
 
 def queue_broadcast(data: dict):
     for q in list(_ws_clients):
-        try:
+        try: 
             q.put_nowait(data)
-        except:
+        except: 
             pass
 
 _TG_RETRIES = 12
@@ -151,7 +157,7 @@ def fmt_money(val) -> str:
 
 
 class SmoothedMarkovPredictor:
-    def __init__(self, window: int = 60, order: int = 4):  # CAMBIO: order de 2 a 4
+    def __init__(self, window: int = 60, order: int = 4):  # Orden 4
         self.window = window
         self.order = order
         self.transition_counts: dict = {}
@@ -423,6 +429,7 @@ class SessionManager:
         engine = self.engines[self.current_idx]
         logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_money(self.session_start_chips)}")
         tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n🪙 Meta: +{fmt_money(SESSION_TARGET)}\n⏱ Duración: 25 mins")
+        queue_broadcast({"type": "session", "status": "active"})
 
     def _end_session(self, target_met=False):
         engine = self.engines[self.current_idx]
@@ -449,6 +456,8 @@ class SessionManager:
         else:
             self.current_idx = (self.current_idx + 1) % len(self.engines)
             tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\nLabouchere reiniciado.")
+            
+        queue_broadcast({"type": "session", "status": "closed"})
 
     async def session_watchdog(self):
         while True:
@@ -558,6 +567,12 @@ class RouletteEngine:
                 self.spins_since_train = 0
         if persist:
             self._persist(number)
+            
+        # Enviar giro al HTML externo
+        queue_broadcast({
+            "type": "spin", "number": number, "color": c, "paridad": p, "zona": z,
+            "bankroll": GLOBAL_STATS.global_chips
+        })
 
     def _get_predictions(self, cat: str) -> dict:
         hist = getattr(self, f"hist_{cat.lower()}")
@@ -617,6 +632,12 @@ class RouletteEngine:
         msg_id = tg_send_with_button(self._build_signal_text(), self.name)
         if msg_id:
             self.active_signal_msg_id = msg_id
+            
+        # Enviar señal al HTML externo
+        queue_broadcast({
+            "type": "signal", "target": self.active_target, "chips": self.active_chips,
+            "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips
+        })
 
     def iniciar_senal(self, sig: dict):
         self.cycle_active = True
@@ -636,6 +657,7 @@ class RouletteEngine:
         won = (actual_val == self.active_target)
         is_zero = (number == 0)
         current_bet = self.active_chips
+        
         if won:
             seq_completed = self.labouchere.win()
             GLOBAL_STATS.global_chips += current_bet
@@ -646,6 +668,7 @@ class RouletteEngine:
             tg_send(msg)
             self._send_analyzing_msg()
             self._end_cycle()
+            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips})
         else:
             GLOBAL_STATS.global_chips -= current_bet
             self.labouchere.loss(current_bet)
@@ -653,12 +676,14 @@ class RouletteEngine:
                 self.attempt += 1
                 self.signal_active = False
                 self._send_analyzing_msg()
+                queue_broadcast({"type": "result_retry", "attempt": self.attempt, "bankroll": GLOBAL_STATS.global_chips})
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 msg = f"🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
                 tg_send(f"{msg}\n🚨 Racha de 3 intentos perdida.\n🪙 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}")
                 self._send_analyzing_msg()
                 self._end_cycle()
+                queue_broadcast({"type": "result", "result": "EMPATE" if is_zero else "LOSS", "number": number, "bankroll": GLOBAL_STATS.global_chips})
 
     def _end_cycle(self):
         self.attempt = 1
@@ -822,9 +847,39 @@ async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionMan
             reconnect_delay = min(reconnect_delay * 2, 60)
 
 
+# ─── WS SERVER PARA HTML EXTERNO ─────────────────────────────────────────────
+async def ws_client_handler(websocket):
+    """Maneja las conexiones del HTML externo y envía datos en tiempo real"""
+    q = asyncio.Queue()
+    _ws_clients.add(q)
+    try:
+        # Enviar estado inicial al HTML cuando se conecta
+        if engines_global:
+            e = engines_global[0]
+            state = {
+                "type": "init", "bankroll": GLOBAL_STATS.global_chips,
+                "session_active": session_mgr_global.session_active if session_mgr_global else False,
+                "labouchere": e.labouchere.seq, "history": e.spin_history[-20:]
+            }
+            await websocket.send(json.dumps(state))
+        
+        # Mantener conexión enviando eventos
+        while True:
+            data = await q.get()
+            await websocket.send(json.dumps(data))
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        _ws_clients.discard(q)
+
 async def _ws_server_main():
-    async with websockets.serve(lambda ws, path: None, "0.0.0.0", WS_SERVER_PORT):
-        await asyncio.Future()
+    """Inicia el servidor WS para el HTML externo en el WS_SERVER_PORT"""
+    try:
+        async with websockets.serve(ws_client_handler, "0.0.0.0", WS_SERVER_PORT):
+            logger.info(f"[WSServer] 🌐 Servidor WebSocket para HTML iniciado en puerto {WS_SERVER_PORT}")
+            await asyncio.Future()
+    except Exception as e:
+        logger.error(f"[WSServer] Error al iniciar servidor WS: {e}")
 
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
@@ -921,7 +976,7 @@ async def main():
         asyncio.create_task(session_mgr_global.session_watchdog()),
         asyncio.create_task(daily_stats_loop()),
         asyncio.create_task(self_ping_loop()),
-        asyncio.create_task(_ws_server_main()),
+        asyncio.create_task(_ws_server_main()),  # Restaurado para el HTML
     ]
     for i, r in enumerate(ROULETTES):
         tasks.append(asyncio.create_task(ws_reader(r["key"], engines_global[i], session_mgr_global)))
