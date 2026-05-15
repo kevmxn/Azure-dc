@@ -69,11 +69,11 @@ bot.session = _session
 
 # ─── RULETA CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 206, "name": "ROULETTE MACAO 🇲🇴"},
+    {"key": 225, "name": "ROULETTE MACAO 🇲🇴"},
 ]
 
 ROULETTE_LINKS = {
-    "ROULETTE MACAO 🇲🇴": "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
+    "ROULETTE MACAO 🇲🇴": "https://1win.lat/casino/play/v_pragmatic:1winroulettemacao",
 }
 
 def get_roulette_url(name: str) -> Optional[str]:
@@ -101,7 +101,7 @@ WARMUP_SPINS        = 25
 MIN_PROB            = 0.65
 TRAIN_INTERVAL      = 50
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
-SESSION_TARGET      = 1500  # Meta de $1500 por sesión
+SESSION_TARGET      = 2000  # Meta de $1500 por sesión
 
 SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
 SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
@@ -266,26 +266,34 @@ class AMXAnalyzer:
     def adjust_probability(self, base_prob: float, target: str, predictions: dict, recent_hist: list, seq_state) -> float:
         cross_boost = 0.0
         target_cat = "COLOR" if target in ["ROJO", "NEGRO"] else ("PARIDAD" if target in ["PAR", "IMPAR"] else "ZONA")
+        
+        # ── Cruces Simétricos (Ahora ROJO/PAR/MENOR tienen los mismos derechos) ──
         if target_cat == "COLOR":
-            if target == "ROJO" and predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55:
-                cross_boost += 0.02
-            if target == "NEGRO" and predictions.get("ZONA", {}).get("MAYOR", 0.5) > 0.55:
-                cross_boost += 0.02
+            if target == "ROJO":
+                if predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55: cross_boost += 0.02
+                if predictions.get("ZONA", {}).get("MENOR", 0.5) > 0.55: cross_boost += 0.02
+            elif target == "NEGRO":
+                if predictions.get("PARIDAD", {}).get("IMPAR", 0.5) > 0.55: cross_boost += 0.02
+                if predictions.get("ZONA", {}).get("MAYOR", 0.5) > 0.55: cross_boost += 0.02
         elif target_cat == "PARIDAD":
-            if target == "IMPAR" and predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55:
-                cross_boost += 0.02
-            if target == "PAR" and predictions.get("ZONA", {}).get("MAYOR", 0.5) > 0.55:
-                cross_boost += 0.02
+            if target == "PAR":
+                if predictions.get("COLOR", {}).get("NEGRO", 0.5) > 0.55: cross_boost += 0.02
+                if predictions.get("ZONA", {}).get("MENOR", 0.5) > 0.55: cross_boost += 0.02
+            elif target == "IMPAR":
+                if predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55: cross_boost += 0.02
+                if predictions.get("ZONA", {}).get("MAYOR", 0.5) > 0.55: cross_boost += 0.02
         elif target_cat == "ZONA":
-            if target == "MENOR" and predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55:
-                cross_boost += 0.02
-            if target == "MAYOR" and predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55:
-                cross_boost += 0.02
+            if target == "MENOR":
+                if predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55: cross_boost += 0.02
+                if predictions.get("COLOR", {}).get("NEGRO", 0.5) > 0.55: cross_boost += 0.02
+            elif target == "MAYOR":
+                if predictions.get("PARIDAD", {}).get("IMPAR", 0.5) > 0.55: cross_boost += 0.02
+                if predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55: cross_boost += 0.02
 
+        # ── Resonancia por Racha Real (Reemplaza la resonancia de secuencia fija) ──
         matches = 0
-        check_depth = min(3, len(recent_hist), seq_state.idx)
-        for i in range(1, check_depth + 1):
-            if recent_hist[-i] == seq_state.sequence[(seq_state.idx - i) % len(seq_state.sequence)]:
+        for i in range(1, min(4, len(recent_hist)) + 1):
+            if recent_hist[-i] == target:
                 matches += 1
             else:
                 break
@@ -296,8 +304,13 @@ class AMXAnalyzer:
         elif matches >= 3:
             cross_boost += 0.12
 
+        # ── Ruptura de Repetición ──
         if len(recent_hist) >= 2 and recent_hist[-1] == recent_hist[-2] and recent_hist[-1] != "CERO" and recent_hist[-1] != target:
             cross_boost += 0.04
+
+        # ── Bonus de Alineación con Secuencia Fija ──
+        if target == seq_state.expected():
+            cross_boost += 0.03
 
         return min(1.0, base_prob + cross_boost)
 
@@ -385,22 +398,22 @@ class GlobalStats:
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text = "📊 RESUMEN DIARIO — AUTO ROULETTE 📊\n 🕛 Reporte 12:00 hs\n\n"
+        text = "📊 RESUMEN — ROULETTE MACAO 🇲🇴\n 🕛 Reporte 12:00 hs\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Bankroll Global: 🪙 {fmt_money(self.global_chips)}\n"
+        text += f"► Bankroll Global: 💵 {fmt_money(self.global_chips)}\n"
         text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 INTENTO #{s['attempt']}"
-            b_str = f"🪙 +{fmt_money(s['val'])}" if s['result'] == 'WIN' else f"🪙 -{fmt_money(s['val'])}"
+            b_str = f"💵 +{fmt_money(s['val'])}" if s['result'] == 'WIN' else f"💵 -{fmt_money(s['val'])}"
             if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} | {a_str} | {b_str}\n"
+                text += f"✅ WIN #{s['number']} {s['type']} | {a_str} | {b_str}\n\n"
             elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n"
+                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n\n"
             else:
-                text += f"❌ LOSS #{s['number']} {s['type']} | {a_str} | {b_str}\n"
+                text += f"❌ LOSS #{s['number']} {s['type']} | {a_str} | {b_str}\n\n"
         return text
 
 
@@ -435,7 +448,7 @@ class SessionManager:
         self.session_start_chips = GLOBAL_STATS.global_chips
         engine = self.engines[self.current_idx]
         logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_money(self.session_start_chips)}")
-        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n🪙 Meta: +{fmt_money(SESSION_TARGET)}\n⏱ La sesión no cierra hasta cumplir la meta")
+        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n💵 Meta: +{fmt_money(SESSION_TARGET)}\n⏱ La sesión no cierra hasta cumplir la meta")
         queue_broadcast({"type": "session", "status": "active"})
 
     def _end_session(self):
@@ -584,18 +597,32 @@ class RouletteEngine:
         best_prob = 0.0
         best_info = ""
         
+        targets_map = {
+            "COLOR": ["ROJO", "NEGRO"],
+            "PARIDAD": ["PAR", "IMPAR"],
+            "ZONA": ["MENOR", "MAYOR"]
+        }
+        
+        # ── EVALUAR AMBOS LADOS (Ya no hay ceguedad) ──
         for cat in ["COLOR", "PARIDAD", "ZONA"]:
-            seq_target = self.seq_states[cat].expected()
-            base_prob = predictions[cat].get(seq_target, 0)
             hist = getattr(self, f"hist_{cat.lower()}")
-            final_prob = self.amx.adjust_probability(base_prob, seq_target, predictions, hist, self.seq_states[cat])
+            best_cat_prob = 0.0
+            best_cat_target = None
             
-            if final_prob > best_prob:
-                best_prob = final_prob
-                best_info = f"{cat} -> {seq_target} ({final_prob*100:.1f}%)"
+            for target in targets_map[cat]:
+                base_prob = predictions[cat].get(target, 0)
+                final_prob = self.amx.adjust_probability(base_prob, target, predictions, hist, self.seq_states[cat])
                 
-            if final_prob >= MIN_PROB:
-                valid_signals[cat] = {"target": seq_target, "prob": final_prob}
+                if final_prob > best_cat_prob:
+                    best_cat_prob = final_prob
+                    best_cat_target = target
+                    
+            if best_cat_prob > best_prob:
+                best_prob = best_cat_prob
+                best_info = f"{cat} -> {best_cat_target} ({best_cat_prob*100:.1f}%)"
+                
+            if best_cat_prob >= MIN_PROB:
+                valid_signals[cat] = {"target": best_cat_target, "prob": best_cat_prob}
 
         # ── LOG DE TESTING ──────────────────────────────────────
         last_num = self.spin_history[-1]["number"] if self.spin_history else "?"
@@ -632,7 +659,7 @@ class RouletteEngine:
             f"🔸 APUESTA: {fmt_money(self.active_chips)}\n"
             f"🔹 INTENTO: {self.attempt} DE 3\n\n"
             f"💡 Probabilidad de Patrón — {self._last_signal_prob:.1f}%\n"
-            f"🪙 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
+            f"💵 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
         )
 
     def send_signal(self):
@@ -673,7 +700,7 @@ class RouletteEngine:
             seq_completed = self.labouchere.win()
             GLOBAL_STATS.global_chips += current_bet
             GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
-            msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_money(current_bet)}!\n🪙 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
+            msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_money(current_bet)}!\n💵 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
             if seq_completed:
                 msg += "\n🏆 Secuencia Labouchere completada."
             tg_send(msg)
@@ -691,7 +718,7 @@ class RouletteEngine:
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 msg = f"🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
-                tg_send(f"{msg}\n🚨 Racha de 3 intentos perdida.\n🪙 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}")
+                tg_send(f"{msg}\n🚨 Racha de 3 intentos perdida.\n💵 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}")
                 self._send_analyzing_msg()
                 self._end_cycle()
                 queue_broadcast({"type": "result", "result": "EMPATE" if is_zero else "LOSS", "number": number, "bankroll": GLOBAL_STATS.global_chips})
@@ -725,19 +752,16 @@ class RouletteEngine:
                 self.ws_count += 1
                 if self.ws_count >= WARMUP_SPINS:
                     self.warmup_done = True
-                    tg_send("🟢 <b>AUTO ROULETTE</b> — Sistema Listo.")
+                    tg_send("🟢 <b>ROULETTE MACAO 🇲🇴</b> — Sistema Listo.")
                 return
             if not session_active:
                 return
                 
-            # Resolver señal si está activa
             if self.signal_active:
                 self.resolve(number)
                 
-            # Siempre evaluar probabilidades para el log de testing
             sig = self.detect_signal()
             
-            # Si no hay señal activa, evaluar si entramos en una nueva
             if not self.signal_active:
                 if sig:
                     if self.cycle_active:
