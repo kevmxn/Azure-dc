@@ -1,13 +1,12 @@
-
 #!/usr/bin/env python3
 """
-Speed Roulette 2 — Bot de señales Híbrido (Secuencias + ML + AMX + Labouchere)
+Auto Roulette — Bot de señales Híbrido (Secuencias + ML + AMX + Labouchere)
 Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
-  - Ventana Móvil Markov 60 giros + ML Cruzado + Resonancia/Ruptura.
+  - Ventana Móvil Markov 60 giros (Orden 4) + ML Cruzado + Resonancia/Ruptura.
   - Gestión Labouchere: Secuencia inicial [$250, $500, $250] (Ganar la secuencia = +$1000).
   - Sesiones Estrictas: 25 minutos (Cierre en :25/:55, Inicio en :00/:30).
-  - Meta por sesión: +$1,000. Si se cumple, se cierra la sesión y reinicia Labouchere.
+  - Meta por sesión: +$1,500. Si se cumple, se cierra la sesión y reinicia Labouchere.
 """
 
 import asyncio
@@ -35,8 +34,8 @@ from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s [Speed2DC] %(levelname)s %(message)s')
-logger = logging.getLogger("Speed2DC")
+                    format='%(asctime)s [AutoRoulette] %(levelname)s %(message)s')
+logger = logging.getLogger("AutoRoulette")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
@@ -55,11 +54,11 @@ bot.session = _session
 
 # ─── RULETA CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 205, "name": "SPEED ROULETTE 2"},
+    {"key": 225, "name": "AUTO ROULETTE"},
 ]
 
 ROULETTE_LINKS = {
-    "SPEED ROULETTE 2": "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
+    "AUTO ROULETTE": "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
 }
 
 def get_roulette_url(name: str) -> Optional[str]:
@@ -152,7 +151,7 @@ def fmt_money(val) -> str:
 
 
 class SmoothedMarkovPredictor:
-    def __init__(self, window: int = 60, order: int = 2):
+    def __init__(self, window: int = 60, order: int = 4):  # CAMBIO: order de 2 a 4
         self.window = window
         self.order = order
         self.transition_counts: dict = {}
@@ -372,7 +371,7 @@ class GlobalStats:
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text = "📊 RESUMEN DIARIO — SPEED ROULETTE 2 📊\n 🕛 Reporte 12:00 hs\n\n"
+        text = "📊 RESUMEN DIARIO — AUTO ROULETTE 📊\n 🕛 Reporte 12:00 hs\n\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
@@ -428,6 +427,9 @@ class SessionManager:
     def _end_session(self, target_met=False):
         engine = self.engines[self.current_idx]
         self.session_active = False
+        
+        # Calcular minutos transcurridos
+        duration_mins = int((time.time() - self.session_start_time) / 60)
 
         # Limpiar estado del motor
         engine.labouchere = Labouchere()
@@ -443,10 +445,10 @@ class SessionManager:
 
         logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta alcanzada: {target_met}")
         if target_met:
-            tg_send(f"🏆 META ALCANZADA 🏆\nProfit sesión: +{fmt_money(SESSION_TARGET)}\nSesión cerrada anticipadamente. Labouchere reiniciado.")
+            tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\n¡Felicidades Meta Cumplida!")
         else:
             self.current_idx = (self.current_idx + 1) % len(self.engines)
-            tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: 25 minutos\nLabouchere reiniciado.")
+            tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\nLabouchere reiniciado.")
 
     async def session_watchdog(self):
         while True:
@@ -687,7 +689,7 @@ class RouletteEngine:
                 self.ws_count += 1
                 if self.ws_count >= WARMUP_SPINS:
                     self.warmup_done = True
-                    tg_send("🟢 <b>Speed Roulette 2</b> — Sistema Listo.")
+                    tg_send("🟢 <b>AUTO ROULETTE</b> — Sistema Listo.")
                 return
             if not session_active:
                 return
@@ -877,7 +879,7 @@ async def daily_stats_loop():
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 Speed Roulette 2</b>\nSesiones 25m | Meta +$1000\nLabouchere [$250,$500,$250]\n/status /stats /reset", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesiones 25m | Meta +$1500\nLabouchere [$250,$500,$250]\n/status /stats /reset", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['status'])
