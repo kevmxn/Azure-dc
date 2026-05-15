@@ -87,7 +87,7 @@ MIN_PROB            = 0.65
 TRAIN_INTERVAL      = 50
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
 SESSION_ACTIVE_MINS = 25
-SESSION_TARGET      = 1000  # Meta de $1000 por sesión
+SESSION_TARGET      = 1500 # Meta de $1500 por sesión
 
 SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
 SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
@@ -140,23 +140,15 @@ def fmt_money(val) -> str:
 
 class SmoothedMarkovPredictor:
     def __init__(self, window: int = 60, order: int = 2):
-        self.window = window; self.order = order
-        self.transition_counts: dict = {}
-
+        self.window = window; self.order = order; self.transition_counts: dict = {}
     def update(self, sequence: list):
-        self.transition_counts = defaultdict(lambda: defaultdict(int))
-        recent = sequence[-self.window:]
+        self.transition_counts = defaultdict(lambda: defaultdict(int)); recent = sequence[-self.window:]
         if len(recent) < self.order + 1: return
         for i in range(len(recent) - self.order):
-            state = tuple(recent[i:i + self.order])
-            nxt = recent[i + self.order]
-            self.transition_counts[state][nxt] += 1
-
+            self.transition_counts[tuple(recent[i:i + self.order])][recent[i + self.order]] += 1
     def predict(self, sequence: list, classes: list) -> Optional[dict]:
         if len(sequence) < self.order: return None
-        state = tuple(sequence[-self.order:])
-        counts = dict(self.transition_counts.get(state, {}))
-        total = sum(counts.values())
+        counts = dict(self.transition_counts.get(tuple(sequence[-self.order:]), {})); total = sum(counts.values())
         if total < 5: return None
         alpha = 1.0; vocab_size = len(classes)
         probs = {k: (v + alpha) / (total + alpha * vocab_size) for k, v in counts.items()}
@@ -165,24 +157,19 @@ class SmoothedMarkovPredictor:
         return probs
 
 class OnlineEnsemblePredictor:
-    WINDOW = 5
-    CLASSES_COLOR = ["ROJO", "NEGRO", "CERO"]; CLASSES_PARIDAD = ["PAR", "IMPAR", "CERO"]; CLASSES_ZONA = ["MENOR", "MAYOR", "CERO"]
-
+    WINDOW = 5; CLASSES_COLOR = ["ROJO", "NEGRO", "CERO"]; CLASSES_PARIDAD = ["PAR", "IMPAR", "CERO"]; CLASSES_ZONA = ["MENOR", "MAYOR", "CERO"]
     def __init__(self):
         self.mnb_color = MultinomialNB(alpha=1.0); self.sgd_color = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
         self.mnb_paridad = MultinomialNB(alpha=1.0); self.sgd_paridad = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
         self.mnb_zona = MultinomialNB(alpha=1.0); self.sgd_zona = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
         self.trained = {"COLOR": False, "PARIDAD": False, "ZONA": False}; self.sample_count = 0
-
     def _extract_features(self, hist_c, hist_p, hist_z) -> Optional[list]:
-        if len(hist_c) < self.WINDOW: return None
-        features = []
+        if len(hist_c) < self.WINDOW: return None; features = []
         for i in range(1, self.WINDOW + 1):
             c, p, z = hist_c[-i], hist_p[-i], hist_z[-i]
             vec_c = [1 if x==c else 0 for x in self.CLASSES_COLOR]; vec_p = [1 if x==p else 0 for x in self.CLASSES_PARIDAD]; vec_z = [1 if x==z else 0 for x in self.CLASSES_ZONA]
             features.extend(vec_c + vec_p + vec_z)
         return features
-
     def partial_train(self, hist_c, hist_p, hist_z, target_c, target_p, target_z):
         feats = self._extract_features(hist_c, hist_p, hist_z)
         if feats is None: return
@@ -192,12 +179,10 @@ class OnlineEnsemblePredictor:
             if not self.trained[cat]: mnb.partial_fit(X, y, classes=classes); sgd.partial_fit(X, y, classes=classes); self.trained[cat] = True
             else: mnb.partial_fit(X, y); sgd.partial_fit(X, y)
         self.sample_count += 1
-
     def predict(self, hist_c, hist_p, hist_z, cat: str) -> Optional[dict]:
         if not self.trained[cat]: return None
         feats = self._extract_features(hist_c, hist_p, hist_z)
-        if feats is None: return None
-        X = np.array(feats).reshape(1, -1)
+        if feats is None: return None; X = np.array(feats).reshape(1, -1)
         try:
             mnb, sgd = getattr(self, f"mnb_{cat.lower()}"), getattr(self, f"sgd_{cat.lower()}")
             nb_p = mnb.predict_proba(X)[0]; sg_p = sgd.predict_proba(X)[0]; final = 0.5 * nb_p + 0.5 * sg_p; classes = getattr(self, f"CLASSES_{cat.upper()}")
@@ -217,8 +202,7 @@ class AMXAnalyzer:
         elif target_cat == "ZONA":
             if target == "MENOR" and predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55: cross_boost += 0.02
             if target == "MAYOR" and predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55: cross_boost += 0.02
-        matches = 0
-        check_depth = min(3, len(recent_hist), seq_state.idx)
+        matches = 0; check_depth = min(3, len(recent_hist), seq_state.idx)
         for i in range(1, check_depth + 1):
             if recent_hist[-i] == seq_state.sequence[(seq_state.idx - i) % len(seq_state.sequence)]: matches += 1
             else: break
@@ -230,20 +214,17 @@ class AMXAnalyzer:
 
 class Labouchere:
     def __init__(self):
-        self.base_seq = [250, 500, 250] # Secuencia $1000
+        self.base_seq = [250, 500, 250]
         self.seq = list(self.base_seq)
-        
     def get_bet(self) -> int:
         if not self.seq: return 250
         if len(self.seq) == 1: return self.seq[0]
         return self.seq[0] + self.seq[-1]
-        
     def win(self) -> bool:
         if len(self.seq) >= 2: self.seq.pop(0); self.seq.pop(-1)
         elif len(self.seq) == 1: self.seq.pop(0)
         if not self.seq: self.seq = list(self.base_seq); return True
         return False
-        
     def loss(self, bet: int): self.seq.append(bet)
 
 class SequenceState:
@@ -256,8 +237,7 @@ class SequenceState:
         except ValueError: self.idx = 0
 
 class GlobalStats:
-    def __init__(self):
-        self.wins = 0; self.zeros = 0; self.losses = 0; self.consecutive = 0; self.last_20 = deque(maxlen=20); self.signals_processed = 0; self.global_chips: int = 0; self.last_report_signals = 0
+    def __init__(self): self.wins = 0; self.zeros = 0; self.losses = 0; self.consecutive = 0; self.last_20 = deque(maxlen=20); self.signals_processed = 0; self.global_chips: int = 0; self.last_report_signals = 0
     def record(self, result_type: str, attempt: int, number: int, val, type_str: str, roulette_name: str):
         self.signals_processed += 1
         if result_type == 'WIN': self.wins += 1; self.consecutive += 1
@@ -268,7 +248,7 @@ class GlobalStats:
     def mark_sent(self): self.last_report_signals = self.signals_processed
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses; eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text  = "📊 RESUMEN DIARIO — SPEED ROULETTE 2 📊\n 🕛 Reporte 12:00 hs (Argentina)\n\n"
+        text  = "📊 RESUMEN DIARIO — SPEED ROULETTE 2 📊\n 🕛 Reporte 12:00 hs\n\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n► Consecutivas = {self.consecutive}\n► Assertividade = {eff:.2f}%\n► Bankroll Global: 🪙 {fmt_money(self.global_chips)}\n► Total señales del día: {total}\n\n📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 INTENTO #{s['attempt']}"; b_str = f"🪙 +{fmt_money(s['val'])}" if s['result'] == 'WIN' else f"🪙 -{fmt_money(s['val'])}"
@@ -281,16 +261,11 @@ GLOBAL_STATS = GlobalStats()
 
 class SessionManager:
     ARG_UTC_OFFSET = -3
-
     def __init__(self, engines):
-        self.engines = engines
-        self.current_idx = 0
-        self.session_active = False
-        self.session_start_time = 0.0
-        self.session_start_chips = 0
+        self.engines = engines; self.current_idx = 0; self.session_active = False; self.session_start_time = 0.0; self.session_start_chips = 0
         
     def _now_arg(self): return datetime.utcnow() + timedelta(hours=self.ARG_UTC_OFFSET)
-
+    
     def seconds_to_next_slot(self) -> float:
         now = self._now_arg()
         if now.second <= 5 and now.minute in (0, 30): return 0.0
@@ -299,8 +274,7 @@ class SessionManager:
         return max(0.0, (target - now).total_seconds())
 
     def _start_session(self):
-        self.session_active = True
-        self.session_start_time = time.time()
+        self.session_active = True; self.session_start_time = time.time()
         self.session_start_chips = GLOBAL_STATS.global_chips
         engine = self.engines[self.current_idx]
         logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_money(self.session_start_chips)}")
@@ -309,10 +283,14 @@ class SessionManager:
     def _end_session(self, target_met=False):
         engine = self.engines[self.current_idx]
         self.session_active = False
-        engine.labouchere = Labouchere() # Reset Labouchere al cerrar
-        engine.cycle_active = False; engine.signal_active = False
-        logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta alcanzada: {target_met}")
         
+        # Limpiar estado del motor
+        engine.labouchere = Labouchere()
+        engine.cycle_active = False; engine.signal_active = False; engine.attempt = 1
+        if engine.active_signal_msg_id: tg_delete(CHAT_ID, engine.active_signal_msg_id); engine.active_signal_msg_id = None
+        if engine.analyzing_msg_id: tg_delete(CHAT_ID, engine.analyzing_msg_id); engine.analyzing_msg_id = None
+        
+        logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta alcanzada: {target_met}")
         if target_met:
             tg_send(f"🏆 META ALCANZADA 🏆\nProfit sesión: +{fmt_money(SESSION_TARGET)}\nSesión cerrada anticipadamente. Labouchere reiniciado.")
         else:
@@ -320,28 +298,19 @@ class SessionManager:
             tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: 25 minutos\nLabouchere reiniciado.")
 
     async def session_watchdog(self):
-        wait = self.seconds_to_next_slot()
-        logger.info(f"[Session] ⏳ Esperando {wait/60:.1f} min para el primer slot...")
-        await asyncio.sleep(wait)
-        self._start_session()
-
         while True:
-            await asyncio.sleep(1)
-            now_arg = self._now_arg()
+            wait = self.seconds_to_next_slot()
+            logger.info(f"[Session] ⏳ Esperando {wait/60:.1f} min para el próximo slot...")
+            await asyncio.sleep(wait)
+            self._start_session()
             
-            if self.session_active:
-                # Comprobar meta de $1000
+            while self.session_active:
+                await asyncio.sleep(1)
                 if GLOBAL_STATS.global_chips >= self.session_start_chips + SESSION_TARGET:
-                    self._end_session(target_met=True)
-                # Comprobar tiempo 25 mins
-                elif now_arg.minute in (25, 55):
+                    self._end_session(target_met=True); continue
+                now_arg = self._now_arg()
+                if now_arg.minute in (25, 55):
                     self._end_session(target_met=False)
-                    
-            if not self.session_active:
-                wait = self.seconds_to_next_slot()
-                if wait > 2: await asyncio.sleep(wait - 1)
-                elif now_arg.minute in (0, 30) and now_arg.second <= 1: self._start_session()
-
 
 class RouletteEngine:
     def __init__(self, ws_key: int, name: str):
@@ -367,12 +336,9 @@ class RouletteEngine:
         if rows: self._train_models(); self.initialize_sequences_from_history()
         return len(rows)
     def initialize_sequences_from_history(self):
-        last_negro = next((s for s in reversed(self.spin_history) if s["color"] == "NEGRO"), None)
-        if last_negro: self.seq_states["COLOR"].initialize_from_last_value("NEGRO")
-        last_impar = next((s for s in reversed(self.spin_history) if s["paridad"] == "IMPAR"), None)
-        if last_impar: self.seq_states["PARIDAD"].initialize_from_last_value("IMPAR")
-        last_mayor = next((s for s in reversed(self.spin_history) if s["zona"] == "MAYOR"), None)
-        if last_mayor: self.seq_states["ZONA"].initialize_from_last_value("MAYOR")
+        if any(s["color"] == "NEGRO" for s in reversed(self.spin_history)): self.seq_states["COLOR"].initialize_from_last_value("NEGRO")
+        if any(s["paridad"] == "IMPAR" for s in reversed(self.spin_history)): self.seq_states["PARIDAD"].initialize_from_last_value("IMPAR")
+        if any(s["zona"] == "MAYOR" for s in reversed(self.spin_history)): self.seq_states["ZONA"].initialize_from_last_value("MAYOR")
     def _train_models(self):
         for cat in ["COLOR", "PARIDAD", "ZONA"]: self.markov[cat].update(getattr(self, f"hist_{cat.lower()}"))
     def _update_state(self, number: int, persist=True, train_model=True):
@@ -419,7 +385,7 @@ class RouletteEngine:
         if won:
             seq_completed = self.labouchere.win(); GLOBAL_STATS.global_chips += current_bet; GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
             msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_money(current_bet)}!\n🪙 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
-            if seq_completed: msg += "\n🏆 Secuencia Labouchere completada. Reiniciando..."
+            if seq_completed: msg += "\n🏆 Secuencia Labouchere completada."
             tg_send(msg); self._send_analyzing_msg(); self._end_cycle()
         else:
             GLOBAL_STATS.global_chips -= current_bet; self.labouchere.loss(current_bet)
@@ -435,22 +401,23 @@ class RouletteEngine:
     def _check_stats(self):
         if not GLOBAL_STATS.should_send(): return
         tg_send(GLOBAL_STATS.get_stats_text()); GLOBAL_STATS.mark_sent()
-    def feed_number(self, number: int):
-        try: self._update_state(number)
-        except Exception as e: logger.error(f"Error: {e}", exc_info=True)
     def process_spin(self, number: int, session_active: bool):
         try:
-            self.feed_number(number)
+            self._update_state(number)
+            if not self.warmup_done:
+                self.ws_count += 1
+                if self.ws_count >= WARMUP_SPINS: self.warmup_done = True; tg_send("🟢 <b>Speed Roulette 2</b> — Sistema Listo.")
+                return
             if not session_active: return
             if self.signal_active: self.resolve(number)
-            if not self.signal_active and self.warmup_done:
+            if not self.signal_active:
                 sig = self.detect_signal()
                 if sig:
                     if self.cycle_active: self.active_type = sig["type"]; self.active_target = sig["target"]; self._last_signal_prob = sig["prob"] * 100; self.active_chips = self.labouchere.get_bet(); self.signal_active = True; self.send_signal()
                     else: self.iniciar_senal(sig)
         except Exception as e: logger.error(f"Error: {e}", exc_info=True); self._end_cycle()
 
-# WS & MAIN LOGIC (Idéntico a versiones anteriores pero adaptado para SessionManager)
+# WS & MAIN LOGIC
 async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionManager):
     reconnect_delay = 5; initial_loaded = False; seen_ids: set = set(); seen_ids_queue: deque = deque(maxlen=200)
     def is_new_id(gid: str) -> bool:
@@ -517,6 +484,11 @@ session_mgr_global: Optional[SessionManager] = None
 def home(): return jsonify({"status": "ok"})
 @app.route("/ping")
 def ping(): return jsonify({"status": "pong", "ts": time.time()})
+@app.route("/health")
+def health():
+    if not engines_global: return jsonify({"status": "initializing"})
+    e = engines_global[0]; sa = "Active" if session_mgr_global and session_mgr_global.session_active else "Inactive"
+    return jsonify({"bankroll": GLOBAL_STATS.global_chips, "session": sa})
 
 async def self_ping_loop():
     url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
