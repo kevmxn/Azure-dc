@@ -101,7 +101,7 @@ WARMUP_SPINS        = 25
 MIN_PROB            = 0.65
 TRAIN_INTERVAL      = 50
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
-SESSION_TARGET      = 2000  # Meta de $1500 por sesión
+SESSION_TARGET      = 8     # Meta de $0.80 USD por sesión
 
 SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
 SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
@@ -455,7 +455,7 @@ class GlobalStats:
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Balance Global USD: 💵 {fmt_currency_amount(self.global_chips, 'USD')}\n"
+        text += f"► Bankroll Global: 💵 {fmt_currency_amount(self.global_chips, 'USD')}\n"
         text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
@@ -766,7 +766,7 @@ class RouletteEngine:
             if seq_completed:
                 cycle_msg = (
                     f"🎉 CICLO DE LABOUCHER COMPLETADO 🎉\n"
-                    f"🚨 GANANCIAS POR PAIS:\n"
+                    f"🚨 GESTION ACTUAL POR PAIS:\n"
                     f"{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}"
                 )
                 tg_send(cycle_msg)
