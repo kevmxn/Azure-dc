@@ -37,12 +37,24 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [AutoRoulette] %(levelname)s %(message)s')
 logger = logging.getLogger("AutoRoulette")
 
-# Silenciar logs molestos de librerías y el error de HEAD request en el WS Server
+# Silenciar logs molestos de librerías
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 logging.getLogger('websockets').setLevel(logging.CRITICAL)
 logging.getLogger('websockets.server').setLevel(logging.CRITICAL)
 logging.getLogger('websockets.http11').setLevel(logging.CRITICAL)
+
+# Filtro para evitar el spam del error 409 de Telegram (Doble instancia)
+class _TeleBotFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if "409" in msg or "terminated by other getUpdates request" in msg:
+            logger.warning("⚠️ Conflicto 409 detectado: Otra instancia del bot se está ejecutando. (Normal durante despliegues)")
+            return False
+        return True
+
+logging.getLogger('telebot').addFilter(_TeleBotFilter())
+logging.getLogger('telebot.apihelper').addFilter(_TeleBotFilter())
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN           = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
@@ -435,10 +447,8 @@ class SessionManager:
         engine = self.engines[self.current_idx]
         self.session_active = False
         
-        # Calcular minutos transcurridos
         duration_mins = int((time.time() - self.session_start_time) / 60)
 
-        # Limpiar estado del motor
         engine.labouchere = Labouchere()
         engine.cycle_active = False
         engine.signal_active = False
@@ -568,7 +578,6 @@ class RouletteEngine:
         if persist:
             self._persist(number)
             
-        # Enviar giro al HTML externo
         queue_broadcast({
             "type": "spin", "number": number, "color": c, "paridad": p, "zona": z,
             "bankroll": GLOBAL_STATS.global_chips
@@ -633,7 +642,6 @@ class RouletteEngine:
         if msg_id:
             self.active_signal_msg_id = msg_id
             
-        # Enviar señal al HTML externo
         queue_broadcast({
             "type": "signal", "target": self.active_target, "chips": self.active_chips,
             "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips
@@ -778,7 +786,6 @@ async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionMan
                         if not isinstance(data, dict):
                             continue
 
-                        # ── last20Results block ──
                         results = data.get("last20Results")
                         if results and isinstance(results, list):
                             if not initial_loaded:
@@ -815,7 +822,6 @@ async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionMan
                                 engine.process_spin(n, session_mgr.session_active)
                             continue
 
-                        # ── Fallback single-result block ──
                         fallback_gid = str(data.get("gameId", "")).strip()
                         if not fallback_gid:
                             for key in ("result", "number", "outcome", "winningNumber"):
@@ -849,11 +855,9 @@ async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionMan
 
 # ─── WS SERVER PARA HTML EXTERNO ─────────────────────────────────────────────
 async def ws_client_handler(websocket):
-    """Maneja las conexiones del HTML externo y envía datos en tiempo real"""
     q = asyncio.Queue()
     _ws_clients.add(q)
     try:
-        # Enviar estado inicial al HTML cuando se conecta
         if engines_global:
             e = engines_global[0]
             state = {
@@ -863,7 +867,6 @@ async def ws_client_handler(websocket):
             }
             await websocket.send(json.dumps(state))
         
-        # Mantener conexión enviando eventos
         while True:
             data = await q.get()
             await websocket.send(json.dumps(data))
@@ -873,7 +876,6 @@ async def ws_client_handler(websocket):
         _ws_clients.discard(q)
 
 async def _ws_server_main():
-    """Inicia el servidor WS para el HTML externo en el WS_SERVER_PORT"""
     try:
         async with websockets.serve(ws_client_handler, "0.0.0.0", WS_SERVER_PORT):
             logger.info(f"[WSServer] 🌐 Servidor WebSocket para HTML iniciado en puerto {WS_SERVER_PORT}")
@@ -964,19 +966,32 @@ def cmd_reset(m):
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False, use_reloader=False)
 
+def run_bot():
+    # Limpiar webhook previo por si quedó colgado
+    bot.remove_webhook()
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=30)
+        except Exception as e:
+            if "409" in str(e):
+                logger.warning("⚠️ Conflicto 409: Otra instancia del bot está corriendo. Reintentando en 15s...")
+                time.sleep(15)
+            else:
+                logger.error(f"Error en bot.polling: {e}")
+                time.sleep(5)
 
 async def main():
     global engines_global, session_mgr_global
     engines_global = [RouletteEngine(r["key"], r["name"]) for r in ROULETTES]
     session_mgr_global = SessionManager(engines_global)
     threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
+    threading.Thread(target=run_bot, daemon=True).start()
     await asyncio.sleep(5)
     tasks = [
         asyncio.create_task(session_mgr_global.session_watchdog()),
         asyncio.create_task(daily_stats_loop()),
         asyncio.create_task(self_ping_loop()),
-        asyncio.create_task(_ws_server_main()),  # Restaurado para el HTML
+        asyncio.create_task(_ws_server_main()),
     ]
     for i, r in enumerate(ROULETTES):
         tasks.append(asyncio.create_task(ws_reader(r["key"], engines_global[i], session_mgr_global)))
