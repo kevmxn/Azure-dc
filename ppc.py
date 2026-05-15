@@ -69,11 +69,11 @@ bot.session = _session
 
 # ─── RULETA CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 225, "name": "ROULETTE MACAO 🇲🇴"},
+    {"key": 225, "name": "AUTO ROULETTE 🎰"},
 ]
 
 ROULETTE_LINKS = {
-    "ROULETTE MACAO 🇲🇴": "https://1win.lat/casino/play/v_pragmatic:1winroulettemacao",
+    "AUTO ROULETTE 🎰": "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
 }
 
 def get_roulette_url(name: str) -> Optional[str]:
@@ -162,6 +162,59 @@ def fmt_money(val) -> str:
     if val == int(val):
         return f"${int(val)}"
     return f"${val:,.2f}"
+
+# ─── MONEDAS ──────────────────────────────────────────────────────────────────
+CURRENCY_RATES = {
+    "USD": 0.10,
+    "MXN": 2.00,
+    "PEN": 0.50,
+    "COP": 500.0,
+    "ARS": 250.0,
+    "CLP": 100.0,
+}
+CURRENCY_FLAGS = {
+    "USD": "🇺🇲", "MXN": "🇲🇽", "PEN": "🇵🇪",
+    "COP": "🇨🇴", "ARS": "🇦🇷", "CLP": "🇨🇱",
+}
+CURRENCY_SYMBOLS = {
+    "USD": "$", "MXN": "$", "PEN": "./S",
+    "COP": "$", "ARS": "$", "CLP": "$",
+}
+
+def fmt_currency_amount(chips: float, currency: str) -> str:
+    amount = chips * CURRENCY_RATES[currency]
+    sym = CURRENCY_SYMBOLS[currency]
+    if currency in ("USD", "MXN", "PEN"):
+        return f"{sym} {amount:.2f}"
+    return f"{sym} {int(round(amount))}"
+
+def fmt_gestion_signal(chips: float) -> str:
+    """Gestión por país para el mensaje de señal (dos por línea)."""
+    usd = fmt_currency_amount(chips, "USD")
+    mxn = fmt_currency_amount(chips, "MXN")
+    pen = fmt_currency_amount(chips, "PEN")
+    cop = fmt_currency_amount(chips, "COP")
+    ars = fmt_currency_amount(chips, "ARS")
+    clp = fmt_currency_amount(chips, "CLP")
+    return (
+        f"🇺🇲 USD: {usd} — 🇲🇽 MXN: {mxn}\n"
+        f"🇵🇪 PEN: {pen} — 🇨🇴 COP: {cop}\n"
+        f"🇦🇷 ARS: {ars} — 🇨🇱 CLP: {clp}"
+    )
+
+def fmt_gestion_bankroll(chips: float) -> str:
+    """Gestión por país para el mensaje de ciclo completado (dos por línea)."""
+    usd = fmt_currency_amount(chips, "USD")
+    mxn = fmt_currency_amount(chips, "MXN")
+    pen = fmt_currency_amount(chips, "PEN")
+    cop = fmt_currency_amount(chips, "COP")
+    ars = fmt_currency_amount(chips, "ARS")
+    clp = fmt_currency_amount(chips, "CLP")
+    return (
+        f"🇺🇲 USD: {usd} — 🇲🇽 MXN: {mxn}\n"
+        f"🇵🇪 PEN: {pen} — 🇨🇴 COP: {cop}\n"
+        f"🇦🇷 ARS: {ars} — 🇨🇱 CLP: {clp}"
+    )
 
 
 class SmoothedMarkovPredictor:
@@ -317,7 +370,7 @@ class AMXAnalyzer:
 
 class Labouchere:
     def __init__(self):
-        self.base_seq = [250, 500, 250]
+        self.base_seq = [1, 2, 1]
         self.seq = list(self.base_seq)
 
     def get_bet(self) -> int:
@@ -398,16 +451,16 @@ class GlobalStats:
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text = "📊 RESUMEN — ROULETTE MACAO 🇲🇴\n 🕛 Reporte 12:00 hs\n"
+        text = "📊 RESUMEN — AUTO ROULETTE 🎰\n 🕛 Reporte 12:00 hs\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Bankroll Global: 💵 {fmt_money(self.global_chips)}\n"
+        text += f"► Bankroll Global: 💵 {fmt_currency_amount(self.global_chips, 'USD')}\n"
         text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 INTENTO #{s['attempt']}"
-            b_str = f"💵 +{fmt_money(s['val'])}" if s['result'] == 'WIN' else f"💵 -{fmt_money(s['val'])}"
+            b_str = f"💵 +{fmt_currency_amount(s['val'], 'USD')}" if s['result'] == 'WIN' else f"💵 -{fmt_currency_amount(s['val'], 'USD')}"
             if s['result'] == 'WIN':
                 text += f"✅ WIN #{s['number']} {s['type']} | {a_str} | {b_str}\n\n"
             elif s['result'] == 'EMPATE':
@@ -447,8 +500,8 @@ class SessionManager:
         self.session_start_time = time.time()
         self.session_start_chips = GLOBAL_STATS.global_chips
         engine = self.engines[self.current_idx]
-        logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_money(self.session_start_chips)}")
-        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n💵 Meta: +{fmt_money(SESSION_TARGET)}\n⏱ La sesión no cierra hasta cumplir la meta")
+        logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_currency_amount(self.session_start_chips, 'USD')}")
+        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n💵 Meta: +{fmt_currency_amount(SESSION_TARGET, 'USD')}\n⏱ La sesión no cierra hasta cumplir la meta")
         queue_broadcast({"type": "session", "status": "active"})
 
     def _end_session(self):
@@ -469,7 +522,12 @@ class SessionManager:
             engine.analyzing_msg_id = None
 
         logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta cumplida!")
-        tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\n¡Felicidades Meta Cumplida!")
+        tg_send(
+            f"🔴 SESIÓN CERRADA 🔴\n"
+            f"⏱ Duración: {duration_mins} minutos\n"
+            f"💵 BALANCE GLOBAL POR PAIS 💵\n"
+            f"{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}"
+        )
         queue_broadcast({"type": "session", "status": "closed"})
 
     async def session_watchdog(self):
@@ -651,15 +709,15 @@ class RouletteEngine:
             target_display = f"IMPARES {target_emoji}"
         else:
             target_display = f"{target} {target_emoji}"
+        gestion = fmt_gestion_signal(self.active_chips)
         return (
             f"✅ SEÑAL CONFIRMADA — {target_display} ✅\n\n"
             f"🎰 {self.name}\n"
             f"👉 ÚLTIMO NÚMERO: {last_num}\n"
             f"♦️ ENTRAR EN: {target_display}\n"
-            f"🔸 APUESTA: {fmt_money(self.active_chips)}\n"
             f"🔹 INTENTO: {self.attempt} DE 3\n\n"
-            f"💡 Probabilidad de Patrón — {self._last_signal_prob:.1f}%\n"
-            f"💵 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
+            f"💡 PROBABILIDAD PATRÓN — {self._last_signal_prob:.1f}%\n"
+            f"🚨 MONTO DE APUESTA POR PAIS:\n{gestion}"
         )
 
     def send_signal(self):
@@ -700,10 +758,18 @@ class RouletteEngine:
             seq_completed = self.labouchere.win()
             GLOBAL_STATS.global_chips += current_bet
             GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
-            msg = f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_money(current_bet)}!\n💵 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}"
-            if seq_completed:
-                msg += "\n🏆 Secuencia Labouchere completada."
+            msg = (
+                f"✅ WIN {number} — {self.active_type} {self.active_target}\n"
+                f"🎉 ¡Ganaste {fmt_currency_amount(current_bet, 'USD')}!"
+            )
             tg_send(msg)
+            if seq_completed:
+                cycle_msg = (
+                    f"🎉 CICLO DE LABOUCHER COMPLETADO 🎉\n"
+                    f"🚨 GESTION ACTUAL POR PAIS:\n"
+                    f"{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}"
+                )
+                tg_send(cycle_msg)
             self._send_analyzing_msg()
             self._end_cycle()
             queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips})
@@ -718,7 +784,7 @@ class RouletteEngine:
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 msg = f"🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
-                tg_send(f"{msg}\n🚨 Racha de 3 intentos perdida.\n💵 Bankroll Global: {fmt_money(GLOBAL_STATS.global_chips)}")
+                tg_send(f"{msg}\n🚨 Racha de 3 intentos perdida.")
                 self._send_analyzing_msg()
                 self._end_cycle()
                 queue_broadcast({"type": "result", "result": "EMPATE" if is_zero else "LOSS", "number": number, "bankroll": GLOBAL_STATS.global_chips})
@@ -752,7 +818,7 @@ class RouletteEngine:
                 self.ws_count += 1
                 if self.ws_count >= WARMUP_SPINS:
                     self.warmup_done = True
-                    tg_send("🟢 <b>ROULETTE MACAO 🇲🇴</b> — Sistema Listo.")
+                    tg_send("🟢 <b>AUTO ROULETTE 🎰</b> — Sistema Listo.")
                 return
             if not session_active:
                 return
@@ -969,7 +1035,7 @@ async def daily_stats_loop():
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$1500\nLabouchere [$250,$500,$250]\n/status /stats /reset", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta meta\nLabouchere [1,2,1] — Mín USD $0.10\n/status /stats /reset", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['status'])
@@ -978,7 +1044,7 @@ def cmd_status(m):
         return
     e = engines_global[0]
     sa = "🟢 Activa" if session_mgr_global and session_mgr_global.session_active else "⚪ Inactiva"
-    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_money(GLOBAL_STATS.global_chips)}\n<b>Labouchere:</b> {[fmt_money(x) for x in e.labouchere.seq]}", parse_mode="HTML")
+    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_currency_amount(GLOBAL_STATS.global_chips, 'USD')}\n<b>Labouchere:</b> {e.labouchere.seq}", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['stats'])
