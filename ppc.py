@@ -3,10 +3,10 @@
 Auto Roulette — Bot de señales Híbrido (Secuencias + ML + AMX + Labouchere)
 Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
-  - Ventana Móvil Markov 60 giros (Orden 4) + ML Cruzado + Resonancia/Ruptura.
+  - Ventana Móvil Markov 60 giros (Orden 3) + ML Cruzado + Resonancia/Ruptura.
   - Gestión Labouchere: Secuencia inicial [$250, $500, $250] (Ganar la secuencia = +$1000).
-  - Sesiones Estrictas: 25 minutos (Cierre en :25/:55, Inicio en :00/:30).
-  - Meta por sesión: +$1,500. Si se cumple, se cierra la sesión y reinicia Labouchere.
+  - Sesiones Sin Límite: Solo se cierran al cumplir la meta de +$1500.
+  - Inicio de Sesión: Estricto en minutos :00 o :30.
 """
 
 import asyncio
@@ -37,19 +37,17 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [AutoRoulette] %(levelname)s %(message)s')
 logger = logging.getLogger("AutoRoulette")
 
-# Silenciar logs molestos de librerías
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 logging.getLogger('websockets').setLevel(logging.CRITICAL)
 logging.getLogger('websockets.server').setLevel(logging.CRITICAL)
 logging.getLogger('websockets.http11').setLevel(logging.CRITICAL)
 
-# Filtro para evitar el spam del error 409 de Telegram (Doble instancia)
 class _TeleBotFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
         if "409" in msg or "terminated by other getUpdates request" in msg:
-            logger.warning("⚠️ Conflicto 409 detectado: Otra instancia del bot se está ejecutando. (Normal durante despliegues)")
+            logger.warning("⚠️ Conflicto 409 detectado: Otra instancia del bot se está ejecutando.")
             return False
         return True
 
@@ -71,7 +69,7 @@ bot.session = _session
 
 # ─── RULETA CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 225, "name": "AUTO ROULETTE"},
+    {"key": 206, "name": "ROULETTE MACAO 🇲🇴"},
 ]
 
 ROULETTE_LINKS = {
@@ -103,7 +101,6 @@ WARMUP_SPINS        = 25
 MIN_PROB            = 0.65
 TRAIN_INTERVAL      = 50
 WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
-SESSION_ACTIVE_MINS = 25
 SESSION_TARGET      = 1500  # Meta de $1500 por sesión
 
 SEQUENCE_COLOR   = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
@@ -116,7 +113,6 @@ COLOR_MAP: dict = {0:"CERO",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NE
 PARIDAD_MAP: dict = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
 ZONA_MAP: dict = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
 
-# ─── WS CLIENTS (PARA HTML EXTERNO) ──────────────────────────────────────────
 _ws_clients: Set[asyncio.Queue] = set()
 
 def queue_broadcast(data: dict):
@@ -169,7 +165,7 @@ def fmt_money(val) -> str:
 
 
 class SmoothedMarkovPredictor:
-    def __init__(self, window: int = 60, order: int = 4):  # Orden 4
+    def __init__(self, window: int = 60, order: int = 3):  # Orden 3
         self.window = window
         self.order = order
         self.transition_counts: dict = {}
@@ -426,13 +422,12 @@ class SessionManager:
 
     def seconds_to_next_slot(self) -> float:
         now = self._now_arg()
-        if now.second <= 5 and now.minute in (0, 30):
-            return 0.0
         if now.minute < 30:
             target = now.replace(minute=30, second=0, microsecond=0)
         else:
             target = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        return max(0.0, (target - now).total_seconds())
+        wait = (target - now).total_seconds()
+        return max(1.0, wait)
 
     def _start_session(self):
         self.session_active = True
@@ -440,10 +435,10 @@ class SessionManager:
         self.session_start_chips = GLOBAL_STATS.global_chips
         engine = self.engines[self.current_idx]
         logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_money(self.session_start_chips)}")
-        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n🪙 Meta: +{fmt_money(SESSION_TARGET)}\n⏱ Duración: 25 mins")
+        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n🪙 Meta: +{fmt_money(SESSION_TARGET)}\n⏱ La sesión no cierra hasta cumplir la meta")
         queue_broadcast({"type": "session", "status": "active"})
 
-    def _end_session(self, target_met=False):
+    def _end_session(self):
         engine = self.engines[self.current_idx]
         self.session_active = False
         
@@ -460,30 +455,22 @@ class SessionManager:
             tg_delete(CHAT_ID, engine.analyzing_msg_id)
             engine.analyzing_msg_id = None
 
-        logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta alcanzada: {target_met}")
-        if target_met:
-            tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\n¡Felicidades Meta Cumplida!")
-        else:
-            self.current_idx = (self.current_idx + 1) % len(self.engines)
-            tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\nLabouchere reiniciado.")
-            
+        logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta cumplida!")
+        tg_send(f"🔴 SESIÓN CERRADA 🔴\n⏱ Duración: {duration_mins} minutos\n¡Felicidades Meta Cumplida!")
         queue_broadcast({"type": "session", "status": "closed"})
 
     async def session_watchdog(self):
         while True:
             wait = self.seconds_to_next_slot()
-            logger.info(f"[Session] ⏳ Esperando {wait/60:.1f} min para el próximo slot...")
+            logger.info(f"[Session] ⏳ Esperando {wait/60:.1f} min para el próximo slot (:00 o :30)...")
             await asyncio.sleep(wait)
             self._start_session()
 
             while self.session_active:
                 await asyncio.sleep(1)
                 if GLOBAL_STATS.global_chips >= self.session_start_chips + SESSION_TARGET:
-                    self._end_session(target_met=True)
-                    continue
-                now_arg = self._now_arg()
-                if now_arg.minute in (25, 55):
-                    self._end_session(target_met=False)
+                    self._end_session()
+                    break
 
 
 class RouletteEngine:
@@ -593,13 +580,29 @@ class RouletteEngine:
     def detect_signal(self) -> Optional[dict]:
         predictions = {c: self._get_predictions(c) for c in ["COLOR", "PARIDAD", "ZONA"]}
         valid_signals = {}
+        
+        best_prob = 0.0
+        best_info = ""
+        
         for cat in ["COLOR", "PARIDAD", "ZONA"]:
             seq_target = self.seq_states[cat].expected()
             base_prob = predictions[cat].get(seq_target, 0)
             hist = getattr(self, f"hist_{cat.lower()}")
             final_prob = self.amx.adjust_probability(base_prob, seq_target, predictions, hist, self.seq_states[cat])
+            
+            if final_prob > best_prob:
+                best_prob = final_prob
+                best_info = f"{cat} -> {seq_target} ({final_prob*100:.1f}%)"
+                
             if final_prob >= MIN_PROB:
                 valid_signals[cat] = {"target": seq_target, "prob": final_prob}
+
+        # ── LOG DE TESTING ──────────────────────────────────────
+        last_num = self.spin_history[-1]["number"] if self.spin_history else "?"
+        signal_status = "🟢 SEÑAL VALIDA" if valid_signals else "🔴 Sin señal"
+        logger.info(f"🎲 Giro #{last_num} | Prob Máxima: {best_info} | {signal_status}")
+        # ─────────────────────────────────────────────────────────
+
         if not valid_signals:
             return None
         best_cat = max(valid_signals, key=lambda k: valid_signals[k]["prob"])
@@ -726,10 +729,16 @@ class RouletteEngine:
                 return
             if not session_active:
                 return
+                
+            # Resolver señal si está activa
             if self.signal_active:
                 self.resolve(number)
+                
+            # Siempre evaluar probabilidades para el log de testing
+            sig = self.detect_signal()
+            
+            # Si no hay señal activa, evaluar si entramos en una nueva
             if not self.signal_active:
-                sig = self.detect_signal()
                 if sig:
                     if self.cycle_active:
                         self.active_type = sig["type"]
@@ -936,7 +945,7 @@ async def daily_stats_loop():
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesiones 25m | Meta +$1500\nLabouchere [$250,$500,$250]\n/status /stats /reset", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$1500\nLabouchere [$250,$500,$250]\n/status /stats /reset", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['status'])
@@ -967,7 +976,6 @@ def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False, use_reloader=False)
 
 def run_bot():
-    # Limpiar webhook previo por si quedó colgado
     bot.remove_webhook()
     while True:
         try:
