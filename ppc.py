@@ -73,7 +73,7 @@ ROULETTES = [
 ]
 
 ROULETTE_LINKS = {
-    "AUTO ROULETTE": "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
+    "ROULETTE MACAO 🇲🇴": "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
 }
 
 def get_roulette_url(name: str) -> Optional[str]:
