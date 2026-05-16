@@ -103,7 +103,7 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-WARMUP_SPINS = 20
+WARMUP_SPINS = 10
 MIN_PROB = 0.70
 TRAIN_INTERVAL = 50
 SESSION_TARGET = 10
@@ -389,11 +389,11 @@ class AMXAnalyzer:
             cross_boost += 0.04
 
         # ── Bonus de Alineación con Secuencia Fija ────────────────────────────
-        # ROJO recibe +10% cuando la tabla predefinida señala ROJO
-        # El resto de targets reciben +3% estándar
+        # ROJO: +6% cuando la tabla señala ROJO Y el nivel está por encima de EMA20
+        # Resto de targets: +3% estándar
         if target == seq_state.expected():
-            if target == "ROJO":
-                cross_boost += 0.10   # prioridad máxima para ROJO según tabla
+            if target == "ROJO" and levels and ema and len(levels) > 0 and len(ema) > 0 and levels[-1] > ema[-1]:
+                cross_boost += 0.06
             else:
                 cross_boost += 0.03
 
