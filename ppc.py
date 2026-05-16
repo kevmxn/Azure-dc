@@ -5,7 +5,7 @@ Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
   - Ventana Móvil Markov 60 giros (Orden 3) + ML Cruzado + Resonancia/Ruptura.
   - Análisis de Niveles (+1/-1) con Lógica de Cero (±1) y EMA 20 por categoría.
-  - Gestión D'Alembert Modular: Inicio 3 fichas, +1 en pérdida, -1 en ganancia.
+  - Gestión Labouchere: Secuencia [1,2,1] — mínimo 1 ficha.
   - Sesiones Sin Límite: Solo se cierran al cumplir la meta.
 """
 
@@ -389,8 +389,13 @@ class AMXAnalyzer:
             cross_boost += 0.04
 
         # ── Bonus de Alineación con Secuencia Fija ────────────────────────────
+        # ROJO recibe +10% cuando la tabla predefinida señala ROJO
+        # El resto de targets reciben +3% estándar
         if target == seq_state.expected():
-            cross_boost += 0.03
+            if target == "ROJO":
+                cross_boost += 0.10   # prioridad máxima para ROJO según tabla
+            else:
+                cross_boost += 0.03
 
         # ── Boost especial: por encima de EMA20 + racha últimos 5 ───────────
         # Aplica a ROJO, MENOR (nivel orig) y NEGRO, MAYOR (nivel inv)
@@ -410,27 +415,46 @@ class AMXAnalyzer:
 
 
 # ─── GESTIÓN Y SECUENCIAS ────────────────────────────────────────────────────
-class DAlembert:
-    BASE_BET = 3
+class Labouchere:
+    """
+    Sistema Labouchere con secuencia inicial [1, 2, 1].
+    - Apuesta = primer + último elemento de la lista.
+    - Si solo queda un elemento, apuesta = ese elemento.
+    - WIN  → eliminar primer y último elemento. Lista vacía = ciclo completo, reiniciar.
+    - LOSS → agregar el monto apostado al final de la lista.
+    - Apuesta mínima: 1 ficha.
+    """
+    BASE_SEQUENCE = [1, 2, 1]
+    MIN_BET = 1
 
     def __init__(self):
-        self.bet = self.BASE_BET
+        self.sequence = list(self.BASE_SEQUENCE)
 
     def get_bet(self) -> int:
-        return self.bet
+        if not self.sequence:
+            self.sequence = list(self.BASE_SEQUENCE)
+        if len(self.sequence) == 1:
+            return max(self.MIN_BET, self.sequence[0])
+        return max(self.MIN_BET, self.sequence[0] + self.sequence[-1])
 
     def win(self) -> bool:
-        self.bet -= 1
-        if self.bet == 0:
-            self.bet = self.BASE_BET
+        """Elimina extremos. Retorna True si el ciclo se completó."""
+        if len(self.sequence) <= 1:
+            self.sequence = list(self.BASE_SEQUENCE)
+            return True
+        self.sequence.pop(0)
+        self.sequence.pop(-1)
+        if not self.sequence:
+            self.sequence = list(self.BASE_SEQUENCE)
             return True
         return False
 
     def loss(self):
-        self.bet += 1
+        """Agrega la apuesta apostada al final."""
+        self.sequence.append(self.get_bet())
 
     def reset(self):
-        self.bet = self.BASE_BET
+        self.sequence = list(self.BASE_SEQUENCE)
 
 
 class SequenceState:
@@ -548,9 +572,9 @@ class SessionManager:
         queue_broadcast({"type": "session", "status": "active"})
 
     def _reset_cycle_on_meta(self):
-        """Al cumplir la meta, resetea D'Alembert a 3 y continúa la sesión."""
+        """Al cumplir la meta, resetea Labouchere a [1,2,1] y continúa la sesión."""
         engine = self.engines[self.current_idx]
-        engine.dalembert.reset()
+        engine.labouchere.reset()
         engine.cycle_active = False
         engine.signal_active = False
         engine.attempt = 1
@@ -561,14 +585,14 @@ class SessionManager:
             tg_delete(CHAT_ID, engine.analyzing_msg_id)
             engine.analyzing_msg_id = None
         self.session_start_chips = GLOBAL_STATS.global_chips   # resetear baseline
-        logger.info(f"[Session] 🎯 Meta cumplida — D'Alembert reseteado a 3, sesión continúa.")
+        logger.info(f"[Session] 🎯 Meta cumplida — Labouchere reseteado a [1,2,1], sesión continúa.")
         queue_broadcast({"type": "session", "status": "active"})  # sigue activa
 
     def _end_session_legacy(self):
         """Mantener por compatibilidad con /reset. No se usa en flujo normal."""
         engine = self.engines[self.current_idx]
         self.session_active = False
-        engine.dalembert.reset()
+        engine.labouchere.reset()
         engine.cycle_active = False
         engine.signal_active = False
         engine.attempt = 1
@@ -624,7 +648,7 @@ class RouletteEngine:
             "ZONA": ["MENOR", "MAYOR", "CERO"]
         }
         self.seq_states = {cat: SequenceState(cat) for cat in ["COLOR", "PARIDAD", "ZONA"]}
-        self.dalembert = DAlembert()
+        self.labouchere = Labouchere()
         self.attempt = 1
         self.cycle_active = False
         self.wait_next_spin = False
@@ -748,7 +772,7 @@ class RouletteEngine:
 
         queue_broadcast({
             "type": "spin", "number": number, "color": c, "paridad": p, "zona": z,
-            "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet(),
+            "bankroll": GLOBAL_STATS.global_chips, "labouchere_bet": self.labouchere.get_bet(),
             "charts": self.get_chart_data()
         })
 
@@ -816,7 +840,7 @@ class RouletteEngine:
             return None
         best_cat = max(valid_signals, key=lambda k: valid_signals[k]["prob"])
         best_sig = valid_signals[best_cat]
-        return {"type": best_cat, "target": best_sig["target"], "prob": best_sig["prob"], "chips": self.dalembert.get_bet()}
+        return {"type": best_cat, "target": best_sig["target"], "prob": best_sig["prob"], "chips": self.labouchere.get_bet()}
 
     def _build_signal_text(self) -> str:
         last_num = self.spin_history[-1]["number"] if self.spin_history else 0
@@ -849,7 +873,7 @@ class RouletteEngine:
         queue_broadcast({
             "type": "signal", "target": self.active_target, "chips": self.active_chips,
             "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips,
-            "dalembert_bet": self.dalembert.get_bet()
+            "labouchere_bet": self.labouchere.get_bet()
         })
 
     def iniciar_senal(self, sig: dict):
@@ -877,7 +901,7 @@ class RouletteEngine:
         current_bet = self.active_chips
 
         if won:
-            cycle_done = self.dalembert.win()
+            cycle_done = self.labouchere.win()
             GLOBAL_STATS.global_chips += current_bet
             GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
             tg_send(f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_currency_amount(current_bet, 'USD')}!")
@@ -886,10 +910,10 @@ class RouletteEngine:
             self.wait_next_spin = True
             self._send_analyzing_msg()
             self._end_cycle()
-            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet()})
+            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips, "labouchere_bet": self.labouchere.get_bet()})
         else:
             GLOBAL_STATS.global_chips -= current_bet
-            self.dalembert.loss()
+            self.labouchere.loss()
             if self.attempt < 3:
                 lost_attempt = self.attempt
                 self.attempt += 1
@@ -901,7 +925,7 @@ class RouletteEngine:
                     "lost_attempt": lost_attempt,
                     "attempt": self.attempt,
                     "bankroll": GLOBAL_STATS.global_chips,
-                    "dalembert_bet": self.dalembert.get_bet()
+                    "labouchere_bet": self.labouchere.get_bet()
                 })
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
@@ -916,7 +940,7 @@ class RouletteEngine:
                     "attempt": self.attempt,
                     "number": number,
                     "bankroll": GLOBAL_STATS.global_chips,
-                    "dalembert_bet": self.dalembert.get_bet()
+                    "labouchere_bet": self.labouchere.get_bet()
                 })
 
     def _end_cycle(self):
@@ -964,7 +988,7 @@ class RouletteEngine:
                         self.active_type = sig["type"]
                         self.active_target = sig["target"]
                         self._last_signal_prob = sig["prob"] * 100
-                        self.active_chips = self.dalembert.get_bet()
+                        self.active_chips = self.labouchere.get_bet()
                         self.signal_active = True
                         self.send_signal()
                     else:
@@ -1102,7 +1126,7 @@ async def ws_client_handler(request):
                 "type": "init",
                 "bankroll": GLOBAL_STATS.global_chips,
                 "session_active": session_mgr_global.session_active if session_mgr_global else False,
-                "dalembert_bet": e.dalembert.get_bet(),
+                "labouchere_bet": e.labouchere.get_bet(),
                 "history": e.spin_history[-100:],
                 "charts": e.get_chart_data()
             }
@@ -1200,7 +1224,7 @@ async def daily_stats_loop():
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$0.80 USD\nD'Alembert Modular — Inicio $0.30\n/status /stats /reset", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$0.80 USD\nLabouchere [1,2,1] — Mínimo 1 ficha\n/status /stats /reset", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['status'])
@@ -1209,7 +1233,7 @@ def cmd_status(m):
         return
     e = engines_global[0]
     sa = "🟢 Activa" if session_mgr_global and session_mgr_global.session_active else "⚪ Inactiva"
-    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_currency_amount(GLOBAL_STATS.global_chips, 'USD')}\n<b>D'Alembert apuesta:</b> {fmt_currency_amount(e.dalembert.get_bet(), 'USD')}", parse_mode="HTML")
+    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_currency_amount(GLOBAL_STATS.global_chips, 'USD')}\n<b>Labouchere apuesta:</b> {fmt_currency_amount(e.labouchere.get_bet(), 'USD')}", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['stats'])
@@ -1222,7 +1246,7 @@ def cmd_reset(m):
     global GLOBAL_STATS
     GLOBAL_STATS = GlobalStats()
     for e in engines_global:
-        e.dalembert.reset()
+        e.labouchere.reset()
         e._end_cycle()
     if session_mgr_global:
         session_mgr_global._end_session_legacy()
