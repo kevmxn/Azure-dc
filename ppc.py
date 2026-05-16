@@ -27,7 +27,8 @@ from sklearn.linear_model import SGDClassifier
 
 import telebot
 import websockets
-from flask import Flask, jsonify
+from aiohttp import web
+import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -102,10 +103,9 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-WARMUP_SPINS = 100
+WARMUP_SPINS = 20
 MIN_PROB = 0.70
 TRAIN_INTERVAL = 50
-WS_SERVER_PORT = int(os.environ.get("WS_SERVER_PORT", 8765))
 SESSION_TARGET = 10
 
 SEQUENCE_COLOR = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
@@ -737,7 +737,8 @@ class RouletteEngine:
 
         queue_broadcast({
             "type": "spin", "number": number, "color": c, "paridad": p, "zona": z,
-            "bankroll": GLOBAL_STATS.global_chips, "charts": self.get_chart_data()
+            "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet(),
+            "charts": self.get_chart_data()
         })
 
     def _get_predictions(self, cat: str) -> dict:
@@ -810,7 +811,8 @@ class RouletteEngine:
             self.active_signal_msg_id = msg_id
         queue_broadcast({
             "type": "signal", "target": self.active_target, "chips": self.active_chips,
-            "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips
+            "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips,
+            "dalembert_bet": self.dalembert.get_bet()
         })
 
     def iniciar_senal(self, sig: dict):
@@ -847,7 +849,7 @@ class RouletteEngine:
             self.wait_next_spin = True
             self._send_analyzing_msg()
             self._end_cycle()
-            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips})
+            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet()})
         else:
             GLOBAL_STATS.global_chips -= current_bet
             self.dalembert.loss()
@@ -856,7 +858,7 @@ class RouletteEngine:
                 self.signal_active = False
                 self.wait_next_spin = True
                 self._send_analyzing_msg()
-                queue_broadcast({"type": "result_retry", "attempt": self.attempt, "bankroll": GLOBAL_STATS.global_chips})
+                queue_broadcast({"type": "result_retry", "attempt": self.attempt, "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet()})
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 msg = "🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
@@ -864,7 +866,7 @@ class RouletteEngine:
                 self.wait_next_spin = True
                 self._send_analyzing_msg()
                 self._end_cycle()
-                queue_broadcast({"type": "result", "result": "EMPATE" if is_zero else "LOSS", "number": number, "bankroll": GLOBAL_STATS.global_chips})
+                queue_broadcast({"type": "result", "result": "EMPATE" if is_zero else "LOSS", "number": number, "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet()})
 
     def _end_cycle(self):
         self.attempt = 1
@@ -1029,10 +1031,19 @@ async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionMan
             reconnect_delay = min(reconnect_delay * 2, 60)
 
 
-# ─── WS SERVER PARA HTML EXTERNO ─────────────────────────────────────────────
-async def ws_client_handler(websocket):
+# ─── WS SERVER PARA HTML EXTERNO (aiohttp — mismo puerto que HTTP) ────────────
+async def ws_client_handler(request):
+    """
+    Maneja conexiones WebSocket entrantes desde el HTML externo.
+    Accesible en: wss://azureroulette.onrender.com/ws
+    """
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+
     q = asyncio.Queue()
     _ws_clients.add(q)
+    logger.info(f"[WSClient] ✅ Cliente conectado: {request.remote}")
+
     try:
         if engines_global:
             e = engines_global[0]
@@ -1041,53 +1052,74 @@ async def ws_client_handler(websocket):
                 "bankroll": GLOBAL_STATS.global_chips,
                 "session_active": session_mgr_global.session_active if session_mgr_global else False,
                 "dalembert_bet": e.dalembert.get_bet(),
-                "history": e.spin_history[-20:],
+                "history": e.spin_history[-100:],
                 "charts": e.get_chart_data()
             }
-            await websocket.send(json.dumps(state))
+            await ws.send_str(json.dumps(state))
 
-        while True:
-            data = await q.get()
-            await websocket.send(json.dumps(data))
-    except websockets.exceptions.ConnectionClosed:
-        pass
+        # Enviar mensajes de la cola al cliente; leer mensajes entrantes (ping/pong)
+        async def sender():
+            while not ws.closed:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=1.0)
+                    await ws.send_str(json.dumps(data))
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+
+        sender_task = asyncio.create_task(sender())
+        async for msg in ws:
+            if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                break
+        sender_task.cancel()
+
+    except Exception as e:
+        logger.warning(f"[WSClient] Desconectado: {e}")
     finally:
         _ws_clients.discard(q)
+        logger.info(f"[WSClient] ❌ Cliente desconectado: {request.remote}")
+
+    return ws
 
 
-async def _ws_server_main():
-    try:
-        async with websockets.serve(ws_client_handler, "0.0.0.0", WS_SERVER_PORT):
-            logger.info(f"[WSServer] 🌐 Servidor WebSocket para HTML iniciado en puerto {WS_SERVER_PORT}")
-            await asyncio.Future()
-    except Exception as e:
-        logger.error(f"[WSServer] Error al iniciar servidor WS: {e}")
-
-
-# ─── FLASK ────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+# ─── HTTP ROUTES ──────────────────────────────────────────────────────────────
 engines_global: list = []
 session_mgr_global: Optional[SessionManager] = None
 SESSION_MANAGER_REF: Optional[SessionManager] = None
 
 
-@app.route("/")
-def home():
-    return jsonify({"status": "ok"})
+async def route_home(request):
+    return web.json_response({"status": "ok"})
 
 
-@app.route("/ping")
-def ping():
-    return jsonify({"status": "pong", "ts": time.time()})
+async def route_ping(request):
+    return web.json_response({"status": "pong", "ts": time.time()})
 
 
-@app.route("/health")
-def health():
+async def route_health(request):
     if not engines_global:
-        return jsonify({"status": "initializing"})
+        return web.json_response({"status": "initializing"})
     e = engines_global[0]
     sa = "Active" if session_mgr_global and session_mgr_global.session_active else "Inactive"
-    return jsonify({"bankroll": GLOBAL_STATS.global_chips, "session": sa})
+    return web.json_response({"bankroll": GLOBAL_STATS.global_chips, "session": sa})
+
+
+async def _aiohttp_server():
+    """Servidor HTTP + WebSocket unificado en el puerto PORT de Render."""
+    PORT = int(os.environ.get("PORT", 10000))
+    app_http = web.Application()
+    app_http.router.add_get("/", route_home)
+    app_http.router.add_get("/ping", route_ping)
+    app_http.router.add_get("/health", route_health)
+    app_http.router.add_get("/ws", ws_client_handler)   # ← punto de conexión WS
+
+    runner = web.AppRunner(app_http)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"[Server] 🌐 HTTP+WebSocket escuchando en puerto {PORT}  →  /ws")
+    await asyncio.Future()   # mantener vivo
 
 
 async def self_ping_loop():
@@ -1144,10 +1176,6 @@ def cmd_reset(m):
     bot.reply_to(m, "🔄 <b>Resetado</b>", parse_mode="HTML")
 
 
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False, use_reloader=False)
-
-
 def run_bot():
     bot.remove_webhook()
     while True:
@@ -1167,14 +1195,13 @@ async def main():
     engines_global = [RouletteEngine(r["key"], r["name"]) for r in ROULETTES]
     session_mgr_global = SessionManager(engines_global)
     SESSION_MANAGER_REF = session_mgr_global
-    threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()
     await asyncio.sleep(5)
     tasks = [
         asyncio.create_task(session_mgr_global.session_watchdog()),
         asyncio.create_task(daily_stats_loop()),
         asyncio.create_task(self_ping_loop()),
-        asyncio.create_task(_ws_server_main()),
+        asyncio.create_task(_aiohttp_server()),        # HTTP + WS en el mismo puerto
     ]
     for i, r in enumerate(ROULETTES):
         tasks.append(asyncio.create_task(ws_reader(r["key"], engines_global[i], session_mgr_global)))
