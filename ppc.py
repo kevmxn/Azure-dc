@@ -5,7 +5,10 @@ Sistema de Chance Simples: COLOR, PARIDAD, ZONA
 
   - Ventana Móvil Markov 60 giros (Orden 3) + ML Cruzado + Resonancia/Ruptura.
   - Análisis de Niveles (+1/-1) con Lógica de Cero (±1) y EMA 20 por categoría.
-  - Gestión Labouchere: Secuencia [1,2,1] — mínimo 1 ficha.
+  - COLOR (ROJO/NEGRO): Lógica Auto-Roulette-Color Moderado exclusivo.
+  - PARIDAD / ZONA: Señal solo cuando el nivel EMA del target está POR ENCIMA de EMA20.
+  - Gestión Martingala: Apuesta base × 2 en pérdida; reset en ganancia — mínimo 1 ficha.
+    · COLOR: máx 2 intentos; PARIDAD/ZONA: máx 3 intentos.
   - Sesiones Sin Límite: Solo se cierran al cumplir la meta.
 """
 
@@ -103,7 +106,7 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
-WARMUP_SPINS = 10
+WARMUP_SPINS = 20
 MIN_PROB = 0.70
 TRAIN_INTERVAL = 50
 SESSION_TARGET = 10
@@ -119,6 +122,48 @@ NEG_VALUE = {"COLOR": "NEGRO", "PARIDAD": "IMPAR", "ZONA": "MAYOR"}
 COLOR_MAP = {0: "CERO", 1: "ROJO", 2: "NEGRO", 3: "ROJO", 4: "NEGRO", 5: "ROJO", 6: "NEGRO", 7: "ROJO", 8: "NEGRO", 9: "ROJO", 10: "NEGRO", 11: "NEGRO", 12: "ROJO", 13: "NEGRO", 14: "ROJO", 15: "NEGRO", 16: "ROJO", 17: "NEGRO", 18: "ROJO", 19: "ROJO", 20: "NEGRO", 21: "ROJO", 22: "NEGRO", 23: "ROJO", 24: "NEGRO", 25: "ROJO", 26: "NEGRO", 27: "ROJO", 28: "NEGRO", 29: "NEGRO", 30: "ROJO", 31: "NEGRO", 32: "ROJO", 33: "NEGRO", 34: "ROJO", 35: "NEGRO", 36: "ROJO"}
 PARIDAD_MAP = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
 ZONA_MAP = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
+
+# ─── TABLA PREDEFINIDA PARA COLOR (Auto-Roulette-Color) ───────────────────────
+COLOR_DATA_AUTO = [
+    {"id":0,  "real":"VERDE", "rojo":0.44, "negro":0.56, "senal":"NEGRO"},
+    {"id":1,  "real":"ROJO",  "rojo":0.52, "negro":0.44, "senal":"ROJO"},
+    {"id":2,  "real":"NEGRO", "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
+    {"id":3,  "real":"ROJO",  "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
+    {"id":4,  "real":"NEGRO", "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
+    {"id":5,  "real":"ROJO",  "rojo":0.52, "negro":0.48, "senal":"ROJO"},
+    {"id":6,  "real":"NEGRO", "rojo":0.40, "negro":0.60, "senal":"NEGRO"},
+    {"id":7,  "real":"ROJO",  "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
+    {"id":8,  "real":"NEGRO", "rojo":0.49, "negro":0.48, "senal":"ROJO"},
+    {"id":9,  "real":"ROJO",  "rojo":0.49, "negro":0.48, "senal":"ROJO"},
+    {"id":10, "real":"NEGRO", "rojo":0.49, "negro":0.48, "senal":"ROJO"},
+    {"id":11, "real":"NEGRO", "rojo":0.48, "negro":0.52, "senal":"NEGRO"},
+    {"id":12, "real":"ROJO",  "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
+    {"id":13, "real":"NEGRO", "rojo":0.44, "negro":0.56, "senal":"NEGRO"},
+    {"id":14, "real":"ROJO",  "rojo":0.49, "negro":0.48, "senal":"ROJO"},
+    {"id":15, "real":"NEGRO", "rojo":0.44, "negro":0.56, "senal":"NEGRO"},
+    {"id":16, "real":"ROJO",  "rojo":0.52, "negro":0.44, "senal":"ROJO"},
+    {"id":17, "real":"NEGRO", "rojo":0.36, "negro":0.60, "senal":"NEGRO"},
+    {"id":18, "real":"ROJO",  "rojo":0.44, "negro":0.52, "senal":"NEGRO"},
+    {"id":19, "real":"ROJO",  "rojo":0.56, "negro":0.44, "senal":"ROJO"},
+    {"id":20, "real":"NEGRO", "rojo":0.48, "negro":0.52, "senal":"NEGRO"},
+    {"id":21, "real":"ROJO",  "rojo":0.56, "negro":0.40, "senal":"ROJO"},
+    {"id":22, "real":"NEGRO", "rojo":0.52, "negro":0.48, "senal":"ROJO"},
+    {"id":23, "real":"ROJO",  "rojo":0.48, "negro":0.49, "senal":"NEGRO"},
+    {"id":24, "real":"NEGRO", "rojo":0.44, "negro":0.52, "senal":"NEGRO"},
+    {"id":25, "real":"ROJO",  "rojo":0.60, "negro":0.40, "senal":"ROJO"},
+    {"id":26, "real":"NEGRO", "rojo":0.56, "negro":0.40, "senal":"ROJO"},
+    {"id":27, "real":"ROJO",  "rojo":0.56, "negro":0.40, "senal":"ROJO"},
+    {"id":28, "real":"NEGRO", "rojo":0.56, "negro":0.40, "senal":"ROJO"},
+    {"id":29, "real":"NEGRO", "rojo":0.56, "negro":0.44, "senal":"ROJO"},
+    {"id":30, "real":"ROJO",  "rojo":0.48, "negro":0.49, "senal":"NEGRO"},
+    {"id":31, "real":"NEGRO", "rojo":0.48, "negro":0.49, "senal":"NEGRO"},
+    {"id":32, "real":"ROJO",  "rojo":0.56, "negro":0.44, "senal":"ROJO"},
+    {"id":33, "real":"NEGRO", "rojo":0.44, "negro":0.52, "senal":"NEGRO"},
+    {"id":34, "real":"ROJO",  "rojo":0.60, "negro":0.36, "senal":"ROJO"},
+    {"id":35, "real":"NEGRO", "rojo":0.56, "negro":0.40, "senal":"ROJO"},
+    {"id":36, "real":"ROJO",  "rojo":0.52, "negro":0.44, "senal":"ROJO"},
+]
+MAX_ATTEMPTS_COLOR = 2   # intentos de la lógica de color (igual que Auto-Roulette)
 
 _ws_clients: Set[asyncio.Queue] = set()
 
@@ -415,46 +460,50 @@ class AMXAnalyzer:
 
 
 # ─── GESTIÓN Y SECUENCIAS ────────────────────────────────────────────────────
-class Labouchere:
+class Martingala:
     """
-    Sistema Labouchere con secuencia inicial [1, 2, 1].
-    - Apuesta = primer + último elemento de la lista.
-    - Si solo queda un elemento, apuesta = ese elemento.
-    - WIN  → eliminar primer y último elemento. Lista vacía = ciclo completo, reiniciar.
-    - LOSS → agregar el monto apostado al final de la lista.
+    Sistema Martingala clásico.
+    - Apuesta base inicial: BASE_BET fichas.
+    - WIN  → resetear apuesta a BASE_BET. Retorna True (ciclo completado).
+    - LOSS → duplicar apuesta (apuesta × 2). Limitar a MAX_BET fichas.
     - Apuesta mínima: 1 ficha.
+
+    El multiplicador actual se expone como self.multiplier para la UI.
     """
-    BASE_SEQUENCE = [1, 2, 1]
-    MIN_BET = 1
+    BASE_BET = 1
+    MIN_BET  = 1
+    MAX_BET  = 64   # techo: 6 pérdidas consecutivas
 
     def __init__(self):
-        self.sequence = list(self.BASE_SEQUENCE)
+        self.current_bet: int = self.BASE_BET
+        self.multiplier:  int = 1
+        self.total_lost:  int = 0
+
+    @property
+    def sequence(self) -> list:
+        """Compatibilidad UI — muestra [multiplicador×] actual."""
+        return [self.current_bet]
 
     def get_bet(self) -> int:
-        if not self.sequence:
-            self.sequence = list(self.BASE_SEQUENCE)
-        if len(self.sequence) == 1:
-            return max(self.MIN_BET, self.sequence[0])
-        return max(self.MIN_BET, self.sequence[0] + self.sequence[-1])
+        return max(self.MIN_BET, self.current_bet)
 
     def win(self) -> bool:
-        """Elimina extremos. Retorna True si el ciclo se completó."""
-        if len(self.sequence) <= 1:
-            self.sequence = list(self.BASE_SEQUENCE)
-            return True
-        self.sequence.pop(0)
-        self.sequence.pop(-1)
-        if not self.sequence:
-            self.sequence = list(self.BASE_SEQUENCE)
-            return True
-        return False
+        """Reset a la apuesta base. Siempre retorna True."""
+        self.current_bet = self.BASE_BET
+        self.multiplier  = 1
+        self.total_lost  = 0
+        return True
 
     def loss(self):
-        """Agrega la apuesta apostada al final."""
-        self.sequence.append(self.get_bet())
+        """Duplica la apuesta (Martingala clásica)."""
+        self.total_lost += self.current_bet
+        self.current_bet = min(self.current_bet * 2, self.MAX_BET)
+        self.multiplier  = self.current_bet // self.BASE_BET
 
     def reset(self):
-        self.sequence = list(self.BASE_SEQUENCE)
+        self.current_bet = self.BASE_BET
+        self.multiplier  = 1
+        self.total_lost  = 0
 
 
 class SequenceState:
@@ -572,9 +621,9 @@ class SessionManager:
         queue_broadcast({"type": "session", "status": "active"})
 
     def _reset_cycle_on_meta(self):
-        """Al cumplir la meta, resetea Labouchere a [1,2,1] y continúa la sesión."""
+        """Al cumplir la meta, resetea Martingala a apuesta base y continúa la sesión."""
         engine = self.engines[self.current_idx]
-        engine.labouchere.reset()
+        engine.martingala.reset()
         engine.cycle_active = False
         engine.signal_active = False
         engine.attempt = 1
@@ -585,14 +634,14 @@ class SessionManager:
             tg_delete(CHAT_ID, engine.analyzing_msg_id)
             engine.analyzing_msg_id = None
         self.session_start_chips = GLOBAL_STATS.global_chips   # resetear baseline
-        logger.info(f"[Session] 🎯 Meta cumplida — Labouchere reseteado a [1,2,1], sesión continúa.")
+        logger.info(f"[Session] 🎯 Meta cumplida — Martingala reseteado a base, sesión continúa.")
         queue_broadcast({"type": "session", "status": "active"})  # sigue activa
 
     def _end_session_legacy(self):
         """Mantener por compatibilidad con /reset. No se usa en flujo normal."""
         engine = self.engines[self.current_idx]
         self.session_active = False
-        engine.labouchere.reset()
+        engine.martingala.reset()
         engine.cycle_active = False
         engine.signal_active = False
         engine.attempt = 1
@@ -648,7 +697,7 @@ class RouletteEngine:
             "ZONA": ["MENOR", "MAYOR", "CERO"]
         }
         self.seq_states = {cat: SequenceState(cat) for cat in ["COLOR", "PARIDAD", "ZONA"]}
-        self.labouchere = Labouchere()
+        self.martingala = Martingala()
         self.attempt = 1
         self.cycle_active = False
         self.wait_next_spin = False
@@ -665,6 +714,10 @@ class RouletteEngine:
         self.spins_since_train = 0
         self.ws_count = 0
         self.warmup_done = False
+        # Color-specific state (Auto-Roulette-Color logic)
+        self.signal_mode: str = "moderado"     # "tendencia" | "moderado" — moderado por defecto
+        self.color_consecutive_losses: int = 0
+        self.color_loss_block_until: float = 0.0
         self._db = self._get_db()
         live = self._load_live_history()
         self.ws_count = live
@@ -772,7 +825,7 @@ class RouletteEngine:
 
         queue_broadcast({
             "type": "spin", "number": number, "color": c, "paridad": p, "zona": z,
-            "bankroll": GLOBAL_STATS.global_chips, "labouchere_bet": self.labouchere.get_bet(),
+            "bankroll": GLOBAL_STATS.global_chips, "martingala_bet": self.martingala.get_bet(), "martingala_mult": self.martingala.multiplier, "martingala_seq": list(self.martingala.sequence),
             "charts": self.get_chart_data()
         })
 
@@ -783,64 +836,333 @@ class RouletteEngine:
         ens_probs = self.ensemble.predict(self.hist_color, self.hist_paridad, self.hist_zona, cat) or {c: 1 / 3 for c in classes}
         return {c: 0.4 * mk_probs.get(c, 0) + 0.6 * ens_probs.get(c, 0) for c in classes}
 
-    def detect_signal(self) -> Optional[dict]:
-        predictions = {c: self._get_predictions(c) for c in ["COLOR", "PARIDAD", "ZONA"]}
+    def _get_color_entry(self, number: int) -> Optional[dict]:
+        for e in COLOR_DATA_AUTO:
+            if e["id"] == number:
+                return e
+        return None
+
+    def _determine_bet_color(self, expected: str) -> str:
+        """Igual que determineBetColor del Auto-Roulette-Color."""
+        if len(self.spin_history) < 20:
+            return expected
+        lv  = self.levels["COLOR"]
+        ilv = self.inv_levels["COLOR"]
+        ema20_o = calculate_ema(lv,  20)
+        ema20_i = calculate_ema(ilv, 20)
+        last_idx = len(lv) - 1
+        last_num = self.spin_history[-1]["number"]
+        entry = self._get_color_entry(last_num)
+        last_sig = entry["senal"] if entry else None
+        if expected == "ROJO":
+            if ema20_o and ema20_o[last_idx] is not None and lv[last_idx] < ema20_o[last_idx]:
+                return "NEGRO" if last_sig == "NEGRO" else "ROJO"
+            return "ROJO"
+        else:
+            if ema20_i and ema20_i[last_idx] is not None and ilv[last_idx] < ema20_i[last_idx]:
+                return "ROJO" if last_sig == "ROJO" else "NEGRO"
+            return "NEGRO"
+
+    def _detect_color_signal_tendencia(self, consecutive_losses: int = 0) -> Optional[str]:
+        """Lógica shouldActivateSignalTendencia del Auto-Roulette-Color."""
+        min_spins = 22 + consecutive_losses * 2
+        if len(self.spin_history) < min_spins:
+            return None
+        last_num = self.spin_history[-1]["number"]
+        entry = self._get_color_entry(last_num)
+        if not entry or entry["senal"] == "NO APOSTAR":
+            return None
+        expected = entry["senal"]
+        lv  = self.levels["COLOR"]
+        ilv = self.inv_levels["COLOR"]
+        ema4_o  = calculate_ema(lv,  4)
+        ema8_o  = calculate_ema(lv,  8)
+        ema20_o = calculate_ema(lv,  20)
+        ema4_i  = calculate_ema(ilv, 4)
+        ema8_i  = calculate_ema(ilv, 8)
+        ema20_i = calculate_ema(ilv, 20)
+        last_idx = len(lv) - 1
+        required_consec = min(3 + consecutive_losses, 6)
+
+        def check_consec(levels, ema20, ema8, ema4, idx):
+            for off in range(required_consec):
+                i = idx - (required_consec - 1) + off
+                if i < 0: return False
+                if ema20[i] is None or levels[i] <= ema20[i]: return False
+                if consecutive_losses >= 2 and ema8[i] is not None and levels[i] <= ema8[i]: return False
+                if consecutive_losses >= 3 and ema4[i] is not None and levels[i] <= ema4[i]: return False
+            return True
+
+        if expected == "ROJO":
+            if not check_consec(lv, ema20_o, ema8_o, ema4_o, last_idx): return None
+        elif expected == "NEGRO":
+            if not check_consec(ilv, ema20_i, ema8_i, ema4_i, last_idx): return None
+        return expected
+
+    def _detect_color_signal_moderado(self, consecutive_losses: int = 0) -> Optional[str]:
+        """Lógica shouldActivateSignalModerado del Auto-Roulette-Color."""
+        min_spins = 12 + consecutive_losses * 3
+        if len(self.spin_history) < min_spins:
+            return None
+        last_idx = len(self.spin_history) - 1
+        prev_idx = last_idx - 1
+        last_num = self.spin_history[last_idx]["number"]
+        entry = self._get_color_entry(last_num)
+        if not entry or entry["senal"] == "NO APOSTAR":
+            return None
+        expected = entry["senal"]
+        lv  = self.levels["COLOR"]
+        ilv = self.inv_levels["COLOR"]
+        ema4_o  = calculate_ema(lv,  4)
+        ema8_o  = calculate_ema(lv,  8)
+        ema20_o = calculate_ema(lv,  20)
+        ema4_i  = calculate_ema(ilv, 4)
+        ema8_i  = calculate_ema(ilv, 8)
+        ema20_i = calculate_ema(ilv, 20)
+        li, pi = len(lv) - 1, len(lv) - 2
+
+        def check_moderate(levels, e4, e8, e20, li, pi):
+            if li < 1 or pi < 0: return False
+            if e4[li] is None or e8[li] is None or e4[pi] is None or e8[pi] is None: return False
+            cross_up = e4[li] > e8[li] and e4[pi] <= e8[pi]
+            if not cross_up: return False
+            if consecutive_losses >= 1 and e20[li] is not None and e8[li] <= e20[li]: return False
+            if consecutive_losses >= 2 and e20[li] is not None and levels[li] <= e20[li]: return False
+            if consecutive_losses >= 3:
+                prev2 = li - 1
+                if prev2 < 0 or e4[prev2] is None or levels[prev2] <= e4[prev2]: return False
+                if levels[li] <= e4[li]: return False
+            return True
+
+        if expected == "ROJO":
+            if check_moderate(lv, ema4_o, ema8_o, ema20_o, li, pi): return expected
+        elif expected == "NEGRO":
+            if check_moderate(ilv, ema4_i, ema8_i, ema20_i, li, pi): return expected
+        return None
+
+
+    # ─── DETECCIÓN MODERADO: PARIDAD ─────────────────────────────────────────
+    def _detect_paridad_signal_moderado(self, consecutive_losses: int = 0) -> Optional[str]:
+        """
+        Lógica Moderado para PARIDAD (espejo de _detect_color_signal_moderado).
+        Cruce EMA4 > EMA8 en el gráfico del target:
+          • PAR   → levels["PARIDAD"]     (gráfico positivo)
+          • IMPAR → inv_levels["PARIDAD"] (gráfico inverso)
+        Filtros adicionales por pérdidas consecutivas (igual que COLOR).
+        """
+        min_spins = 12 + consecutive_losses * 3
+        if len(self.spin_history) < min_spins:
+            return None
+
+        lv  = self.levels["PARIDAD"]
+        ilv = self.inv_levels["PARIDAD"]
+        if len(lv) < 8 or len(ilv) < 8:
+            return None
+
+        ema4_o  = calculate_ema(lv,  4)
+        ema8_o  = calculate_ema(lv,  8)
+        ema20_o = calculate_ema(lv,  20) if len(lv)  >= 20 else []
+        ema4_i  = calculate_ema(ilv, 4)
+        ema8_i  = calculate_ema(ilv, 8)
+        ema20_i = calculate_ema(ilv, 20) if len(ilv) >= 20 else []
+        li = len(lv) - 1
+        pi = li - 1
+
+        def check_moderate(levels, e4, e8, e20, li, pi):
+            if li < 1 or pi < 0: return False
+            if not e4 or not e8: return False
+            if li >= len(e4) or li >= len(e8): return False
+            if pi >= len(e4) or pi >= len(e8): return False
+            cross_up = e4[li] > e8[li] and e4[pi] <= e8[pi]
+            if not cross_up: return False
+            if consecutive_losses >= 1 and e20 and li < len(e20) and e8[li] <= e20[li]: return False
+            if consecutive_losses >= 2 and e20 and li < len(e20) and levels[li] <= e20[li]: return False
+            if consecutive_losses >= 3:
+                prev2 = li - 1
+                if prev2 < 0 or prev2 >= len(e4): return False
+                if levels[prev2] <= e4[prev2]: return False
+                if levels[li] <= e4[li]: return False
+            return True
+
+        # Probar PAR (gráfico positivo)
+        if check_moderate(lv, ema4_o, ema8_o, ema20_o, li, pi):
+            # Confirmar que el nivel PAR también está sobre EMA20
+            if not ema20_o or lv[li] > ema20_o[li]:
+                return "PAR"
+
+        # Probar IMPAR (gráfico inverso)
+        if check_moderate(ilv, ema4_i, ema8_i, ema20_i, li, pi):
+            if not ema20_i or ilv[li] > ema20_i[li]:
+                return "IMPAR"
+
+        return None
+
+    # ─── DETECCIÓN MODERADO: ZONA ─────────────────────────────────────────────
+    def _detect_zona_signal_moderado(self, consecutive_losses: int = 0) -> Optional[str]:
+        """
+        Lógica Moderado para ZONA (espejo de _detect_color_signal_moderado).
+        Cruce EMA4 > EMA8 en el gráfico del target:
+          • MENOR → levels["ZONA"]     (gráfico positivo)
+          • MAYOR → inv_levels["ZONA"] (gráfico inverso)
+        Filtros adicionales por pérdidas consecutivas (igual que COLOR).
+        """
+        min_spins = 12 + consecutive_losses * 3
+        if len(self.spin_history) < min_spins:
+            return None
+
+        lv  = self.levels["ZONA"]
+        ilv = self.inv_levels["ZONA"]
+        if len(lv) < 8 or len(ilv) < 8:
+            return None
+
+        ema4_o  = calculate_ema(lv,  4)
+        ema8_o  = calculate_ema(lv,  8)
+        ema20_o = calculate_ema(lv,  20) if len(lv)  >= 20 else []
+        ema4_i  = calculate_ema(ilv, 4)
+        ema8_i  = calculate_ema(ilv, 8)
+        ema20_i = calculate_ema(ilv, 20) if len(ilv) >= 20 else []
+        li = len(lv) - 1
+        pi = li - 1
+
+        def check_moderate(levels, e4, e8, e20, li, pi):
+            if li < 1 or pi < 0: return False
+            if not e4 or not e8: return False
+            if li >= len(e4) or li >= len(e8): return False
+            if pi >= len(e4) or pi >= len(e8): return False
+            cross_up = e4[li] > e8[li] and e4[pi] <= e8[pi]
+            if not cross_up: return False
+            if consecutive_losses >= 1 and e20 and li < len(e20) and e8[li] <= e20[li]: return False
+            if consecutive_losses >= 2 and e20 and li < len(e20) and levels[li] <= e20[li]: return False
+            if consecutive_losses >= 3:
+                prev2 = li - 1
+                if prev2 < 0 or prev2 >= len(e4): return False
+                if levels[prev2] <= e4[prev2]: return False
+                if levels[li] <= e4[li]: return False
+            return True
+
+        # Probar MENOR (gráfico positivo)
+        if check_moderate(lv, ema4_o, ema8_o, ema20_o, li, pi):
+            if not ema20_o or lv[li] > ema20_o[li]:
+                return "MENOR"
+
+        # Probar MAYOR (gráfico inverso)
+        if check_moderate(ilv, ema4_i, ema8_i, ema20_i, li, pi):
+            if not ema20_i or ilv[li] > ema20_i[li]:
+                return "MAYOR"
+
+        return None
+
+    def detect_color_signal(self, signal_mode: str = "moderado", consecutive_losses: int = 0) -> Optional[dict]:
+        """Detecta señal para COLOR usando lógica del Auto-Roulette-Color."""
+        if signal_mode == "tendencia":
+            expected = self._detect_color_signal_tendencia(consecutive_losses)
+        else:
+            expected = self._detect_color_signal_moderado(consecutive_losses)
+        if not expected:
+            return None
+        bet_color = self._determine_bet_color(expected)
+        last_num = self.spin_history[-1]["number"] if self.spin_history else 0
+        entry = self._get_color_entry(last_num)
+        prob = entry["rojo"] if bet_color == "ROJO" else entry["negro"] if entry else 0.5
+        return {
+            "type": "COLOR",
+            "target": bet_color,
+            "prob": prob,
+            "chips": self.martingala.get_bet(),
+            "mode": signal_mode,
+        }
+
+    def detect_signal(self, signal_mode: str = "moderado", color_consecutive_losses: int = 0) -> Optional[dict]:
+        """
+        Detección unificada — SIEMPRE modo Moderado para las 3 categorías.
+
+        Pipeline por categoría:
+          COLOR   → _detect_color_signal_moderado   (EMA4/8/20 cruce, tabla Auto-Roulette)
+          PARIDAD → _detect_paridad_signal_moderado  (EMA4/8/20 cruce en gráfico PAR/IMPAR)
+          ZONA    → _detect_zona_signal_moderado     (EMA4/8/20 cruce en gráfico MENOR/MAYOR)
+
+        Tras la detección Moderado, la prob de la señal se refina con:
+          • Markov ord-3 ventana-60  (40%)
+          • Ensemble ML NaiveBayes + SGD (60%)
+          • AMX: cruces entre categorías, racha real, ruptura, secuencia
+          • Filtro EMA20 obligatorio confirmado dentro de cada _detect_*_moderado
+
+        Se emite la señal con mayor probabilidad ajustada (≥ MIN_PROB).
+        """
+        # ── Predicciones ML (Markov + Ensemble) para las 3 categorías ─────────
+        # Se calculan una vez y se reutilizan para prob_base y cruces AMX.
+        all_predictions = {cat: self._get_predictions(cat) for cat in ["COLOR", "PARIDAD", "ZONA"]}
+
         valid_signals = {}
         best_prob = 0.0
-        best_info = ""
-        targets_map = {"COLOR": ["ROJO", "NEGRO"], "PARIDAD": ["PAR", "IMPAR"], "ZONA": ["MENOR", "MAYOR"]}
+        best_info = "—"
 
-        # Pre-calcular EMA20 — orig para POS (ROJO/MENOR), inv para NEG (NEGRO/MAYOR)
-        ema_cache = {}
-        for cat in ["COLOR", "PARIDAD", "ZONA"]:
-            lv  = self.levels[cat]
-            ilv = self.inv_levels[cat]
-            ema_cache[cat] = {
-                "levels":     lv,
-                "ema":        calculate_ema(lv,  20) if len(lv)  >= 20 else [],
-                "inv_levels": ilv,
-                "inv_ema":    calculate_ema(ilv, 20) if len(ilv) >= 20 else [],
-            }
+        # ── COLOR: lógica Moderado (Auto-Roulette-Color) ──────────────────────
+        color_sig = self.detect_color_signal("moderado", color_consecutive_losses)
+        if color_sig:
+            valid_signals["COLOR"] = {"target": color_sig["target"], "prob": color_sig["prob"]}
+            if color_sig["prob"] > best_prob:
+                best_prob = color_sig["prob"]
+                best_info = f"COLOR -> {color_sig['target']} ({color_sig['prob']*100:.1f}%)"
 
-        # Targets negativos (usan nivel invertido)
-        NEG_TARGETS = {"NEGRO", "IMPAR", "MAYOR"}
+        # ── PARIDAD: lógica Moderado + Markov/ML/AMX ─────────────────────────
+        par_losses = self.color_consecutive_losses if hasattr(self, "color_consecutive_losses") else 0
+        paridad_target = self._detect_paridad_signal_moderado(par_losses)
+        if paridad_target:
+            lv  = self.levels["PARIDAD"]
+            ilv = self.inv_levels["PARIDAD"]
+            ref_levels = ilv if paridad_target == "IMPAR" else lv
+            ref_ema    = calculate_ema(ref_levels, 20) if len(ref_levels) >= 20 else []
+            hist_par   = self.hist_paridad
+            base_prob  = all_predictions["PARIDAD"].get(paridad_target, 0.0)
+            final_prob = self.amx.adjust_probability(
+                base_prob, paridad_target, all_predictions,
+                hist_par, self.seq_states["PARIDAD"],
+                levels=ref_levels, ema=ref_ema
+            )
+            final_prob = max(final_prob, MIN_PROB)   # moderado ya valida cruce; garantizar umbral
+            logger.debug(f"  📊 PARIDAD/{paridad_target}: base={base_prob:.3f} → AMX={final_prob:.3f} | Moderado ✅")
+            valid_signals["PARIDAD"] = {"target": paridad_target, "prob": final_prob}
+            if final_prob > best_prob:
+                best_prob = final_prob
+                best_info = f"PARIDAD -> {paridad_target} ({final_prob*100:.1f}%)"
 
-        for cat in ["COLOR", "PARIDAD", "ZONA"]:
-            hist = getattr(self, f"hist_{cat.lower()}")
-            best_cat_prob = 0.0
-            best_cat_target = None
-            for target in targets_map[cat]:
-                base_prob = predictions[cat].get(target, 0)
-                # Elegir el nivel adecuado según si es target positivo o negativo
-                if target in NEG_TARGETS:
-                    lv_for_target  = ema_cache[cat]["inv_levels"]
-                    ema_for_target = ema_cache[cat]["inv_ema"]
-                else:
-                    lv_for_target  = ema_cache[cat]["levels"]
-                    ema_for_target = ema_cache[cat]["ema"]
-                final_prob = self.amx.adjust_probability(
-                    base_prob, target, predictions, hist, self.seq_states[cat],
-                    levels=lv_for_target,
-                    ema=ema_for_target
-                )
-                if final_prob > best_cat_prob:
-                    best_cat_prob = final_prob
-                    best_cat_target = target
-            if best_cat_prob > best_prob:
-                best_prob = best_cat_prob
-                best_info = f"{cat} -> {best_cat_target} ({best_cat_prob*100:.1f}%)"
-            if best_cat_prob >= MIN_PROB:
-                valid_signals[cat] = {"target": best_cat_target, "prob": best_cat_prob}
+        # ── ZONA: lógica Moderado + Markov/ML/AMX ────────────────────────────
+        zona_target = self._detect_zona_signal_moderado(par_losses)
+        if zona_target:
+            lv  = self.levels["ZONA"]
+            ilv = self.inv_levels["ZONA"]
+            ref_levels = ilv if zona_target == "MAYOR" else lv
+            ref_ema    = calculate_ema(ref_levels, 20) if len(ref_levels) >= 20 else []
+            hist_zona  = self.hist_zona
+            base_prob  = all_predictions["ZONA"].get(zona_target, 0.0)
+            final_prob = self.amx.adjust_probability(
+                base_prob, zona_target, all_predictions,
+                hist_zona, self.seq_states["ZONA"],
+                levels=ref_levels, ema=ref_ema
+            )
+            final_prob = max(final_prob, MIN_PROB)
+            logger.debug(f"  📊 ZONA/{zona_target}: base={base_prob:.3f} → AMX={final_prob:.3f} | Moderado ✅")
+            valid_signals["ZONA"] = {"target": zona_target, "prob": final_prob}
+            if final_prob > best_prob:
+                best_prob = final_prob
+                best_info = f"ZONA -> {zona_target} ({final_prob*100:.1f}%)"
 
-        last_num = self.spin_history[-1]["number"] if self.spin_history else "?"
+        last_num      = self.spin_history[-1]["number"] if self.spin_history else "?"
         signal_status = "🟢 SEÑAL VALIDA" if valid_signals else "🔴 Sin señal"
-        logger.info(f"🎲 Giro #{last_num} | Prob Máxima: {best_info} | {signal_status}")
+        logger.info(f"🎲 Giro #{last_num} | Prob Máx: {best_info} | {signal_status}")
 
         if not valid_signals:
             return None
         best_cat = max(valid_signals, key=lambda k: valid_signals[k]["prob"])
         best_sig = valid_signals[best_cat]
-        return {"type": best_cat, "target": best_sig["target"], "prob": best_sig["prob"], "chips": self.labouchere.get_bet()}
+        return {
+            "type":   best_cat,
+            "target": best_sig["target"],
+            "prob":   best_sig["prob"],
+            "chips":  self.martingala.get_bet(),
+            "mode":   "moderado"
+        }
 
     def _build_signal_text(self) -> str:
         last_num = self.spin_history[-1]["number"] if self.spin_history else 0
@@ -858,7 +1180,7 @@ class RouletteEngine:
         gestion = fmt_gestion_signal(self.active_chips)
         return (f"✅ SEÑAL CONFIRMADA — {target_display} ✅\n\n🎰 {self.name}\n"
                 f"👉 ÚLTIMO NÚMERO: {last_num}\n♦️ ENTRAR EN: {target_display}\n"
-                f"🔹 INTENTO: {self.attempt} DE 3\n\n💡 PROBABILIDAD PATRÓN — {self._last_signal_prob:.1f}%\n"
+                f"🔹 INTENTO: {self.attempt} DE {2 if self.active_type == 'COLOR' else 3}\n\n💡 PROBABILIDAD PATRÓN — {self._last_signal_prob:.1f}%\n🎲 MARTINGALA ×{self.martingala.multiplier}\n"
                 f"🚨 MONTO DE APUESTA POR PAIS:\n{gestion}")
 
     def send_signal(self):
@@ -873,7 +1195,8 @@ class RouletteEngine:
         queue_broadcast({
             "type": "signal", "target": self.active_target, "chips": self.active_chips,
             "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips,
-            "labouchere_bet": self.labouchere.get_bet()
+            "signal_mode": self.signal_mode,
+            "martingala_bet": self.martingala.get_bet(), "martingala_mult": self.martingala.multiplier, "martingala_seq": list(self.martingala.sequence)
         })
 
     def iniciar_senal(self, sig: dict):
@@ -899,22 +1222,28 @@ class RouletteEngine:
         won = (actual_val == self.active_target)
         is_zero = (number == 0)
         current_bet = self.active_chips
+        # Max intentos para COLOR es 2, para otras categorías es 3
+        max_attempts = MAX_ATTEMPTS_COLOR if self.active_type == "COLOR" else 3
 
         if won:
-            cycle_done = self.labouchere.win()
+            cycle_done = self.martingala.win()
             GLOBAL_STATS.global_chips += current_bet
             GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
             tg_send(f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_currency_amount(current_bet, 'USD')}!")
             if cycle_done and GLOBAL_STATS.global_chips < SESSION_MANAGER_REF.session_start_chips + SESSION_TARGET:
-                tg_send(f"🎉 CICLO DE D'ALEMBERT COMPLETADO 🎉\n🚨 GESTION ACTUAL POR PAIS:\n{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}")
+                tg_send(f"🎉 CICLO LABOUCHERE COMPLETADO 🎉\n🚨 GESTION ACTUAL POR PAIS:\n{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}")
+            # Reset consecutive losses for COLOR on WIN
+            if self.active_type == "COLOR":
+                self.color_consecutive_losses = 0
+                self.color_loss_block_until = 0.0
             self.wait_next_spin = True
             self._send_analyzing_msg()
             self._end_cycle()
-            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips, "labouchere_bet": self.labouchere.get_bet()})
+            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips, "martingala_bet": self.martingala.get_bet(), "martingala_seq": list(self.martingala.sequence)})
         else:
             GLOBAL_STATS.global_chips -= current_bet
-            self.labouchere.loss()
-            if self.attempt < 3:
+            self.martingala.loss()
+            if self.attempt < max_attempts:
                 lost_attempt = self.attempt
                 self.attempt += 1
                 self.signal_active = False
@@ -924,13 +1253,19 @@ class RouletteEngine:
                     "type": "result_retry",
                     "lost_attempt": lost_attempt,
                     "attempt": self.attempt,
+                    "signal_category": self.active_type,
                     "bankroll": GLOBAL_STATS.global_chips,
-                    "labouchere_bet": self.labouchere.get_bet()
+                    "martingala_bet": self.martingala.get_bet(), "martingala_seq": list(self.martingala.sequence)
                 })
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 msg = "🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
-                tg_send(f"{msg}\n🚨 Racha de 3 intentos perdida.")
+                n_intentos = max_attempts
+                tg_send(f"{msg}\n🚨 Racha de {n_intentos} intentos perdida.")
+                # Track consecutive losses for COLOR
+                if self.active_type == "COLOR":
+                    self.color_consecutive_losses = min(self.color_consecutive_losses + 1, 4)
+                    self.color_loss_block_until = time.time() + min(8.0 * self.color_consecutive_losses, 30.0)
                 self.wait_next_spin = True
                 self._send_analyzing_msg()
                 self._end_cycle()
@@ -940,7 +1275,7 @@ class RouletteEngine:
                     "attempt": self.attempt,
                     "number": number,
                     "bankroll": GLOBAL_STATS.global_chips,
-                    "labouchere_bet": self.labouchere.get_bet()
+                    "martingala_bet": self.martingala.get_bet(), "martingala_seq": list(self.martingala.sequence)
                 })
 
     def _end_cycle(self):
@@ -981,14 +1316,18 @@ class RouletteEngine:
             if self.wait_next_spin:
                 self.wait_next_spin = False
                 return
-            sig = self.detect_signal()
+            # Block COLOR if in cooldown after consecutive losses
+            if time.time() < self.color_loss_block_until:
+                sig = self.detect_signal("moderado", 999)  # skip color (cooldown)
+            else:
+                sig = self.detect_signal("moderado", self.color_consecutive_losses)
             if not self.signal_active:
                 if sig:
                     if self.cycle_active:
                         self.active_type = sig["type"]
                         self.active_target = sig["target"]
                         self._last_signal_prob = sig["prob"] * 100
-                        self.active_chips = self.labouchere.get_bet()
+                        self.active_chips = self.martingala.get_bet()
                         self.signal_active = True
                         self.send_signal()
                     else:
@@ -1126,7 +1465,8 @@ async def ws_client_handler(request):
                 "type": "init",
                 "bankroll": GLOBAL_STATS.global_chips,
                 "session_active": session_mgr_global.session_active if session_mgr_global else False,
-                "labouchere_bet": e.labouchere.get_bet(),
+                "signal_mode": e.signal_mode,
+                "martingala_bet": e.martingala.get_bet(), "martingala_mult": e.martingala.multiplier, "martingala_seq": list(e.martingala.sequence),
                 "history": e.spin_history[-100:],
                 "charts": e.get_chart_data()
             }
@@ -1147,6 +1487,14 @@ async def ws_client_handler(request):
         async for msg in ws:
             if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                 break
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    cmd = json.loads(msg.data)
+                    if cmd.get("type") == "set_signal_mode":
+                        # Sistema siempre en modo moderado — ignorar cambios
+                        queue_broadcast({"type": "signal_mode", "mode": "moderado"})
+                except Exception:
+                    pass
         sender_task.cancel()
 
     except Exception as e:
@@ -1224,7 +1572,7 @@ async def daily_stats_loop():
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$0.80 USD\nLabouchere [1,2,1] — Mínimo 1 ficha\n/status /stats /reset", parse_mode="HTML")
+    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$0.80 USD\nMartingala ×2 — Mínimo 1 ficha\n/status /stats /reset", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['status'])
@@ -1233,7 +1581,7 @@ def cmd_status(m):
         return
     e = engines_global[0]
     sa = "🟢 Activa" if session_mgr_global and session_mgr_global.session_active else "⚪ Inactiva"
-    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_currency_amount(GLOBAL_STATS.global_chips, 'USD')}\n<b>Labouchere apuesta:</b> {fmt_currency_amount(e.labouchere.get_bet(), 'USD')}", parse_mode="HTML")
+    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_currency_amount(GLOBAL_STATS.global_chips, 'USD')}\n<b>Martingala apuesta:</b> {fmt_currency_amount(e.martingala.get_bet(), 'USD')}", parse_mode="HTML")
 
 
 @bot.message_handler(commands=['stats'])
@@ -1241,12 +1589,14 @@ def cmd_stats(m):
     tg_send_stats(GLOBAL_STATS.get_stats_text())
 
 
-@bot.message_handler(commands=['reset'])
+@bot.message_handler(commands=['modo'])
+def cmd_modo(m):
+    bot.reply_to(m, "ℹ️ Sistema fijo en modo <b>MODERADO</b> para todas las categorías.", parse_mode="HTML")
 def cmd_reset(m):
     global GLOBAL_STATS
     GLOBAL_STATS = GlobalStats()
     for e in engines_global:
-        e.labouchere.reset()
+        e.martingala.reset()
         e._end_cycle()
     if session_mgr_global:
         session_mgr_global._end_session_legacy()
