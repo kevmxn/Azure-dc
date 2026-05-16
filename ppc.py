@@ -328,11 +328,13 @@ class OnlineEnsemblePredictor:
 
 
 class AMXAnalyzer:
-    def adjust_probability(self, base_prob: float, target: str, predictions: dict, recent_hist: list, seq_state) -> float:
+    def adjust_probability(self, base_prob: float, target: str, predictions: dict,
+                           recent_hist: list, seq_state,
+                           levels: list = None, ema: list = None) -> float:
         cross_boost = 0.0
         target_cat = "COLOR" if target in ["ROJO", "NEGRO"] else ("PARIDAD" if target in ["PAR", "IMPAR"] else "ZONA")
 
-        # Cruces Simétricos
+        # ── Cruces Simétricos ──────────────────────────────────────────────────
         if target_cat == "COLOR":
             if target == "ROJO":
                 if predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55:
@@ -367,7 +369,7 @@ class AMXAnalyzer:
                 if predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55:
                     cross_boost += 0.02
 
-        # Resonancia por Racha Real
+        # ── Resonancia por Racha Real ─────────────────────────────────────────
         matches = 0
         for i in range(1, min(4, len(recent_hist)) + 1):
             if recent_hist[-i] == target:
@@ -381,14 +383,28 @@ class AMXAnalyzer:
         elif matches >= 3:
             cross_boost += 0.12
 
-        # Ruptura de Repetición
+        # ── Ruptura de Repetición ─────────────────────────────────────────────
         if (len(recent_hist) >= 2 and recent_hist[-1] == recent_hist[-2]
                 and recent_hist[-1] != "CERO" and recent_hist[-1] != target):
             cross_boost += 0.04
 
-        # Bonus de Alineación con Secuencia Fija
+        # ── Bonus de Alineación con Secuencia Fija ────────────────────────────
         if target == seq_state.expected():
             cross_boost += 0.03
+
+        # ── Boost especial: por encima de EMA20 + racha últimos 5 ───────────
+        # Aplica a ROJO, MENOR (nivel orig) y NEGRO, MAYOR (nivel inv)
+        if target in ("ROJO", "MENOR", "NEGRO", "MAYOR") and levels and ema:
+            above_ema = len(levels) > 0 and len(ema) > 0 and levels[-1] > ema[-1]
+            if above_ema:
+                last5 = recent_hist[-5:] if len(recent_hist) >= 5 else recent_hist
+                streak5 = sum(1 for v in last5 if v == target)
+                if streak5 >= 3:
+                    cross_boost += 0.06
+                if streak5 >= 4:
+                    cross_boost += 0.04   # acumulado +0.10 para rachas muy fuertes
+                if len(levels) >= 3 and levels[-1] > levels[-2] > levels[-3]:
+                    cross_boost += 0.03
 
         return min(1.0, base_prob + cross_boost)
 
@@ -528,14 +544,12 @@ class SessionManager:
         self.session_start_time = time.time()
         self.session_start_chips = GLOBAL_STATS.global_chips
         engine = self.engines[self.current_idx]
-        logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll Inicio: {fmt_currency_amount(self.session_start_chips, 'USD')}")
-        tg_send(f"🟢 SESIÓN INICIADA 🟢\n🎰 {engine.name}\n💵 Meta: +{fmt_currency_amount(SESSION_TARGET, 'USD')}\n⏱ La sesión no cierra hasta cumplir la meta")
+        logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll: {fmt_currency_amount(self.session_start_chips, 'USD')}")
         queue_broadcast({"type": "session", "status": "active"})
 
-    def _end_session(self):
+    def _reset_cycle_on_meta(self):
+        """Al cumplir la meta, resetea D'Alembert a 3 y continúa la sesión."""
         engine = self.engines[self.current_idx]
-        self.session_active = False
-        duration_mins = int((time.time() - self.session_start_time) / 60)
         engine.dalembert.reset()
         engine.cycle_active = False
         engine.signal_active = False
@@ -546,13 +560,25 @@ class SessionManager:
         if engine.analyzing_msg_id:
             tg_delete(CHAT_ID, engine.analyzing_msg_id)
             engine.analyzing_msg_id = None
-        logger.info(f"[Session] 🔴 Terminada: {engine.name} | Meta cumplida!")
-        tg_send(
-            f"🔴 SESIÓN CERRADA 🔴\n"
-            f"⏱ Duración: {duration_mins} minutos\n"
-            f"💵 BALANCE GLOBAL POR PAIS 💵\n"
-            f"{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}"
-        )
+        self.session_start_chips = GLOBAL_STATS.global_chips   # resetear baseline
+        logger.info(f"[Session] 🎯 Meta cumplida — D'Alembert reseteado a 3, sesión continúa.")
+        queue_broadcast({"type": "session", "status": "active"})  # sigue activa
+
+    def _end_session_legacy(self):
+        """Mantener por compatibilidad con /reset. No se usa en flujo normal."""
+        engine = self.engines[self.current_idx]
+        self.session_active = False
+        engine.dalembert.reset()
+        engine.cycle_active = False
+        engine.signal_active = False
+        engine.attempt = 1
+        if engine.active_signal_msg_id:
+            tg_delete(CHAT_ID, engine.active_signal_msg_id)
+            engine.active_signal_msg_id = None
+        if engine.analyzing_msg_id:
+            tg_delete(CHAT_ID, engine.analyzing_msg_id)
+            engine.analyzing_msg_id = None
+        logger.info(f"[Session] 🔴 Terminada: {engine.name}")
         queue_broadcast({"type": "session", "status": "closed"})
 
     async def session_watchdog(self):
@@ -564,31 +590,16 @@ class SessionManager:
             REMINDER_SECS = 300
             if wait > REMINDER_SECS + 10:
                 await asyncio.sleep(wait - REMINDER_SECS)
-                now = self._now_arg()
-                if now.minute < 30:
-                    slot_str = now.strftime("%H:30")
-                else:
-                    slot_str = (now + timedelta(hours=1)).strftime("%H:00")
-                self._reminder_msg_id = tg_send(
-                    f"⏰ PRÓXIMA SESIÓN EN 5 MINUTOS ⏰\n"
-                    f"🎰 AUTO ROULETTE 🎰\n"
-                    f"🕐 Arranca a las {slot_str} hs — ¡prepárate!"
-                )
                 await asyncio.sleep(REMINDER_SECS)
             else:
                 await asyncio.sleep(wait)
-
-            if self._reminder_msg_id:
-                tg_delete(CHAT_ID, self._reminder_msg_id)
-                self._reminder_msg_id = None
 
             self._start_session()
 
             while self.session_active:
                 await asyncio.sleep(1)
                 if GLOBAL_STATS.global_chips >= self.session_start_chips + SESSION_TARGET:
-                    self._end_session()
-                    break
+                    self._reset_cycle_on_meta()
 
 
 # ─── MOTOR DE RULETA ─────────────────────────────────────────────────────────
@@ -755,13 +766,39 @@ class RouletteEngine:
         best_info = ""
         targets_map = {"COLOR": ["ROJO", "NEGRO"], "PARIDAD": ["PAR", "IMPAR"], "ZONA": ["MENOR", "MAYOR"]}
 
+        # Pre-calcular EMA20 — orig para POS (ROJO/MENOR), inv para NEG (NEGRO/MAYOR)
+        ema_cache = {}
+        for cat in ["COLOR", "PARIDAD", "ZONA"]:
+            lv  = self.levels[cat]
+            ilv = self.inv_levels[cat]
+            ema_cache[cat] = {
+                "levels":     lv,
+                "ema":        calculate_ema(lv,  20) if len(lv)  >= 20 else [],
+                "inv_levels": ilv,
+                "inv_ema":    calculate_ema(ilv, 20) if len(ilv) >= 20 else [],
+            }
+
+        # Targets negativos (usan nivel invertido)
+        NEG_TARGETS = {"NEGRO", "IMPAR", "MAYOR"}
+
         for cat in ["COLOR", "PARIDAD", "ZONA"]:
             hist = getattr(self, f"hist_{cat.lower()}")
             best_cat_prob = 0.0
             best_cat_target = None
             for target in targets_map[cat]:
                 base_prob = predictions[cat].get(target, 0)
-                final_prob = self.amx.adjust_probability(base_prob, target, predictions, hist, self.seq_states[cat])
+                # Elegir el nivel adecuado según si es target positivo o negativo
+                if target in NEG_TARGETS:
+                    lv_for_target  = ema_cache[cat]["inv_levels"]
+                    ema_for_target = ema_cache[cat]["inv_ema"]
+                else:
+                    lv_for_target  = ema_cache[cat]["levels"]
+                    ema_for_target = ema_cache[cat]["ema"]
+                final_prob = self.amx.adjust_probability(
+                    base_prob, target, predictions, hist, self.seq_states[cat],
+                    levels=lv_for_target,
+                    ema=ema_for_target
+                )
                 if final_prob > best_cat_prob:
                     best_cat_prob = final_prob
                     best_cat_target = target
@@ -854,11 +891,18 @@ class RouletteEngine:
             GLOBAL_STATS.global_chips -= current_bet
             self.dalembert.loss()
             if self.attempt < 3:
+                lost_attempt = self.attempt
                 self.attempt += 1
                 self.signal_active = False
                 self.wait_next_spin = True
                 self._send_analyzing_msg()
-                queue_broadcast({"type": "result_retry", "attempt": self.attempt, "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet()})
+                queue_broadcast({
+                    "type": "result_retry",
+                    "lost_attempt": lost_attempt,
+                    "attempt": self.attempt,
+                    "bankroll": GLOBAL_STATS.global_chips,
+                    "dalembert_bet": self.dalembert.get_bet()
+                })
             else:
                 GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
                 msg = "🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
@@ -866,7 +910,14 @@ class RouletteEngine:
                 self.wait_next_spin = True
                 self._send_analyzing_msg()
                 self._end_cycle()
-                queue_broadcast({"type": "result", "result": "EMPATE" if is_zero else "LOSS", "number": number, "bankroll": GLOBAL_STATS.global_chips, "dalembert_bet": self.dalembert.get_bet()})
+                queue_broadcast({
+                    "type": "result",
+                    "result": "EMPATE" if is_zero else "LOSS",
+                    "attempt": self.attempt,
+                    "number": number,
+                    "bankroll": GLOBAL_STATS.global_chips,
+                    "dalembert_bet": self.dalembert.get_bet()
+                })
 
     def _end_cycle(self):
         self.attempt = 1
@@ -1173,6 +1224,8 @@ def cmd_reset(m):
     for e in engines_global:
         e.dalembert.reset()
         e._end_cycle()
+    if session_mgr_global:
+        session_mgr_global._end_session_legacy()
     bot.reply_to(m, "🔄 <b>Resetado</b>", parse_mode="HTML")
 
 
