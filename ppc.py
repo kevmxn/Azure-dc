@@ -867,6 +867,7 @@ class ImmersiveRouletteEngine:
         self.processed_game_ids={}          # dict ordenado: gid→True (evita duplicados)
         self.MAX_PROCESSED_IDS=300
         self._load_processed_ids()          # sincroniza con DB (anti-duplicados multi-instancia)
+        self._first_poll_done = False       # en la 1ª poll se marcan giros existentes sin procesar
 
         # Warmup
         live_loaded=self._load_live_history()
@@ -1263,13 +1264,13 @@ class ImmersiveRouletteEngine:
 
     def _fmt_last_numbers(self, count: int = 5) -> str:
         """Últimos `count` giros como 🔴7 ⚫11 🔴1 ..."""
-        hist = list(self.spin_history)[-count:]
+        hist = list(self.spin_history)[-count:][::-1]
         parts = [f"{self._num_color_emoji(s['number'])}{s['number']}" for s in hist]
         return " ".join(parts)
 
     def _fmt_last_zone_numbers(self, count: int = 5) -> str:
         """Últimos `count` giros con emoji de zona: 🟣 bajo (1-18), 🔵 alto (19-36)."""
-        hist = list(self.spin_history)[-count:]
+        hist = list(self.spin_history)[-count:][::-1]
         parts = []
         for s in hist:
             z  = get_zone(s["number"])
@@ -1772,7 +1773,21 @@ class ImmersiveRouletteEngine:
                             self.sc.update(data)
                             last_20=data.get("last_20",[])
                             if isinstance(last_20,list) and last_20 and isinstance(last_20[0],dict):
-                                self.process_batch(last_20)
+                                if not self._first_poll_done:
+                                    # Primera poll: marcar TODOS los giros actuales como ya vistos
+                                    # sin procesarlos. Evita que esta instancia repita giros que
+                                    # ya manejó la instancia anterior durante el redeploy.
+                                    for spin in last_20:
+                                        gid = spin.get("game_id")
+                                        if gid:
+                                            self.processed_game_ids[gid] = True
+                                    self._first_poll_done = True
+                                    logger.info(
+                                        f"[ImmersiveDC] 🔒 Primera poll: {len(last_20)} giros "
+                                        f"marcados como existentes — no procesados"
+                                    )
+                                else:
+                                    self.process_batch(last_20)
                         else:
                             self.sc.connected=False
                 except Exception as e:
