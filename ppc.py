@@ -275,7 +275,7 @@ class DailyScoreboard:
         total = self.wins + self.losses
         pct   = (self.wins / total * 100) if total > 0 else 0.0
         return (
-            f"📊 <b>MARCADOR DIARIO:</b>\n"
+            f"📊 MARCADOR DIARIO:\n"
             f"✅ GANADAS: {self.wins}\n"
             f"❌ PERDIDAS: {self.losses}\n"
             f"📈 ACIERTOS = {pct:.2f}%"
@@ -444,101 +444,119 @@ class StatsClient:
         except Exception as e:
             logger.debug(f"[SERVER] Señal docena no registrada (no crítico): {e}")
 
-    # ── Predicción Color: P1 (transición) + P3 (global) ──────────────────────
+    # ── Predicción Color: todos los patrones pendientes (N5, N7, R5, R7) ────────
+    def predict_color_signals(self, last_number: int) -> List[Dict]:
+        """Devuelve TODOS los patrones de color pendientes (N5, N7, R5, R7).
+
+        Soporta:
+          - 'pendings': lista de patrones (formato nuevo del servidor)
+          - 'pending':  dict con un solo patrón (formato legacy)
+        """
+        raw = self.color_patterns.get("pendings")
+        if raw is None:
+            single = self.color_patterns.get("pending")
+            raw = [single] if single else []
+
+        summary = self.color_patterns.get("summary", {})
+        results = []
+        for pending in raw:
+            if not pending:
+                continue
+            pid      = pending.get("pid", "")
+            bet      = pending.get("bet", "")
+            sequence = pending.get("sequence", [])
+
+            p3 = self._global_eff(summary, pid)
+            if p3 is None:
+                logger.info(f"[COLOR] {pid} sin datos globales — omitido")
+                continue
+
+            p1 = None
+            if last_number is not None and last_number != 0:
+                color_trans = self.stats_color.get(str(last_number), {})
+                if color_trans.get("total", 0) >= TRANS_MIN_SAMPLES:
+                    if bet == "Negro":
+                        p1 = color_trans.get("N", 0) / 100.0
+                    elif bet == "Rojo":
+                        p1 = color_trans.get("R", 0) / 100.0
+
+            if p1 is not None:
+                prob       = round(P1_W_COLOR * p1 + P3_W_COLOR * p3, 4)
+                components = f"Trans={p1:.0%} | Global={p3:.0%}"
+                logger.info(f"[COLOR] {pid} bet={bet} P1={p1:.0%} P3={p3:.0%} → {prob:.0%}")
+            else:
+                prob       = p3
+                components = f"Global={p3:.0%}"
+                logger.info(f"[COLOR] {pid} bet={bet} P3={p3:.0%} (sin P1)")
+
+            results.append({
+                "type": "color", "pid": pid, "bet": bet, "prob": prob,
+                "p1_trans": p1 or 0, "p3_global": p3,
+                "sequence": sequence, "components": components,
+            })
+        return results
+
+    # Alias legacy usado en /debug (retorna primer patrón disponible)
     def predict_color_signal(self, last_number: int) -> Optional[Dict]:
-        pending = self.color_patterns.get("pending")
-        if not pending: return None
-        pid      = pending.get("pid", "")
-        bet      = pending.get("bet", "")
-        sequence = pending.get("sequence", [])
+        results = self.predict_color_signals(last_number)
+        return results[0] if results else None
 
-        # P3: efectividad global del patrón
-        p3 = self._global_eff(self.color_patterns.get("summary", {}), pid)
-        if p3 is None:
-            logger.info(f"[COLOR] {pid} sin datos globales suficientes — señal omitida")
-            return None
+    # ── Predicción Zona: todos los patrones pendientes (B5, B7, A5, A7) ─────────
+    def predict_zone_signals(self, last_number: int) -> List[Dict]:
+        """Devuelve TODOS los patrones de zona pendientes (B5, B7, A5, A7).
 
-        # P1: probabilidad de transición estadística desde last_number
-        p1 = None
-        if last_number is not None and last_number != 0:
-            color_trans = self.stats_color.get(str(last_number), {})
-            if color_trans.get("total", 0) >= TRANS_MIN_SAMPLES:
-                if bet == "Negro":
-                    p1 = color_trans.get("N", 0) / 100.0
-                elif bet == "Rojo":
-                    p1 = color_trans.get("R", 0) / 100.0
+        Soporta:
+          - 'pendings': lista de patrones (formato nuevo del servidor)
+          - 'pending':  dict con un solo patrón (formato legacy)
+        """
+        raw = self.zone_patterns.get("pendings")
+        if raw is None:
+            single = self.zone_patterns.get("pending")
+            raw = [single] if single else []
 
-        # Combinar P1 + P3 (sin P2)
-        if p1 is not None:
-            prob       = round(P1_W_COLOR * p1 + P3_W_COLOR * p3, 4)
-            components = f"Trans={p1:.0%} | Global={p3:.0%}"
-            logger.info(
-                f"[COLOR] {pid} bet={bet} | P1(trans)={p1:.0%} "
-                f"P3(global)={p3:.0%} → prob={prob:.0%}"
-            )
-        else:
-            prob       = p3
-            components = f"Global={p3:.0%}"
-            logger.info(f"[COLOR] {pid} bet={bet} | P3(global)={p3:.0%} (sin datos P1)")
+        summary = self.zone_patterns.get("summary", {})
+        results = []
+        for pending in raw:
+            if not pending:
+                continue
+            pid      = pending.get("pid", "")
+            bet      = pending.get("bet", "")
+            sequence = pending.get("sequence", [])
 
-        return {
-            "type":       "color",
-            "pid":        pid,
-            "bet":        bet,
-            "prob":       prob,
-            "p1_trans":   p1 or 0,
-            "p3_global":  p3,
-            "sequence":   sequence,
-            "components": components,
-        }
+            p3 = self._global_eff(summary, pid)
+            if p3 is None:
+                logger.info(f"[ZONA] {pid} sin datos globales — omitido")
+                continue
 
-    # ── Predicción Zona: P1 (transición) + P3 (global) ───────────────────────
+            p1 = None
+            if last_number is not None and last_number != 0:
+                zone_trans = self.stats_zone.get(str(last_number), {})
+                if zone_trans.get("total", 0) >= TRANS_MIN_SAMPLES:
+                    if bet == "Bajo":
+                        p1 = zone_trans.get("B", 0) / 100.0
+                    elif bet == "Alto":
+                        p1 = zone_trans.get("A", 0) / 100.0
+
+            if p1 is not None:
+                prob       = round(P1_W_COLOR * p1 + P3_W_COLOR * p3, 4)
+                components = f"Trans={p1:.0%} | Global={p3:.0%}"
+                logger.info(f"[ZONA] {pid} bet={bet} P1={p1:.0%} P3={p3:.0%} → {prob:.0%}")
+            else:
+                prob       = p3
+                components = f"Global={p3:.0%}"
+                logger.info(f"[ZONA] {pid} bet={bet} P3={p3:.0%} (sin P1)")
+
+            results.append({
+                "type": "zone", "pid": pid, "bet": bet, "prob": prob,
+                "p1_trans": p1 or 0, "p3_global": p3,
+                "sequence": sequence, "components": components,
+            })
+        return results
+
+    # Alias legacy usado en /debug (retorna primer patrón disponible)
     def predict_zone_signal(self, last_number: int) -> Optional[Dict]:
-        pending = self.zone_patterns.get("pending")
-        if not pending: return None
-        pid      = pending.get("pid", "")
-        bet      = pending.get("bet", "")
-        sequence = pending.get("sequence", [])
-
-        # P3: efectividad global del patrón
-        p3 = self._global_eff(self.zone_patterns.get("summary", {}), pid)
-        if p3 is None:
-            logger.info(f"[ZONA] {pid} sin datos globales suficientes — señal omitida")
-            return None
-
-        # P1: probabilidad de transición estadística desde last_number
-        p1 = None
-        if last_number is not None and last_number != 0:
-            zone_trans = self.stats_zone.get(str(last_number), {})
-            if zone_trans.get("total", 0) >= TRANS_MIN_SAMPLES:
-                if bet == "Bajo":
-                    p1 = zone_trans.get("B", 0) / 100.0
-                elif bet == "Alto":
-                    p1 = zone_trans.get("A", 0) / 100.0
-
-        # Combinar P1 + P3 (sin P2)
-        if p1 is not None:
-            prob       = round(P1_W_COLOR * p1 + P3_W_COLOR * p3, 4)
-            components = f"Trans={p1:.0%} | Global={p3:.0%}"
-            logger.info(
-                f"[ZONA] {pid} bet={bet} | P1(trans)={p1:.0%} "
-                f"P3(global)={p3:.0%} → prob={prob:.0%}"
-            )
-        else:
-            prob       = p3
-            components = f"Global={p3:.0%}"
-            logger.info(f"[ZONA] {pid} bet={bet} | P3(global)={p3:.0%} (sin datos P1)")
-
-        return {
-            "type":       "zone",
-            "pid":        pid,
-            "bet":        bet,
-            "prob":       prob,
-            "p1_trans":   p1 or 0,
-            "p3_global":  p3,
-            "sequence":   sequence,
-            "components": components,
-        }
+        results = self.predict_zone_signals(last_number)
+        return results[0] if results else None
 
     @staticmethod
     def _global_eff(summary, pid) -> Optional[float]:
@@ -808,28 +826,27 @@ class ImmersiveRouletteEngine:
         self.ensemble_d=OnlineEnsemblePredictor()
         self.spins_since_train=0
 
+        # ── Máximo de intentos por señal ─────────────────────────────────────
+        self.MAX_INTENTOS_DOCENA  = 2
+        self.MAX_INTENTOS_COLOR   = 2
+        self.MAX_INTENTOS_ZONA    = 2
+        self.MAX_INTENTOS_COLUMNA = 2
+
         # Señal docenas
         self.signal_active      =False
         self.active_strategy    =None
         self.active_pair        =()
         self.active_missing     =0
         self.active_signal_msg_id=None
+        self.active_intento     =1    # intento actual (1 o 2)
 
-        # Señal color
-        self.color_signal_active   =False
-        self.color_signal_bet      =""
-        self.color_signal_pid      =""
-        self.color_signal_prob     =0.0
-        self.color_signal_msg_id   =None
-        self.color_signal_sequence =[]
+        # Señales color — dict keyed por pid: N5, N7, R5, R7
+        # Cada entrada: {bet, prob, sequence, msg_id, intento}
+        self.color_signals: Dict[str, dict] = {}
 
-        # Señal zona
-        self.zone_signal_active    =False
-        self.zone_signal_bet       =""
-        self.zone_signal_pid       =""
-        self.zone_signal_prob      =0.0
-        self.zone_signal_msg_id    =None
-        self.zone_signal_sequence  =[]
+        # Señales zona — dict keyed por pid: B5, B7, A5, A7
+        # Cada entrada: {bet, prob, sequence, msg_id, intento}
+        self.zone_signals: Dict[str, dict] = {}
 
         # Señal columna (patrón de secuencia 2C en últimos 5)
         self.column_signal_active  =False
@@ -837,12 +854,13 @@ class ImmersiveRouletteEngine:
         self.column_signal_missing =0
         self.column_signal_prob    =0.0
         self.column_signal_msg_id  =None
+        self.column_intento        =1
 
         # DB y aprendizaje
         self._db    =_get_db()
         self.learner=SignalLearner(self._db)
 
-        self.processed_game_ids:set=set()
+        self.processed_game_ids={}          # dict ordenado: gid→True (evita duplicados)
         self.MAX_PROCESSED_IDS=300
 
         # Warmup
@@ -865,6 +883,35 @@ class ImmersiveRouletteEngine:
         for (n,c,z) in rows: self._update_state(n,persist=False,train_model=False)
         if rows: self.markov_d.update(self.dozen_seq)
         return len(rows)
+
+    # ── Propiedades de compatibilidad para color_signals / zone_signals ────────
+    @property
+    def color_signal_active(self) -> bool:
+        return bool(self.color_signals)
+
+    @property
+    def color_signal_bet(self) -> str:
+        if not self.color_signals: return ""
+        return next(iter(self.color_signals.values()))["bet"]
+
+    @property
+    def color_signal_prob(self) -> float:
+        if not self.color_signals: return 0.0
+        return next(iter(self.color_signals.values()))["prob"]
+
+    @property
+    def zone_signal_active(self) -> bool:
+        return bool(self.zone_signals)
+
+    @property
+    def zone_signal_bet(self) -> str:
+        if not self.zone_signals: return ""
+        return next(iter(self.zone_signals.values()))["bet"]
+
+    @property
+    def zone_signal_prob(self) -> float:
+        if not self.zone_signals: return 0.0
+        return next(iter(self.zone_signals.values()))["prob"]
 
     def _persist(self, number,color,zone):
         try:
@@ -1189,9 +1236,55 @@ class ImmersiveRouletteEngine:
             "last_number": last_num,
         }
 
+    # ── Helpers de formato ────────────────────────────────────────────────────
+    @staticmethod
+    def _num_color_emoji(number: int) -> str:
+        """Emoji de color del número: 🔴 rojo, ⚫ negro, 🟢 cero."""
+        c = get_color(number)
+        return {"R": "🔴", "N": "⚫", "V": "🟢"}.get(c, "⚪")
+
+    def _fmt_last_numbers(self, count: int = 5) -> str:
+        """Últimos `count` giros como 🔴7 ⚫11 🔴1 ..."""
+        hist = list(self.spin_history)[-count:]
+        parts = [f"{self._num_color_emoji(s['number'])}{s['number']}" for s in hist]
+        return " ".join(parts)
+
+    def _fmt_last_zone_numbers(self, count: int = 5) -> str:
+        """Últimos `count` giros con emoji de zona: 🟣 bajo (1-18), 🔵 alto (19-36)."""
+        hist = list(self.spin_history)[-count:]
+        parts = []
+        for s in hist:
+            z  = get_zone(s["number"])
+            em = {"B": "🟣", "A": "🔵", "Z": "🟢"}.get(z, "⚪")
+            parts.append(f"{em}{s['number']}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _strat_letter(strategy) -> str:
+        return {STRAT_E1: "A", STRAT_E2: "B", STRAT_E3: "C"}.get(strategy, "A")
+
+    @staticmethod
+    def _color_seq_str(sequence) -> str:
+        """Convierte ['Negro','Rojo',...] o ['N','R',...] a 'N-R-...'"""
+        mapping = {"Negro": "N", "Rojo": "R", "N": "N", "R": "R",
+                   "Bajo": "B", "Alto": "A", "B": "B", "A": "A"}
+        return "-".join(mapping.get(str(v), str(v)) for v in sequence)
+
     # ── Señales ───────────────────────────────────────────────────────────────
     def _strat_icon(self):
         return {STRAT_E1:"🅐",STRAT_E2:"🅑",STRAT_E3:"🅒"}.get(self.active_strategy,"?")
+
+    def _dozen_signal_text(self, p, intento: int) -> str:
+        letra = self._strat_letter(self.active_strategy)
+        last5 = self._fmt_last_numbers(5)
+        return (
+            f"✅✅ <b>SEÑAL DETECTADA</b> ✅✅\n\n"
+            f"💎 Estrategia: Docenas {letra}\n"
+            f"⚪ Apuesta: D{p[0]} y D{p[1]}\n"
+            f"🆔 Intento: {intento}/2\n"
+            f"🕐 Últimos números:\n"
+            f"{last5}"
+        )
 
     def _activate_dozen_signal(self, sig):
         self.signal_active=True
@@ -1199,14 +1292,9 @@ class ImmersiveRouletteEngine:
         self.active_pair=sig["pair"]
         self.active_missing=sig["missing"]
         p=sig["pair"]
-        icon=self._strat_icon()
         trend=sig.get("ema_trend",ema_trend_str(self.doc_levels))
         msg_id=tg_send(
-            f"✅✅ SEÑAL CONFIRMADA ✅✅\n\n"
-            f"🎡 IMMERSIVE ROULETTE {icon}\n"
-            f"🎯 Apostar Docenas: <b>D{p[0]} y D{p[1]}</b>\n"
-            f"📊 Probabilidad: {sig['prob']:.0%}\n"
-            f"🔍 Estrategia: {sig['label']}",
+            self._dozen_signal_text(p, intento=1),
             markup=immersive_keyboard()
         )
         if msg_id: self.active_signal_msg_id=msg_id
@@ -1229,141 +1317,234 @@ class ImmersiveRouletteEngine:
 
     def _resolve_dozen_signal(self, number):
         d=get_dozen(number); won=(d!=0 and d in self.active_pair)
-        icon=self._strat_icon()
+        em=self._num_color_emoji(number)
+        p=self.active_pair
         if won:
+            op_txt = "1° OP" if self.active_intento == 1 else "2° OP"
             tg_send(
-                f"✅ WIN #{number} — DOCENA D{d}\n"
-                f"🎡 IMMERSIVE ROULETTE {icon}\n"
-                f"🎯 Apuesta: D{self.active_pair[0]} y D{self.active_pair[1]}",
+                f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
                 markup=immersive_keyboard()
             )
             scoreboard.record_win()
-            self.learner.resolve("WIN",f"WIN D{d} | par correcto {self.active_pair}")
+            self.learner.resolve("WIN",f"WIN D{d} | par correcto {p} | intento {self.active_intento}")
+            scoreboard.send()
+            self._reset_dozen_signal()
         else:
-            tg_send(
-                f"❌ LOSS #{number} — DOCENA D{d}\n"
-                f"🎡 IMMERSIVE ROULETTE {icon}\n"
-                f"🎯 Apuesta era: D{self.active_pair[0]} y D{self.active_pair[1]}",
-                markup=immersive_keyboard()
-            )
-            scoreboard.record_loss()
-            self.learner.resolve("LOSS",f"LOSS D{d} cayó | faltaba D{self.active_missing}")
-        scoreboard.send()
-        self._reset_dozen_signal()
+            if self.active_intento < self.MAX_INTENTOS_DOCENA:
+                # Primer fallo → borrar señal 1 y reenviar señal intento 2
+                if self.active_signal_msg_id:
+                    tg_delete(CHAT_ID, self.active_signal_msg_id)
+                    self.active_signal_msg_id = None
+                self.active_intento += 1
+                msg_id = tg_send(
+                    self._dozen_signal_text(p, intento=2),
+                    markup=immersive_keyboard()
+                )
+                if msg_id: self.active_signal_msg_id = msg_id
+                logger.info(f"[DOCENA] 🔁 Intento 1 fallido D{d} | señal re-enviada intento 2")
+            else:
+                # Segundo fallo → LOSS definitivo
+                tg_send(
+                    f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
+                    markup=immersive_keyboard()
+                )
+                scoreboard.record_loss()
+                self.learner.resolve("LOSS",f"LOSS D{d} cayó | faltaba D{self.active_missing} | intento {self.active_intento}")
+                scoreboard.send()
+                self._reset_dozen_signal()
 
     def _reset_dozen_signal(self):
         self.signal_active=False; self.active_strategy=None
-        self.active_pair=(); self.active_missing=0; self.active_signal_msg_id=None
+        self.active_pair=(); self.active_missing=0
+        self.active_signal_msg_id=None; self.active_intento=1
 
     # ── Color ─────────────────────────────────────────────────────────────────
+    def _color_signal_text(self, bet: str, intento: int, sequence: list = None) -> str:
+        if bet == "Negro":
+            apuesta_txt = "NEGRO ⚫"
+        elif bet == "Rojo":
+            apuesta_txt = "ROJO 🔴"
+        else:
+            apuesta_txt = bet
+        seq = sequence if sequence is not None else []
+        pat = self._color_seq_str(seq) if seq else "—"
+        last5 = self._fmt_last_numbers(5)
+        return (
+            f"✅✅ <b>SEÑAL DETECTADA</b> ✅✅\n\n"
+            f"💎 Estrategia: COLOR\n"
+            f"⚪ Apuesta: {apuesta_txt}\n"
+            f"🟡 Patrón: {pat}\n"
+            f"🆔 Intento: {intento}/2\n"
+            f"🕐 Últimos números:\n"
+            f"{last5}"
+        )
+
     def _check_color_signal(self, number):
-        if self.color_signal_active:
-            color=get_color(number); bet=self.color_signal_bet
-            won=(bet=="Negro" and color=="N") or (bet=="Rojo" and color=="R")
+        """Resuelve señales de color activas y activa nuevas (N5, N7, R5, R7)."""
+        color = get_color(number)
+        em    = self._num_color_emoji(number)
+
+        # ── Resolver señales activas ──────────────────────────────────────────
+        pids_done = []
+        for pid, sig in list(self.color_signals.items()):
+            bet = sig["bet"]
+            won = (bet == "Negro" and color == "N") or (bet == "Rojo" and color == "R")
             if won:
+                op_txt = "1° OP" if sig["intento"] == 1 else "2° OP"
                 tg_send(
-                    f"✅ WIN #{number} — {color_label(color)}\n"
-                    f"🎡 IMMERSIVE ROULETTE 🎨\n"
-                    f"🎯 Apuesta: {bet}",
+                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
                     markup=immersive_keyboard()
                 )
                 scoreboard.record_win()
-                self.learner.resolve("WIN",f"COLOR WIN #{number} bet={bet} cayó {color}")
+                self.learner.resolve("WIN", f"COLOR WIN #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
+                scoreboard.send()
+                pids_done.append(pid)
             else:
-                tg_send(
-                    f"❌ LOSS #{number} — {color_label(color)}\n"
-                    f"🎡 IMMERSIVE ROULETTE 🎨\n"
-                    f"🎯 Apuesta era: {bet}",
-                    markup=immersive_keyboard()
-                )
-                scoreboard.record_loss()
-                self.learner.resolve("LOSS",f"COLOR LOSS #{number} bet={bet} cayó {color}")
-            scoreboard.send()
-            self._reset_color_signal()
-            return
+                if sig["intento"] < self.MAX_INTENTOS_COLOR:
+                    if sig.get("msg_id"):
+                        tg_delete(CHAT_ID, sig["msg_id"])
+                        sig["msg_id"] = None
+                    sig["intento"] += 1
+                    msg_id = tg_send(
+                        self._color_signal_text(bet, sig["intento"], sig.get("sequence", [])),
+                        markup=immersive_keyboard()
+                    )
+                    if msg_id: sig["msg_id"] = msg_id
+                    logger.info(f"[COLOR] 🔁 {pid} intento 1 fallido #{number} → intento 2")
+                else:
+                    tg_send(
+                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
+                        markup=immersive_keyboard()
+                    )
+                    scoreboard.record_loss()
+                    self.learner.resolve("LOSS", f"COLOR LOSS #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
+                    scoreboard.send()
+                    pids_done.append(pid)
 
-        pred=self.sc.predict_color_signal(number)
-        if pred and pred["prob"]>=MIN_PROB_COLOR_ZONE:
-            bet=pred["bet"]; prob=pred["prob"]; seq=pred.get("sequence",[])
-            self.color_signal_active=True; self.color_signal_bet=bet
-            self.color_signal_pid=pred["pid"]; self.color_signal_prob=prob
-            self.color_signal_sequence=seq
-            msg_id=tg_send(
-                f"🔔 SEÑAL COLOR — IMMERSIVE ROULETTE 🎨\n\n"
-                f"🎯 Apostar: <b>{bet}</b>\n"
-                f"📊 Probabilidad: {prob:.0%}\n"
-                f"🔢 Secuencia: {seq}\n"
-                f"📈 {pred.get('components','')}",
+        for pid in pids_done:
+            self.color_signals.pop(pid, None)
+
+        # ── Activar nuevas señales (todos los patrones que califiquen) ─────────
+        preds = self.sc.predict_color_signals(number)
+        for pred in preds:
+            pid  = pred["pid"]
+            prob = pred["prob"]
+            if pid in self.color_signals or prob < MIN_PROB_COLOR_ZONE:
+                continue
+            bet = pred["bet"]
+            seq = pred.get("sequence", [])
+            msg_id = tg_send(
+                self._color_signal_text(bet, 1, seq),
                 markup=immersive_keyboard()
             )
-            if msg_id: self.color_signal_msg_id=msg_id
+            self.color_signals[pid] = {
+                "bet": bet, "prob": prob, "sequence": seq,
+                "msg_id": msg_id, "intento": 1,
+            }
             self.learner.register_signal(
-                strategy=STRAT_COLOR,pair=(0,0),missing=0,prob=prob,
-                pf_prob=pred.get("p1_trans",0),phf_prob=pred.get("p3_global",0) or 0,
-                ema_trend="neutral",last_number=number,
+                strategy=STRAT_COLOR, pair=(0, 0), missing=0, prob=prob,
+                pf_prob=pred.get("p1_trans", 0), phf_prob=pred.get("p3_global", 0) or 0,
+                ema_trend="neutral", last_number=number,
                 dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
             )
-            logger.info(f"[COLOR] 🎨 Señal: {bet} ({prob:.0%}) | seq={seq}")
+            logger.info(f"[COLOR] 🎨 Señal {pid}: {bet} ({prob:.0%}) | seq={seq}")
 
     def _reset_color_signal(self):
-        self.color_signal_active=False; self.color_signal_bet=""
-        self.color_signal_pid=""; self.color_signal_prob=0.0
-        self.color_signal_msg_id=None; self.color_signal_sequence=[]
+        self.color_signals.clear()
 
     # ── Zona ──────────────────────────────────────────────────────────────────
+    def _zone_signal_text(self, bet: str, intento: int, sequence: list = None) -> str:
+        if bet == "Bajo":
+            apuesta_txt = "BAJO 🟣"
+        elif bet == "Alto":
+            apuesta_txt = "ALTO 🔵"
+        else:
+            apuesta_txt = bet
+        seq = sequence if sequence is not None else []
+        pat = self._color_seq_str(seq) if seq else "—"
+        last5 = self._fmt_last_zone_numbers(5)
+        return (
+            f"✅✅ <b>SEÑAL DETECTADA</b> ✅✅\n\n"
+            f"💎 Estrategia: ZONA\n"
+            f"⚪ Apuesta: {apuesta_txt}\n"
+            f"🟡 Patrón: {pat}\n"
+            f"🆔 Intento: {intento}/2\n"
+            f"🕐 Últimos números:\n"
+            f"{last5}"
+        )
+
     def _check_zone_signal(self, number):
-        if self.zone_signal_active:
-            zone=get_zone(number); bet=self.zone_signal_bet
-            won=(bet=="Bajo" and zone=="B") or (bet=="Alto" and zone=="A")
+        """Resuelve señales de zona activas y activa nuevas (B5, B7, A5, A7)."""
+        zone = get_zone(number)
+        em   = self._num_color_emoji(number)
+
+        # ── Resolver señales activas ──────────────────────────────────────────
+        pids_done = []
+        for pid, sig in list(self.zone_signals.items()):
+            bet = sig["bet"]
+            won = (bet == "Bajo" and zone == "B") or (bet == "Alto" and zone == "A")
             if won:
+                op_txt = "1° OP" if sig["intento"] == 1 else "2° OP"
                 tg_send(
-                    f"✅ WIN #{number} — {zone_label(zone)}\n"
-                    f"🎡 IMMERSIVE ROULETTE 🗺\n"
-                    f"🎯 Apuesta: {bet}",
+                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
                     markup=immersive_keyboard()
                 )
                 scoreboard.record_win()
-                self.learner.resolve("WIN",f"ZONA WIN #{number} bet={bet} cayó {zone}")
+                self.learner.resolve("WIN", f"ZONA WIN #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
+                scoreboard.send()
+                pids_done.append(pid)
             else:
-                tg_send(
-                    f"❌ LOSS #{number} — {zone_label(zone)}\n"
-                    f"🎡 IMMERSIVE ROULETTE 🗺\n"
-                    f"🎯 Apuesta era: {bet}",
-                    markup=immersive_keyboard()
-                )
-                scoreboard.record_loss()
-                self.learner.resolve("LOSS",f"ZONA LOSS #{number} bet={bet} cayó {zone}")
-            scoreboard.send()
-            self._reset_zone_signal()
-            return
+                if sig["intento"] < self.MAX_INTENTOS_ZONA:
+                    if sig.get("msg_id"):
+                        tg_delete(CHAT_ID, sig["msg_id"])
+                        sig["msg_id"] = None
+                    sig["intento"] += 1
+                    msg_id = tg_send(
+                        self._zone_signal_text(bet, sig["intento"], sig.get("sequence", [])),
+                        markup=immersive_keyboard()
+                    )
+                    if msg_id: sig["msg_id"] = msg_id
+                    logger.info(f"[ZONA] 🔁 {pid} intento 1 fallido #{number} → intento 2")
+                else:
+                    tg_send(
+                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
+                        markup=immersive_keyboard()
+                    )
+                    scoreboard.record_loss()
+                    self.learner.resolve("LOSS", f"ZONA LOSS #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
+                    scoreboard.send()
+                    pids_done.append(pid)
 
-        pred=self.sc.predict_zone_signal(number)
-        if pred and pred["prob"]>=MIN_PROB_COLOR_ZONE:
-            bet=pred["bet"]; prob=pred["prob"]; seq=pred.get("sequence",[])
-            self.zone_signal_active=True; self.zone_signal_bet=bet
-            self.zone_signal_pid=pred["pid"]; self.zone_signal_prob=prob
-            self.zone_signal_sequence=seq
-            msg_id=tg_send(
-                f"🔔 SEÑAL ZONA — IMMERSIVE ROULETTE 🗺\n\n"
-                f"🎯 Apostar: <b>{bet}</b>\n"
-                f"📊 Probabilidad: {prob:.0%}\n"
-                f"🔢 Secuencia: {seq}\n"
-                f"📈 {pred.get('components','')}",
+        for pid in pids_done:
+            self.zone_signals.pop(pid, None)
+
+        # ── Activar nuevas señales (todos los patrones que califiquen) ─────────
+        preds = self.sc.predict_zone_signals(number)
+        for pred in preds:
+            pid  = pred["pid"]
+            prob = pred["prob"]
+            if pid in self.zone_signals or prob < MIN_PROB_COLOR_ZONE:
+                continue
+            bet = pred["bet"]
+            seq = pred.get("sequence", [])
+            msg_id = tg_send(
+                self._zone_signal_text(bet, 1, seq),
                 markup=immersive_keyboard()
             )
-            if msg_id: self.zone_signal_msg_id=msg_id
+            self.zone_signals[pid] = {
+                "bet": bet, "prob": prob, "sequence": seq,
+                "msg_id": msg_id, "intento": 1,
+            }
             self.learner.register_signal(
-                strategy=STRAT_ZONE,pair=(0,0),missing=0,prob=prob,
-                pf_prob=pred.get("p1_trans",0),phf_prob=pred.get("p3_global",0) or 0,
-                ema_trend="neutral",last_number=number,
+                strategy=STRAT_ZONE, pair=(0, 0), missing=0, prob=prob,
+                pf_prob=pred.get("p1_trans", 0), phf_prob=pred.get("p3_global", 0) or 0,
+                ema_trend="neutral", last_number=number,
                 dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
             )
-            logger.info(f"[ZONA] 🗺 Señal: {bet} ({prob:.0%}) | seq={seq}")
+            logger.info(f"[ZONA] 🗺 Señal {pid}: {bet} ({prob:.0%}) | seq={seq}")
 
     def _reset_zone_signal(self):
-        self.zone_signal_active=False; self.zone_signal_bet=""
-        self.zone_signal_pid=""; self.zone_signal_prob=0.0
-        self.zone_signal_msg_id=None; self.zone_signal_sequence=[]
+        self.zone_signals.clear()
 
     # ── Columna (patrón de secuencia 2C) ─────────────────────────────────────
 
@@ -1373,29 +1554,42 @@ class ImmersiveRouletteEngine:
             col  = ((number - 1) % 3) + 1 if number != 0 else 0
             pair = self.column_signal_pair
             won  = (col != 0 and col in pair)
+            em   = self._num_color_emoji(number)
             if won:
+                op_txt = "1° OP" if self.column_intento == 1 else "2° OP"
                 tg_send(
-                    f"✅ WIN #{number} — C{col}\n"
-                    f"🎡 IMMERSIVE ROULETTE 🏛\n"
-                    f"🎯 Apuesta: C{pair[0]} y C{pair[1]}",
+                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
                     markup=immersive_keyboard()
                 )
                 scoreboard.record_win()
-                self.learner.resolve("WIN", f"COL WIN #{number} C{col} | par={pair}")
+                self.learner.resolve("WIN", f"COL WIN #{number} C{col} | par={pair} | intento {self.column_intento}")
+                scoreboard.send()
+                self._reset_column_signal()
             else:
-                tg_send(
-                    f"❌ LOSS #{number} — C{col}\n"
-                    f"🎡 IMMERSIVE ROULETTE 🏛\n"
-                    f"🎯 Apuesta era: C{pair[0]} y C{pair[1]}",
-                    markup=immersive_keyboard()
-                )
-                scoreboard.record_loss()
-                self.learner.resolve(
-                    "LOSS",
-                    f"COL LOSS #{number} C{col} | faltaba C{self.column_signal_missing}"
-                )
-            scoreboard.send()
-            self._reset_column_signal()
+                if self.column_intento < self.MAX_INTENTOS_COLUMNA:
+                    # Primer fallo → borrar señal 1 y reenviar señal intento 2
+                    if self.column_signal_msg_id:
+                        tg_delete(CHAT_ID, self.column_signal_msg_id)
+                        self.column_signal_msg_id = None
+                    self.column_intento += 1
+                    msg_id = tg_send(
+                        self._column_signal_text(pair, intento=2),
+                        markup=immersive_keyboard()
+                    )
+                    if msg_id: self.column_signal_msg_id = msg_id
+                    logger.info(f"[COL] 🔁 Intento 1 fallido #{number} | señal re-enviada intento 2")
+                else:
+                    tg_send(
+                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
+                        markup=immersive_keyboard()
+                    )
+                    scoreboard.record_loss()
+                    self.learner.resolve(
+                        "LOSS",
+                        f"COL LOSS #{number} C{col} | faltaba C{self.column_signal_missing} | intento {self.column_intento}"
+                    )
+                    scoreboard.send()
+                    self._reset_column_signal()
             return
 
         # Intentar activar nueva señal
@@ -1404,21 +1598,25 @@ class ImmersiveRouletteEngine:
         if sig and sig["prob"] >= COL_SEQ_MIN_PROB:
             self._activate_column_signal(sig)
 
+    def _column_signal_text(self, pair, intento: int) -> str:
+        last5 = self._fmt_last_numbers(5)
+        return (
+            f"✅✅ <b>SEÑAL DETECTADA</b> ✅✅\n\n"
+            f"💎 Estrategia: Columna\n"
+            f"⚪ Apuesta: C{pair[0]} y C{pair[1]}\n"
+            f"🆔 Intento: {intento}/2\n"
+            f"🕐 Últimos números:\n"
+            f"{last5}"
+        )
+
     def _activate_column_signal(self, sig: dict):
         pair = sig["pair"]
         self.column_signal_active  = True
         self.column_signal_pair    = pair
         self.column_signal_missing = sig["missing"]
         self.column_signal_prob    = sig["prob"]
-        nums = sig.get("numbers", [])
-        pat  = sig.get("pattern_str", "")
         msg_id = tg_send(
-            f"✅✅ SEÑAL COLUMNA ✅✅\n\n"
-            f"🎡 IMMERSIVE ROULETTE 🏛\n"
-            f"🎯 Apostar Columnas: <b>C{pair[0]} y C{pair[1]}</b>\n"
-            f"📊 Probabilidad: {sig['prob']:.0%}\n"
-            f"🔢 Secuencia: {nums}\n"
-            f"🔍 Patrón: [{pat}]",
+            self._column_signal_text(pair, intento=1),
             markup=immersive_keyboard()
         )
         if msg_id:
@@ -1437,6 +1635,8 @@ class ImmersiveRouletteEngine:
             prob=sig["prob"],
             last_number=sig.get("last_number", 0),
         )
+        pat = sig.get("pattern_str", "")
+        nums = sig.get("numbers", [])
         logger.info(
             f"[COL-SEQ] 🎯 SEÑAL COLUMNA: C{pair} ({sig['prob']:.0%}) | "
             f"pat=[{pat}] nums={nums}"
@@ -1448,26 +1648,32 @@ class ImmersiveRouletteEngine:
         self.column_signal_missing = 0
         self.column_signal_prob    = 0.0
         self.column_signal_msg_id  = None
+        self.column_intento        = 1
 
     # ── Loop principal ────────────────────────────────────────────────────────
     def process_batch(self, batch):
-        new_spins=[]
+        new_spins = []
+        seen_in_batch = set()          # evita duplicados dentro del mismo batch
         for spin in reversed(batch):
-            gid=spin.get("game_id")
-            if not gid or gid in self.processed_game_ids: continue
+            gid = spin.get("game_id")
+            if not gid or gid in self.processed_game_ids or gid in seen_in_batch:
+                continue
+            seen_in_batch.add(gid)     # marcar inmediatamente para no repetir
             new_spins.append(spin)
         if not new_spins: return
         for spin in new_spins:
             gid=spin["game_id"]; number=spin["number"]
-            self.processed_game_ids.add(gid)
+            self.processed_game_ids[gid] = True
             if 0<=number<=36:
                 try: self._process_inner(number)
                 except Exception as e:
                     logger.error(f"Error procesando spin: {e}",exc_info=True)
                     self._reset_dozen_signal()
         if len(self.processed_game_ids)>self.MAX_PROCESSED_IDS:
-            for gid in list(self.processed_game_ids)[:150]:
-                self.processed_game_ids.discard(gid)
+            # Eliminar los 150 MÁS ANTIGUOS (primeros insertados)
+            keys_old = list(self.processed_game_ids.keys())[:150]
+            for k in keys_old:
+                self.processed_game_ids.pop(k, None)
 
     def _process_inner(self, number:int):
         d=get_dozen(number)
@@ -1480,7 +1686,7 @@ class ImmersiveRouletteEngine:
             if self.ws_count<WARMUP_SPINS: return
             self.warmup_done=True
             tg_send(
-                "🟢 <b>Immersive Roulette DC v33</b> — Sistema listo.\n"
+                "🟢 <b>Immersive Roulette DC v35</b> — Sistema listo.\n"
                 "🎡 Señales: 🅐🅑🅒 Docenas · 🎨 Color (P1+P3) · 🗺 Zona (P1+P3)\n"
                 "🧠 Aprendizaje adaptativo + tracking aciertos/fallos activo"
             )
@@ -1525,7 +1731,7 @@ engine: Optional[ImmersiveRouletteEngine]=None
 
 @flask_app.route("/")
 def home():
-    return jsonify({"status":"ok","bot":"Immersive Roulette DC v33"})
+    return jsonify({"status":"ok","bot":"Immersive Roulette DC v35"})
 
 @flask_app.route("/ping")
 def ping():
@@ -1556,7 +1762,7 @@ def health():
 @bot.message_handler(commands=["start","help"])
 def cmd_start(m):
     bot.reply_to(m,
-        "<b>🎡 Immersive Roulette DC v33</b>\n\n"
+        "<b>🎡 Immersive Roulette DC v35</b>\n\n"
         "Señales sin gestión de apuesta\n"
         "🅐 E1: PF+PHF+ML · 🅑 E2: PHTML+EMA · 🅒 E3: Retorno\n"
         "🎨 Color (P1+P3) · 🗺 Zona (P1+P3)\n\n"
@@ -1577,10 +1783,21 @@ def cmd_status(m):
         pair=f"D{engine.active_pair[0]}+D{engine.active_pair[1]}" if engine.active_pair else "—"
         d_st=f"🟢 {lbl} | {pair}"
     else: d_st="⚪ Idle"
-    c_st=(f"🟡 {engine.color_signal_bet} ({engine.color_signal_prob:.0%})"
-          if engine.color_signal_active else "⚪")
-    z_st=(f"🟡 {engine.zone_signal_bet} ({engine.zone_signal_prob:.0%})"
-          if engine.zone_signal_active else "⚪")
+
+    if engine.color_signals:
+        c_parts = [f"🟡 {sig['bet']} [{pid}] ({sig['prob']:.0%})"
+                   for pid, sig in engine.color_signals.items()]
+        c_st = "\n  ".join(c_parts)
+    else:
+        c_st = "⚪"
+
+    if engine.zone_signals:
+        z_parts = [f"🟡 {sig['bet']} [{pid}] ({sig['prob']:.0%})"
+                   for pid, sig in engine.zone_signals.items()]
+        z_st = "\n  ".join(z_parts)
+    else:
+        z_st = "⚪"
+
     col_pair = engine.column_signal_pair
     col_st   = (
         f"🟡 C{col_pair[0]}+C{col_pair[1]} ({engine.column_signal_prob:.0%})"
@@ -1590,7 +1807,7 @@ def cmd_status(m):
     ago=time.time()-engine.sc.last_poll_ok if engine.sc.last_poll_ok>0 else 0
     art_now=datetime.now(ART).strftime("%H:%M ART")
     bot.reply_to(m,
-        f"<b>🎡 Immersive Roulette DC v33</b>\n"
+        f"<b>🎡 Immersive Roulette DC v35</b>\n"
         f"<b>Docenas:</b> {d_st}\n"
         f"<b>Columnas:</b> {col_st}\n"
         f"<b>Color:</b> {c_st}\n"
@@ -1609,11 +1826,17 @@ def cmd_debug(m):
     trend=ema_trend_str(engine.doc_levels)
     e1,e2,e3=engine._detect_e1(),engine._detect_e2(),engine._detect_e3()
     def st(s): return f"✅ D{s['pair']} ({s['prob']:.0%})" if s else "—"
-    cp=engine.sc.predict_color_signal(last_num) if last_num else None
-    zp=engine.sc.predict_zone_signal(last_num)  if last_num else None
-    col_sig=engine._detect_col_signal(last_num) if last_num else None
-    cp_txt=(f"✅ {cp['bet']} ({cp['prob']:.0%}) {cp.get('components','')}" if cp else "—")
-    zp_txt=(f"✅ {zp['bet']} ({zp['prob']:.0%}) {zp.get('components','')}" if zp else "—")
+    cp_list = engine.sc.predict_color_signals(last_num) if last_num else []
+    zp_list = engine.sc.predict_zone_signals(last_num)  if last_num else []
+    cp_txt = "\n  ".join(
+        f"✅ {p['pid']} {p['bet']} ({p['prob']:.0%}) {p.get('components','')}"
+        for p in cp_list
+    ) or "—"
+    zp_txt = "\n  ".join(
+        f"✅ {p['pid']} {p['bet']} ({p['prob']:.0%}) {p.get('components','')}"
+        for p in zp_list
+    ) or "—"
+    col_sig = engine._detect_col_signal(last_num) if last_num else None
     col_txt=(
         f"✅ C{col_sig['pair']} ({col_sig['prob']:.0%}) pat=[{col_sig.get('pattern_str','')}]"
         if col_sig else "—"
@@ -1733,7 +1956,7 @@ async def main():
     # Webhook en vez de polling → elimina el error 409 definitivamente
     setup_webhook()
     logger.info(
-        f"[ImmersiveDC] 🎡 Immersive Roulette DC v33 — "
+        f"[ImmersiveDC] 🎡 Immersive Roulette DC v35 — "
         f"HTTP Polling {POLL_INTERVAL}s | Señales sin apuesta | "
         f"Color/Zona: P1+P3 | Tracking docenas → servidor | "
         f"Marcador diario ART | 🧠 Learner ({len(engine.learner.history)} señales)"
