@@ -1695,12 +1695,43 @@ async def self_ping_loop():
 def run_flask():
     flask_app.run(host="0.0.0.0",port=10005,debug=False,use_reloader=False)
 
+def run_telegram():
+    """
+    Inicia el polling de Telegram.
+    - Limpia webhook/sesión anterior antes de arrancar (evita 409).
+    - Si hay 409 Conflict (otra instancia aún activa), espera y reintenta.
+    """
+    # Eliminar webhook y sesiones previas
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook eliminado / sesiones anteriores limpiadas")
+        time.sleep(3)
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo eliminar webhook: {e}")
+
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=30)
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 409:
+                logger.warning(
+                    "⚠️ 409 Conflict: otra instancia del bot aún activa. "
+                    "Esperando 20s antes de reintentar..."
+                )
+                time.sleep(20)
+            else:
+                logger.error(f"❌ Error API Telegram ({e.error_code}): {e}")
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"❌ Error en polling Telegram: {e}")
+            time.sleep(5)
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     global engine
     sc=StatsClient(); engine=ImmersiveRouletteEngine(sc)
     threading.Thread(
-        target=lambda: bot.polling(none_stop=True,interval=1,timeout=30),
+        target=run_telegram,
         daemon=True
     ).start()
     logger.info(
