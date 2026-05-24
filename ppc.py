@@ -1697,33 +1697,57 @@ def run_flask():
 
 def run_telegram():
     """
-    Inicia el polling de Telegram.
-    - Limpia webhook/sesión anterior antes de arrancar (evita 409).
-    - Si hay 409 Conflict (otra instancia aún activa), espera y reintenta.
-    """
-    # Eliminar webhook y sesiones previas
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook eliminado / sesiones anteriores limpiadas")
-        time.sleep(3)
-    except Exception as e:
-        logger.warning(f"⚠️ No se pudo eliminar webhook: {e}")
+    Inicia el polling de Telegram con manejo robusto de conflictos.
 
+    CLAVE: usa none_stop=False para que nuestro except capture el 409.
+    Con none_stop=True telebot lo captura internamente y nunca llega aqui,
+    por eso el bot seguia reintentando cada 6s sin backoff.
+
+    Backoff exponencial en 409: 15s -> 30s -> 60s -> 120s max.
+    """
+    # Limpiar webhook/sesion anterior (hasta 3 intentos)
+    for attempt in range(3):
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook eliminado / sesiones anteriores limpiadas")
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ delete_webhook intento {attempt+1}: {e}")
+            time.sleep(3)
+
+    time.sleep(5)  # Pausa extra para que Telegram libere la sesion anterior
+
+    delay = 15  # backoff inicial
     while True:
         try:
-            bot.polling(none_stop=True, interval=1, timeout=30)
+            # none_stop=False: las excepciones llegan a nuestro except
+            bot.polling(none_stop=False, interval=1, timeout=30)
+            delay = 15  # reset backoff si salio limpio
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 409:
                 logger.warning(
-                    "⚠️ 409 Conflict: otra instancia del bot aún activa. "
-                    "Esperando 20s antes de reintentar..."
+                    f"⚠️ 409 Conflict: otra instancia activa. "
+                    f"Esperando {delay}s... "
+                    f"(verificar en Render que solo haya UN servicio activo)"
                 )
-                time.sleep(20)
+                try:
+                    bot.stop_polling()
+                except Exception:
+                    pass
+                time.sleep(delay)
+                delay = min(delay * 2, 120)  # 15->30->60->120s
+            elif e.error_code == 429:
+                try:
+                    wait = int("".join(filter(str.isdigit, str(e)))) + 2
+                except Exception:
+                    wait = 30
+                logger.warning(f"⏳ Rate limit 429. Esperando {wait}s...")
+                time.sleep(wait)
             else:
                 logger.error(f"❌ Error API Telegram ({e.error_code}): {e}")
                 time.sleep(5)
         except Exception as e:
-            logger.error(f"❌ Error en polling Telegram: {e}")
+            logger.error(f"❌ Error inesperado en polling: {e}")
             time.sleep(5)
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
