@@ -1,183 +1,179 @@
 #!/usr/bin/env python3
 """
-Auto Roulette — Bot de señales Híbrido Unificado
-Sistema de Chance Simples: COLOR, PARIDAD, ZONA
-
-  - Ventana Móvil Markov 60 giros (Orden 3) + ML Cruzado + Resonancia/Ruptura.
-  - Análisis de Niveles (+1/-1) con Lógica de Cero (±1) y EMA 20 por categoría.
-  - COLOR (ROJO/NEGRO): Lógica Auto-Roulette-Color Moderado exclusivo.
-  - PARIDAD / ZONA: Señal solo cuando el nivel EMA del target está POR ENCIMA de EMA20.
-  - Gestión Martingala: Apuesta base × 2 en pérdida; reset en ganancia — mínimo 1 ficha.
-    · COLOR: máx 2 intentos; PARIDAD/ZONA: máx 3 intentos.
-  - Sesiones Sin Límite: Solo se cierran al cumplir la meta.
+Immersive Roulette Bot — DC v32
+===========================================================================
+  - Ruleta única: IMMERSIVE ROULETTE (Evolution)
+  - Señales sin gestión de apuesta (solo indicación)
+  - Categorías: Docenas · Columnas · Color · Zona
+  - Marcador diario (todas las categorías combinadas)
+    → Se resetea a las 00:00 horario Argentina (UTC-3)
+  - Aprendizaje adaptativo (SignalLearner)
+  - Predicción Color/Zona: P1(transición) + P2(específica) + P3(global)
 """
 
 import asyncio
-import json
 import logging
 import os
 import sqlite3
 import threading
 import time
-import urllib.request
 from collections import deque, defaultdict
-from typing import Optional, Dict, Set
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import SGDClassifier
 
 import telebot
-import websockets
-from aiohttp import web
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiohttp
+from flask import Flask, jsonify
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s [AutoRoulette] %(levelname)s %(message)s')
-logger = logging.getLogger("AutoRoulette")
-
-for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [ImmersiveDC] %(levelname)s %(message)s"
+)
+logger = logging.getLogger("ImmersiveDC")
+for _ln in ["werkzeug", "flask.app", "flask", "urllib3"]:
     logging.getLogger(_ln).setLevel(logging.ERROR)
-logging.getLogger('websockets').setLevel(logging.CRITICAL)
-logging.getLogger('websockets.server').setLevel(logging.CRITICAL)
-logging.getLogger('websockets.http11').setLevel(logging.CRITICAL)
 
+# ─── CREDENCIALES ─────────────────────────────────────────────────────────────
+TOKEN   = "8932208184:AAHj_7XYSQQmZZQWrk6LJtJj4CkwuCxrNLI"
+CHAT_ID = -1003610988961
 
-class _TeleBotFilter(logging.Filter):
-    def filter(self, record):
-        msg = record.getMessage()
-        if "409" in msg or "terminated by other getUpdates request" in msg:
-            logger.warning("⚠️ Conflicto 409 detectado: Otra instancia del bot se está ejecutando.")
-            return False
-        return True
+# ─── URL RULETA ───────────────────────────────────────────────────────────────
+IMMERSIVE_URL = "https://www.casino.org/live-casino/roulette/immersive-roulette/"
 
-
-logging.getLogger('telebot').addFilter(_TeleBotFilter())
-logging.getLogger('telebot.apihelper').addFilter(_TeleBotFilter())
+def immersive_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("👆🏻 ACCEDER a IMMERSIVE ROULETTE", url=IMMERSIVE_URL))
+    return kb
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-TOKEN = "8308452662:AAGZFIZyYsmVR39SvIOSlKD3OY_YNMOsEQU"
-CHAT_ID = -1003522684671
-STATS_THREAD_ID = 40034
-
 _session = requests.Session()
-_retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
-               allowed_methods=["GET", "POST"], raise_on_status=False)
+_retry   = Retry(
+    total=5, backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"], raise_on_status=False
+)
 _session.mount("https://", HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
-_session.mount("http://", HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
-bot = telebot.TeleBot(TOKEN, threaded=False)
-bot.session = _session
+_session.mount("http://",  HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
 
-# ─── RULETA CONFIGURACIÓN ────────────────────────────────────────────────────
-ROULETTES = [
-    {"key": 225, "name": "AUTO ROULETTE 🎰"},
-]
-
-ROULETTE_LINKS = {
-    "AUTO ROULETTE 🎰": "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
-}
-
-
-def get_roulette_url(name: str) -> Optional[str]:
-    clean = name.upper().strip()
-    for key, url in ROULETTE_LINKS.items():
-        if key.upper() in clean or clean in key.upper():
-            return url
-    return None
-
-
-def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
-    url = get_roulette_url(roulette_name)
-    if not url:
-        return tg_send(text)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎰 ACCEDER A LA RULETA", url=url))
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
-                   parse_mode="HTML", reply_markup=markup,
-                   disable_web_page_preview=True)
-    return msg.message_id if msg else None
-
+try:
+    bot = telebot.TeleBot(TOKEN, threaded=False)
+    bot.session = _session
+    logger.info("✅ Telegram bot inicializado")
+except Exception as e:
+    logger.error(f"❌ Error inicializando Telegram: {e}")
+    exit(1)
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
-WS_URL = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID = "ppcjd00000007254"
-WARMUP_SPINS = 20
-MIN_PROB = 0.70
-TRAIN_INTERVAL = 50
-SESSION_TARGET = 10
+STATS_URL       = "https://ruletasbot-rjce.onrender.com"
+TARGET_ROULETTE = "IMMERSIVE"
+POLL_INTERVAL   = 2
+LIVE_DB         = "immersive_live.db"
 
-SEQUENCE_COLOR = ["ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO", "ROJO", "NEGRO", "ROJO"]
-SEQUENCE_PARIDAD = ["PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR", "PAR", "IMPAR", "IMPAR", "PAR", "IMPAR", "PAR"]
-SEQUENCE_ZONA = ["MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR", "MENOR", "MAYOR", "MAYOR", "MENOR", "MAYOR", "MENOR"]
+WARMUP_SPINS    = 25
+MIN_PROB        = 0.78
+TRAIN_INTERVAL  = 100
 
-EMOJI_MAP = {"ROJO": "🔴", "NEGRO": "⚫️", "PAR": "🟣", "IMPAR": "🟡", "MENOR": "🟤", "MAYOR": "🔵", "CERO": "🟢"}
-POS_VALUE = {"COLOR": "ROJO", "PARIDAD": "PAR", "ZONA": "MENOR"}
-NEG_VALUE = {"COLOR": "NEGRO", "PARIDAD": "IMPAR", "ZONA": "MAYOR"}
+PHTML_W         = 0.80
+PH_W_COMBINE    = 0.20
+PF_W_NORM       = 0.70;  PH_W_NORM  = 0.30
+BASE_W_NORM     = 0.55;  ML_W_NORM  = 0.45
 
-COLOR_MAP = {0: "CERO", 1: "ROJO", 2: "NEGRO", 3: "ROJO", 4: "NEGRO", 5: "ROJO", 6: "NEGRO", 7: "ROJO", 8: "NEGRO", 9: "ROJO", 10: "NEGRO", 11: "NEGRO", 12: "ROJO", 13: "NEGRO", 14: "ROJO", 15: "NEGRO", 16: "ROJO", 17: "NEGRO", 18: "ROJO", 19: "ROJO", 20: "NEGRO", 21: "ROJO", 22: "NEGRO", 23: "ROJO", 24: "NEGRO", 25: "ROJO", 26: "NEGRO", 27: "ROJO", 28: "NEGRO", 29: "NEGRO", 30: "ROJO", 31: "NEGRO", 32: "ROJO", 33: "NEGRO", 34: "ROJO", 35: "NEGRO", 36: "ROJO"}
-PARIDAD_MAP = {n: ("PAR" if n > 0 and n % 2 == 0 else ("IMPAR" if n > 0 else "CERO")) for n in range(37)}
-ZONA_MAP = {n: ("MENOR" if 1 <= n <= 18 else ("MAYOR" if n >= 19 else "CERO")) for n in range(37)}
+MIN_PROB_COLOR_ZONE = 0.62
 
-# ─── TABLA PREDEFINIDA PARA COLOR (Auto-Roulette-Color) ───────────────────────
-COLOR_DATA_AUTO = [
-    {"id":0,  "real":"VERDE", "rojo":0.44, "negro":0.56, "senal":"NEGRO"},
-    {"id":1,  "real":"ROJO",  "rojo":0.52, "negro":0.44, "senal":"ROJO"},
-    {"id":2,  "real":"NEGRO", "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
-    {"id":3,  "real":"ROJO",  "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
-    {"id":4,  "real":"NEGRO", "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
-    {"id":5,  "real":"ROJO",  "rojo":0.52, "negro":0.48, "senal":"ROJO"},
-    {"id":6,  "real":"NEGRO", "rojo":0.40, "negro":0.60, "senal":"NEGRO"},
-    {"id":7,  "real":"ROJO",  "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
-    {"id":8,  "real":"NEGRO", "rojo":0.49, "negro":0.48, "senal":"ROJO"},
-    {"id":9,  "real":"ROJO",  "rojo":0.49, "negro":0.48, "senal":"ROJO"},
-    {"id":10, "real":"NEGRO", "rojo":0.49, "negro":0.48, "senal":"ROJO"},
-    {"id":11, "real":"NEGRO", "rojo":0.48, "negro":0.52, "senal":"NEGRO"},
-    {"id":12, "real":"ROJO",  "rojo":0.40, "negro":0.56, "senal":"NEGRO"},
-    {"id":13, "real":"NEGRO", "rojo":0.44, "negro":0.56, "senal":"NEGRO"},
-    {"id":14, "real":"ROJO",  "rojo":0.49, "negro":0.48, "senal":"ROJO"},
-    {"id":15, "real":"NEGRO", "rojo":0.44, "negro":0.56, "senal":"NEGRO"},
-    {"id":16, "real":"ROJO",  "rojo":0.52, "negro":0.44, "senal":"ROJO"},
-    {"id":17, "real":"NEGRO", "rojo":0.36, "negro":0.60, "senal":"NEGRO"},
-    {"id":18, "real":"ROJO",  "rojo":0.44, "negro":0.52, "senal":"NEGRO"},
-    {"id":19, "real":"ROJO",  "rojo":0.56, "negro":0.44, "senal":"ROJO"},
-    {"id":20, "real":"NEGRO", "rojo":0.48, "negro":0.52, "senal":"NEGRO"},
-    {"id":21, "real":"ROJO",  "rojo":0.56, "negro":0.40, "senal":"ROJO"},
-    {"id":22, "real":"NEGRO", "rojo":0.52, "negro":0.48, "senal":"ROJO"},
-    {"id":23, "real":"ROJO",  "rojo":0.48, "negro":0.49, "senal":"NEGRO"},
-    {"id":24, "real":"NEGRO", "rojo":0.44, "negro":0.52, "senal":"NEGRO"},
-    {"id":25, "real":"ROJO",  "rojo":0.60, "negro":0.40, "senal":"ROJO"},
-    {"id":26, "real":"NEGRO", "rojo":0.56, "negro":0.40, "senal":"ROJO"},
-    {"id":27, "real":"ROJO",  "rojo":0.56, "negro":0.40, "senal":"ROJO"},
-    {"id":28, "real":"NEGRO", "rojo":0.56, "negro":0.40, "senal":"ROJO"},
-    {"id":29, "real":"NEGRO", "rojo":0.56, "negro":0.44, "senal":"ROJO"},
-    {"id":30, "real":"ROJO",  "rojo":0.48, "negro":0.49, "senal":"NEGRO"},
-    {"id":31, "real":"NEGRO", "rojo":0.48, "negro":0.49, "senal":"NEGRO"},
-    {"id":32, "real":"ROJO",  "rojo":0.56, "negro":0.44, "senal":"ROJO"},
-    {"id":33, "real":"NEGRO", "rojo":0.44, "negro":0.52, "senal":"NEGRO"},
-    {"id":34, "real":"ROJO",  "rojo":0.60, "negro":0.36, "senal":"ROJO"},
-    {"id":35, "real":"NEGRO", "rojo":0.56, "negro":0.40, "senal":"ROJO"},
-    {"id":36, "real":"ROJO",  "rojo":0.52, "negro":0.44, "senal":"ROJO"},
-]
-MAX_ATTEMPTS_COLOR = 2   # intentos de la lógica de color (igual que Auto-Roulette)
+# Argentina UTC-3
+ART = timezone(timedelta(hours=-3))
 
-_ws_clients: Set[asyncio.Queue] = set()
+STRAT_E1    = 1
+STRAT_E2    = 2
+STRAT_E3    = 3
+STRAT_COLOR = 4
+STRAT_ZONE  = 5
 
+# ─── MAPAS ────────────────────────────────────────────────────────────────────
+COLOR_MAP: Dict[int, str] = {
+    0:"V",  1:"R",  2:"N",  3:"R",  4:"N",  5:"R",  6:"N",
+    7:"R",  8:"N",  9:"R",  10:"N", 11:"N", 12:"R",
+    13:"N", 14:"R", 15:"N", 16:"R", 17:"N", 18:"R",
+    19:"R", 20:"N", 21:"R", 22:"N", 23:"R", 24:"N",
+    25:"R", 26:"N", 27:"R", 28:"N", 29:"N", 30:"R",
+    31:"N", 32:"R", 33:"N", 34:"R", 35:"N", 36:"R",
+}
 
-def queue_broadcast(data: dict):
-    for q in list(_ws_clients):
-        try:
-            q.put_nowait(data)
-        except Exception:
-            pass
+def get_color(n: int) -> str:  return COLOR_MAP.get(n, "V")
+def get_zone(n: int)  -> str:  return "0" if n == 0 else ("B" if n <= 18 else "A")
+def get_dozen(n: int) -> int:  return 0 if n == 0 else (n - 1) // 12 + 1
 
+def color_label(c: str) -> str:
+    return {"R": "🔴 Rojo", "N": "⚫ Negro", "V": "🟢 Verde"}.get(c, c)
 
+def zone_label(z: str) -> str:
+    return {"B": "🔵 Bajo (1-18)", "A": "🔴 Alto (19-36)", "0": "🟢 Zero"}.get(z, z)
+
+# ─── TABLA PHTML ──────────────────────────────────────────────────────────────
+DOZEN_TABLE: Dict[int, Dict[str, int]] = {
+    0:  {"d1":32,"d2":32,"d3":32},  1: {"d1":28,"d2":32,"d3":36},
+    2:  {"d1":36,"d2":28,"d3":32},  3: {"d1":24,"d2":32,"d3":36},
+    4:  {"d1":32,"d2":40,"d3":24},  5: {"d1":40,"d2":24,"d3":36},
+    6:  {"d1":32,"d2":24,"d3":40},  7: {"d1":36,"d2":24,"d3":40},
+    8:  {"d1":32,"d2":36,"d3":28},  9: {"d1":28,"d2":36,"d3":32},
+    10: {"d1":40,"d2":32,"d3":28}, 11: {"d1":36,"d2":24,"d3":36},
+    12: {"d1":32,"d2":28,"d3":36}, 13: {"d1":32,"d2":28,"d3":36},
+    14: {"d1":16,"d2":48,"d3":32}, 15: {"d1":36,"d2":28,"d3":32},
+    16: {"d1":28,"d2":32,"d3":36}, 17: {"d1":20,"d2":44,"d3":32},
+    18: {"d1":32,"d2":28,"d3":36}, 19: {"d1":36,"d2":28,"d3":32},
+    20: {"d1":36,"d2":36,"d3":28}, 21: {"d1":24,"d2":44,"d3":28},
+    22: {"d1":36,"d2":36,"d3":28}, 23: {"d1":24,"d2":32,"d3":40},
+    24: {"d1":44,"d2":32,"d3":24}, 25: {"d1":36,"d2":24,"d3":36},
+    26: {"d1":40,"d2":28,"d3":32}, 27: {"d1":32,"d2":28,"d3":36},
+    28: {"d1":36,"d2":28,"d3":32}, 29: {"d1":32,"d2":24,"d3":40},
+    30: {"d1":36,"d2":36,"d3":28}, 31: {"d1":32,"d2":36,"d3":24},
+    32: {"d1":32,"d2":36,"d3":28}, 33: {"d1":28,"d2":32,"d3":36},
+    34: {"d1":36,"d2":28,"d3":32}, 35: {"d1":36,"d2":32,"d3":24},
+    36: {"d1":28,"d2":36,"d3":32},
+}
+
+# ─── DB LOCAL ─────────────────────────────────────────────────────────────────
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(LIVE_DB, check_same_thread=False)
+    conn.execute("""CREATE TABLE IF NOT EXISTS live_spins (
+        id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        number INTEGER NOT NULL,
+        color  TEXT    NOT NULL,
+        zone   TEXT    NOT NULL,
+        ts     INTEGER NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS signal_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts            REAL    NOT NULL,
+        strategy      INTEGER,
+        pair          TEXT,
+        missing       INTEGER,
+        prob          REAL,
+        intento_start INTEGER,
+        nivel         INTEGER DEFAULT 1,
+        pf_prob       REAL,
+        phf_prob      REAL,
+        ema_trend     TEXT,
+        last_number   INTEGER,
+        dozen_seq_5   TEXT,
+        result        TEXT,
+        intento_fin   INTEGER,
+        reason        TEXT
+    )""")
+    conn.commit()
+    return conn
+
+# ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_RETRIES = 12
-
 
 def _tg_call(fn, *a, **kw):
     delay = 2.0
@@ -187,1457 +183,1132 @@ def _tg_call(fn, *a, **kw):
         except Exception as e:
             err = str(e)
             if "retry after" in err.lower():
-                try:
-                    wait = int(''.join(filter(str.isdigit, err))) + 1
-                except Exception:
-                    wait = 30
+                try:    wait = int("".join(filter(str.isdigit, err))) + 1
+                except: wait = 30
+                logger.warning(f"⏳ Rate limited. Esperando {wait}s...")
                 time.sleep(wait)
                 continue
             if attempt == _TG_RETRIES:
+                logger.error(f"❌ TG falló tras {_TG_RETRIES} intentos: {err}")
                 return None
             time.sleep(delay)
             delay = min(delay * 2, 60)
     return None
 
-
-def tg_send(text: str) -> Optional[int]:
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
-    return msg.message_id if msg else None
-
-
-def tg_send_stats(text: str) -> Optional[int]:
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML", message_thread_id=STATS_THREAD_ID)
-    return msg.message_id if msg else None
-
+def tg_send(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
+    if not text: return None
+    try:
+        msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
+                       parse_mode="HTML", reply_markup=markup)
+        if msg:
+            logger.info(f"✅ Mensaje enviado (ID: {msg.message_id})")
+            return msg.message_id
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error en tg_send: {e}")
+        return None
 
 def tg_delete(chat_id: int, message_id: int):
     try:
         _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"⚠️ Error borrando mensaje: {e}")
+
+# ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
+class DailyScoreboard:
+    """
+    Registra aciertos y fallos de TODAS las categorías combinadas.
+    Se resetea automáticamente a las 00:00 horario Argentina (UTC-3).
+    """
+    def __init__(self):
+        self.wins:   int = 0
+        self.losses: int = 0
+        self._current_day: int = self._art_day()
+
+    @staticmethod
+    def _art_day() -> int:
+        """Día actual en hora Argentina."""
+        return datetime.now(ART).day
+
+    def _check_reset(self):
+        today = self._art_day()
+        if today != self._current_day:
+            logger.info(
+                f"[Scoreboard] 🔄 Nuevo día Argentina → reset "
+                f"(anterior: {self.wins}W/{self.losses}L)"
+            )
+            self.wins   = 0
+            self.losses = 0
+            self._current_day = today
+
+    def record_win(self):
+        self._check_reset()
+        self.wins += 1
+
+    def record_loss(self):
+        self._check_reset()
+        self.losses += 1
+
+    def get_text(self) -> str:
+        self._check_reset()
+        total = self.wins + self.losses
+        pct   = (self.wins / total * 100) if total > 0 else 0.0
+        return (
+            f"📊 <b>MARCADOR DIARIO:</b>\n"
+            f"✅ GANADAS: {self.wins}\n"
+            f"❌ PERDIDAS: {self.losses}\n"
+            f"📈 ACIERTOS = {pct:.2f}%"
+        )
+
+    def send(self):
+        tg_send(self.get_text())
 
 
-def fmt_money(val) -> str:
-    if val == int(val):
-        return f"${int(val)}"
-    return f"${val:,.2f}"
+scoreboard = DailyScoreboard()
 
+# ─── STATS CLIENT ─────────────────────────────────────────────────────────────
+class StatsClient:
+    def __init__(self):
+        self.stats_dozen    = {}
+        self.stats_column   = {}
+        self.stats_color    = {}
+        self.stats_zone     = {}
+        self.color_patterns = {}
+        self.zone_patterns  = {}
+        self.last_20        = []
+        self.total_spins    = 0
+        self.connected      = False
+        self.poll_count     = 0
+        self.last_poll_ok   = 0.0
+        self.last_error     = None
 
-# ─── MONEDAS ──────────────────────────────────────────────────────────────────
-CURRENCY_RATES = {"USD": 0.10, "MXN": 2.00, "PEN": 0.50, "COP": 500.0, "ARS": 250.0, "CLP": 100.0}
-CURRENCY_FLAGS = {"USD": "🇺🇲", "MXN": "🇲🇽", "PEN": "🇵🇪", "COP": "🇨🇴", "ARS": "🇦🇷", "CLP": "🇨🇱"}
-CURRENCY_SYMBOLS = {"USD": "$", "MXN": "$", "PEN": "./S", "COP": "$", "ARS": "$", "CLP": "$"}
+    def update(self, data: dict):
+        try:
+            self.last_20        = data.get("last_20",        self.last_20)
+            self.stats_dozen    = data.get("stats_dozen",    self.stats_dozen)
+            self.stats_column   = data.get("stats_column",   self.stats_column)
+            self.stats_color    = data.get("stats_color",    self.stats_color)
+            self.stats_zone     = data.get("stats_zone",     self.stats_zone)
+            self.color_patterns = data.get("color_patterns", self.color_patterns)
+            self.zone_patterns  = data.get("zone_patterns",  self.zone_patterns)
+            self.total_spins    = data.get("total_spins",    self.total_spins)
+            self.connected      = True
+            self.poll_count    += 1
+            self.last_poll_ok   = time.time()
+            self.last_error     = None
+        except Exception as e:
+            self.last_error = str(e)
 
+    def get_ph_probs_raw(self, number: int) -> Optional[Dict]:
+        data = self.stats_dozen.get(str(number), {})
+        if data.get("total", 0) < 10: return None
+        return {1: data.get("1",0)/100.0, 2: data.get("2",0)/100.0, 3: data.get("3",0)/100.0}
 
-def fmt_currency_amount(chips: float, currency: str) -> str:
-    amount = chips * CURRENCY_RATES[currency]
-    sym = CURRENCY_SYMBOLS[currency]
-    if currency in ("USD", "MXN", "PEN"):
-        return f"{sym} {amount:.2f}"
-    return f"{sym} {int(round(amount))}"
+    def get_ph_pair(self, number: int) -> Optional[Dict]:
+        probs = self.get_ph_probs_raw(number)
+        if probs is None: return None
+        sp = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+        if sp[0][1] == 0: return None
+        pair    = tuple(sorted([sp[0][0], sp[1][0]]))
+        missing = list({1, 2, 3} - set(pair))[0]
+        return {"pair": pair, "missing": missing, "prob": sp[0][1] + sp[1][1]}
 
+    def get_color_probs(self, number: int) -> Optional[Dict]:
+        data = self.stats_color.get(str(number), {})
+        if data.get("total", 0) < 5: return None
+        return {"R": data.get("R",0)/100.0, "N": data.get("N",0)/100.0, "V": data.get("V",0)/100.0}
 
-def fmt_gestion_signal(chips: float) -> str:
-    usd = fmt_currency_amount(chips, "USD")
-    mxn = fmt_currency_amount(chips, "MXN")
-    pen = fmt_currency_amount(chips, "PEN")
-    cop = fmt_currency_amount(chips, "COP")
-    ars = fmt_currency_amount(chips, "ARS")
-    clp = fmt_currency_amount(chips, "CLP")
-    return (f"🇺🇲 USD: {usd} — 🇲🇽 MXN: {mxn}\n"
-            f"🇵🇪 PEN: {pen} — 🇨🇴 COP: {cop}\n"
-            f"🇦🇷 ARS: {ars} — 🇨🇱 CLP: {clp}")
+    def get_zone_probs(self, number: int) -> Optional[Dict]:
+        data = self.stats_zone.get(str(number), {})
+        if data.get("total", 0) < 5: return None
+        return {"B": data.get("B",0)/100.0, "A": data.get("A",0)/100.0, "Z": data.get("Z",0)/100.0}
 
+    # ── Predicción Color ──────────────────────────────────────────────────────
+    def predict_color_signal(self, last_number: int) -> Optional[Dict]:
+        pending = self.color_patterns.get("pending")
+        if not pending: return None
+        bet      = pending.get("bet", "")
+        bet_code = "N" if bet == "Negro" else "R"
+        pid      = pending.get("pid", "")
+        sequence = pending.get("sequence", [])
+        num_ref  = sequence[-1] if sequence else last_number
 
-def fmt_gestion_bankroll(chips: float) -> str:
-    usd = fmt_currency_amount(chips, "USD")
-    mxn = fmt_currency_amount(chips, "MXN")
-    pen = fmt_currency_amount(chips, "PEN")
-    cop = fmt_currency_amount(chips, "COP")
-    ars = fmt_currency_amount(chips, "ARS")
-    clp = fmt_currency_amount(chips, "CLP")
-    return (f"🇺🇲 USD: {usd} — 🇲🇽 MXN: {mxn}\n"
-            f"🇵🇪 PEN: {pen} — 🇨🇴 COP: {cop}\n"
-            f"🇦🇷 ARS: {ars} — 🇨🇱 CLP: {clp}")
+        color_probs = self.get_color_probs(num_ref)
+        p1 = color_probs.get(bet_code, 0.5) if color_probs else 0.5
 
+        history = self.color_patterns.get("history", [])
+        p2 = self._specific_eff(history, pid, num_ref)
+        p3 = self._global_eff(self.color_patterns.get("summary", {}), pid)
 
-# ─── FUNCIONES MATEMÁTICAS (EMA) ─────────────────────────────────────────────
-def calculate_ema(data: list, period: int = 20) -> list:
-    if len(data) < period:
-        return []
-    multiplier = 2 / (period + 1)
-    ema = [sum(data[:period]) / period]
-    for price in data[period:]:
-        ema.append((price - ema[-1]) * multiplier + ema[-1])
-    return ema
+        prob, comp = self._combine(p1, p2, p3)
+        logger.info(f"[COLOR] {pid} bet={bet} P1={p1:.0%} P2={p2} P3={p3} → {prob:.0%}")
+        return {"type":"color","pid":pid,"bet":bet,"prob":prob,
+                "p1_trans":p1,"p2_specific":p2,"p3_global":p3,
+                "sequence":sequence,"components":comp}
 
+    # ── Predicción Zona ───────────────────────────────────────────────────────
+    def predict_zone_signal(self, last_number: int) -> Optional[Dict]:
+        pending = self.zone_patterns.get("pending")
+        if not pending: return None
+        bet      = pending.get("bet", "")
+        bet_code = "B" if bet == "Bajo" else "A"
+        pid      = pending.get("pid", "")
+        sequence = pending.get("sequence", [])
+        num_ref  = sequence[-1] if sequence else last_number
 
-# ─── PREDICTORES ML ──────────────────────────────────────────────────────────
+        zone_probs = self.get_zone_probs(num_ref)
+        p1 = zone_probs.get(bet_code, 0.5) if zone_probs else 0.5
+
+        history = self.zone_patterns.get("history", [])
+        p2 = self._specific_eff(history, pid, num_ref)
+        p3 = self._global_eff(self.zone_patterns.get("summary", {}), pid)
+
+        prob, comp = self._combine(p1, p2, p3)
+        logger.info(f"[ZONA] {pid} bet={bet} P1={p1:.0%} P2={p2} P3={p3} → {prob:.0%}")
+        return {"type":"zone","pid":pid,"bet":bet,"prob":prob,
+                "p1_trans":p1,"p2_specific":p2,"p3_global":p3,
+                "sequence":sequence,"components":comp}
+
+    @staticmethod
+    def _specific_eff(history, pid, last_num) -> Optional[float]:
+        m = [h for h in history
+             if h.get("pattern_id") == pid
+             and h.get("sequence") and h["sequence"][-1] == last_num]
+        if len(m) < 3: return None
+        return round(sum(1 for h in m if h.get("result") == "Acierto") / len(m), 4)
+
+    @staticmethod
+    def _global_eff(summary, pid) -> Optional[float]:
+        d = summary.get(pid, {})
+        t = d.get("total", 0)
+        if t < 5: return None
+        return round(d.get("aciertos", 0) / t, 4)
+
+    @staticmethod
+    def _combine(p1, p2, p3) -> Tuple[float, str]:
+        if p2 is not None and p3 is not None:
+            prob = 0.40*p1 + 0.35*p2 + 0.25*p3
+            comp = f"P1={p1:.0%} P2={p2:.0%} P3={p3:.0%}"
+        elif p2 is not None:
+            prob = 0.50*p1 + 0.50*p2
+            comp = f"P1={p1:.0%} P2={p2:.0%}"
+        elif p3 is not None:
+            prob = 0.55*p1 + 0.45*p3
+            comp = f"P1={p1:.0%} P3={p3:.0%}"
+        else:
+            prob = p1
+            comp = f"P1={p1:.0%} (solo transición)"
+        return round(min(0.99, max(0.01, prob)), 4), comp
+
+# ─── EMA ──────────────────────────────────────────────────────────────────────
+def calc_ema(data, period):
+    if len(data) < period: return [None] * len(data)
+    mult = 2 / (period + 1)
+    out  = [None] * (period - 1)
+    prev = sum(data[:period]) / period
+    out.append(prev)
+    for v in data[period:]:
+        prev = v*mult + prev*(1-mult)
+        out.append(prev)
+    return out
+
+def ema_signal(levels, mode="moderado"):
+    if len(levels) < 20: return False
+    e4, e8, e20 = calc_ema(levels,4), calc_ema(levels,8), calc_ema(levels,20)
+    li = len(levels) - 1
+    if any(v is None for v in [e4[li],e8[li],e20[li]]): return False
+    cur = levels[li]
+    ce4,ce8,ce20 = e4[li],e8[li],e20[li]
+    pe4  = e4[li-1]  if li > 0 and e4[li-1]  is not None else ce4
+    pe8  = e8[li-1]  if li > 0 and e8[li-1]  is not None else ce8
+    pe20 = e20[li-1] if li > 0 and e20[li-1] is not None else ce20
+    if mode == "tendencia":
+        return (pe4<=pe20 and ce4>ce20) or (cur>ce4 and cur>ce8 and cur>ce20)
+    vp = False
+    if len(levels) >= 3:
+        a,b,c = levels[-3],levels[-2],levels[-1]
+        vp = (b<a) and (b<c) and (c>a)
+    return (pe4<=pe8 and ce4>ce8) or (pe8<=pe20 and ce8>ce20) or \
+           (cur>ce4 and cur>ce8) or vp
+
+def ema_trend_str(levels) -> str:
+    if len(levels) < 20: return "neutral"
+    e4,e8,e20 = calc_ema(levels,4),calc_ema(levels,8),calc_ema(levels,20)
+    li = len(levels)-1
+    v4,v8,v20 = e4[li],e8[li],e20[li]
+    if any(v is None for v in [v4,v8,v20]): return "neutral"
+    cur = levels[li]
+    if cur>v4 and v4>v8 and v8>v20: return "bull"
+    if cur<v4 and v4<v8 and v8<v20: return "bear"
+    return "neutral"
+
+def ema_trend_pair(trend: str) -> Dict:
+    if trend=="bull": return {"pair":(1,2),"missing":3,"label":"ALCISTA"}
+    if trend=="bear": return {"pair":(2,3),"missing":1,"label":"BAJISTA"}
+    return {"pair":(1,3),"missing":2,"label":"NEUTRAL"}
+
+# ─── MARKOV ───────────────────────────────────────────────────────────────────
 class SmoothedMarkovPredictor:
-    def __init__(self, window: int = 60, order: int = 3):
-        self.window = window
-        self.order = order
-        self.transition_counts: dict = {}
+    def __init__(self, window=60, order=2):
+        self.window=window; self.order=order; self.transition_counts={}
 
-    def update(self, sequence: list):
+    def update(self, sequence):
         self.transition_counts = defaultdict(lambda: defaultdict(int))
         recent = sequence[-self.window:]
-        if len(recent) < self.order + 1:
-            return
-        for i in range(len(recent) - self.order):
-            key = tuple(recent[i:i + self.order])
-            self.transition_counts[key][recent[i + self.order]] += 1
+        if len(recent) < self.order+1: return
+        for i in range(len(recent)-self.order):
+            self.transition_counts[tuple(recent[i:i+self.order])][recent[i+self.order]] += 1
 
-    def predict(self, sequence: list, classes: list) -> Optional[dict]:
-        if len(sequence) < self.order:
-            return None
-        counts = dict(self.transition_counts.get(tuple(sequence[-self.order:]), {}))
-        total = sum(counts.values())
-        if total < 5:
-            return None
-        alpha = 1.0
-        vocab_size = len(classes)
-        probs = {k: (v + alpha) / (total + alpha * vocab_size) for k, v in counts.items()}
-        for c in classes:
-            if c not in probs:
-                probs[c] = alpha / (total + alpha * vocab_size)
+    def predict(self, sequence):
+        if len(sequence) < self.order: return None
+        counts = dict(self.transition_counts.get(tuple(sequence[-self.order:]),{}))
+        total  = sum(counts.values())
+        if total < 10: return None
+        alpha=2.0; vs=3
+        probs = {k:(v+alpha)/(total+alpha*vs) for k,v in counts.items()}
+        for c in [1,2,3]:
+            if c not in probs: probs[c] = alpha/(total+alpha*vs)
         return probs
 
-
+# ─── ENSEMBLE ML ──────────────────────────────────────────────────────────────
 class OnlineEnsemblePredictor:
-    WINDOW = 5
-    CLASSES_COLOR = ["ROJO", "NEGRO", "CERO"]
-    CLASSES_PARIDAD = ["PAR", "IMPAR", "CERO"]
-    CLASSES_ZONA = ["MENOR", "MAYOR", "CERO"]
+    WINDOW=5; CLASSES=[1,2,3]
 
     def __init__(self):
-        self.mnb_color = MultinomialNB(alpha=1.0)
-        self.sgd_color = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
-        self.mnb_paridad = MultinomialNB(alpha=1.0)
-        self.sgd_paridad = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
-        self.mnb_zona = MultinomialNB(alpha=1.0)
-        self.sgd_zona = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.01, penalty='l2', alpha=0.001)
-        self.trained = {"COLOR": False, "PARIDAD": False, "ZONA": False}
-        self.sample_count = 0
+        self.mnb = MultinomialNB(alpha=2.0, class_prior=[0.333,0.333,0.333])
+        self.sgd = SGDClassifier(loss="log_loss",learning_rate="adaptive",eta0=0.005,
+                                 penalty="l2",alpha=0.01,epsilon=0.2)
+        self.trained=False
 
-    def _extract_features(self, hist_c, hist_p, hist_z) -> Optional[list]:
-        if len(hist_c) < self.WINDOW:
-            return None
-        features = []
-        for i in range(1, self.WINDOW + 1):
-            c, p, z = hist_c[-i], hist_p[-i], hist_z[-i]
-            vec_c = [1 if x == c else 0 for x in self.CLASSES_COLOR]
-            vec_p = [1 if x == p else 0 for x in self.CLASSES_PARIDAD]
-            vec_z = [1 if x == z else 0 for x in self.CLASSES_ZONA]
-            features.extend(vec_c + vec_p + vec_z)
+    def _extract_features(self, hist_d, pf_pd, ph_pd):
+        if len(hist_d)<self.WINDOW: return None
+        features=[]
+        for i in range(1,self.WINDOW+1):
+            d=hist_d[-i]; vec=[0,0,0]; vec[d-1]=1; features.extend(vec)
+        for pair in (pf_pd,ph_pd):
+            vec=[0,0,0]
+            for x in pair: vec[x-1]=1
+            features.extend(vec)
         return features
 
-    def partial_train(self, hist_c, hist_p, hist_z, target_c, target_p, target_z):
-        feats = self._extract_features(hist_c, hist_p, hist_z)
-        if feats is None:
-            return
-        X = np.array(feats).reshape(1, -1)
-        for cat, target, mnb, sgd in [
-            ("COLOR", target_c, self.mnb_color, self.sgd_color),
-            ("PARIDAD", target_p, self.mnb_paridad, self.sgd_paridad),
-            ("ZONA", target_z, self.mnb_zona, self.sgd_zona)
-        ]:
-            y = np.array([target])
-            classes = getattr(self, f"CLASSES_{cat}")
-            if not self.trained[cat]:
-                mnb.partial_fit(X, y, classes=classes)
-                sgd.partial_fit(X, y, classes=classes)
-                self.trained[cat] = True
-            else:
-                mnb.partial_fit(X, y)
-                sgd.partial_fit(X, y)
-        self.sample_count += 1
-
-    def predict(self, hist_c, hist_p, hist_z, cat: str) -> Optional[dict]:
-        if not self.trained[cat]:
-            return None
-        feats = self._extract_features(hist_c, hist_p, hist_z)
-        if feats is None:
-            return None
-        X = np.array(feats).reshape(1, -1)
-        try:
-            mnb = getattr(self, f"mnb_{cat.lower()}")
-            sgd = getattr(self, f"sgd_{cat.lower()}")
-            nb_p = mnb.predict_proba(X)[0]
-            sg_p = sgd.predict_proba(X)[0]
-            final = 0.5 * nb_p + 0.5 * sg_p
-            classes = getattr(self, f"CLASSES_{cat.upper()}")
-            return {classes[i]: float(p) for i, p in enumerate(final)}
-        except Exception:
-            return None
-
-
-class AMXAnalyzer:
-    def adjust_probability(self, base_prob: float, target: str, predictions: dict,
-                           recent_hist: list, seq_state,
-                           levels: list = None, ema: list = None) -> float:
-        cross_boost = 0.0
-        target_cat = "COLOR" if target in ["ROJO", "NEGRO"] else ("PARIDAD" if target in ["PAR", "IMPAR"] else "ZONA")
-
-        # ── Cruces Simétricos ──────────────────────────────────────────────────
-        if target_cat == "COLOR":
-            if target == "ROJO":
-                if predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55:
-                    cross_boost += 0.02
-                if predictions.get("ZONA", {}).get("MENOR", 0.5) > 0.55:
-                    cross_boost += 0.02
-            elif target == "NEGRO":
-                if predictions.get("PARIDAD", {}).get("IMPAR", 0.5) > 0.55:
-                    cross_boost += 0.02
-                if predictions.get("ZONA", {}).get("MAYOR", 0.5) > 0.55:
-                    cross_boost += 0.02
-        elif target_cat == "PARIDAD":
-            if target == "PAR":
-                if predictions.get("COLOR", {}).get("NEGRO", 0.5) > 0.55:
-                    cross_boost += 0.02
-                if predictions.get("ZONA", {}).get("MENOR", 0.5) > 0.55:
-                    cross_boost += 0.02
-            elif target == "IMPAR":
-                if predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55:
-                    cross_boost += 0.02
-                if predictions.get("ZONA", {}).get("MAYOR", 0.5) > 0.55:
-                    cross_boost += 0.02
-        elif target_cat == "ZONA":
-            if target == "MENOR":
-                if predictions.get("PARIDAD", {}).get("PAR", 0.5) > 0.55:
-                    cross_boost += 0.02
-                if predictions.get("COLOR", {}).get("NEGRO", 0.5) > 0.55:
-                    cross_boost += 0.02
-            elif target == "MAYOR":
-                if predictions.get("PARIDAD", {}).get("IMPAR", 0.5) > 0.55:
-                    cross_boost += 0.02
-                if predictions.get("COLOR", {}).get("ROJO", 0.5) > 0.55:
-                    cross_boost += 0.02
-
-        # ── Resonancia por Racha Real ─────────────────────────────────────────
-        matches = 0
-        for i in range(1, min(4, len(recent_hist)) + 1):
-            if recent_hist[-i] == target:
-                matches += 1
-            else:
-                break
-        if matches == 1:
-            cross_boost += 0.03
-        elif matches == 2:
-            cross_boost += 0.07
-        elif matches >= 3:
-            cross_boost += 0.12
-
-        # ── Ruptura de Repetición ─────────────────────────────────────────────
-        if (len(recent_hist) >= 2 and recent_hist[-1] == recent_hist[-2]
-                and recent_hist[-1] != "CERO" and recent_hist[-1] != target):
-            cross_boost += 0.04
-
-        # ── Bonus de Alineación con Secuencia Fija ────────────────────────────
-        # ROJO: +6% cuando la tabla señala ROJO Y el nivel está por encima de EMA20
-        # Resto de targets: +3% estándar
-        if target == seq_state.expected():
-            if target == "ROJO" and levels and ema and len(levels) > 0 and len(ema) > 0 and levels[-1] > ema[-1]:
-                cross_boost += 0.06
-            else:
-                cross_boost += 0.03
-
-        # ── Boost especial: por encima de EMA20 + racha últimos 5 ───────────
-        # Aplica a ROJO, MENOR (nivel orig) y NEGRO, MAYOR (nivel inv)
-        if target in ("ROJO", "MENOR", "NEGRO", "MAYOR") and levels and ema:
-            above_ema = len(levels) > 0 and len(ema) > 0 and levels[-1] > ema[-1]
-            if above_ema:
-                last5 = recent_hist[-5:] if len(recent_hist) >= 5 else recent_hist
-                streak5 = sum(1 for v in last5 if v == target)
-                if streak5 >= 3:
-                    cross_boost += 0.06
-                if streak5 >= 4:
-                    cross_boost += 0.04   # acumulado +0.10 para rachas muy fuertes
-                if len(levels) >= 3 and levels[-1] > levels[-2] > levels[-3]:
-                    cross_boost += 0.03
-
-        return min(1.0, base_prob + cross_boost)
-
-
-# ─── GESTIÓN Y SECUENCIAS ────────────────────────────────────────────────────
-class Martingala:
-    """
-    Sistema Martingala clásico.
-    - Apuesta base inicial: BASE_BET fichas.
-    - WIN  → resetear apuesta a BASE_BET. Retorna True (ciclo completado).
-    - LOSS → duplicar apuesta (apuesta × 2). Limitar a MAX_BET fichas.
-    - Apuesta mínima: 1 ficha.
-
-    El multiplicador actual se expone como self.multiplier para la UI.
-    """
-    BASE_BET = 1
-    MIN_BET  = 1
-    MAX_BET  = 64   # techo: 6 pérdidas consecutivas
-
-    def __init__(self):
-        self.current_bet: int = self.BASE_BET
-        self.multiplier:  int = 1
-        self.total_lost:  int = 0
-
-    @property
-    def sequence(self) -> list:
-        """Compatibilidad UI — muestra [multiplicador×] actual."""
-        return [self.current_bet]
-
-    def get_bet(self) -> int:
-        return max(self.MIN_BET, self.current_bet)
-
-    def win(self) -> bool:
-        """Reset a la apuesta base. Siempre retorna True."""
-        self.current_bet = self.BASE_BET
-        self.multiplier  = 1
-        self.total_lost  = 0
-        return True
-
-    def loss(self):
-        """Duplica la apuesta (Martingala clásica)."""
-        self.total_lost += self.current_bet
-        self.current_bet = min(self.current_bet * 2, self.MAX_BET)
-        self.multiplier  = self.current_bet // self.BASE_BET
-
-    def reset(self):
-        self.current_bet = self.BASE_BET
-        self.multiplier  = 1
-        self.total_lost  = 0
-
-
-class SequenceState:
-    def __init__(self, category: str):
-        self.category = category
-        if category == "COLOR":
-            self.sequence = SEQUENCE_COLOR
-        elif category == "PARIDAD":
-            self.sequence = SEQUENCE_PARIDAD
+    def partial_train(self, hist_d, target, pf_d, ph_d):
+        feats=self._extract_features(hist_d[:-1],pf_d,ph_d)
+        if feats is None: return
+        X=np.array(feats).reshape(1,-1); y=np.array([target])
+        if not self.trained:
+            self.mnb.partial_fit(X,y,classes=self.CLASSES)
+            self.sgd.partial_fit(X,y,classes=self.CLASSES)
+            self.trained=True
         else:
-            self.sequence = SEQUENCE_ZONA
-        self.idx = 0
+            self.mnb.partial_fit(X,y); self.sgd.partial_fit(X,y)
 
-    def advance(self):
-        self.idx = (self.idx + 1) % len(self.sequence)
-
-    def expected(self) -> str:
-        return self.sequence[self.idx]
-
-    def initialize_from_last_value(self, last_val: str):
+    def predict(self, hist_d, pf_d, ph_d):
+        if not self.trained: return None
+        feats=self._extract_features(hist_d,pf_d,ph_d)
+        if feats is None: return None
+        X=np.array(feats).reshape(1,-1)
         try:
-            idx = self.sequence.index(last_val)
-            self.idx = (idx + 1) % len(self.sequence)
-        except ValueError:
-            self.idx = 0
+            pm=dict(zip(self.CLASSES,self.mnb.predict_proba(X)[0]))
+            ps=dict(zip(self.CLASSES,self.sgd.predict_proba(X)[0]))
+            return {c:0.5*pm[c]+0.5*ps[c] for c in self.CLASSES}
+        except Exception: return None
 
+# ─── SIGNAL LEARNER ───────────────────────────────────────────────────────────
+class SignalLearner:
+    MAX_HISTORY=500; WINDOW=50; MIN_SAMPLES=5
 
-class GlobalStats:
-    def __init__(self):
-        self.wins = 0
-        self.zeros = 0
-        self.losses = 0
-        self.consecutive = 0
-        self.last_20 = deque(maxlen=20)
-        self.signals_processed = 0
-        self.global_chips: int = 0
-        self.last_report_signals = 0
+    _COLS=["id","ts","strategy","pair","missing","prob","intento_start","nivel",
+           "pf_prob","phf_prob","ema_trend","last_number","dozen_seq_5",
+           "result","intento_fin","reason"]
 
-    def record(self, result_type: str, attempt: int, number: int, val, type_str: str, roulette_name: str):
-        self.signals_processed += 1
-        if result_type == 'WIN':
-            self.wins += 1
-            self.consecutive += 1
-        elif result_type == 'LOSS':
-            self.losses += 1
-            self.consecutive = 0
-        elif result_type == 'EMPATE':
-            self.zeros += 1
-            self.consecutive = 0
-        self.last_20.append({
-            "result": result_type, "attempt": attempt, "number": number,
-            "val": val, "type": type_str, "roulette": roulette_name
-        })
+    def __init__(self, db: sqlite3.Connection):
+        self.db=db; self.history=deque(maxlen=self.MAX_HISTORY)
+        self.pending_id: Optional[int]=None
+        self._init_db(); self._load_history()
 
-    def should_send(self) -> bool:
-        return (self.signals_processed - self.last_report_signals) >= 20
+    def _init_db(self):
+        self.db.execute("""CREATE TABLE IF NOT EXISTS signal_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+            strategy INTEGER, pair TEXT, missing INTEGER, prob REAL,
+            intento_start INTEGER, nivel INTEGER DEFAULT 1,
+            pf_prob REAL, phf_prob REAL, ema_trend TEXT,
+            last_number INTEGER, dozen_seq_5 TEXT,
+            result TEXT, intento_fin INTEGER, reason TEXT
+        )"""); self.db.commit()
 
-    def mark_sent(self):
-        self.last_report_signals = self.signals_processed
+    def _row_to_dict(self, row) -> dict:
+        d=dict(zip(self._COLS,row))
+        raw=d.get("pair","")
+        try: d["pair"]=tuple(int(x) for x in raw.split(",") if x)
+        except: d["pair"]=()
+        return d
 
-    def get_stats_text(self) -> str:
-        total = self.wins + self.zeros + self.losses
-        eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text = "📊 RESUMEN — AUTO ROULETTE 🎰\n 🕛 Reporte 12:00 hs\n"
-        text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
-        text += f"► Consecutivas = {self.consecutive}\n"
-        text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Bankroll Global: 💵 {fmt_currency_amount(self.global_chips, 'USD')}\n"
-        text += f"► Total señales del día: {total}\n\n📌 Últimas 20 SEÑALES 📌\n"
-        for s in reversed(list(self.last_20)):
-            a_str = f"🔄 INTENTO #{s['attempt']}"
-            if s['result'] == 'WIN':
-                b_str = f"💵 +{fmt_currency_amount(s['val'], 'USD')}"
-            else:
-                b_str = f"💵 -{fmt_currency_amount(s['val'], 'USD')}"
-            if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} | {a_str} | {b_str}\n\n"
-            elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n\n"
-            else:
-                text += f"❌ LOSS #{s['number']} {s['type']} | {a_str} | {b_str}\n\n"
-        return text
-
-
-GLOBAL_STATS = GlobalStats()
-
-
-class SessionManager:
-    ARG_UTC_OFFSET = -3
-
-    def __init__(self, engines):
-        self.engines = engines
-        self.current_idx = 0
-        self.session_active = False
-        self.session_start_time = 0.0
-        self.session_start_chips = 0
-
-    def _now_arg(self):
-        return datetime.utcnow() + timedelta(hours=self.ARG_UTC_OFFSET)
-
-    def seconds_to_next_slot(self) -> float:
-        now = self._now_arg()
-        if now.minute < 30:
-            target = now.replace(minute=30, second=0, microsecond=0)
-        else:
-            target = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        return max(1.0, (target - now).total_seconds())
-
-    def _start_session(self):
-        self.session_active = True
-        self.session_start_time = time.time()
-        self.session_start_chips = GLOBAL_STATS.global_chips
-        engine = self.engines[self.current_idx]
-        logger.info(f"[Session] 🟢 Iniciada: {engine.name} | Bankroll: {fmt_currency_amount(self.session_start_chips, 'USD')}")
-        queue_broadcast({"type": "session", "status": "active"})
-
-    def _reset_cycle_on_meta(self):
-        """Al cumplir la meta, resetea Martingala a apuesta base y continúa la sesión."""
-        engine = self.engines[self.current_idx]
-        engine.martingala.reset()
-        engine.cycle_active = False
-        engine.signal_active = False
-        engine.attempt = 1
-        if engine.active_signal_msg_id:
-            tg_delete(CHAT_ID, engine.active_signal_msg_id)
-            engine.active_signal_msg_id = None
-        if engine.analyzing_msg_id:
-            tg_delete(CHAT_ID, engine.analyzing_msg_id)
-            engine.analyzing_msg_id = None
-        self.session_start_chips = GLOBAL_STATS.global_chips   # resetear baseline
-        logger.info(f"[Session] 🎯 Meta cumplida — Martingala reseteado a base, sesión continúa.")
-        queue_broadcast({"type": "session", "status": "active"})  # sigue activa
-
-    def _end_session_legacy(self):
-        """Mantener por compatibilidad con /reset. No se usa en flujo normal."""
-        engine = self.engines[self.current_idx]
-        self.session_active = False
-        engine.martingala.reset()
-        engine.cycle_active = False
-        engine.signal_active = False
-        engine.attempt = 1
-        if engine.active_signal_msg_id:
-            tg_delete(CHAT_ID, engine.active_signal_msg_id)
-            engine.active_signal_msg_id = None
-        if engine.analyzing_msg_id:
-            tg_delete(CHAT_ID, engine.analyzing_msg_id)
-            engine.analyzing_msg_id = None
-        logger.info(f"[Session] 🔴 Terminada: {engine.name}")
-        queue_broadcast({"type": "session", "status": "closed"})
-
-    async def session_watchdog(self):
-        self._reminder_msg_id: Optional[int] = None
-        while True:
-            wait = self.seconds_to_next_slot()
-            logger.info(f"[Session] ⏳ Esperando {wait/60:.1f} min para el próximo slot (:00 o :30)...")
-
-            REMINDER_SECS = 300
-            if wait > REMINDER_SECS + 10:
-                await asyncio.sleep(wait - REMINDER_SECS)
-                await asyncio.sleep(REMINDER_SECS)
-            else:
-                await asyncio.sleep(wait)
-
-            self._start_session()
-
-            while self.session_active:
-                await asyncio.sleep(1)
-                if GLOBAL_STATS.global_chips >= self.session_start_chips + SESSION_TARGET:
-                    self._reset_cycle_on_meta()
-
-
-# ─── MOTOR DE RULETA ─────────────────────────────────────────────────────────
-class RouletteEngine:
-    def __init__(self, ws_key: int, name: str):
-        self.ws_key = ws_key
-        self.name = name
-        self.db_path = f"main_roulette_{ws_key}.db"
-        self.spin_history: list = []
-        self.hist_color: list = []
-        self.hist_paridad: list = []
-        self.hist_zona: list = []
-
-        # Niveles y EMA para las 3 categorías
-        self.levels = {"COLOR": [], "PARIDAD": [], "ZONA": []}
-        self.inv_levels = {"COLOR": [], "PARIDAD": [], "ZONA": []}
-        self.last_non_zero = {"COLOR": None, "PARIDAD": None, "ZONA": None}
-
-        self.CLASSES = {
-            "COLOR": ["ROJO", "NEGRO", "CERO"],
-            "PARIDAD": ["PAR", "IMPAR", "CERO"],
-            "ZONA": ["MENOR", "MAYOR", "CERO"]
-        }
-        self.seq_states = {cat: SequenceState(cat) for cat in ["COLOR", "PARIDAD", "ZONA"]}
-        self.martingala = Martingala()
-        self.attempt = 1
-        self.cycle_active = False
-        self.wait_next_spin = False
-        self.analyzing_msg_id = None
-        self.markov = {cat: SmoothedMarkovPredictor() for cat in ["COLOR", "PARIDAD", "ZONA"]}
-        self.ensemble = OnlineEnsemblePredictor()
-        self.amx = AMXAnalyzer()
-        self.signal_active = False
-        self.active_type = None
-        self.active_target = ""
-        self.active_chips = 0
-        self._last_signal_prob = 0.0
-        self.active_signal_msg_id = None
-        self.spins_since_train = 0
-        self.ws_count = 0
-        self.warmup_done = False
-        # Color-specific state (Auto-Roulette-Color logic)
-        self.signal_mode: str = "moderado"     # "tendencia" | "moderado" — moderado por defecto
-        self.color_consecutive_losses: int = 0
-        self.color_loss_block_until: float = 0.0
-        self._db = self._get_db()
-        live = self._load_live_history()
-        self.ws_count = live
-        self.warmup_done = live >= WARMUP_SPINS
-
-    def _get_db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.execute("CREATE TABLE IF NOT EXISTS live_spins (id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, ts INTEGER NOT NULL)")
-        conn.commit()
-        return conn
-
-    def _persist(self, number: int):
+    def _load_history(self):
         try:
-            self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (number, int(time.time())))
-            self._db.commit()
-        except Exception:
-            pass
+            rows=self.db.execute(
+                "SELECT * FROM signal_log WHERE result IS NOT NULL ORDER BY id DESC LIMIT ?",
+                (self.MAX_HISTORY,)
+            ).fetchall()
+            for row in reversed(rows): self.history.append(self._row_to_dict(row))
+            logger.info(f"[Learner] 📚 {len(self.history)} señales cargadas")
+        except Exception as e:
+            logger.warning(f"[Learner] ⚠️ Error cargando historial: {e}")
 
+    def register_signal(self, strategy, pair, missing, prob,
+                        pf_prob, phf_prob, ema_trend, last_number, dozen_seq_5):
+        try:
+            cur=self.db.execute(
+                """INSERT INTO signal_log
+                   (ts,strategy,pair,missing,prob,intento_start,nivel,pf_prob,
+                    phf_prob,ema_trend,last_number,dozen_seq_5)
+                   VALUES(?,?,?,?,?,1,1,?,?,?,?,?)""",
+                (time.time(),strategy,
+                 ",".join(str(x) for x in sorted(pair)),
+                 missing,round(prob,6),round(pf_prob,6),round(phf_prob,6),
+                 ema_trend,last_number,",".join(str(x) for x in dozen_seq_5))
+            )
+            self.db.commit(); self.pending_id=cur.lastrowid
+        except Exception as e:
+            logger.warning(f"[Learner] ⚠️ Error registrando señal: {e}")
+
+    def resolve(self, result: str, reason: str=""):
+        if self.pending_id is None: return
+        try:
+            self.db.execute(
+                "UPDATE signal_log SET result=?,intento_fin=1,reason=? WHERE id=?",
+                (result,reason,self.pending_id)
+            )
+            self.db.commit()
+            row=self.db.execute("SELECT * FROM signal_log WHERE id=?",
+                                (self.pending_id,)).fetchone()
+            if row: self.history.append(self._row_to_dict(row))
+        except Exception as e:
+            logger.warning(f"[Learner] ⚠️ Error resolviendo señal: {e}")
+        finally:
+            self.pending_id=None
+
+    def _recent(self) -> List[dict]:
+        completed=[s for s in self.history if s.get("result") in ("WIN","LOSS")]
+        return list(completed)[-self.WINDOW:]
+
+    def _win_rate(self, subset) -> Optional[float]:
+        if len(subset)<self.MIN_SAMPLES: return None
+        return sum(1 for s in subset if s["result"]=="WIN")/len(subset)
+
+    @staticmethod
+    def _adj(wr,scale):
+        return 0.0 if wr is None else round((wr-0.5)*2.0*scale,4)
+
+    def strat_adj(self,s): return self._adj(self._win_rate([x for x in self._recent() if x.get("strategy")==s]),0.08)
+    def pair_adj(self,p):
+        key=tuple(sorted(p))
+        return self._adj(self._win_rate([x for x in self._recent() if tuple(sorted(x.get("pair",())))== key]),0.06)
+    def trend_adj(self,t): return self._adj(self._win_rate([x for x in self._recent() if x.get("ema_trend")==t]),0.05)
+
+    def get_adjustment(self, strategy, pair, ema_trend) -> Tuple[float, str]:
+        s=self.strat_adj(strategy); p=self.pair_adj(pair); t=self.trend_adj(ema_trend)
+        total=round(max(-0.18,min(0.18,s+p+t)),4)
+        parts=[]
+        if abs(s)>=0.005: parts.append(f"Strat:{s:+.3f}")
+        if abs(p)>=0.005: parts.append(f"Par:{p:+.3f}")
+        if abs(t)>=0.005: parts.append(f"EMA:{t:+.3f}")
+        return total," | ".join(parts) if parts else "sin ajuste"
+
+    def get_summary(self, n=30) -> str:
+        recent=self._recent()[-n:]
+        total_db=0
+        try:
+            row=self.db.execute("SELECT COUNT(*) FROM signal_log WHERE result IS NOT NULL").fetchone()
+            total_db=row[0] if row else 0
+        except: pass
+        if not recent:
+            return "🧠 <b>Aprendizaje activo</b>\n\nAún sin señales resueltas."
+        total=len(recent); wins=sum(1 for s in recent if s["result"]=="WIN")
+        eff=wins/total*100
+        si={STRAT_E1:"🅐E1",STRAT_E2:"🅑E2",STRAT_E3:"🅒E3",STRAT_COLOR:"🎨Color",STRAT_ZONE:"🗺Zona"}
+        lines=[
+            "🧠 <b>APRENDIZAJE ADAPTATIVO</b>",
+            f"Total DB: {total_db} | Ventana: {total} | {wins}/{total} ({eff:.1f}%)\n",
+            "<b>Por estrategia:</b>",
+        ]
+        for st in [STRAT_E1,STRAT_E2,STRAT_E3,STRAT_COLOR,STRAT_ZONE]:
+            sb=[s for s in recent if s.get("strategy")==st]
+            if not sb: continue
+            sw=sum(1 for s in sb if s["result"]=="WIN"); wr=sw/len(sb)*100
+            adj=self.strat_adj(st); bar="▓"*int(wr/10)+"░"*(10-int(wr/10))
+            lines.append(f"  {si[st]}: {sw}/{len(sb)} ({wr:.0f}%) {bar} adj:{adj:+.3f}")
+        return "\n".join(lines)
+
+# ─── ENGINE PRINCIPAL ─────────────────────────────────────────────────────────
+class ImmersiveRouletteEngine:
+    def __init__(self, sc: StatsClient):
+        self.sc=sc
+
+        # Historial
+        self.spin_history:  List[dict]=[]
+        self.dozen_seq:     List[int] =[]
+        self.color_seq:     List[str] =[]
+        self.zone_seq:      List[str] =[]
+        self.d_levels:      Dict[int,List]={1:[],2:[],3:[]}
+        self.doc_levels:    List[float]=[]
+        self._last_doc_inc: float=0
+
+        # After-number local
+        self.after_number_dozen=defaultdict(lambda: defaultdict(int))
+
+        # ML
+        self.markov_d=SmoothedMarkovPredictor()
+        self.ensemble_d=OnlineEnsemblePredictor()
+        self.spins_since_train=0
+
+        # Señal docenas
+        self.signal_active      =False
+        self.active_strategy    =None
+        self.active_pair        =()
+        self.active_missing     =0
+        self.active_signal_msg_id=None
+
+        # Señal color
+        self.color_signal_active   =False
+        self.color_signal_bet      =""
+        self.color_signal_pid      =""
+        self.color_signal_prob     =0.0
+        self.color_signal_msg_id   =None
+        self.color_signal_sequence =[]
+
+        # Señal zona
+        self.zone_signal_active    =False
+        self.zone_signal_bet       =""
+        self.zone_signal_pid       =""
+        self.zone_signal_prob      =0.0
+        self.zone_signal_msg_id    =None
+        self.zone_signal_sequence  =[]
+
+        # DB y aprendizaje
+        self._db    =_get_db()
+        self.learner=SignalLearner(self._db)
+
+        self.processed_game_ids:set=set()
+        self.MAX_PROCESSED_IDS=300
+
+        # Warmup
+        live_loaded=self._load_live_history()
+        self.ws_count=live_loaded
+        self.warmup_done=live_loaded>=WARMUP_SPINS
+        logger.info(
+            f"[ImmersiveDC] 📦 Pre-cargados: {live_loaded} | "
+            f"Warmup: {'✅' if self.warmup_done else '⏳'} | "
+            f"Learner: {len(self.learner.history)} señales"
+        )
+
+    # ── DB local ──────────────────────────────────────────────────────────────
     def _load_live_history(self) -> int:
         try:
-            rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
-        except Exception:
-            return 0
-        for (n,) in rows:
-            self._update_state(n, persist=False, train_model=False)
-        if rows:
-            self._train_models()
-            self.initialize_sequences_from_history()
+            rows=self._db.execute(
+                "SELECT number,color,zone FROM live_spins ORDER BY id ASC"
+            ).fetchall()
+        except: return 0
+        for (n,c,z) in rows: self._update_state(n,persist=False,train_model=False)
+        if rows: self.markov_d.update(self.dozen_seq)
         return len(rows)
 
-    def initialize_sequences_from_history(self):
-        if any(s["color"] == "NEGRO" for s in reversed(self.spin_history)):
-            self.seq_states["COLOR"].initialize_from_last_value("NEGRO")
-        if any(s["paridad"] == "IMPAR" for s in reversed(self.spin_history)):
-            self.seq_states["PARIDAD"].initialize_from_last_value("IMPAR")
-        if any(s["zona"] == "MAYOR" for s in reversed(self.spin_history)):
-            self.seq_states["ZONA"].initialize_from_last_value("MAYOR")
+    def _persist(self, number,color,zone):
+        try:
+            self._db.execute("INSERT INTO live_spins(number,color,zone,ts) VALUES(?,?,?,?)",
+                             (number,color,zone,int(time.time())))
+            self._db.commit()
+        except Exception as e: logger.debug(f"⚠️ DB persist: {e}")
 
-    def _train_models(self):
-        for cat in ["COLOR", "PARIDAD", "ZONA"]:
-            self.markov[cat].update(getattr(self, f"hist_{cat.lower()}"))
+    # ── Estado interno ────────────────────────────────────────────────────────
+    def _update_state(self, number:int, persist=True, train_model=True):
+        color=get_color(number); zone=get_zone(number); d=get_dozen(number)
+        if number!=0 and self.spin_history:
+            prev=self.spin_history[-1]["number"]
+            if prev!=0: self.after_number_dozen[prev][d]+=1
+        self.spin_history.append({"number":number,"color":color,"zone":zone})
+        self.color_seq.append(color); self.zone_seq.append(zone)
+        if len(self.color_seq)>200: self.color_seq.pop(0)
+        if len(self.zone_seq)>200:  self.zone_seq.pop(0)
+        if d!=0:
+            for dd in (1,2,3):
+                prev=self.d_levels[dd][-1] if self.d_levels[dd] else 0
+                self.d_levels[dd].append(prev+(1 if d==dd else -1))
+                if len(self.d_levels[dd])>300: self.d_levels[dd].pop(0)
+            self.dozen_seq.append(d)
+            if len(self.dozen_seq)>200: self.dozen_seq.pop(0)
+            if train_model and len(self.dozen_seq)>5:
+                pf_d=self._get_pf(); ph_d=self._get_ph(number)
+                if pf_d and ph_d:
+                    self.ensemble_d.partial_train(self.dozen_seq,d,pf_d["pair"],ph_d["pair"])
+                self.spins_since_train+=1
+                if self.spins_since_train>=TRAIN_INTERVAL:
+                    self.markov_d.update(self.dozen_seq); self.spins_since_train=0
+        inc=1 if d==1 else(-1 if d==3 else(1 if number!=0 and number<=18 else -1))
+        if number==0: inc=self._last_doc_inc
+        else: self._last_doc_inc=inc
+        prev_lvl=self.doc_levels[-1] if self.doc_levels else 0
+        self.doc_levels.append(prev_lvl+inc)
+        if len(self.doc_levels)>300: self.doc_levels.pop(0)
+        if persist: self._persist(number,color,zone)
 
-    def _update_levels(self, cat: str, val: str):
-        pos = POS_VALUE[cat]
-        neg = NEG_VALUE[cat]
-        lv = self.levels[cat]
-        il = self.inv_levels[cat]
-        last_l = lv[-1] if lv else 0
-        last_il = il[-1] if il else 0
-        last_nz = self.last_non_zero[cat]
+    # ── PF / PH / PHTML / PHF ─────────────────────────────────────────────────
+    def _get_pf(self):
+        if len(self.spin_history)<5: return None
+        counts={1:0,2:0,3:0}
+        for s in self.spin_history[-5:]:
+            n=s["number"]
+            if n!=0: counts[get_dozen(n)]+=1
+        active=[k for k,v in counts.items() if v>0]
+        if len(active)!=2: return None
+        pair=tuple(sorted(active)); missing=list({1,2,3}-set(pair))[0]
+        return {"pair":pair,"missing":missing,"prob":sum(counts[a] for a in pair)/5.0}
 
-        if val == "CERO":
-            if last_nz:
-                ch = 1 if last_nz == pos else -1
-                ich = 1 if last_nz == neg else -1
-            else:
-                ch = 0
-                ich = 0
-        else:
-            ch = 1 if val == pos else -1
-            ich = 1 if val == neg else -1
-            self.last_non_zero[cat] = val
+    def _get_ph(self, number=None):
+        if number is None:
+            if not self.spin_history: return None
+            number=self.spin_history[-1]["number"]
+        if number==0: return None
+        srv=self.sc.get_ph_pair(number)
+        if srv: return srv
+        counts=self.after_number_dozen.get(number,{}); total=sum(counts.values())
+        if total<10: return None
+        sc=sorted(counts.items(),key=lambda x:x[1],reverse=True)
+        if len(sc)<2: return None
+        pair=tuple(sorted([sc[0][0],sc[1][0]])); missing=list({1,2,3}-set(pair))[0]
+        return {"pair":pair,"missing":missing,"prob":(sc[0][1]+sc[1][1])/total}
 
-        lv.append(last_l + ch)
-        il.append(last_il + ich)
-        if len(lv) > 300:
-            lv.pop(0)
-            il.pop(0)
+    def _get_phtml_probs(self, number):
+        if number==0: return None
+        entry=DOZEN_TABLE.get(number)
+        if not entry: return None
+        d1,d2,d3=entry["d1"],entry["d2"],entry["d3"]; total=d1+d2+d3
+        if total==0: return None
+        return {1:d1/total,2:d2/total,3:d3/total}
 
-    def get_chart_data(self) -> dict:
-        out = {}
-        for cat in ["COLOR", "PARIDAD", "ZONA"]:
-            lv = self.levels[cat][-100:]
-            il = self.inv_levels[cat][-100:]
-            out[cat] = {
-                "levels": lv,
-                "inv_levels": il,
-                "ema": calculate_ema(lv, 20) if len(lv) >= 20 else [],
-                "inv_ema": calculate_ema(il, 20) if len(il) >= 20 else []
-            }
-        return out
+    def _get_phtml_pair(self, number):
+        probs=self._get_phtml_probs(number)
+        if probs is None: return None
+        sd=sorted(probs.items(),key=lambda x:x[1],reverse=True)
+        pair=tuple(sorted([sd[0][0],sd[1][0]])); missing=list({1,2,3}-set(pair))[0]
+        return {"pair":pair,"missing":missing,"prob":probs[sd[0][0]]+probs[sd[1][0]]}
 
-    def _update_state(self, number: int, persist=True, train_model=True):
-        c = COLOR_MAP[number]
-        p = PARIDAD_MAP[number]
-        z = ZONA_MAP[number]
-        self.spin_history.append({"number": number, "color": c, "paridad": p, "zona": z})
-        self.hist_color.append(c)
-        self.hist_paridad.append(p)
-        self.hist_zona.append(z)
+    def _get_phf(self, number):
+        if number==0: return None
+        phtml=self._get_phtml_probs(number)
+        if phtml is None: return None
+        ph=self.sc.get_ph_probs_raw(number)
+        if ph is None:
+            counts=self.after_number_dozen.get(number,{}); total=sum(counts.values())
+            if total>=10: ph={1:counts.get(1,0)/total,2:counts.get(2,0)/total,3:counts.get(3,0)/total}
+        phf_raw=({d:PHTML_W*phtml[d]+PH_W_COMBINE*ph[d] for d in [1,2,3]}
+                 if ph is not None else dict(phtml))
+        total=sum(phf_raw.values())
+        if total==0: return None
+        phf={d:v/total for d,v in phf_raw.items()}
+        sd=sorted(phf.items(),key=lambda x:x[1],reverse=True)
+        pair=tuple(sorted([sd[0][0],sd[1][0]])); missing=list({1,2,3}-set(pair))[0]
+        return {"pair":pair,"missing":missing,"prob":phf[sd[0][0]]+phf[sd[1][0]],"probs":phf}
 
-        for cat, val in [("COLOR", c), ("PARIDAD", p), ("ZONA", z)]:
-            self._update_levels(cat, val)
-        for cat in ["COLOR", "PARIDAD", "ZONA"]:
-            self.seq_states[cat].advance()
+    # ── ML ────────────────────────────────────────────────────────────────────
+    def _predict_pair_ml(self, missing_num):
+        mk_pred=self.markov_d.predict(self.dozen_seq)
+        m_p_miss=mk_pred.get(missing_num,1/3) if mk_pred else 1/3
+        pf_d=self._get_pf(); ph_d=self._get_ph(); ens_p_miss=1/3
+        if pf_d and ph_d:
+            ens=self.ensemble_d.predict(self.dozen_seq,pf_d["pair"],ph_d["pair"])
+            if ens: ens_p_miss=ens.get(missing_num,1/3)
+        ml_miss=0.4*m_p_miss+0.6*ens_p_miss
+        levels=self.d_levels.get(missing_num,[])
+        if len(levels)>=20:
+            if ema_signal(levels,"tendencia"): ml_miss*=0.85
+            elif ema_signal(levels,"moderado"): ml_miss*=0.92
+        return 1.0-ml_miss
 
-        if train_model and number != 0 and len(self.hist_color) > 5:
-            self.ensemble.partial_train(self.hist_color, self.hist_paridad, self.hist_zona, c, p, z)
-            self.spins_since_train += 1
-            if self.spins_since_train >= TRAIN_INTERVAL:
-                self._train_models()
-                self.spins_since_train = 0
-        if persist:
-            self._persist(number)
+    # ── E1/E2/E3 ──────────────────────────────────────────────────────────────
+    def _detect_e1(self):
+        if not self.warmup_done or not self.spin_history: return None
+        last_num=self.spin_history[-1]["number"]
+        if last_num==0: return None
+        pf_d=self._get_pf()
+        if not pf_d: return None
+        phf_d=self._get_phf(last_num)
+        if not phf_d: return None
+        if set(pf_d["pair"])!=set(phf_d["pair"]): return None
+        base=PF_W_NORM*pf_d["prob"]+PH_W_NORM*phf_d["prob"]
+        ml=self._predict_pair_ml(pf_d["missing"])
+        prob=BASE_W_NORM*base+ML_W_NORM*ml
+        trend=ema_trend_str(self.doc_levels)
+        adj,adj_d=self.learner.get_adjustment(STRAT_E1,pf_d["pair"],trend)
+        prob_adj=round(max(0.0,min(1.0,prob+adj)),4)
+        if prob_adj<MIN_PROB: return None
+        return {"strategy":STRAT_E1,"pair":pf_d["pair"],"missing":pf_d["missing"],
+                "prob":prob_adj,"label":"PF+PHF+ML","pf_prob":pf_d["prob"],
+                "phf_prob":phf_d["prob"],"ema_trend":trend,"last_number":last_num}
 
-        queue_broadcast({
-            "type": "spin", "number": number, "color": c, "paridad": p, "zona": z,
-            "bankroll": GLOBAL_STATS.global_chips, "martingala_bet": self.martingala.get_bet(), "martingala_mult": self.martingala.multiplier, "martingala_seq": list(self.martingala.sequence),
-            "charts": self.get_chart_data()
-        })
+    def _detect_e2(self, number=None):
+        if not self.warmup_done: return None
+        if number is None:
+            if not self.spin_history: return None
+            number=self.spin_history[-1]["number"]
+        if number==0: return None
+        phtml_pair=self._get_phtml_pair(number)
+        if phtml_pair is None: return None
+        trend=ema_trend_str(self.doc_levels); e_pair=ema_trend_pair(trend)
+        if set(phtml_pair["pair"])!=set(e_pair["pair"]): return None
+        prob=phtml_pair["prob"]
+        adj,adj_d=self.learner.get_adjustment(STRAT_E2,phtml_pair["pair"],trend)
+        prob_adj=round(max(0.0,min(1.0,prob+adj)),4)
+        return {"strategy":STRAT_E2,"pair":phtml_pair["pair"],"missing":phtml_pair["missing"],
+                "prob":prob_adj,"label":f"PHTML+EMA({e_pair['label']})","ema_trend":trend,
+                "pf_prob":prob,"phf_prob":prob,"last_number":number}
 
-    def _get_predictions(self, cat: str) -> dict:
-        hist = getattr(self, f"hist_{cat.lower()}")
-        classes = self.CLASSES[cat]
-        mk_probs = self.markov[cat].predict(hist, classes) or {c: 1 / 3 for c in classes}
-        ens_probs = self.ensemble.predict(self.hist_color, self.hist_paridad, self.hist_zona, cat) or {c: 1 / 3 for c in classes}
-        return {c: 0.4 * mk_probs.get(c, 0) + 0.6 * ens_probs.get(c, 0) for c in classes}
+    def _detect_e3(self):
+        if not self.warmup_done: return None
+        non_zero=[s["number"] for s in self.spin_history if s["number"]!=0]
+        if len(non_zero)<6: return None
+        prev5=non_zero[-6:-1]; last_n=non_zero[-1]
+        cats5=list(set(get_dozen(n) for n in prev5))
+        if len(cats5)!=2: return None
+        pair=tuple(sorted(cats5)); last_dozen=get_dozen(last_n)
+        if last_dozen in pair: return None
+        streak=0
+        for n in reversed(non_zero[:-1]):
+            if get_dozen(n) in pair: streak+=1
+            else: break
+        phf_break=self._get_phf(last_n)
+        if phf_break is None or set(phf_break["pair"])!=set(pair): return None
+        return_prob=self._calc_return_prob(pair,streak,last_n)
+        trend=ema_trend_str(self.doc_levels)
+        adj,adj_d=self.learner.get_adjustment(STRAT_E3,pair,trend)
+        return_prob_adj=round(max(0.0,min(1.0,return_prob+adj)),4)
+        if return_prob_adj<MIN_PROB: return None
+        return {"strategy":STRAT_E3,"pair":pair,"missing":last_dozen,
+                "prob":return_prob_adj,"label":f"RETORNO(racha {streak}g)",
+                "pf_prob":return_prob,"phf_prob":phf_break["prob"],
+                "ema_trend":trend,"last_number":last_n}
 
-    def _get_color_entry(self, number: int) -> Optional[dict]:
-        for e in COLOR_DATA_AUTO:
-            if e["id"] == number:
-                return e
-        return None
+    def _calc_return_prob(self, pair, streak, break_num):
+        non_zero=[s["number"] for s in self.spin_history if s["number"]!=0]
+        last20=non_zero[-20:]
+        pair_count=sum(1 for n in last20 if get_dozen(n) in pair)
+        base_prob=pair_count/len(last20) if last20 else 0.66
+        streak_bst=min(0.40,streak*0.04); brk_d=get_dozen(break_num)
+        brk_adj=0.02 if brk_d in pair else -0.04
+        missing=list({1,2,3}-set(pair))[0]; levels=self.d_levels.get(missing,[]); ema_adj=0.0
+        if len(levels)>=20:
+            if ema_signal(levels,"tendencia"): ema_adj=-0.08
+            elif ema_signal(levels,"moderado"): ema_adj=-0.04
+        return round(max(0.35,min(0.97,base_prob+streak_bst+brk_adj+ema_adj)),4)
 
-    def _determine_bet_color(self, expected: str) -> str:
-        """Igual que determineBetColor del Auto-Roulette-Color."""
-        if len(self.spin_history) < 20:
-            return expected
-        lv  = self.levels["COLOR"]
-        ilv = self.inv_levels["COLOR"]
-        ema20_o = calculate_ema(lv,  20)
-        ema20_i = calculate_ema(ilv, 20)
-        last_idx = len(lv) - 1
-        last_num = self.spin_history[-1]["number"]
-        entry = self._get_color_entry(last_num)
-        last_sig = entry["senal"] if entry else None
-        if expected == "ROJO":
-            if ema20_o and ema20_o[last_idx] is not None and lv[last_idx] < ema20_o[last_idx]:
-                return "NEGRO" if last_sig == "NEGRO" else "ROJO"
-            return "ROJO"
-        else:
-            if ema20_i and ema20_i[last_idx] is not None and ilv[last_idx] < ema20_i[last_idx]:
-                return "ROJO" if last_sig == "ROJO" else "NEGRO"
-            return "NEGRO"
+    def _select_best_signal(self):
+        e1,e2,e3=self._detect_e1(),self._detect_e2(),self._detect_e3()
+        candidates=[s for s in [e1,e2,e3] if s]
+        if not candidates: return None
+        if e1 and e2 and set(e1["pair"])==set(e2["pair"]):
+            e1["prob"]=min(0.99,e1["prob"]*0.55+e2["prob"]*0.45)
+            e1["label"]=f"E1+E2({e1['pair']})"
+        _pri={STRAT_E1:3,STRAT_E3:2,STRAT_E2:1}
+        candidates.sort(key=lambda x:(x["prob"],_pri.get(x["strategy"],0)),reverse=True)
+        return candidates[0]
 
-    def _detect_color_signal_tendencia(self, consecutive_losses: int = 0) -> Optional[str]:
-        """Lógica shouldActivateSignalTendencia del Auto-Roulette-Color."""
-        min_spins = 22 + consecutive_losses * 2
-        if len(self.spin_history) < min_spins:
-            return None
-        last_num = self.spin_history[-1]["number"]
-        entry = self._get_color_entry(last_num)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-        expected = entry["senal"]
-        lv  = self.levels["COLOR"]
-        ilv = self.inv_levels["COLOR"]
-        ema4_o  = calculate_ema(lv,  4)
-        ema8_o  = calculate_ema(lv,  8)
-        ema20_o = calculate_ema(lv,  20)
-        ema4_i  = calculate_ema(ilv, 4)
-        ema8_i  = calculate_ema(ilv, 8)
-        ema20_i = calculate_ema(ilv, 20)
-        last_idx = len(lv) - 1
-        required_consec = min(3 + consecutive_losses, 6)
+    # ── Señales ───────────────────────────────────────────────────────────────
+    def _strat_icon(self):
+        return {STRAT_E1:"🅐",STRAT_E2:"🅑",STRAT_E3:"🅒"}.get(self.active_strategy,"?")
 
-        def check_consec(levels, ema20, ema8, ema4, idx):
-            for off in range(required_consec):
-                i = idx - (required_consec - 1) + off
-                if i < 0: return False
-                if ema20[i] is None or levels[i] <= ema20[i]: return False
-                if consecutive_losses >= 2 and ema8[i] is not None and levels[i] <= ema8[i]: return False
-                if consecutive_losses >= 3 and ema4[i] is not None and levels[i] <= ema4[i]: return False
-            return True
+    def _activate_dozen_signal(self, sig):
+        self.signal_active=True
+        self.active_strategy=sig["strategy"]
+        self.active_pair=sig["pair"]
+        self.active_missing=sig["missing"]
+        p=sig["pair"]
+        icon=self._strat_icon()
+        trend=sig.get("ema_trend",ema_trend_str(self.doc_levels))
+        msg_id=tg_send(
+            f"✅✅ SEÑAL CONFIRMADA ✅✅\n\n"
+            f"🎡 IMMERSIVE ROULETTE {icon}\n"
+            f"🎯 Apostar Docenas: <b>D{p[0]} y D{p[1]}</b>\n"
+            f"📊 Probabilidad: {sig['prob']:.0%}\n"
+            f"🔍 Estrategia: {sig['label']}",
+            markup=immersive_keyboard()
+        )
+        if msg_id: self.active_signal_msg_id=msg_id
+        self.learner.register_signal(
+            strategy=sig["strategy"], pair=sig["pair"], missing=sig["missing"],
+            prob=sig["prob"], pf_prob=sig.get("pf_prob",0.0),
+            phf_prob=sig.get("phf_prob",0.0), ema_trend=trend,
+            last_number=sig.get("last_number",0),
+            dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
+        )
+        logger.info(f"[ImmersiveDC] 🎯 SEÑAL DOCENA {sig['label']}: D{p} ({sig['prob']:.0%})")
 
-        if expected == "ROJO":
-            if not check_consec(lv, ema20_o, ema8_o, ema4_o, last_idx): return None
-        elif expected == "NEGRO":
-            if not check_consec(ilv, ema20_i, ema8_i, ema4_i, last_idx): return None
-        return expected
-
-    def _detect_color_signal_moderado(self, consecutive_losses: int = 0) -> Optional[str]:
-        """Lógica shouldActivateSignalModerado del Auto-Roulette-Color."""
-        min_spins = 12 + consecutive_losses * 3
-        if len(self.spin_history) < min_spins:
-            return None
-        last_idx = len(self.spin_history) - 1
-        prev_idx = last_idx - 1
-        last_num = self.spin_history[last_idx]["number"]
-        entry = self._get_color_entry(last_num)
-        if not entry or entry["senal"] == "NO APOSTAR":
-            return None
-        expected = entry["senal"]
-        lv  = self.levels["COLOR"]
-        ilv = self.inv_levels["COLOR"]
-        ema4_o  = calculate_ema(lv,  4)
-        ema8_o  = calculate_ema(lv,  8)
-        ema20_o = calculate_ema(lv,  20)
-        ema4_i  = calculate_ema(ilv, 4)
-        ema8_i  = calculate_ema(ilv, 8)
-        ema20_i = calculate_ema(ilv, 20)
-        li, pi = len(lv) - 1, len(lv) - 2
-
-        def check_moderate(levels, e4, e8, e20, li, pi):
-            if li < 1 or pi < 0: return False
-            if e4[li] is None or e8[li] is None or e4[pi] is None or e8[pi] is None: return False
-            cross_up = e4[li] > e8[li] and e4[pi] <= e8[pi]
-            if not cross_up: return False
-            if consecutive_losses >= 1 and e20[li] is not None and e8[li] <= e20[li]: return False
-            if consecutive_losses >= 2 and e20[li] is not None and levels[li] <= e20[li]: return False
-            if consecutive_losses >= 3:
-                prev2 = li - 1
-                if prev2 < 0 or e4[prev2] is None or levels[prev2] <= e4[prev2]: return False
-                if levels[li] <= e4[li]: return False
-            return True
-
-        if expected == "ROJO":
-            if check_moderate(lv, ema4_o, ema8_o, ema20_o, li, pi): return expected
-        elif expected == "NEGRO":
-            if check_moderate(ilv, ema4_i, ema8_i, ema20_i, li, pi): return expected
-        return None
-
-
-    # ─── DETECCIÓN MODERADO: PARIDAD ─────────────────────────────────────────
-    def _detect_paridad_signal_moderado(self, consecutive_losses: int = 0) -> Optional[str]:
-        """
-        Lógica Moderado para PARIDAD (espejo de _detect_color_signal_moderado).
-        Cruce EMA4 > EMA8 en el gráfico del target:
-          • PAR   → levels["PARIDAD"]     (gráfico positivo)
-          • IMPAR → inv_levels["PARIDAD"] (gráfico inverso)
-        Filtros adicionales por pérdidas consecutivas (igual que COLOR).
-        """
-        min_spins = 12 + consecutive_losses * 3
-        if len(self.spin_history) < min_spins:
-            return None
-
-        lv  = self.levels["PARIDAD"]
-        ilv = self.inv_levels["PARIDAD"]
-        if len(lv) < 8 or len(ilv) < 8:
-            return None
-
-        ema4_o  = calculate_ema(lv,  4)
-        ema8_o  = calculate_ema(lv,  8)
-        ema20_o = calculate_ema(lv,  20) if len(lv)  >= 20 else []
-        ema4_i  = calculate_ema(ilv, 4)
-        ema8_i  = calculate_ema(ilv, 8)
-        ema20_i = calculate_ema(ilv, 20) if len(ilv) >= 20 else []
-        li = len(lv) - 1
-        pi = li - 1
-
-        def check_moderate(levels, e4, e8, e20, li, pi):
-            if li < 1 or pi < 0: return False
-            if not e4 or not e8: return False
-            if li >= len(e4) or li >= len(e8): return False
-            if pi >= len(e4) or pi >= len(e8): return False
-            cross_up = e4[li] > e8[li] and e4[pi] <= e8[pi]
-            if not cross_up: return False
-            if consecutive_losses >= 1 and e20 and li < len(e20) and e8[li] <= e20[li]: return False
-            if consecutive_losses >= 2 and e20 and li < len(e20) and levels[li] <= e20[li]: return False
-            if consecutive_losses >= 3:
-                prev2 = li - 1
-                if prev2 < 0 or prev2 >= len(e4): return False
-                if levels[prev2] <= e4[prev2]: return False
-                if levels[li] <= e4[li]: return False
-            return True
-
-        # Probar PAR (gráfico positivo)
-        if check_moderate(lv, ema4_o, ema8_o, ema20_o, li, pi):
-            # Confirmar que el nivel PAR también está sobre EMA20
-            if not ema20_o or lv[li] > ema20_o[li]:
-                return "PAR"
-
-        # Probar IMPAR (gráfico inverso)
-        if check_moderate(ilv, ema4_i, ema8_i, ema20_i, li, pi):
-            if not ema20_i or ilv[li] > ema20_i[li]:
-                return "IMPAR"
-
-        return None
-
-    # ─── DETECCIÓN MODERADO: ZONA ─────────────────────────────────────────────
-    def _detect_zona_signal_moderado(self, consecutive_losses: int = 0) -> Optional[str]:
-        """
-        Lógica Moderado para ZONA (espejo de _detect_color_signal_moderado).
-        Cruce EMA4 > EMA8 en el gráfico del target:
-          • MENOR → levels["ZONA"]     (gráfico positivo)
-          • MAYOR → inv_levels["ZONA"] (gráfico inverso)
-        Filtros adicionales por pérdidas consecutivas (igual que COLOR).
-        """
-        min_spins = 12 + consecutive_losses * 3
-        if len(self.spin_history) < min_spins:
-            return None
-
-        lv  = self.levels["ZONA"]
-        ilv = self.inv_levels["ZONA"]
-        if len(lv) < 8 or len(ilv) < 8:
-            return None
-
-        ema4_o  = calculate_ema(lv,  4)
-        ema8_o  = calculate_ema(lv,  8)
-        ema20_o = calculate_ema(lv,  20) if len(lv)  >= 20 else []
-        ema4_i  = calculate_ema(ilv, 4)
-        ema8_i  = calculate_ema(ilv, 8)
-        ema20_i = calculate_ema(ilv, 20) if len(ilv) >= 20 else []
-        li = len(lv) - 1
-        pi = li - 1
-
-        def check_moderate(levels, e4, e8, e20, li, pi):
-            if li < 1 or pi < 0: return False
-            if not e4 or not e8: return False
-            if li >= len(e4) or li >= len(e8): return False
-            if pi >= len(e4) or pi >= len(e8): return False
-            cross_up = e4[li] > e8[li] and e4[pi] <= e8[pi]
-            if not cross_up: return False
-            if consecutive_losses >= 1 and e20 and li < len(e20) and e8[li] <= e20[li]: return False
-            if consecutive_losses >= 2 and e20 and li < len(e20) and levels[li] <= e20[li]: return False
-            if consecutive_losses >= 3:
-                prev2 = li - 1
-                if prev2 < 0 or prev2 >= len(e4): return False
-                if levels[prev2] <= e4[prev2]: return False
-                if levels[li] <= e4[li]: return False
-            return True
-
-        # Probar MENOR (gráfico positivo)
-        if check_moderate(lv, ema4_o, ema8_o, ema20_o, li, pi):
-            if not ema20_o or lv[li] > ema20_o[li]:
-                return "MENOR"
-
-        # Probar MAYOR (gráfico inverso)
-        if check_moderate(ilv, ema4_i, ema8_i, ema20_i, li, pi):
-            if not ema20_i or ilv[li] > ema20_i[li]:
-                return "MAYOR"
-
-        return None
-
-    def detect_color_signal(self, signal_mode: str = "moderado", consecutive_losses: int = 0) -> Optional[dict]:
-        """Detecta señal para COLOR usando lógica del Auto-Roulette-Color."""
-        if signal_mode == "tendencia":
-            expected = self._detect_color_signal_tendencia(consecutive_losses)
-        else:
-            expected = self._detect_color_signal_moderado(consecutive_losses)
-        if not expected:
-            return None
-        bet_color = self._determine_bet_color(expected)
-        last_num = self.spin_history[-1]["number"] if self.spin_history else 0
-        entry = self._get_color_entry(last_num)
-        prob = entry["rojo"] if bet_color == "ROJO" else entry["negro"] if entry else 0.5
-        return {
-            "type": "COLOR",
-            "target": bet_color,
-            "prob": prob,
-            "chips": self.martingala.get_bet(),
-            "mode": signal_mode,
-        }
-
-    def detect_signal(self, signal_mode: str = "moderado", color_consecutive_losses: int = 0) -> Optional[dict]:
-        """
-        Detección unificada — SIEMPRE modo Moderado para las 3 categorías.
-
-        Pipeline por categoría:
-          COLOR   → _detect_color_signal_moderado   (EMA4/8/20 cruce, tabla Auto-Roulette)
-          PARIDAD → _detect_paridad_signal_moderado  (EMA4/8/20 cruce en gráfico PAR/IMPAR)
-          ZONA    → _detect_zona_signal_moderado     (EMA4/8/20 cruce en gráfico MENOR/MAYOR)
-
-        Tras la detección Moderado, la prob de la señal se refina con:
-          • Markov ord-3 ventana-60  (40%)
-          • Ensemble ML NaiveBayes + SGD (60%)
-          • AMX: cruces entre categorías, racha real, ruptura, secuencia
-          • Filtro EMA20 obligatorio confirmado dentro de cada _detect_*_moderado
-
-        Se emite la señal con mayor probabilidad ajustada (≥ MIN_PROB).
-        """
-        # ── Predicciones ML (Markov + Ensemble) para las 3 categorías ─────────
-        # Se calculan una vez y se reutilizan para prob_base y cruces AMX.
-        all_predictions = {cat: self._get_predictions(cat) for cat in ["COLOR", "PARIDAD", "ZONA"]}
-
-        valid_signals = {}
-        best_prob = 0.0
-        best_info = "—"
-
-        # ── COLOR: lógica Moderado (Auto-Roulette-Color) ──────────────────────
-        color_sig = self.detect_color_signal("moderado", color_consecutive_losses)
-        if color_sig:
-            valid_signals["COLOR"] = {"target": color_sig["target"], "prob": color_sig["prob"]}
-            if color_sig["prob"] > best_prob:
-                best_prob = color_sig["prob"]
-                best_info = f"COLOR -> {color_sig['target']} ({color_sig['prob']*100:.1f}%)"
-
-        # ── PARIDAD: lógica Moderado + Markov/ML/AMX ─────────────────────────
-        par_losses = self.color_consecutive_losses if hasattr(self, "color_consecutive_losses") else 0
-        paridad_target = self._detect_paridad_signal_moderado(par_losses)
-        if paridad_target:
-            lv  = self.levels["PARIDAD"]
-            ilv = self.inv_levels["PARIDAD"]
-            ref_levels = ilv if paridad_target == "IMPAR" else lv
-            ref_ema    = calculate_ema(ref_levels, 20) if len(ref_levels) >= 20 else []
-            hist_par   = self.hist_paridad
-            base_prob  = all_predictions["PARIDAD"].get(paridad_target, 0.0)
-            final_prob = self.amx.adjust_probability(
-                base_prob, paridad_target, all_predictions,
-                hist_par, self.seq_states["PARIDAD"],
-                levels=ref_levels, ema=ref_ema
-            )
-            final_prob = max(final_prob, MIN_PROB)   # moderado ya valida cruce; garantizar umbral
-            logger.debug(f"  📊 PARIDAD/{paridad_target}: base={base_prob:.3f} → AMX={final_prob:.3f} | Moderado ✅")
-            valid_signals["PARIDAD"] = {"target": paridad_target, "prob": final_prob}
-            if final_prob > best_prob:
-                best_prob = final_prob
-                best_info = f"PARIDAD -> {paridad_target} ({final_prob*100:.1f}%)"
-
-        # ── ZONA: lógica Moderado + Markov/ML/AMX ────────────────────────────
-        zona_target = self._detect_zona_signal_moderado(par_losses)
-        if zona_target:
-            lv  = self.levels["ZONA"]
-            ilv = self.inv_levels["ZONA"]
-            ref_levels = ilv if zona_target == "MAYOR" else lv
-            ref_ema    = calculate_ema(ref_levels, 20) if len(ref_levels) >= 20 else []
-            hist_zona  = self.hist_zona
-            base_prob  = all_predictions["ZONA"].get(zona_target, 0.0)
-            final_prob = self.amx.adjust_probability(
-                base_prob, zona_target, all_predictions,
-                hist_zona, self.seq_states["ZONA"],
-                levels=ref_levels, ema=ref_ema
-            )
-            final_prob = max(final_prob, MIN_PROB)
-            logger.debug(f"  📊 ZONA/{zona_target}: base={base_prob:.3f} → AMX={final_prob:.3f} | Moderado ✅")
-            valid_signals["ZONA"] = {"target": zona_target, "prob": final_prob}
-            if final_prob > best_prob:
-                best_prob = final_prob
-                best_info = f"ZONA -> {zona_target} ({final_prob*100:.1f}%)"
-
-        last_num      = self.spin_history[-1]["number"] if self.spin_history else "?"
-        signal_status = "🟢 SEÑAL VALIDA" if valid_signals else "🔴 Sin señal"
-        logger.info(f"🎲 Giro #{last_num} | Prob Máx: {best_info} | {signal_status}")
-
-        if not valid_signals:
-            return None
-        best_cat = max(valid_signals, key=lambda k: valid_signals[k]["prob"])
-        best_sig = valid_signals[best_cat]
-        return {
-            "type":   best_cat,
-            "target": best_sig["target"],
-            "prob":   best_sig["prob"],
-            "chips":  self.martingala.get_bet(),
-            "mode":   "moderado"
-        }
-
-    def _build_signal_text(self) -> str:
-        last_num = self.spin_history[-1]["number"] if self.spin_history else 0
-        target = self.active_target
-        target_emoji = EMOJI_MAP.get(target, "")
-        target_display = f"{target} {target_emoji}"
-        if target == "MENOR":
-            target_display = f"MENOR (1-18) {target_emoji}"
-        elif target == "MAYOR":
-            target_display = f"MAYOR (19-36) {target_emoji}"
-        elif target == "PAR":
-            target_display = f"PARES {target_emoji}"
-        elif target == "IMPAR":
-            target_display = f"IMPARES {target_emoji}"
-        gestion = fmt_gestion_signal(self.active_chips)
-        return (f"✅ SEÑAL CONFIRMADA — {target_display} ✅\n\n🎰 {self.name}\n"
-                f"👉 ÚLTIMO NÚMERO: {last_num}\n♦️ ENTRAR EN: {target_display}\n"
-                f"🔹 INTENTO: {self.attempt} DE {2 if self.active_type == 'COLOR' else 3}\n\n💡 PROBABILIDAD PATRÓN — {self._last_signal_prob:.1f}%\n🎲 MARTINGALA ×{self.martingala.multiplier}\n"
-                f"🚨 MONTO DE APUESTA POR PAIS:\n{gestion}")
-
-    def send_signal(self):
-        if self.analyzing_msg_id:
-            tg_delete(CHAT_ID, self.analyzing_msg_id)
-            self.analyzing_msg_id = None
-        if self.active_signal_msg_id:
-            tg_delete(CHAT_ID, self.active_signal_msg_id)
-        msg_id = tg_send_with_button(self._build_signal_text(), self.name)
-        if msg_id:
-            self.active_signal_msg_id = msg_id
-        queue_broadcast({
-            "type": "signal", "target": self.active_target, "chips": self.active_chips,
-            "attempt": self.attempt, "prob": self._last_signal_prob, "bankroll": GLOBAL_STATS.global_chips,
-            "signal_mode": self.signal_mode,
-            "martingala_bet": self.martingala.get_bet(), "martingala_mult": self.martingala.multiplier, "martingala_seq": list(self.martingala.sequence)
-        })
-
-    def iniciar_senal(self, sig: dict):
-        self.cycle_active = True
-        self.signal_active = True
-        self.active_type = sig["type"]
-        self.active_target = sig["target"]
-        self._last_signal_prob = sig["prob"] * 100
-        self.active_chips = sig["chips"]
-        self.attempt = 1
-        self.send_signal()
-
-    def resolve(self, number: int):
-        c = COLOR_MAP[number]
-        p = PARIDAD_MAP[number]
-        z = ZONA_MAP[number]
-        if self.active_type == "COLOR":
-            actual_val = c
-        elif self.active_type == "PARIDAD":
-            actual_val = p
-        else:
-            actual_val = z
-        won = (actual_val == self.active_target)
-        is_zero = (number == 0)
-        current_bet = self.active_chips
-        # Max intentos para COLOR es 2, para otras categorías es 3
-        max_attempts = MAX_ATTEMPTS_COLOR if self.active_type == "COLOR" else 3
-
+    def _resolve_dozen_signal(self, number):
+        d=get_dozen(number); won=(d!=0 and d in self.active_pair)
+        icon=self._strat_icon()
         if won:
-            cycle_done = self.martingala.win()
-            GLOBAL_STATS.global_chips += current_bet
-            GLOBAL_STATS.record('WIN', self.attempt, number, current_bet, self.active_type, self.name)
-            tg_send(f"✅ WIN {number} — {self.active_type} {self.active_target}\n🎉 ¡Ganaste {fmt_currency_amount(current_bet, 'USD')}!")
-            if cycle_done and GLOBAL_STATS.global_chips < SESSION_MANAGER_REF.session_start_chips + SESSION_TARGET:
-                tg_send(f"🎉 CICLO LABOUCHERE COMPLETADO 🎉\n🚨 GESTION ACTUAL POR PAIS:\n{fmt_gestion_bankroll(GLOBAL_STATS.global_chips)}")
-            # Reset consecutive losses for COLOR on WIN
-            if self.active_type == "COLOR":
-                self.color_consecutive_losses = 0
-                self.color_loss_block_until = 0.0
-            self.wait_next_spin = True
-            self._send_analyzing_msg()
-            self._end_cycle()
-            queue_broadcast({"type": "result", "result": "WIN", "number": number, "bankroll": GLOBAL_STATS.global_chips, "martingala_bet": self.martingala.get_bet(), "martingala_seq": list(self.martingala.sequence)})
+            tg_send(
+                f"✅ WIN #{number} — DOCENA D{d}\n"
+                f"🎡 IMMERSIVE ROULETTE {icon}\n"
+                f"🎯 Apuesta: D{self.active_pair[0]} y D{self.active_pair[1]}",
+                markup=immersive_keyboard()
+            )
+            scoreboard.record_win()
+            self.learner.resolve("WIN",f"WIN D{d} | par correcto {self.active_pair}")
         else:
-            GLOBAL_STATS.global_chips -= current_bet
-            self.martingala.loss()
-            if self.attempt < max_attempts:
-                lost_attempt = self.attempt
-                self.attempt += 1
-                self.signal_active = False
-                self.wait_next_spin = True
-                self._send_analyzing_msg()
-                queue_broadcast({
-                    "type": "result_retry",
-                    "lost_attempt": lost_attempt,
-                    "attempt": self.attempt,
-                    "signal_category": self.active_type,
-                    "bankroll": GLOBAL_STATS.global_chips,
-                    "martingala_bet": self.martingala.get_bet(), "martingala_seq": list(self.martingala.sequence)
-                })
+            tg_send(
+                f"❌ LOSS #{number} — DOCENA D{d}\n"
+                f"🎡 IMMERSIVE ROULETTE {icon}\n"
+                f"🎯 Apuesta era: D{self.active_pair[0]} y D{self.active_pair[1]}",
+                markup=immersive_keyboard()
+            )
+            scoreboard.record_loss()
+            self.learner.resolve("LOSS",f"LOSS D{d} cayó | faltaba D{self.active_missing}")
+        scoreboard.send()
+        self._reset_dozen_signal()
+
+    def _reset_dozen_signal(self):
+        self.signal_active=False; self.active_strategy=None
+        self.active_pair=(); self.active_missing=0; self.active_signal_msg_id=None
+
+    # ── Color ─────────────────────────────────────────────────────────────────
+    def _check_color_signal(self, number):
+        if self.color_signal_active:
+            color=get_color(number); bet=self.color_signal_bet
+            won=(bet=="Negro" and color=="N") or (bet=="Rojo" and color=="R")
+            if won:
+                tg_send(
+                    f"✅ WIN #{number} — {color_label(color)}\n"
+                    f"🎡 IMMERSIVE ROULETTE 🎨\n"
+                    f"🎯 Apuesta: {bet}",
+                    markup=immersive_keyboard()
+                )
+                scoreboard.record_win()
+                self.learner.resolve("WIN",f"COLOR WIN #{number} bet={bet} cayó {color}")
             else:
-                GLOBAL_STATS.record('EMPATE' if is_zero else 'LOSS', self.attempt, number, current_bet, self.active_type, self.name)
-                msg = "🟠 EMPATE 0" if is_zero else f"❌ LOSS TOTAL {number} — {self.active_type}"
-                n_intentos = max_attempts
-                tg_send(f"{msg}\n🚨 Racha de {n_intentos} intentos perdida.")
-                # Track consecutive losses for COLOR
-                if self.active_type == "COLOR":
-                    self.color_consecutive_losses = min(self.color_consecutive_losses + 1, 4)
-                    self.color_loss_block_until = time.time() + min(8.0 * self.color_consecutive_losses, 30.0)
-                self.wait_next_spin = True
-                self._send_analyzing_msg()
-                self._end_cycle()
-                queue_broadcast({
-                    "type": "result",
-                    "result": "EMPATE" if is_zero else "LOSS",
-                    "attempt": self.attempt,
-                    "number": number,
-                    "bankroll": GLOBAL_STATS.global_chips,
-                    "martingala_bet": self.martingala.get_bet(), "martingala_seq": list(self.martingala.sequence)
-                })
+                tg_send(
+                    f"❌ LOSS #{number} — {color_label(color)}\n"
+                    f"🎡 IMMERSIVE ROULETTE 🎨\n"
+                    f"🎯 Apuesta era: {bet}",
+                    markup=immersive_keyboard()
+                )
+                scoreboard.record_loss()
+                self.learner.resolve("LOSS",f"COLOR LOSS #{number} bet={bet} cayó {color}")
+            scoreboard.send()
+            self._reset_color_signal()
+            return
 
-    def _end_cycle(self):
-        self.attempt = 1
-        self.cycle_active = False
-        self.signal_active = False
-        self.active_type = None
-        self.active_target = ""
-        self.active_signal_msg_id = None
-        self._last_signal_prob = 0.0
-        self.active_chips = 0
-        self._check_stats()
+        pred=self.sc.predict_color_signal(number)
+        if pred and pred["prob"]>=MIN_PROB_COLOR_ZONE:
+            bet=pred["bet"]; prob=pred["prob"]; seq=pred.get("sequence",[])
+            self.color_signal_active=True; self.color_signal_bet=bet
+            self.color_signal_pid=pred["pid"]; self.color_signal_prob=prob
+            self.color_signal_sequence=seq
+            msg_id=tg_send(
+                f"🔔 SEÑAL COLOR — IMMERSIVE ROULETTE 🎨\n\n"
+                f"🎯 Apostar: <b>{bet}</b>\n"
+                f"📊 Probabilidad: {prob:.0%}\n"
+                f"🔢 Secuencia: {seq}\n"
+                f"📈 {pred.get('components','')}",
+                markup=immersive_keyboard()
+            )
+            if msg_id: self.color_signal_msg_id=msg_id
+            self.learner.register_signal(
+                strategy=STRAT_COLOR,pair=(0,0),missing=0,prob=prob,
+                pf_prob=pred.get("p1_trans",0),phf_prob=pred.get("p3_global",0) or 0,
+                ema_trend="neutral",last_number=number,
+                dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
+            )
+            logger.info(f"[COLOR] 🎨 Señal: {bet} ({prob:.0%}) | seq={seq}")
 
-    def _send_analyzing_msg(self):
-        if self.analyzing_msg_id:
-            tg_delete(CHAT_ID, self.analyzing_msg_id)
-        self.analyzing_msg_id = tg_send("🚨 ANALIZADO PATRONES EN CADA GIRO 🚨")
+    def _reset_color_signal(self):
+        self.color_signal_active=False; self.color_signal_bet=""
+        self.color_signal_pid=""; self.color_signal_prob=0.0
+        self.color_signal_msg_id=None; self.color_signal_sequence=[]
 
-    def _check_stats(self):
-        if GLOBAL_STATS.should_send():
-            tg_send(GLOBAL_STATS.get_stats_text())
-            GLOBAL_STATS.mark_sent()
-
-    def process_spin(self, number: int, session_active: bool):
-        try:
-            self._update_state(number)
-            if not self.warmup_done:
-                self.ws_count += 1
-                if self.ws_count >= WARMUP_SPINS:
-                    self.warmup_done = True
-                    tg_send("🟢 <b>AUTO ROULETTE 🎰</b> — Sistema Listo.")
-                return
-            if not session_active:
-                return
-            if self.signal_active:
-                self.resolve(number)
-                return
-            if self.wait_next_spin:
-                self.wait_next_spin = False
-                return
-            # Block COLOR if in cooldown after consecutive losses
-            if time.time() < self.color_loss_block_until:
-                sig = self.detect_signal("moderado", 999)  # skip color (cooldown)
+    # ── Zona ──────────────────────────────────────────────────────────────────
+    def _check_zone_signal(self, number):
+        if self.zone_signal_active:
+            zone=get_zone(number); bet=self.zone_signal_bet
+            won=(bet=="Bajo" and zone=="B") or (bet=="Alto" and zone=="A")
+            if won:
+                tg_send(
+                    f"✅ WIN #{number} — {zone_label(zone)}\n"
+                    f"🎡 IMMERSIVE ROULETTE 🗺\n"
+                    f"🎯 Apuesta: {bet}",
+                    markup=immersive_keyboard()
+                )
+                scoreboard.record_win()
+                self.learner.resolve("WIN",f"ZONA WIN #{number} bet={bet} cayó {zone}")
             else:
-                sig = self.detect_signal("moderado", self.color_consecutive_losses)
-            if not self.signal_active:
-                if sig:
-                    if self.cycle_active:
-                        self.active_type = sig["type"]
-                        self.active_target = sig["target"]
-                        self._last_signal_prob = sig["prob"] * 100
-                        self.active_chips = self.martingala.get_bet()
-                        self.signal_active = True
-                        self.send_signal()
-                    else:
-                        self.iniciar_senal(sig)
-        except Exception as e:
-            logger.error(f"Error: {e}", exc_info=True)
-            self._end_cycle()
+                tg_send(
+                    f"❌ LOSS #{number} — {zone_label(zone)}\n"
+                    f"🎡 IMMERSIVE ROULETTE 🗺\n"
+                    f"🎯 Apuesta era: {bet}",
+                    markup=immersive_keyboard()
+                )
+                scoreboard.record_loss()
+                self.learner.resolve("LOSS",f"ZONA LOSS #{number} bet={bet} cayó {zone}")
+            scoreboard.send()
+            self._reset_zone_signal()
+            return
 
+        pred=self.sc.predict_zone_signal(number)
+        if pred and pred["prob"]>=MIN_PROB_COLOR_ZONE:
+            bet=pred["bet"]; prob=pred["prob"]; seq=pred.get("sequence",[])
+            self.zone_signal_active=True; self.zone_signal_bet=bet
+            self.zone_signal_pid=pred["pid"]; self.zone_signal_prob=prob
+            self.zone_signal_sequence=seq
+            msg_id=tg_send(
+                f"🔔 SEÑAL ZONA — IMMERSIVE ROULETTE 🗺\n\n"
+                f"🎯 Apostar: <b>{bet}</b>\n"
+                f"📊 Probabilidad: {prob:.0%}\n"
+                f"🔢 Secuencia: {seq}\n"
+                f"📈 {pred.get('components','')}",
+                markup=immersive_keyboard()
+            )
+            if msg_id: self.zone_signal_msg_id=msg_id
+            self.learner.register_signal(
+                strategy=STRAT_ZONE,pair=(0,0),missing=0,prob=prob,
+                pf_prob=pred.get("p1_trans",0),phf_prob=pred.get("p3_global",0) or 0,
+                ema_trend="neutral",last_number=number,
+                dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
+            )
+            logger.info(f"[ZONA] 🗺 Señal: {bet} ({prob:.0%}) | seq={seq}")
 
-# ─── WS & MAIN LOGIC ─────────────────────────────────────────────────────────
-async def ws_reader(ws_key: int, engine: RouletteEngine, session_mgr: SessionManager):
-    reconnect_delay = 5
-    initial_loaded = False
-    seen_ids: set = set()
-    seen_ids_queue: deque = deque(maxlen=200)
+    def _reset_zone_signal(self):
+        self.zone_signal_active=False; self.zone_signal_bet=""
+        self.zone_signal_pid=""; self.zone_signal_prob=0.0
+        self.zone_signal_msg_id=None; self.zone_signal_sequence=[]
 
-    def is_new_id(gid: str) -> bool:
-        if not gid or gid in seen_ids:
-            return False
-        if len(seen_ids_queue) == seen_ids_queue.maxlen:
-            seen_ids.discard(seen_ids_queue[0])
-        seen_ids.add(gid)
-        seen_ids_queue.append(gid)
-        return True
+    # ── Loop principal ────────────────────────────────────────────────────────
+    def process_batch(self, batch):
+        new_spins=[]
+        for spin in reversed(batch):
+            gid=spin.get("game_id")
+            if not gid or gid in self.processed_game_ids: continue
+            new_spins.append(spin)
+        if not new_spins: return
+        for spin in new_spins:
+            gid=spin["game_id"]; number=spin["number"]
+            self.processed_game_ids.add(gid)
+            if 0<=number<=36:
+                try: self._process_inner(number)
+                except Exception as e:
+                    logger.error(f"Error procesando spin: {e}",exc_info=True)
+                    self._reset_dozen_signal()
+        if len(self.processed_game_ids)>self.MAX_PROCESSED_IDS:
+            for gid in list(self.processed_game_ids)[:150]:
+                self.processed_game_ids.discard(gid)
 
-    while True:
-        try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=40, close_timeout=10) as ws:
-                await ws.send(json.dumps({"type": "subscribe", "key": ws_key, "casinoId": CASINO_ID}))
-                logger.info(f"[WS-{ws_key}] ✅ Conectado")
-                reconnect_delay = 5
+    def _process_inner(self, number:int):
+        d=get_dozen(number)
+        logger.info(f"[ImmersiveDC] 🎰 #{len(self.spin_history)+1}: "
+                    f"{number} D{d} {get_color(number)}/{get_zone(number)}")
+        self._update_state(number)
 
-                async def poll_1s():
-                    while True:
-                        await asyncio.sleep(1)
-                        try:
-                            await ws.send(json.dumps({"type": "subscribe", "key": ws_key, "casinoId": CASINO_ID}))
-                        except Exception:
-                            break
+        if not self.warmup_done:
+            self.ws_count+=1
+            if self.ws_count<WARMUP_SPINS: return
+            self.warmup_done=True
+            tg_send(
+                "🟢 <b>Immersive Roulette DC v32</b> — Sistema listo.\n"
+                "🎡 Señales: 🅐🅑🅒 Docenas · 🎨 Color · 🗺 Zona\n"
+                "🧠 Aprendizaje adaptativo activo"
+            )
 
-                poll_task = asyncio.create_task(poll_1s())
+        # Color y Zona independientes de Docenas
+        self._check_color_signal(number)
+        self._check_zone_signal(number)
+
+        # Docenas
+        if self.signal_active:
+            self._resolve_dozen_signal(number)
+        else:
+            sig=self._select_best_signal()
+            if sig: self._activate_dozen_signal(sig)
+
+    async def poll_loop(self):
+        url=f"{STATS_URL}/latest/{TARGET_ROULETTE}"
+        logger.info(f"[ImmersiveDC] 🔄 Polling cada {POLL_INTERVAL}s → {url}")
+        async with aiohttp.ClientSession() as session:
+            while True:
                 try:
-                    async for raw in ws:
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-                        if not isinstance(data, dict):
-                            continue
+                    async with session.get(url,timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                        if resp.status==200:
+                            data=await resp.json()
+                            self.sc.update(data)
+                            last_20=data.get("last_20",[])
+                            if isinstance(last_20,list) and last_20 and isinstance(last_20[0],dict):
+                                self.process_batch(last_20)
+                        else:
+                            self.sc.connected=False
+                except Exception as e:
+                    self.sc.connected=False
+                    logger.debug(f"Poll error: {e}")
+                await asyncio.sleep(POLL_INTERVAL)
 
-                        results = data.get("last20Results")
-                        if results and isinstance(results, list):
-                            if not initial_loaded:
-                                initial_loaded = True
-                                for item in reversed(results):
-                                    gid_init = str(item.get("gameId", ""))
-                                    if gid_init:
-                                        if len(seen_ids_queue) == seen_ids_queue.maxlen:
-                                            seen_ids.discard(seen_ids_queue[0])
-                                        seen_ids.add(gid_init)
-                                        seen_ids_queue.append(gid_init)
-                                    try:
-                                        n = int(item.get("result", ""))
-                                    except Exception:
-                                        continue
-                                    if 0 <= n <= 36:
-                                        engine._update_state(n, persist=False, train_model=True)
-                                engine._train_models()
-                                engine.initialize_sequences_from_history()
-                                if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
-                                    engine.warmup_done = True
-                                    engine.ws_count = len(engine.spin_history)
-                                continue
+# ─── FLASK ────────────────────────────────────────────────────────────────────
+flask_app=Flask(__name__)
+engine: Optional[ImmersiveRouletteEngine]=None
 
-                            latest = results[0]
-                            gid = str(latest.get("gameId", ""))
-                            if not is_new_id(gid):
-                                continue
-                            try:
-                                n = int(latest.get("result", ""))
-                            except Exception:
-                                continue
-                            if 0 <= n <= 36:
-                                engine.process_spin(n, session_mgr.session_active)
-                            continue
+@flask_app.route("/")
+def home():
+    return jsonify({"status":"ok","bot":"Immersive Roulette DC v32"})
 
-                        fallback_gid = str(data.get("gameId", "")).strip()
-                        if not fallback_gid:
-                            for key in ("result", "number", "outcome", "winningNumber"):
-                                if key in data:
-                                    fallback_gid = f"{ws_key}_{data[key]}_{int(time.time())}"
-                                    break
-                        if not fallback_gid or not is_new_id(fallback_gid):
-                            continue
-                        for key in ("result", "number", "outcome", "winningNumber"):
-                            if key in data:
-                                try:
-                                    n = int(data[key])
-                                    if 0 <= n <= 36:
-                                        engine.process_spin(n, session_mgr.session_active)
-                                except Exception:
-                                    pass
-                                break
+@flask_app.route("/ping")
+def ping():
+    return jsonify({"status":"pong","ts":time.time()})
 
-                finally:
-                    poll_task.cancel()
-                    try:
-                        await poll_task
-                    except asyncio.CancelledError:
-                        pass
+@flask_app.route("/health")
+def health():
+    if not engine: return jsonify({"status":"not_ready"}),503
+    art_now=datetime.now(ART).strftime("%Y-%m-%d %H:%M ART")
+    recent=engine.learner._recent()
+    wins_r=sum(1 for s in recent if s["result"]=="WIN")
+    return jsonify({
+        "warmup":          engine.warmup_done,
+        "spins":           len(engine.spin_history),
+        "stats_connected": engine.sc.connected,
+        "polls":           engine.sc.poll_count,
+        "dozen_signal":    engine.signal_active,
+        "color_signal":    engine.color_signal_active,
+        "zone_signal":     engine.zone_signal_active,
+        "scoreboard":      scoreboard.get_text().replace("<b>","").replace("</b>",""),
+        "art_time":        art_now,
+        "learner_signals": len(engine.learner.history),
+        "learner_wr":      f"{wins_r/len(recent)*100:.1f}%" if recent else "—",
+    })
 
-        except Exception as e:
-            logger.warning(f"[WS-{ws_key}] Desconectado: {e}")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+# ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
+@bot.message_handler(commands=["start","help"])
+def cmd_start(m):
+    bot.reply_to(m,
+        "<b>🎡 Immersive Roulette DC v32</b>\n\n"
+        "Señales sin gestión de apuesta\n"
+        "🅐 E1: PF+PHF+ML · 🅑 E2: PHTML+EMA · 🅒 E3: Retorno\n"
+        "🎨 Color (Negro/Rojo) · 🗺 Zona (Bajo/Alto)\n\n"
+        "Marcador diario → reset 00:00 ART\n\n"
+        "/status /marcador /aprendizaje /debug /reset",
+        parse_mode="HTML")
 
+@bot.message_handler(commands=["marcador","score"])
+def cmd_marcador(m):
+    bot.reply_to(m, scoreboard.get_text(), parse_mode="HTML")
 
-# ─── WS SERVER PARA HTML EXTERNO (aiohttp — mismo puerto que HTTP) ────────────
-async def ws_client_handler(request):
-    """
-    Maneja conexiones WebSocket entrantes desde el HTML externo.
-    Accesible en: wss://azureroulette.onrender.com/ws
-    """
-    ws = web.WebSocketResponse(heartbeat=30)
-    await ws.prepare(request)
+@bot.message_handler(commands=["status"])
+def cmd_status(m):
+    if not engine: bot.reply_to(m,"❌ Engine no inicializado",parse_mode="HTML"); return
+    _strat={STRAT_E1:"🅐E1",STRAT_E2:"🅑E2",STRAT_E3:"🅒E3"}
+    if engine.signal_active:
+        lbl=_strat.get(engine.active_strategy,"—")
+        pair=f"D{engine.active_pair[0]}+D{engine.active_pair[1]}" if engine.active_pair else "—"
+        d_st=f"🟢 {lbl} | {pair}"
+    else: d_st="⚪ Idle"
+    c_st=(f"🟡 {engine.color_signal_bet} ({engine.color_signal_prob:.0%})"
+          if engine.color_signal_active else "⚪")
+    z_st=(f"🟡 {engine.zone_signal_bet} ({engine.zone_signal_prob:.0%})"
+          if engine.zone_signal_active else "⚪")
+    conn="🟢 OK" if engine.sc.connected else "🔴 Desc."
+    ago=time.time()-engine.sc.last_poll_ok if engine.sc.last_poll_ok>0 else 0
+    art_now=datetime.now(ART).strftime("%H:%M ART")
+    bot.reply_to(m,
+        f"<b>🎡 Immersive Roulette DC v32</b>\n"
+        f"<b>Docenas:</b> {d_st}\n"
+        f"<b>Color:</b> {c_st}\n"
+        f"<b>Zona:</b> {z_st}\n"
+        f"<b>Giros:</b> {len(engine.spin_history)}\n"
+        f"<b>Servidor:</b> {conn} ({ago:.0f}s)\n"
+        f"<b>Hora:</b> {art_now}\n\n"
+        f"{scoreboard.get_text()}",
+        parse_mode="HTML")
 
-    q = asyncio.Queue()
-    _ws_clients.add(q)
-    logger.info(f"[WSClient] ✅ Cliente conectado: {request.remote}")
+@bot.message_handler(commands=["debug"])
+def cmd_debug(m):
+    if not engine or not engine.warmup_done:
+        bot.reply_to(m,"⏳ Calentando...",parse_mode="HTML"); return
+    last_num=engine.spin_history[-1]["number"] if engine.spin_history else None
+    trend=ema_trend_str(engine.doc_levels)
+    e1,e2,e3=engine._detect_e1(),engine._detect_e2(),engine._detect_e3()
+    def st(s): return f"✅ D{s['pair']} ({s['prob']:.0%})" if s else "—"
+    cp=engine.sc.predict_color_signal(last_num) if last_num else None
+    zp=engine.sc.predict_zone_signal(last_num)  if last_num else None
+    cp_txt=(f"✅ {cp['bet']} ({cp['prob']:.0%}) {cp.get('components','')}" if cp else "—")
+    zp_txt=(f"✅ {zp['bet']} ({zp['prob']:.0%}) {zp.get('components','')}" if zp else "—")
+    bot.reply_to(m,
+        f"<b>🔬 Debug #{last_num} | EMA {trend.upper()}</b>\n\n"
+        f"🅐 E1: {st(e1)}\n🅑 E2: {st(e2)}\n🅒 E3: {st(e3)}\n\n"
+        f"🎨 Color: {cp_txt}\n🗺 Zona:  {zp_txt}\n\n"
+        f"Colores últimos 5: {engine.color_seq[-5:]}\n"
+        f"Zonas últimas 5:  {engine.zone_seq[-5:]}\n"
+        f"Docenas últimas 5:{engine.dozen_seq[-5:]}",
+        parse_mode="HTML")
 
+@bot.message_handler(commands=["aprendizaje"])
+def cmd_aprendizaje(m):
+    if not engine: bot.reply_to(m,"❌ Engine no inicializado",parse_mode="HTML"); return
+    bot.reply_to(m,engine.learner.get_summary(30),parse_mode="HTML")
+
+@bot.message_handler(commands=["reset"])
+def cmd_reset(m):
+    if engine:
+        engine.processed_game_ids.clear()
+        engine._reset_dozen_signal()
+        engine._reset_color_signal()
+        engine._reset_zone_signal()
+    bot.reply_to(m,
+        "🔄 <b>Señales reseteadas</b>\n"
+        "<i>🧠 Aprendizaje conservado</i>",
+        parse_mode="HTML")
+
+@bot.message_handler(commands=["reset_marcador"])
+def cmd_reset_marcador(m):
+    scoreboard.wins=0; scoreboard.losses=0
+    scoreboard._current_day=scoreboard._art_day()
+    bot.reply_to(m,"🔄 <b>Marcador diario reseteado.</b>",parse_mode="HTML")
+
+@bot.message_handler(commands=["reset_learning"])
+def cmd_reset_learning(m):
+    if not engine: bot.reply_to(m,"❌ Engine no inicializado",parse_mode="HTML"); return
     try:
-        if engines_global:
-            e = engines_global[0]
-            state = {
-                "type": "init",
-                "bankroll": GLOBAL_STATS.global_chips,
-                "session_active": session_mgr_global.session_active if session_mgr_global else False,
-                "signal_mode": e.signal_mode,
-                "martingala_bet": e.martingala.get_bet(), "martingala_mult": e.martingala.multiplier, "martingala_seq": list(e.martingala.sequence),
-                "history": e.spin_history[-100:],
-                "charts": e.get_chart_data()
-            }
-            await ws.send_str(json.dumps(state))
-
-        # Enviar mensajes de la cola al cliente; leer mensajes entrantes (ping/pong)
-        async def sender():
-            while not ws.closed:
-                try:
-                    data = await asyncio.wait_for(q.get(), timeout=1.0)
-                    await ws.send_str(json.dumps(data))
-                except asyncio.TimeoutError:
-                    continue
-                except Exception:
-                    break
-
-        sender_task = asyncio.create_task(sender())
-        async for msg in ws:
-            if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
-                break
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    cmd = json.loads(msg.data)
-                    if cmd.get("type") == "set_signal_mode":
-                        # Sistema siempre en modo moderado — ignorar cambios
-                        queue_broadcast({"type": "signal_mode", "mode": "moderado"})
-                except Exception:
-                    pass
-        sender_task.cancel()
-
+        engine._db.execute("DELETE FROM signal_log"); engine._db.commit()
+        engine.learner.history.clear(); engine.learner.pending_id=None
+        bot.reply_to(m,"🗑️ <b>Historial de aprendizaje borrado.</b>",parse_mode="HTML")
     except Exception as e:
-        logger.warning(f"[WSClient] Desconectado: {e}")
-    finally:
-        _ws_clients.discard(q)
-        logger.info(f"[WSClient] ❌ Cliente desconectado: {request.remote}")
+        bot.reply_to(m,f"❌ Error: {e}",parse_mode="HTML")
 
-    return ws
-
-
-# ─── HTTP ROUTES ──────────────────────────────────────────────────────────────
-engines_global: list = []
-session_mgr_global: Optional[SessionManager] = None
-SESSION_MANAGER_REF: Optional[SessionManager] = None
-
-
-async def route_home(request):
-    return web.json_response({"status": "ok"})
-
-
-async def route_ping(request):
-    return web.json_response({"status": "pong", "ts": time.time()})
-
-
-async def route_health(request):
-    if not engines_global:
-        return web.json_response({"status": "initializing"})
-    e = engines_global[0]
-    sa = "Active" if session_mgr_global and session_mgr_global.session_active else "Inactive"
-    return web.json_response({"bankroll": GLOBAL_STATS.global_chips, "session": sa})
-
-
-async def _aiohttp_server():
-    """Servidor HTTP + WebSocket unificado en el puerto PORT de Render."""
-    PORT = int(os.environ.get("PORT", 10000))
-    app_http = web.Application()
-    app_http.router.add_get("/", route_home)
-    app_http.router.add_get("/ping", route_ping)
-    app_http.router.add_get("/health", route_health)
-    app_http.router.add_get("/ws", ws_client_handler)   # ← punto de conexión WS
-
-    runner = web.AppRunner(app_http)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"[Server] 🌐 HTTP+WebSocket escuchando en puerto {PORT}  →  /ws")
-    await asyncio.Future()   # mantener vivo
-
-
+# ─── SELF PING ────────────────────────────────────────────────────────────────
 async def self_ping_loop():
-    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if not url:
-        return
+    url=os.environ.get("RENDER_EXTERNAL_URL","").rstrip("/")
+    if not url or "localhost" in url: return
     await asyncio.sleep(30)
     while True:
         try:
-            urllib.request.urlopen(f"{url}/ping", timeout=15)
-        except Exception:
-            pass
+            import urllib.request as _ur
+            _ur.urlopen(f"{url}/ping",timeout=15)
+        except: pass
         await asyncio.sleep(240)
 
+def run_flask():
+    flask_app.run(host="0.0.0.0",port=10005,debug=False,use_reloader=False)
 
-async def daily_stats_loop():
-    while True:
-        now_utc = datetime.utcnow()
-        now_arg = now_utc + timedelta(hours=-3)
-        target = now_arg.replace(hour=12, minute=0, second=0, microsecond=0)
-        if now_arg >= target:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now_arg).total_seconds())
-        tg_send_stats(GLOBAL_STATS.get_stats_text())
-
-
-# ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
-@bot.message_handler(commands=['start', 'help'])
-def cmd_start(m):
-    bot.reply_to(m, "<b>🎰 AUTO ROULETTE</b>\nSesión ilimitada hasta +$0.80 USD\nMartingala ×2 — Mínimo 1 ficha\n/status /stats /reset", parse_mode="HTML")
-
-
-@bot.message_handler(commands=['status'])
-def cmd_status(m):
-    if not engines_global:
-        return
-    e = engines_global[0]
-    sa = "🟢 Activa" if session_mgr_global and session_mgr_global.session_active else "⚪ Inactiva"
-    bot.reply_to(m, f"<b>Sesión:</b> {sa}\n<b>Bankroll:</b> 🪙 {fmt_currency_amount(GLOBAL_STATS.global_chips, 'USD')}\n<b>Martingala apuesta:</b> {fmt_currency_amount(e.martingala.get_bet(), 'USD')}", parse_mode="HTML")
-
-
-@bot.message_handler(commands=['stats'])
-def cmd_stats(m):
-    tg_send_stats(GLOBAL_STATS.get_stats_text())
-
-
-@bot.message_handler(commands=['modo'])
-def cmd_modo(m):
-    bot.reply_to(m, "ℹ️ Sistema fijo en modo <b>MODERADO</b> para todas las categorías.", parse_mode="HTML")
-def cmd_reset(m):
-    global GLOBAL_STATS
-    GLOBAL_STATS = GlobalStats()
-    for e in engines_global:
-        e.martingala.reset()
-        e._end_cycle()
-    if session_mgr_global:
-        session_mgr_global._end_session_legacy()
-    bot.reply_to(m, "🔄 <b>Resetado</b>", parse_mode="HTML")
-
-
-def run_bot():
-    bot.remove_webhook()
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=1, timeout=30)
-        except Exception as e:
-            if "409" in str(e):
-                logger.warning("⚠️ Conflicto 409: Otra instancia del bot está corriendo. Reintentando en 15s...")
-                time.sleep(15)
-            else:
-                logger.error(f"Error en bot.polling: {e}")
-                time.sleep(5)
-
-
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
-    global engines_global, session_mgr_global, SESSION_MANAGER_REF
-    engines_global = [RouletteEngine(r["key"], r["name"]) for r in ROULETTES]
-    session_mgr_global = SessionManager(engines_global)
-    SESSION_MANAGER_REF = session_mgr_global
-    threading.Thread(target=run_bot, daemon=True).start()
-    await asyncio.sleep(5)
-    tasks = [
-        asyncio.create_task(session_mgr_global.session_watchdog()),
-        asyncio.create_task(daily_stats_loop()),
+    global engine
+    sc=StatsClient(); engine=ImmersiveRouletteEngine(sc)
+    threading.Thread(
+        target=lambda: bot.polling(none_stop=True,interval=1,timeout=30),
+        daemon=True
+    ).start()
+    logger.info(
+        f"[ImmersiveDC] 🎡 Immersive Roulette DC v32 — "
+        f"HTTP Polling {POLL_INTERVAL}s | Señales sin apuesta | "
+        f"Marcador diario ART | 🧠 Learner ({len(engine.learner.history)} señales)"
+    )
+    await asyncio.gather(
+        asyncio.create_task(engine.poll_loop()),
         asyncio.create_task(self_ping_loop()),
-        asyncio.create_task(_aiohttp_server()),        # HTTP + WS en el mismo puerto
-    ]
-    for i, r in enumerate(ROULETTES):
-        tasks.append(asyncio.create_task(ws_reader(r["key"], engines_global[i], session_mgr_global)))
-    logger.info("[Main] 🎰 Bot Unificado iniciado")
-    await asyncio.gather(*tasks)
+    )
 
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+if __name__=="__main__":
+    threading.Thread(target=run_flask,daemon=True).start()
+    try: asyncio.run(main())
+    except KeyboardInterrupt: logger.info("Bot detenido.")
