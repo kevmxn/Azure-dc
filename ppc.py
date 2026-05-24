@@ -49,7 +49,7 @@ for _ln in ["werkzeug", "flask.app", "flask", "urllib3"]:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
 # ─── CREDENCIALES ─────────────────────────────────────────────────────────────
-TOKEN   = "8932208184:AAHj_7XYSQQmZZQWrk6LJtJj4CkwuCxrNLI"
+TOKEN   = "8657427877:AAG9E5JozV40mm3IQoREIHvTnBFEFPgRSQo"
 CHAT_ID = -1003610988961
 
 # ─── URL RULETA ───────────────────────────────────────────────────────────────
