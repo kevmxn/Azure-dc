@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Immersive Roulette Bot — DC v33
@@ -35,7 +34,7 @@ from sklearn.linear_model import SGDClassifier
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiohttp
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -1696,69 +1695,43 @@ async def self_ping_loop():
 def run_flask():
     flask_app.run(host="0.0.0.0",port=10005,debug=False,use_reloader=False)
 
-def run_telegram():
-    """
-    Inicia el polling de Telegram con manejo robusto de conflictos.
+# ─── WEBHOOK ──────────────────────────────────────────────────────────────────
+@flask_app.route("/tgwebhook", methods=["POST"])
+def tg_webhook():
+    """Recibe updates de Telegram via webhook (sin polling, sin 409)."""
+    try:
+        json_string = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+    except Exception as e:
+        logger.error(f"❌ Error procesando webhook update: {e}")
+    return "", 200
 
-    CLAVE: usa none_stop=False para que nuestro except capture el 409.
-    Con none_stop=True telebot lo captura internamente y nunca llega aqui,
-    por eso el bot seguia reintentando cada 6s sin backoff.
-
-    Backoff exponencial en 409: 15s -> 30s -> 60s -> 120s max.
-    """
-    # Limpiar webhook/sesion anterior (hasta 3 intentos)
+def setup_webhook():
+    """Registra el webhook en Telegram al arrancar."""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not render_url:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL no definida — webhook no registrado")
+        return
+    webhook_url = f"{render_url}/tgwebhook"
     for attempt in range(3):
         try:
-            bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Webhook eliminado / sesiones anteriores limpiadas")
-            break
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+            logger.info(f"✅ Webhook registrado: {webhook_url}")
+            return
         except Exception as e:
-            logger.warning(f"⚠️ delete_webhook intento {attempt+1}: {e}")
+            logger.warning(f"⚠️ setup_webhook intento {attempt+1}: {e}")
             time.sleep(3)
-
-    time.sleep(45)  # Espera a que Render termine la instancia anterior (~30-60s)
-
-    delay = 15  # backoff inicial
-    while True:
-        try:
-            # none_stop=False: las excepciones llegan a nuestro except
-            bot.polling(none_stop=False, interval=1, timeout=30)
-            delay = 15  # reset backoff si salio limpio
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.error_code == 409:
-                logger.warning(
-                    f"⚠️ 409 Conflict: otra instancia activa. "
-                    f"Esperando {delay}s... "
-                    f"(verificar en Render que solo haya UN servicio activo)"
-                )
-                try:
-                    bot.stop_polling()
-                except Exception:
-                    pass
-                time.sleep(delay)
-                delay = min(delay * 2, 120)  # 15->30->60->120s
-            elif e.error_code == 429:
-                try:
-                    wait = int("".join(filter(str.isdigit, str(e)))) + 2
-                except Exception:
-                    wait = 30
-                logger.warning(f"⏳ Rate limit 429. Esperando {wait}s...")
-                time.sleep(wait)
-            else:
-                logger.error(f"❌ Error API Telegram ({e.error_code}): {e}")
-                time.sleep(5)
-        except Exception as e:
-            logger.error(f"❌ Error inesperado en polling: {e}")
-            time.sleep(5)
+    logger.error("❌ No se pudo registrar el webhook tras 3 intentos")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     global engine
     sc=StatsClient(); engine=ImmersiveRouletteEngine(sc)
-    threading.Thread(
-        target=run_telegram,
-        daemon=True
-    ).start()
+    # Webhook en vez de polling → elimina el error 409 definitivamente
+    setup_webhook()
     logger.info(
         f"[ImmersiveDC] 🎡 Immersive Roulette DC v33 — "
         f"HTTP Polling {POLL_INTERVAL}s | Señales sin apuesta | "
@@ -1773,4 +1746,7 @@ async def main():
 if __name__=="__main__":
     threading.Thread(target=run_flask,daemon=True).start()
     try: asyncio.run(main())
-    except KeyboardInterrupt: logger.info("Bot detenido.")
+    except KeyboardInterrupt:
+        logger.info("Bot detenido.")
+        try: bot.remove_webhook()
+        except: pass
