@@ -88,8 +88,8 @@ WARMUP_SPINS    = 25
 MIN_PROB        = 0.78
 TRAIN_INTERVAL  = 100
 
-PHTML_W         = 0.80
-PH_W_COMBINE    = 0.20
+PHTML_W         = 0.00
+PH_W_COMBINE    = 1.00
 PF_W_NORM       = 0.70;  PH_W_NORM  = 0.30
 BASE_W_NORM     = 0.55;  ML_W_NORM  = 0.45
 
