@@ -1322,8 +1322,7 @@ class ImmersiveRouletteEngine:
         if won:
             op_txt = "1° OP" if self.active_intento == 1 else "2° OP"
             tg_send(
-                f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
-                markup=immersive_keyboard()
+                f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
             )
             scoreboard.record_win()
             self.learner.resolve("WIN",f"WIN D{d} | par correcto {p} | intento {self.active_intento}")
@@ -1345,8 +1344,7 @@ class ImmersiveRouletteEngine:
             else:
                 # Segundo fallo → LOSS definitivo
                 tg_send(
-                    f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
-                    markup=immersive_keyboard()
+                    f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                 )
                 scoreboard.record_loss()
                 self.learner.resolve("LOSS",f"LOSS D{d} cayó | faltaba D{self.active_missing} | intento {self.active_intento}")
@@ -1392,8 +1390,7 @@ class ImmersiveRouletteEngine:
             if won:
                 op_txt = "1° OP" if sig["intento"] == 1 else "2° OP"
                 tg_send(
-                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
-                    markup=immersive_keyboard()
+                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
                 )
                 scoreboard.record_win()
                 self.learner.resolve("WIN", f"COLOR WIN #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
@@ -1413,8 +1410,7 @@ class ImmersiveRouletteEngine:
                     logger.info(f"[COLOR] 🔁 {pid} intento 1 fallido #{number} → intento 2")
                 else:
                     tg_send(
-                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
-                        markup=immersive_keyboard()
+                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                     )
                     scoreboard.record_loss()
                     self.learner.resolve("LOSS", f"COLOR LOSS #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
@@ -1424,12 +1420,14 @@ class ImmersiveRouletteEngine:
         for pid in pids_done:
             self.color_signals.pop(pid, None)
 
-        # ── Activar nuevas señales (todos los patrones que califiquen) ─────────
+        # ── Activar nueva señal solo si no hay ninguna pendiente ──────────────
+        if self.color_signals:
+            return  # señal de color activa → esperar a que se resuelva
         preds = self.sc.predict_color_signals(number)
         for pred in preds:
             pid  = pred["pid"]
             prob = pred["prob"]
-            if pid in self.color_signals or prob < MIN_PROB_COLOR_ZONE:
+            if prob < MIN_PROB_COLOR_ZONE:
                 continue
             bet = pred["bet"]
             seq = pred.get("sequence", [])
@@ -1486,8 +1484,7 @@ class ImmersiveRouletteEngine:
             if won:
                 op_txt = "1° OP" if sig["intento"] == 1 else "2° OP"
                 tg_send(
-                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
-                    markup=immersive_keyboard()
+                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
                 )
                 scoreboard.record_win()
                 self.learner.resolve("WIN", f"ZONA WIN #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
@@ -1507,8 +1504,7 @@ class ImmersiveRouletteEngine:
                     logger.info(f"[ZONA] 🔁 {pid} intento 1 fallido #{number} → intento 2")
                 else:
                     tg_send(
-                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
-                        markup=immersive_keyboard()
+                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                     )
                     scoreboard.record_loss()
                     self.learner.resolve("LOSS", f"ZONA LOSS #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
@@ -1518,12 +1514,14 @@ class ImmersiveRouletteEngine:
         for pid in pids_done:
             self.zone_signals.pop(pid, None)
 
-        # ── Activar nuevas señales (todos los patrones que califiquen) ─────────
+        # ── Activar nueva señal solo si no hay ninguna pendiente ──────────────
+        if self.zone_signals:
+            return  # señal de zona activa → esperar a que se resuelva
         preds = self.sc.predict_zone_signals(number)
         for pred in preds:
             pid  = pred["pid"]
             prob = pred["prob"]
-            if pid in self.zone_signals or prob < MIN_PROB_COLOR_ZONE:
+            if prob < MIN_PROB_COLOR_ZONE:
                 continue
             bet = pred["bet"]
             seq = pred.get("sequence", [])
@@ -1558,8 +1556,7 @@ class ImmersiveRouletteEngine:
             if won:
                 op_txt = "1° OP" if self.column_intento == 1 else "2° OP"
                 tg_send(
-                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}",
-                    markup=immersive_keyboard()
+                    f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
                 )
                 scoreboard.record_win()
                 self.learner.resolve("WIN", f"COL WIN #{number} C{col} | par={pair} | intento {self.column_intento}")
@@ -1580,8 +1577,7 @@ class ImmersiveRouletteEngine:
                     logger.info(f"[COL] 🔁 Intento 1 fallido #{number} | señal re-enviada intento 2")
                 else:
                     tg_send(
-                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP",
-                        markup=immersive_keyboard()
+                        f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                     )
                     scoreboard.record_loss()
                     self.learner.resolve(
@@ -1691,19 +1687,48 @@ class ImmersiveRouletteEngine:
                 "🧠 Aprendizaje adaptativo + tracking aciertos/fallos activo"
             )
 
-        # Color y Zona independientes de Docenas
+        # Color y Zona: independientes de Docenas/Columna
         self._check_color_signal(number)
         self._check_zone_signal(number)
 
-        # Columna (patrón de secuencia 2C en últimos 5)
-        self._check_column_signal(number)
-
-        # Docenas
+        # ── Docenas + Columna (mutuamente exclusivas) ─────────────────────────
+        # Regla 1: si hay señal activa, no enviar nueva hasta que se resuelva.
+        # Regla 2: si en el mismo giro hay señal de ambas, enviar la de mayor prob.
         if self.signal_active:
+            # Señal de docenas pendiente → resolver; no activar columna
             self._resolve_dozen_signal(number)
+        elif self.column_signal_active:
+            # Señal de columna pendiente → resolver; no activar docenas
+            self._check_column_signal(number)
         else:
-            sig=self._select_best_signal()
-            if sig: self._activate_dozen_signal(sig)
+            # Ninguna señal activa → detectar ambas y enviar la de mayor prob
+            dozen_sig = self._select_best_signal()
+            last_num  = self.spin_history[-1]["number"] if self.spin_history else 0
+            col_sig   = (
+                self._detect_col_signal(last_num)
+                if self.warmup_done and last_num != 0
+                else None
+            )
+            col_valid = col_sig is not None and col_sig["prob"] >= COL_SEQ_MIN_PROB
+
+            if dozen_sig and col_valid:
+                # Ambas califican → enviar solo la de mayor probabilidad
+                if dozen_sig["prob"] >= col_sig["prob"]:
+                    logger.info(
+                        f"[ENGINE] ⚖️ Docena ({dozen_sig['prob']:.0%}) ≥ "
+                        f"Columna ({col_sig['prob']:.0%}) → activando Docena"
+                    )
+                    self._activate_dozen_signal(dozen_sig)
+                else:
+                    logger.info(
+                        f"[ENGINE] ⚖️ Columna ({col_sig['prob']:.0%}) > "
+                        f"Docena ({dozen_sig['prob']:.0%}) → activando Columna"
+                    )
+                    self._activate_column_signal(col_sig)
+            elif dozen_sig:
+                self._activate_dozen_signal(dozen_sig)
+            elif col_valid:
+                self._activate_column_signal(col_sig)
 
     async def poll_loop(self):
         url=f"{STATS_URL}/latest/{TARGET_ROULETTE}"
