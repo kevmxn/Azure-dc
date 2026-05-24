@@ -53,11 +53,11 @@ TOKEN   = "8657427877:AAG9E5JozV40mm3IQoREIHvTnBFEFPgRSQo"
 CHAT_ID = -1003610988961
 
 # ─── URL RULETA ───────────────────────────────────────────────────────────────
-IMMERSIVE_URL = "https://www.casino.org/live-casino/roulette/immersive-roulette/"
+IMMERSIVE_URL = "https://1win.lat/casino/play/v_evolution:immersiveroulette"
 
 def immersive_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("👆🏻 ACCEDER a IMMERSIVE ROULETTE", url=IMMERSIVE_URL))
+    kb.add(InlineKeyboardButton("🎡 IMMERSIVE ROULETTE", url=IMMERSIVE_URL))
     return kb
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -1447,7 +1447,7 @@ class ImmersiveRouletteEngine:
                 ema_trend="neutral", last_number=number,
                 dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
             )
-            logger.info(f"[COLOR] 🎨 Señal {pid}: {bet} ({prob:.0%}) | seq={seq}")
+            logger.info(f"[COLOR] 🔴⚫ Señal {pid}: {bet} ({prob:.0%}) | seq={seq}")
 
     def _reset_color_signal(self):
         self.color_signals.clear()
@@ -1541,7 +1541,7 @@ class ImmersiveRouletteEngine:
                 ema_trend="neutral", last_number=number,
                 dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
             )
-            logger.info(f"[ZONA] 🗺 Señal {pid}: {bet} ({prob:.0%}) | seq={seq}")
+            logger.info(f"[ZONA] 🟣🔵 Señal {pid}: {bet} ({prob:.0%}) | seq={seq}")
 
     def _reset_zone_signal(self):
         self.zone_signals.clear()
@@ -1687,7 +1687,7 @@ class ImmersiveRouletteEngine:
             self.warmup_done=True
             tg_send(
                 "🟢 <b>Immersive Roulette DC v35</b> — Sistema listo.\n"
-                "🎡 Señales: 🅐🅑🅒 Docenas · 🎨 Color (P1+P3) · 🗺 Zona (P1+P3)\n"
+                "🎡 Señales: 🅐🅑🅒 Docenas · 🔴⚫ Color (P1+P3) · 🟣🔵 Zona (P1+P3)\n"
                 "🧠 Aprendizaje adaptativo + tracking aciertos/fallos activo"
             )
 
