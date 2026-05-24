@@ -172,6 +172,10 @@ def _get_db() -> sqlite3.Connection:
         zone   TEXT    NOT NULL,
         ts     INTEGER NOT NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS processed_spins (
+        game_id TEXT PRIMARY KEY,
+        ts      INTEGER NOT NULL
+    )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS signal_log (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         ts            REAL    NOT NULL,
@@ -862,6 +866,7 @@ class ImmersiveRouletteEngine:
 
         self.processed_game_ids={}          # dict ordenado: gid→True (evita duplicados)
         self.MAX_PROCESSED_IDS=300
+        self._load_processed_ids()          # sincroniza con DB (anti-duplicados multi-instancia)
 
         # Warmup
         live_loaded=self._load_live_history()
@@ -874,6 +879,19 @@ class ImmersiveRouletteEngine:
         )
 
     # ── DB local ──────────────────────────────────────────────────────────────
+    def _load_processed_ids(self):
+        """Carga game_ids procesados en la última hora desde SQLite (evita duplicados entre instancias)."""
+        try:
+            cutoff = int(time.time()) - 3600
+            rows = self._db.execute(
+                "SELECT game_id FROM processed_spins WHERE ts > ?", (cutoff,)
+            ).fetchall()
+            for row in rows:
+                self.processed_game_ids[row[0]] = True
+            logger.info(f"[ImmersiveDC] 🔒 {len(rows)} game_ids cargados desde DB (anti-dup)")
+        except Exception as e:
+            logger.warning(f"[ImmersiveDC] ⚠️ Error cargando processed_ids: {e}")
+
     def _load_live_history(self) -> int:
         try:
             rows=self._db.execute(
@@ -1659,6 +1677,18 @@ class ImmersiveRouletteEngine:
         if not new_spins: return
         for spin in new_spins:
             gid=spin["game_id"]; number=spin["number"]
+            # Doble-chequeo en DB: si otra instancia ya procesó este gid, saltear
+            try:
+                inserted = self._db.execute(
+                    "INSERT OR IGNORE INTO processed_spins (game_id, ts) VALUES (?, ?)",
+                    (gid, int(time.time()))
+                ).rowcount
+                self._db.commit()
+                if inserted == 0:
+                    logger.info(f"[ImmersiveDC] 🔒 gid={gid} ya procesado por otra instancia — saltando")
+                    continue
+            except Exception as e:
+                logger.warning(f"[ImmersiveDC] ⚠️ Error persistiendo gid {gid}: {e}")
             self.processed_game_ids[gid] = True
             if 0<=number<=36:
                 try: self._process_inner(number)
