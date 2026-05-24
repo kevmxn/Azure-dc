@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Immersive Roulette Bot — DC v33
@@ -88,8 +89,8 @@ WARMUP_SPINS    = 25
 MIN_PROB        = 0.78
 TRAIN_INTERVAL  = 100
 
-PHTML_W         = 0.80
-PH_W_COMBINE    = 0.20
+PHTML_W         = 0.00
+PH_W_COMBINE    = 1.00
 PF_W_NORM       = 0.70;  PH_W_NORM  = 0.30
 BASE_W_NORM     = 0.55;  ML_W_NORM  = 0.45
 
@@ -1715,7 +1716,7 @@ def run_telegram():
             logger.warning(f"⚠️ delete_webhook intento {attempt+1}: {e}")
             time.sleep(3)
 
-    time.sleep(5)  # Pausa extra para que Telegram libere la sesion anterior
+    time.sleep(45)  # Espera a que Render termine la instancia anterior (~30-60s)
 
     delay = 15  # backoff inicial
     while True:
