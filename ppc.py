@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Immersive Roulette Bot — DC v33
+Immersive Roulette Bot — DC v35
 ===========================================================================
-  CAMBIOS vs v32:
+  CAMBIOS vs v33:
+  - Antiduplicados en webhook (update_id)
+  - Antiduplicados en tg_send (ventana 5s)
+  - Marcador diario centralizado (único envío por giro)
+  - Estrategia B: 3 docenas iguales consecutivas → apostar las otras dos
+  - Columna: 3 columnas iguales consecutivas → apostar las otras dos
   - Color/Zona: P2 eliminado. Se usa P1 (transición) + P3 (global).
     P1 = prob. estadística desde stats_color/stats_zone por último número.
     P3 = efectividad global del patrón (historial servidor).
@@ -18,6 +23,7 @@ Immersive Roulette Bot — DC v33
 """
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -96,15 +102,13 @@ BASE_W_NORM     = 0.55;  ML_W_NORM  = 0.45
 MIN_PROB_COLOR_ZONE = 0.62
 
 # ── Pesos para predicción Color/Zona (P1 + P3, sin P2) ──────────────────────
-# P1 = probabilidad de transición estadística (stats_color/stats_zone por número)
-# P3 = efectividad global del patrón en el historial del servidor
-P1_W_COLOR = 0.35    # Peso de P1 (transición desde last_number)
-P3_W_COLOR = 0.65    # Peso de P3 (efectividad global del patrón)
-TRANS_MIN_SAMPLES = 15  # Mínimo de muestras en stats_color/zone para usar P1
+P1_W_COLOR = 0.35
+P3_W_COLOR = 0.65
+TRANS_MIN_SAMPLES = 15
 
 # ── Ajuste por historial de señales de docenas por número ───────────────────
-DOZEN_HIST_MIN   = 5     # Mínimo de señales resueltas para usar el ajuste
-DOZEN_HIST_SCALE = 0.12  # Escala del ajuste (ej: wr=70% → adj=+0.024)
+DOZEN_HIST_MIN   = 5
+DOZEN_HIST_SCALE = 0.12
 
 # Argentina UTC-3
 ART = timezone(timedelta(hours=-3))
@@ -114,9 +118,8 @@ STRAT_E2    = 2
 STRAT_E3    = 3
 STRAT_COLOR = 4
 STRAT_ZONE  = 5
-STRAT_COL_SEQ = 6   # Columna secuencia (2 columnas en últimos 5)
+STRAT_COL_SEQ = 6   # Columna secuencia (nueva lógica: 3 columnas iguales)
 
-# Mínima prob para activar señal de columna por patrón de secuencia
 COL_SEQ_MIN_PROB = 0.78
 
 # ─── MAPAS ────────────────────────────────────────────────────────────────────
@@ -220,8 +223,22 @@ def _tg_call(fn, *a, **kw):
             delay = min(delay * 2, 60)
     return None
 
+# ─── CACHÉ ANTI-DUPLICADOS DE MENSAJES SALIENTES ──────────────────────────────
+_RECENT_MESSAGES = {}
+_DEDUP_WINDOW = 5  # segundos
+
 def tg_send(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
     if not text: return None
+    now = time.time()
+    key = hash(text)
+    # limpiar entradas viejas
+    for k in list(_RECENT_MESSAGES.keys()):
+        if now - _RECENT_MESSAGES[k] > _DEDUP_WINDOW:
+            del _RECENT_MESSAGES[k]
+    if key in _RECENT_MESSAGES:
+        logger.info(f"🚫 Mensaje duplicado bloqueado: {text[:60]}...")
+        return None
+    _RECENT_MESSAGES[key] = now
     try:
         msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
                        parse_mode="HTML", reply_markup=markup)
@@ -239,12 +256,12 @@ def tg_delete(chat_id: int, message_id: int):
     except Exception as e:
         logger.warning(f"⚠️ Error borrando mensaje: {e}")
 
+# ─── CACHÉ ANTI-DUPLICADOS WEBHOOK ────────────────────────────────────────────
+PROCESSED_UPDATE_IDS = set()
+MAX_UPDATE_IDS = 500
+
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
 class DailyScoreboard:
-    """
-    Registra aciertos y fallos de TODAS las categorías combinadas.
-    Se resetea automáticamente a las 00:00 horario Argentina (UTC-3).
-    """
     def __init__(self):
         self.wins:   int = 0
         self.losses: int = 0
@@ -252,7 +269,6 @@ class DailyScoreboard:
 
     @staticmethod
     def _art_day() -> int:
-        """Día actual en hora Argentina."""
         return datetime.now(ART).day
 
     def _check_reset(self):
@@ -288,7 +304,6 @@ class DailyScoreboard:
     def send(self):
         tg_send(self.get_text())
 
-
 scoreboard = DailyScoreboard()
 
 # ─── STATS CLIENT ─────────────────────────────────────────────────────────────
@@ -300,11 +315,10 @@ class StatsClient:
         self.stats_zone     = {}
         self.color_patterns = {}
         self.zone_patterns  = {}
-        self.dozen_signals  = {}   # pending, summary, by_number
-        self.column_signals = {}   # pending, summary, by_number
-        # Patrones de secuencia 2D / 2C (nuevo)
-        self.dozen_seq_patterns  = {}  # pending, history, by_number
-        self.column_seq_patterns = {}  # pending, history, by_number
+        self.dozen_signals  = {}
+        self.column_signals = {}
+        self.dozen_seq_patterns  = {}
+        self.column_seq_patterns = {}
         self.last_20        = []
         self.total_spins    = 0
         self.connected      = False
@@ -347,9 +361,7 @@ class StatsClient:
         missing = list({1, 2, 3} - set(pair))[0]
         return {"pair": pair, "missing": missing, "prob": sp[0][1] + sp[1][1]}
 
-    # ── Historial de señales de docenas por número ────────────────────────────
     def get_dozen_signal_winrate(self, last_number: int) -> Optional[float]:
-        """Win rate histórico de señales de docena cuando el último número fue last_number."""
         by_num = self.dozen_signals.get("by_number", {})
         stats  = by_num.get(str(last_number), {})
         total  = stats.get("total", 0)
@@ -358,7 +370,6 @@ class StatsClient:
         return stats.get("aciertos", 0) / total
 
     def get_column_signal_winrate(self, last_number: int) -> Optional[float]:
-        """Win rate histórico de señales de columna cuando el último número fue last_number."""
         by_num = self.column_signals.get("by_number", {})
         stats  = by_num.get(str(last_number), {})
         total  = stats.get("total", 0)
@@ -366,18 +377,7 @@ class StatsClient:
             return None
         return stats.get("aciertos", 0) / total
 
-    # ── Consultas a patrones de secuencia (servidor) ──────────────────────────
-
     def get_dozen_seq_top_pair(self, last_number: int) -> Optional[dict]:
-        """Par de docenas más frecuente en patrones de secuencia cuando last_number fue X.
-
-        Devuelve:
-            pair            : [d1, d2]
-            efectividad     : win rate global del número (%)
-            top_efectividad : win rate del par más frecuente (%)
-            total           : total de muestras
-        Devuelve None si hay menos de DOZEN_HIST_MIN muestras.
-        """
         by_num = self.dozen_seq_patterns.get("by_number", {})
         stats  = by_num.get(str(last_number), {})
         total  = stats.get("total", 0)
@@ -392,7 +392,6 @@ class StatsClient:
         }
 
     def get_column_seq_top_pair(self, last_number: int) -> Optional[dict]:
-        """Par de columnas más frecuente en patrones de secuencia cuando last_number fue X."""
         by_num = self.column_seq_patterns.get("by_number", {})
         stats  = by_num.get(str(last_number), {})
         total  = stats.get("total", 0)
@@ -407,7 +406,6 @@ class StatsClient:
         }
 
     def post_column_signal(self, strategy, pair, missing, prob, last_number):
-        """Registra la señal de columna activa en el servidor (tracking aciertos/fallos)."""
         try:
             resp = requests.post(
                 f"{STATS_URL}/signals/{TARGET_ROULETTE}/column",
@@ -428,7 +426,6 @@ class StatsClient:
             logger.debug(f"[SERVER] Señal columna no registrada (no crítico): {e}")
 
     def post_dozen_signal(self, strategy, pair, missing, prob, last_number):
-        """Registra la señal de docena activa en el servidor (tracking aciertos/fallos)."""
         try:
             resp = requests.post(
                 f"{STATS_URL}/signals/{TARGET_ROULETTE}/dozen",
@@ -448,19 +445,11 @@ class StatsClient:
         except Exception as e:
             logger.debug(f"[SERVER] Señal docena no registrada (no crítico): {e}")
 
-    # ── Predicción Color: todos los patrones pendientes (N5, N7, R5, R7) ────────
     def predict_color_signals(self, last_number: int) -> List[Dict]:
-        """Devuelve TODOS los patrones de color pendientes (N5, N7, R5, R7).
-
-        Soporta:
-          - 'pendings': lista de patrones (formato nuevo del servidor)
-          - 'pending':  dict con un solo patrón (formato legacy)
-        """
         raw = self.color_patterns.get("pendings")
         if raw is None:
             single = self.color_patterns.get("pending")
             raw = [single] if single else []
-
         summary = self.color_patterns.get("summary", {})
         results = []
         for pending in raw:
@@ -469,12 +458,10 @@ class StatsClient:
             pid      = pending.get("pid", "")
             bet      = pending.get("bet", "")
             sequence = pending.get("sequence", [])
-
             p3 = self._global_eff(summary, pid)
             if p3 is None:
                 logger.info(f"[COLOR] {pid} sin datos globales — omitido")
                 continue
-
             p1 = None
             if last_number is not None and last_number != 0:
                 color_trans = self.stats_color.get(str(last_number), {})
@@ -483,7 +470,6 @@ class StatsClient:
                         p1 = color_trans.get("N", 0) / 100.0
                     elif bet == "Rojo":
                         p1 = color_trans.get("R", 0) / 100.0
-
             if p1 is not None:
                 prob       = round(P1_W_COLOR * p1 + P3_W_COLOR * p3, 4)
                 components = f"Trans={p1:.0%} | Global={p3:.0%}"
@@ -492,7 +478,6 @@ class StatsClient:
                 prob       = p3
                 components = f"Global={p3:.0%}"
                 logger.info(f"[COLOR] {pid} bet={bet} P3={p3:.0%} (sin P1)")
-
             results.append({
                 "type": "color", "pid": pid, "bet": bet, "prob": prob,
                 "p1_trans": p1 or 0, "p3_global": p3,
@@ -500,24 +485,15 @@ class StatsClient:
             })
         return results
 
-    # Alias legacy usado en /debug (retorna primer patrón disponible)
     def predict_color_signal(self, last_number: int) -> Optional[Dict]:
         results = self.predict_color_signals(last_number)
         return results[0] if results else None
 
-    # ── Predicción Zona: todos los patrones pendientes (B5, B7, A5, A7) ─────────
     def predict_zone_signals(self, last_number: int) -> List[Dict]:
-        """Devuelve TODOS los patrones de zona pendientes (B5, B7, A5, A7).
-
-        Soporta:
-          - 'pendings': lista de patrones (formato nuevo del servidor)
-          - 'pending':  dict con un solo patrón (formato legacy)
-        """
         raw = self.zone_patterns.get("pendings")
         if raw is None:
             single = self.zone_patterns.get("pending")
             raw = [single] if single else []
-
         summary = self.zone_patterns.get("summary", {})
         results = []
         for pending in raw:
@@ -526,12 +502,10 @@ class StatsClient:
             pid      = pending.get("pid", "")
             bet      = pending.get("bet", "")
             sequence = pending.get("sequence", [])
-
             p3 = self._global_eff(summary, pid)
             if p3 is None:
                 logger.info(f"[ZONA] {pid} sin datos globales — omitido")
                 continue
-
             p1 = None
             if last_number is not None and last_number != 0:
                 zone_trans = self.stats_zone.get(str(last_number), {})
@@ -540,7 +514,6 @@ class StatsClient:
                         p1 = zone_trans.get("B", 0) / 100.0
                     elif bet == "Alto":
                         p1 = zone_trans.get("A", 0) / 100.0
-
             if p1 is not None:
                 prob       = round(P1_W_COLOR * p1 + P3_W_COLOR * p3, 4)
                 components = f"Trans={p1:.0%} | Global={p3:.0%}"
@@ -549,7 +522,6 @@ class StatsClient:
                 prob       = p3
                 components = f"Global={p3:.0%}"
                 logger.info(f"[ZONA] {pid} bet={bet} P3={p3:.0%} (sin P1)")
-
             results.append({
                 "type": "zone", "pid": pid, "bet": bet, "prob": prob,
                 "p1_trans": p1 or 0, "p3_global": p3,
@@ -557,7 +529,6 @@ class StatsClient:
             })
         return results
 
-    # Alias legacy usado en /debug (retorna primer patrón disponible)
     def predict_zone_signal(self, last_number: int) -> Optional[Dict]:
         results = self.predict_zone_signals(last_number)
         return results[0] if results else None
@@ -842,17 +813,15 @@ class ImmersiveRouletteEngine:
         self.active_pair        =()
         self.active_missing     =0
         self.active_signal_msg_id=None
-        self.active_intento     =1    # intento actual (1 o 2)
+        self.active_intento     =1
 
-        # Señales color — dict keyed por pid: N5, N7, R5, R7
-        # Cada entrada: {bet, prob, sequence, msg_id, intento}
+        # Señales color — dict keyed por pid
         self.color_signals: Dict[str, dict] = {}
 
-        # Señales zona — dict keyed por pid: B5, B7, A5, A7
-        # Cada entrada: {bet, prob, sequence, msg_id, intento}
+        # Señales zona — dict keyed por pid
         self.zone_signals: Dict[str, dict] = {}
 
-        # Señal columna (patrón de secuencia 2C en últimos 5)
+        # Señal columna (nueva lógica: 3 columnas iguales)
         self.column_signal_active  =False
         self.column_signal_pair    =()
         self.column_signal_missing =0
@@ -864,12 +833,13 @@ class ImmersiveRouletteEngine:
         self._db    =_get_db()
         self.learner=SignalLearner(self._db)
 
-        self.processed_game_ids={}          # dict ordenado: gid→True (evita duplicados)
+        self.processed_game_ids={}
         self.MAX_PROCESSED_IDS=300
-        self._load_processed_ids()          # sincroniza con DB (anti-duplicados multi-instancia)
-        self._first_poll_done = False       # en la 1ª poll se marcan giros existentes sin procesar
+        self._load_processed_ids()
+        self._first_poll_done = False
 
-        # Warmup
+        self._scoreboard_dirty = False    # flag para enviar marcador una vez por giro
+
         live_loaded=self._load_live_history()
         self.ws_count=live_loaded
         self.warmup_done=live_loaded>=WARMUP_SPINS
@@ -881,7 +851,6 @@ class ImmersiveRouletteEngine:
 
     # ── DB local ──────────────────────────────────────────────────────────────
     def _load_processed_ids(self):
-        """Carga game_ids procesados en la última hora desde SQLite (evita duplicados entre instancias)."""
         try:
             cutoff = int(time.time()) - 3600
             rows = self._db.execute(
@@ -1065,22 +1034,31 @@ class ImmersiveRouletteEngine:
                 "prob":prob_adj,"label":"PF+PHF+ML","pf_prob":pf_d["prob"],
                 "phf_prob":phf_d["prob"],"ema_trend":trend,"last_number":last_num}
 
-    def _detect_e2(self, number=None):
-        if not self.warmup_done: return None
-        if number is None:
-            if not self.spin_history: return None
-            number=self.spin_history[-1]["number"]
-        if number==0: return None
-        phtml_pair=self._get_phtml_pair(number)
-        if phtml_pair is None: return None
-        trend=ema_trend_str(self.doc_levels); e_pair=ema_trend_pair(trend)
-        if set(phtml_pair["pair"])!=set(e_pair["pair"]): return None
-        prob=phtml_pair["prob"]
-        adj,adj_d=self.learner.get_adjustment(STRAT_E2,phtml_pair["pair"],trend)
-        prob_adj=round(max(0.0,min(1.0,prob+adj)),4)
-        return {"strategy":STRAT_E2,"pair":phtml_pair["pair"],"missing":phtml_pair["missing"],
-                "prob":prob_adj,"label":f"PHTML+EMA({e_pair['label']})","ema_trend":trend,
-                "pf_prob":prob,"phf_prob":prob,"last_number":number}
+    def _detect_e2(self):
+        """NUEVA lógica: 3 docenas iguales consecutivas → apostar las otras dos."""
+        if not self.warmup_done or not self.spin_history:
+            return None
+        non_zero = [s["number"] for s in self.spin_history if s["number"] != 0]
+        if len(non_zero) < 3:
+            return None
+        last3 = non_zero[-3:]
+        dozens = [get_dozen(n) for n in last3]
+        if len(set(dozens)) != 1:
+            return None
+        repeating_dozen = dozens[0]
+        pair = tuple(sorted({1, 2, 3} - {repeating_dozen}))
+        prob = 0.82
+        return {
+            "strategy": STRAT_E2,
+            "pair": pair,
+            "missing": repeating_dozen,
+            "prob": prob,
+            "label": f"Repetir D{repeating_dozen}x3",
+            "pf_prob": prob,
+            "phf_prob": prob,
+            "ema_trend": ema_trend_str(self.doc_levels),
+            "last_number": last3[-1]
+        }
 
     def _detect_e3(self):
         if not self.warmup_done: return None
@@ -1128,7 +1106,6 @@ class ImmersiveRouletteEngine:
             e1["prob"]=min(0.99,e1["prob"]*0.55+e2["prob"]*0.45)
             e1["label"]=f"E1+E2({e1['pair']})"
 
-        # ── Ajuste por historial de señales de docena para el último número ──
         if self.spin_history:
             last_num = self.spin_history[-1]["number"]
             if last_num != 0:
@@ -1144,7 +1121,6 @@ class ImmersiveRouletteEngine:
                         f"wr={hist_wr:.0%} adj={hist_adj:+.3f}"
                     )
 
-                # ── Ajuste por patrón de secuencia histórico del servidor ───
                 seq_stats = self.sc.get_dozen_seq_top_pair(last_num)
                 if seq_stats and seq_stats.get("pair"):
                     top_pair = tuple(sorted(seq_stats["pair"]))
@@ -1165,111 +1141,45 @@ class ImmersiveRouletteEngine:
         candidates.sort(key=lambda x:(x["prob"],_pri.get(x["strategy"],0)),reverse=True)
         return candidates[0]
 
-    # ── Columna: detección de patrón de secuencia (2C en últimos 5) ──────────
-
-    def _get_col_pf(self) -> Optional[dict]:
-        """Detecta si los últimos 5 no-cero tienen exactamente 2 columnas distintas.
-
-        Retorna: pair, missing, prob, pattern_str, numbers
-        """
-        nz = [s for s in self.spin_history if s["number"] != 0]
-        if len(nz) < 5:
-            return None
-        last5    = nz[-5:]
-        cols     = [((s["number"] - 1) % 3) + 1 for s in last5]
-        unique   = set(cols)
-        if len(unique) != 2:
-            return None
-        pair    = tuple(sorted(unique))
-        missing = list({1, 2, 3} - set(pair))[0]
-        prob    = sum(1 for c in cols if c in pair) / 5.0
-        pattern_str = ",".join(f"C{c}" for c in cols)
-        numbers     = [s["number"] for s in last5]
-        return {
-            "pair":        pair,
-            "missing":     missing,
-            "prob":        prob,
-            "pattern_str": pattern_str,
-            "numbers":     numbers,
-        }
-
+    # ── Columna: detección (NUEVA lógica: 3 columnas iguales) ──────────
     def _detect_col_signal(self, last_num: int) -> Optional[dict]:
-        """Construye señal de columna combinando detección local + historial servidor.
-
-        Fuentes:
-          1. Patrón local: 2 columnas en últimos 5 no-cero (prob base = porción de las 5)
-          2. seq_adj: ajuste por top_pair del servidor para este last_number
-          3. col_adj: ajuste por win rate histórico de señales de columna para este número
-        """
         if not self.warmup_done or last_num == 0:
             return None
-
-        col_pf = self._get_col_pf()
-        if not col_pf:
+        non_zero = [s["number"] for s in self.spin_history if s["number"] != 0]
+        if len(non_zero) < 3:
             return None
-
-        pair        = col_pf["pair"]
-        missing     = col_pf["missing"]
-        base_prob   = col_pf["prob"]
-        pattern_str = col_pf["pattern_str"]
-        numbers     = col_pf["numbers"]
-
-        # Ajuste por patrón de secuencia histórico (servidor)
-        seq_stats = self.sc.get_column_seq_top_pair(last_num)
-        seq_adj   = 0.0
-        if seq_stats and seq_stats.get("pair"):
-            if tuple(sorted(seq_stats["pair"])) == pair:
-                eff     = seq_stats["top_efectividad"] / 100.0
-                seq_adj = round((eff - 0.5) * DOZEN_HIST_SCALE * 2, 4)
-                logger.info(
-                    f"[COL-SEQ] Ajuste seq #{last_num}: "
-                    f"top_par=C{seq_stats['pair']} eff={seq_stats['top_efectividad']:.1f}% "
-                    f"adj={seq_adj:+.3f}"
-                )
-
-        # Ajuste por win rate histórico de señales de columna
-        col_wr  = self.sc.get_column_signal_winrate(last_num)
-        col_adj = 0.0
-        if col_wr is not None:
-            col_adj = round((col_wr - 0.5) * DOZEN_HIST_SCALE * 2, 4)
-            logger.info(
-                f"[COL-SEQ] Ajuste col_wr #{last_num}: wr={col_wr:.0%} adj={col_adj:+.3f}"
-            )
-
-        prob = round(max(0.0, min(1.0, base_prob + seq_adj + col_adj)), 4)
-        logger.info(
-            f"[COL-SEQ] #{last_num} pat=[{pattern_str}] nums={numbers} "
-            f"base={base_prob:.0%} seq_adj={seq_adj:+.3f} col_adj={col_adj:+.3f} "
-            f"→ prob={prob:.0%}"
-        )
+        last3 = non_zero[-3:]
+        columns = [((n - 1) % 3) + 1 for n in last3]
+        if len(set(columns)) != 1:
+            return None
+        repeating_col = columns[0]
+        pair = tuple(sorted({1, 2, 3} - {repeating_col}))
+        prob = 0.82
         return {
-            "strategy":    STRAT_COL_SEQ,
-            "pair":        pair,
-            "missing":     missing,
-            "prob":        prob,
-            "label":       f"COL-SEQ[{pattern_str}]",
-            "pattern_str": pattern_str,
-            "numbers":     numbers,
-            "seq_adj":     seq_adj,
-            "col_adj":     col_adj,
-            "last_number": last_num,
+            "strategy": STRAT_COL_SEQ,
+            "pair": pair,
+            "missing": repeating_col,
+            "prob": prob,
+            "label": f"Repetir C{repeating_col}x3",
+            "pattern_str": f"C{repeating_col},C{repeating_col},C{repeating_col}",
+            "numbers": last3,
+            "seq_adj": 0.0,
+            "col_adj": 0.0,
+            "last_number": last3[-1]
         }
 
     # ── Helpers de formato ────────────────────────────────────────────────────
     @staticmethod
     def _num_color_emoji(number: int) -> str:
-        """Emoji de color del número: 🔴 rojo, ⚫ negro, 🟢 cero."""
         c = get_color(number)
         return {"R": "🔴", "N": "⚫", "V": "🟢"}.get(c, "⚪")
 
     def _fmt_last_numbers(self, count: int = 5) -> str:
-        """Últimos `count` giros como 🔴7 ⚫11 🔴1 ..."""
         hist = list(self.spin_history)[-count:][::-1]
         parts = [f"{self._num_color_emoji(s['number'])}{s['number']}" for s in hist]
         return " ".join(parts)
 
     def _fmt_last_zone_numbers(self, count: int = 5) -> str:
-        """Últimos `count` giros con emoji de zona: 🟣 bajo (1-18), 🔵 alto (19-36)."""
         hist = list(self.spin_history)[-count:][::-1]
         parts = []
         for s in hist:
@@ -1284,7 +1194,6 @@ class ImmersiveRouletteEngine:
 
     @staticmethod
     def _color_seq_str(sequence) -> str:
-        """Convierte ['Negro','Rojo',...] o ['N','R',...] a 'N-R-...'"""
         mapping = {"Negro": "N", "Rojo": "R", "N": "N", "R": "R",
                    "Bajo": "B", "Alto": "A", "B": "B", "A": "A"}
         return "-".join(mapping.get(str(v), str(v)) for v in sequence)
@@ -1324,7 +1233,6 @@ class ImmersiveRouletteEngine:
             last_number=sig.get("last_number",0),
             dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
         )
-        # ── Registrar en servidor para tracking aciertos/fallos ───────────────
         self.sc.post_dozen_signal(
             strategy=sig["strategy"],
             pair=list(sig["pair"]),
@@ -1344,12 +1252,11 @@ class ImmersiveRouletteEngine:
                 f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
             )
             scoreboard.record_win()
+            self._scoreboard_dirty = True
             self.learner.resolve("WIN",f"WIN D{d} | par correcto {p} | intento {self.active_intento}")
-            scoreboard.send()
             self._reset_dozen_signal()
         else:
             if self.active_intento < self.MAX_INTENTOS_DOCENA:
-                # Primer fallo → borrar señal 1 y reenviar señal intento 2
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
@@ -1361,13 +1268,12 @@ class ImmersiveRouletteEngine:
                 if msg_id: self.active_signal_msg_id = msg_id
                 logger.info(f"[DOCENA] 🔁 Intento 1 fallido D{d} | señal re-enviada intento 2")
             else:
-                # Segundo fallo → LOSS definitivo
                 tg_send(
                     f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                 )
                 scoreboard.record_loss()
+                self._scoreboard_dirty = True
                 self.learner.resolve("LOSS",f"LOSS D{d} cayó | faltaba D{self.active_missing} | intento {self.active_intento}")
-                scoreboard.send()
                 self._reset_dozen_signal()
 
     def _reset_dozen_signal(self):
@@ -1397,11 +1303,8 @@ class ImmersiveRouletteEngine:
         )
 
     def _check_color_signal(self, number):
-        """Resuelve señales de color activas y activa nuevas (N5, N7, R5, R7)."""
         color = get_color(number)
         em    = self._num_color_emoji(number)
-
-        # ── Resolver señales activas ──────────────────────────────────────────
         pids_done = []
         for pid, sig in list(self.color_signals.items()):
             bet = sig["bet"]
@@ -1412,8 +1315,8 @@ class ImmersiveRouletteEngine:
                     f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
                 )
                 scoreboard.record_win()
+                self._scoreboard_dirty = True
                 self.learner.resolve("WIN", f"COLOR WIN #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
-                scoreboard.send()
                 pids_done.append(pid)
             else:
                 if sig["intento"] < self.MAX_INTENTOS_COLOR:
@@ -1432,16 +1335,14 @@ class ImmersiveRouletteEngine:
                         f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                     )
                     scoreboard.record_loss()
+                    self._scoreboard_dirty = True
                     self.learner.resolve("LOSS", f"COLOR LOSS #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
-                    scoreboard.send()
                     pids_done.append(pid)
-
         for pid in pids_done:
             self.color_signals.pop(pid, None)
 
-        # ── Activar nueva señal solo si no hay ninguna pendiente ──────────────
         if self.color_signals:
-            return  # señal de color activa → esperar a que se resuelva
+            return
         preds = self.sc.predict_color_signals(number)
         for pred in preds:
             pid  = pred["pid"]
@@ -1491,11 +1392,8 @@ class ImmersiveRouletteEngine:
         )
 
     def _check_zone_signal(self, number):
-        """Resuelve señales de zona activas y activa nuevas (B5, B7, A5, A7)."""
         zone = get_zone(number)
         em   = self._num_color_emoji(number)
-
-        # ── Resolver señales activas ──────────────────────────────────────────
         pids_done = []
         for pid, sig in list(self.zone_signals.items()):
             bet = sig["bet"]
@@ -1506,8 +1404,8 @@ class ImmersiveRouletteEngine:
                     f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
                 )
                 scoreboard.record_win()
+                self._scoreboard_dirty = True
                 self.learner.resolve("WIN", f"ZONA WIN #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
-                scoreboard.send()
                 pids_done.append(pid)
             else:
                 if sig["intento"] < self.MAX_INTENTOS_ZONA:
@@ -1526,16 +1424,14 @@ class ImmersiveRouletteEngine:
                         f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                     )
                     scoreboard.record_loss()
+                    self._scoreboard_dirty = True
                     self.learner.resolve("LOSS", f"ZONA LOSS #{number} bet={bet} | pid={pid} | intento {sig['intento']}")
-                    scoreboard.send()
                     pids_done.append(pid)
-
         for pid in pids_done:
             self.zone_signals.pop(pid, None)
 
-        # ── Activar nueva señal solo si no hay ninguna pendiente ──────────────
         if self.zone_signals:
-            return  # señal de zona activa → esperar a que se resuelva
+            return
         preds = self.sc.predict_zone_signals(number)
         for pred in preds:
             pid  = pred["pid"]
@@ -1563,10 +1459,9 @@ class ImmersiveRouletteEngine:
     def _reset_zone_signal(self):
         self.zone_signals.clear()
 
-    # ── Columna (patrón de secuencia 2C) ─────────────────────────────────────
+    # ── Columna (nueva lógica) ─────────────────────────────────────────────────
 
     def _check_column_signal(self, number: int):
-        """Verifica señal activa de columna o intenta activar una nueva."""
         if self.column_signal_active:
             col  = ((number - 1) % 3) + 1 if number != 0 else 0
             pair = self.column_signal_pair
@@ -1578,12 +1473,11 @@ class ImmersiveRouletteEngine:
                     f"✅ WIN #{number} {em}  — ☑️ GANADA EN {op_txt}"
                 )
                 scoreboard.record_win()
+                self._scoreboard_dirty = True
                 self.learner.resolve("WIN", f"COL WIN #{number} C{col} | par={pair} | intento {self.column_intento}")
-                scoreboard.send()
                 self._reset_column_signal()
             else:
                 if self.column_intento < self.MAX_INTENTOS_COLUMNA:
-                    # Primer fallo → borrar señal 1 y reenviar señal intento 2
                     if self.column_signal_msg_id:
                         tg_delete(CHAT_ID, self.column_signal_msg_id)
                         self.column_signal_msg_id = None
@@ -1599,15 +1493,14 @@ class ImmersiveRouletteEngine:
                         f"❌  LOSS #{number} {em} — ♦️ PERDIDA EN 2° OP"
                     )
                     scoreboard.record_loss()
+                    self._scoreboard_dirty = True
                     self.learner.resolve(
                         "LOSS",
                         f"COL LOSS #{number} C{col} | faltaba C{self.column_signal_missing} | intento {self.column_intento}"
                     )
-                    scoreboard.send()
                     self._reset_column_signal()
             return
 
-        # Intentar activar nueva señal
         last_num = self.spin_history[-1]["number"] if self.spin_history else 0
         sig = self._detect_col_signal(last_num)
         if sig and sig["prob"] >= COL_SEQ_MIN_PROB:
@@ -1642,7 +1535,6 @@ class ImmersiveRouletteEngine:
             ema_trend="neutral", last_number=sig.get("last_number", 0),
             dozen_seq_5=self.dozen_seq[-5:] if self.dozen_seq else []
         )
-        # Registrar en servidor para tracking aciertos/fallos
         self.sc.post_column_signal(
             strategy=STRAT_COL_SEQ,
             pair=list(pair),
@@ -1650,11 +1542,9 @@ class ImmersiveRouletteEngine:
             prob=sig["prob"],
             last_number=sig.get("last_number", 0),
         )
-        pat = sig.get("pattern_str", "")
-        nums = sig.get("numbers", [])
         logger.info(
-            f"[COL-SEQ] 🎯 SEÑAL COLUMNA: C{pair} ({sig['prob']:.0%}) | "
-            f"pat=[{pat}] nums={nums}"
+            f"[COL] 🎯 SEÑAL COLUMNA: C{pair} ({sig['prob']:.0%}) | "
+            f"pat=[{sig.get('pattern_str','')}]"
         )
 
     def _reset_column_signal(self):
@@ -1668,17 +1558,16 @@ class ImmersiveRouletteEngine:
     # ── Loop principal ────────────────────────────────────────────────────────
     def process_batch(self, batch):
         new_spins = []
-        seen_in_batch = set()          # evita duplicados dentro del mismo batch
+        seen_in_batch = set()
         for spin in reversed(batch):
             gid = spin.get("game_id")
             if not gid or gid in self.processed_game_ids or gid in seen_in_batch:
                 continue
-            seen_in_batch.add(gid)     # marcar inmediatamente para no repetir
+            seen_in_batch.add(gid)
             new_spins.append(spin)
         if not new_spins: return
         for spin in new_spins:
             gid=spin["game_id"]; number=spin["number"]
-            # Doble-chequeo en DB: si otra instancia ya procesó este gid, saltear
             try:
                 inserted = self._db.execute(
                     "INSERT OR IGNORE INTO processed_spins (game_id, ts) VALUES (?, ?)",
@@ -1697,7 +1586,6 @@ class ImmersiveRouletteEngine:
                     logger.error(f"Error procesando spin: {e}",exc_info=True)
                     self._reset_dozen_signal()
         if len(self.processed_game_ids)>self.MAX_PROCESSED_IDS:
-            # Eliminar los 150 MÁS ANTIGUOS (primeros insertados)
             keys_old = list(self.processed_game_ids.keys())[:150]
             for k in keys_old:
                 self.processed_game_ids.pop(k, None)
@@ -1718,21 +1606,14 @@ class ImmersiveRouletteEngine:
                 "🧠 Aprendizaje adaptativo + tracking aciertos/fallos activo"
             )
 
-        # Color y Zona: independientes de Docenas/Columna
         self._check_color_signal(number)
         self._check_zone_signal(number)
 
-        # ── Docenas + Columna (mutuamente exclusivas) ─────────────────────────
-        # Regla 1: si hay señal activa, no enviar nueva hasta que se resuelva.
-        # Regla 2: si en el mismo giro hay señal de ambas, enviar la de mayor prob.
         if self.signal_active:
-            # Señal de docenas pendiente → resolver; no activar columna
             self._resolve_dozen_signal(number)
         elif self.column_signal_active:
-            # Señal de columna pendiente → resolver; no activar docenas
             self._check_column_signal(number)
         else:
-            # Ninguna señal activa → detectar ambas y enviar la de mayor prob
             dozen_sig = self._select_best_signal()
             last_num  = self.spin_history[-1]["number"] if self.spin_history else 0
             col_sig   = (
@@ -1743,7 +1624,6 @@ class ImmersiveRouletteEngine:
             col_valid = col_sig is not None and col_sig["prob"] >= COL_SEQ_MIN_PROB
 
             if dozen_sig and col_valid:
-                # Ambas califican → enviar solo la de mayor probabilidad
                 if dozen_sig["prob"] >= col_sig["prob"]:
                     logger.info(
                         f"[ENGINE] ⚖️ Docena ({dozen_sig['prob']:.0%}) ≥ "
@@ -1761,6 +1641,11 @@ class ImmersiveRouletteEngine:
             elif col_valid:
                 self._activate_column_signal(col_sig)
 
+        # Enviar marcador si hubo cambios
+        if self._scoreboard_dirty:
+            scoreboard.send()
+            self._scoreboard_dirty = False
+
     async def poll_loop(self):
         url=f"{STATS_URL}/latest/{TARGET_ROULETTE}"
         logger.info(f"[ImmersiveDC] 🔄 Polling cada {POLL_INTERVAL}s → {url}")
@@ -1774,9 +1659,6 @@ class ImmersiveRouletteEngine:
                             last_20=data.get("last_20",[])
                             if isinstance(last_20,list) and last_20 and isinstance(last_20[0],dict):
                                 if not self._first_poll_done:
-                                    # Primera poll: marcar TODOS los giros actuales como ya vistos
-                                    # sin procesarlos. Evita que esta instancia repita giros que
-                                    # ya manejó la instancia anterior durante el redeploy.
                                     for spin in last_20:
                                         gid = spin.get("game_id")
                                         if gid:
@@ -1834,8 +1716,9 @@ def cmd_start(m):
     bot.reply_to(m,
         "<b>🎡 Immersive Roulette DC v35</b>\n\n"
         "Señales sin gestión de apuesta\n"
-        "🅐 E1: PF+PHF+ML · 🅑 E2: PHTML+EMA · 🅒 E3: Retorno\n"
-        "🎨 Color (P1+P3) · 🗺 Zona (P1+P3)\n\n"
+        "🅐 E1: PF+PHF+ML · 🅑 E2: 3 docenas iguales · 🅒 E3: Retorno\n"
+        "🎨 Color (P1+P3) · 🗺 Zona (P1+P3)\n"
+        "Columna: 3 columnas iguales\n\n"
         "Marcador diario → reset 00:00 ART\n\n"
         "/status /marcador /aprendizaje /debug /reset",
         parse_mode="HTML")
@@ -1911,8 +1794,6 @@ def cmd_debug(m):
         f"✅ C{col_sig['pair']} ({col_sig['prob']:.0%}) pat=[{col_sig.get('pattern_str','')}]"
         if col_sig else "—"
     )
-
-    # Seq stats servidor para last_num
     d_seq  = engine.sc.get_dozen_seq_top_pair(last_num)  if last_num else None
     c_seq  = engine.sc.get_column_seq_top_pair(last_num) if last_num else None
     d_seq_txt = (
@@ -1923,7 +1804,6 @@ def cmd_debug(m):
         f"C{c_seq['pair']} eff={c_seq['top_efectividad']:.1f}% n={c_seq['total']}"
         if c_seq else "sin datos"
     )
-
     bot.reply_to(m,
         f"<b>🔬 Debug #{last_num} | EMA {trend.upper()}</b>\n\n"
         f"🅐 E1: {st(e1)}\n🅑 E2: {st(e2)}\n🅒 E3: {st(e3)}\n\n"
@@ -1993,7 +1873,17 @@ def run_flask():
 def tg_webhook():
     """Recibe updates de Telegram via webhook (sin polling, sin 409)."""
     try:
-        json_string = request.get_data().decode("utf-8")
+        data = request.get_json(force=True)
+        update_id = data.get("update_id")
+        # Si ya procesamos este update_id, ignorarlo
+        if update_id and update_id in PROCESSED_UPDATE_IDS:
+            logger.info(f"🔄 Update {update_id} ya procesado – ignorado")
+            return "", 200
+        if update_id:
+            PROCESSED_UPDATE_IDS.add(update_id)
+            if len(PROCESSED_UPDATE_IDS) > MAX_UPDATE_IDS:
+                PROCESSED_UPDATE_IDS.clear()
+        json_string = json.dumps(data)
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
     except Exception as e:
@@ -2001,7 +1891,6 @@ def tg_webhook():
     return "", 200
 
 def setup_webhook():
-    """Registra el webhook en Telegram al arrancar."""
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not render_url:
         logger.warning("⚠️ RENDER_EXTERNAL_URL no definida — webhook no registrado")
@@ -2023,7 +1912,6 @@ def setup_webhook():
 async def main():
     global engine
     sc=StatsClient(); engine=ImmersiveRouletteEngine(sc)
-    # Webhook en vez de polling → elimina el error 409 definitivamente
     setup_webhook()
     logger.info(
         f"[ImmersiveDC] 🎡 Immersive Roulette DC v35 — "
