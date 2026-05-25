@@ -1873,14 +1873,28 @@ async def main():
     asyncio.create_task(engine.poll_loop())
     asyncio.create_task(self_ping_loop())
 
-    # Iniciar polling de Telegram
-    await bot.infinity_polling(skip_pending=True)
+    # Bucle de reconexión para Telegram (evita que error 409 detenga el bot)
+    while True:
+        try:
+            await bot.infinity_polling(skip_pending=True)
+        except Exception as e:
+            logger.error(f"Error en polling de Telegram: {e}")
+            if "Conflict" in str(e) or "409" in str(e):
+                logger.warning("Conflicto de polling (409). Esperando 10 segundos antes de reconectar...")
+                await asyncio.sleep(10)
+            else:
+                logger.error("Error fatal, deteniendo...")
+                break
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     # Flask en hilo separado
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 10005)}")
+    logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 10000)}")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
