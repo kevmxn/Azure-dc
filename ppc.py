@@ -6,7 +6,7 @@ Agregados:
   ⑨ Comandos /detenersenal, /encendersenal, /resetearmarcador.
   ⑩ Canal secundario fijo (-1003613599867) que siempre recibe señales.
   ⑪ Marcador diario (ganancias/pérdidas del día) reiniciable.
-  ⑫ Menú de comandos en Telegram.
+  ⑫ Menú de comandos en Telegram (corregido: sin await en set_my_commands).
 """
 
 import asyncio
@@ -128,6 +128,47 @@ CURRENCY_FLAGS     = {"USD":"🇺🇲","MXN":"🇲🇽","PEN":"🇵🇪","COP":"
 CURRENCY_DECIMALS  = {"USD":2,"MXN":2,"PEN":2,"COP":0,"ARS":0,"CLP":0}
 CURRENCY_MULTIPLIERS = {k: v / BASE_BET for k, v in CURRENCY_CHIPS.items()}
 
+# ─── TABLA PHTML (docenas) ──────────────────────────────────────────────────
+DOZEN_TABLE: Dict[int, Dict[str, int]] = {
+    0:  {"d1": 32, "d2": 32, "d3": 32},
+    1:  {"d1": 28, "d2": 32, "d3": 36},
+    2:  {"d1": 36, "d2": 28, "d3": 32},
+    3:  {"d1": 24, "d2": 32, "d3": 36},
+    4:  {"d1": 32, "d2": 40, "d3": 24},
+    5:  {"d1": 40, "d2": 24, "d3": 36},
+    6:  {"d1": 32, "d2": 24, "d3": 40},
+    7:  {"d1": 36, "d2": 24, "d3": 40},
+    8:  {"d1": 32, "d2": 36, "d3": 28},
+    9:  {"d1": 28, "d2": 36, "d3": 32},
+    10: {"d1": 40, "d2": 32, "d3": 28},
+    11: {"d1": 36, "d2": 24, "d3": 36},
+    12: {"d1": 32, "d2": 28, "d3": 36},
+    13: {"d1": 32, "d2": 28, "d3": 36},
+    14: {"d1": 16, "d2": 48, "d3": 32},
+    15: {"d1": 36, "d2": 28, "d3": 32},
+    16: {"d1": 28, "d2": 32, "d3": 36},
+    17: {"d1": 20, "d2": 44, "d3": 32},
+    18: {"d1": 32, "d2": 28, "d3": 36},
+    19: {"d1": 36, "d2": 28, "d3": 32},
+    20: {"d1": 36, "d2": 36, "d3": 28},
+    21: {"d1": 24, "d2": 44, "d3": 28},
+    22: {"d1": 36, "d2": 36, "d3": 28},
+    23: {"d1": 24, "d2": 32, "d3": 40},
+    24: {"d1": 44, "d2": 32, "d3": 24},
+    25: {"d1": 36, "d2": 24, "d3": 36},
+    26: {"d1": 40, "d2": 28, "d3": 32},
+    27: {"d1": 32, "d2": 28, "d3": 36},
+    28: {"d1": 36, "d2": 28, "d3": 32},
+    29: {"d1": 32, "d2": 24, "d3": 40},
+    30: {"d1": 36, "d2": 36, "d3": 28},
+    31: {"d1": 32, "d2": 36, "d3": 24},
+    32: {"d1": 32, "d2": 36, "d3": 28},
+    33: {"d1": 28, "d2": 32, "d3": 36},
+    34: {"d1": 36, "d2": 28, "d3": 32},
+    35: {"d1": 36, "d2": 32, "d3": 24},
+    36: {"d1": 28, "d2": 36, "d3": 32},
+}
+
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def get_dozen(n: int) -> int:
     if n == 0: return 0
@@ -156,7 +197,7 @@ def _get_db() -> sqlite3.Connection:
     conn.commit()
     return conn
 
-# ─── TELEGRAM HELPERS (con envío dual) ─────────────────────────────────────────
+# ─── TELEGRAM HELPERS (envío dual) ────────────────────────────────────────────
 _TG_RETRIES = 12
 
 def _tg_call(fn, *a, **kw):
@@ -182,7 +223,6 @@ def _tg_call(fn, *a, **kw):
     return None
 
 def tg_send(chat_id: int, text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
-    """Envía a un chat específico."""
     if not text:
         return None
     try:
@@ -200,18 +240,15 @@ def tg_send(chat_id: int, text: str, markup: InlineKeyboardMarkup = None) -> Opt
         return None
 
 def tg_send_main(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
-    """Envía al canal principal solo si las señales no están pausadas."""
     if not engine or engine.signals_paused:
         logger.info("📵 Señales pausadas, no se envía al canal principal.")
         return None
     return tg_send(CHAT_ID, text, markup)
 
 def tg_send_secondary(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
-    """Siempre envía al canal secundario."""
     return tg_send(SECONDARY_CHAT_ID, text, markup)
 
 def tg_send_both(text: str, markup: InlineKeyboardMarkup = None):
-    """Envía a ambos canales (secundario siempre, principal si no pausado)."""
     tg_send_secondary(text, markup)
     if engine and not engine.signals_paused:
         tg_send(CHAT_ID, text, markup)
@@ -751,7 +788,6 @@ class SignalLearner:
 
 # ─── ESTADÍSTICAS DETALLADAS (con marcador diario) ─────────────────────────────
 class DailyStats:
-    """Estadísticas del día (reiniciables)."""
     def __init__(self):
         self.date = datetime.now().date()
         self.wins = 0
@@ -766,7 +802,6 @@ class DailyStats:
             self.losses = 0
             self.net_profit = 0.0
             logger.info("📅 Marcador diario reiniciado automáticamente por nuevo día.")
-            # Enviar notificación al canal secundario
             tg_send_secondary("📅 *NUEVO DÍA* — El marcador diario ha sido reiniciado automáticamente.", parse_mode="Markdown")
 
     def record(self, won: bool, profit: float):
@@ -956,7 +991,7 @@ class RussianRouletteEngine:
         self.warmup_done = live_loaded >= WARMUP_SPINS
         logger.info(f"[RussianDC] 📦 Pre-cargados: {live_loaded} | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
-    # ── DB y estado (omitido por brevedad, pero igual que antes) ──
+    # ── DB y estado ──────────────────────────────────────────────────────────
     def _load_live_history(self) -> int:
         try:
             rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
@@ -1012,6 +1047,7 @@ class RussianRouletteEngine:
         if persist:
             self._persist(number)
 
+    # ── Estrategias ──────────────────────────────────────────────────────────
     def _get_pf(self) -> Optional[Dict]:
         if len(self.spin_history) < 5:
             return None
@@ -1418,14 +1454,9 @@ class RussianRouletteEngine:
     def _send_signal(self):
         text = self._build_signal_text()
         markup = roulette_keyboard()
-        # Siempre al secundario
-        msg_sec = tg_send_secondary(text, markup)
-        # Al principal solo si no pausado
+        tg_send_secondary(text, markup)
         if not self.signals_paused:
-            msg_main = tg_send_main(text, markup)
-            self.active_signal_msg_id = msg_main
-        else:
-            self.active_signal_msg_id = None
+            tg_send_main(text, markup)
 
     def _activate_signal(self, sig: Dict):
         self.signal_active = True
@@ -1507,7 +1538,6 @@ class RussianRouletteEngine:
                 f"🎉 {sign}{signal_profit:.2f} USD 🎉\n"
                 f"💰 Balance: ${self.bankroll:.2f} USD | Nivel: {self.gestor.nivel}"
             )
-            # Enviar a ambos canales
             tg_send_both(result_text, markup=roulette_keyboard())
             self.stats.record('WIN', self.active_intento, number,
                               self.active_missing if self.active_strategy == STRAT_E2_REP else d,
@@ -1686,11 +1716,7 @@ def health():
 def cmd_start(m):
     chat_id = m.chat.id
     if chat_id == CHAT_ID:
-        # Canal principal: mostrar bienvenida y enviar al canal secundario también
         tg_send_secondary("🆕 *Canal principal reiniciado* — El bot está activo.", parse_mode="Markdown")
-    else:
-        # Chat privado: registrar el chat para enviar notificaciones? Por ahora solo bienvenida
-        pass
     bot.reply_to(m,
         "<b>🎰 IMMERSIVE ROULETTE DC v33</b>\n\n"
         "🤖 Bot de señales para ruleta Immersive.\n"
@@ -1895,7 +1921,7 @@ async def main():
     global engine
     stats_client = StatsClient()
     engine = RussianRouletteEngine(stats_client)
-    # Configurar menú de comandos en Telegram
+    # Configurar menú de comandos (síncrono, sin await)
     commands = [
         BotCommand("start", "Iniciar / estado del bot"),
         BotCommand("detenersenal", "Pausar señales en el canal principal"),
@@ -1909,7 +1935,7 @@ async def main():
         BotCommand("reset", "Reiniciar balance y nivel"),
         BotCommand("reset_learning", "Borrar historial de aprendizaje")
     ]
-    await bot.set_my_commands(commands)
+    bot.set_my_commands(commands)   # ← SIN await, es síncrono
     logger.info("✅ Menú de comandos configurado.")
     threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
     logger.info(f"[RussianDC] 🎰 Immersive Roulette DC v33 — Control de señales activo. Canal secundario: {SECONDARY_CHAT_ID}")
