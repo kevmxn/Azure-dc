@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Immersive Roulette Bot — DC v36
+Immersive Roulette Bot — DC v36.1
 ===========================================================================
-  - Comandos de menú: /detenersenal, /encendersenal, /resetearmarcador, /start.
+  - Comandos de menú: /detenersenal, /encendersenal, /resetearmarcador.
   - Canal secundario (ID: -1003613599867) siempre recibe señales.
   - Flag signal_sending_enabled controla envíos al principal.
   - Estrategia E2 (docenas y columnas): triple histórico con efectividad ponderada.
@@ -11,6 +11,7 @@ Immersive Roulette Bot — DC v36
   - Selección unificada de señal (docena o columna, la de mayor prob).
   - Antiduplicados en webhook y tg_send.
   - Marcador diario centralizado.
+  - Correcciones: _pending_triple_column_pair, NoneType en resolución.
 """
 
 import asyncio
@@ -107,10 +108,9 @@ STRAT_E2    = 2
 STRAT_E3    = 3
 STRAT_COLOR = 4
 STRAT_ZONE  = 5
-STRAT_COL_SEQ = 6  # mantenido por compatibilidad, aunque ahora se usan E1/E2/E3 también para columna
+STRAT_COL_SEQ = 6
 
-# ─── FLAG CONTROL DE ENVÍO AL CANAL PRINCIPAL ────────────────────────────────
-signal_sending_enabled = True  # True = enviar al principal, False = solo secundario
+signal_sending_enabled = True
 
 # ─── MAPAS ────────────────────────────────────────────────────────────────────
 COLOR_MAP: Dict[int, str] = {
@@ -185,13 +185,13 @@ def _get_db() -> sqlite3.Connection:
     conn.execute("""CREATE TABLE IF NOT EXISTS triple_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts REAL NOT NULL,
-        type TEXT NOT NULL,         -- 'dozen' o 'column'
-        triple TEXT NOT NULL,       -- '1,1,1'
-        numbers TEXT,               -- '10,15,11'
+        type TEXT NOT NULL,
+        triple TEXT NOT NULL,
+        numbers TEXT,
         next_dozen INTEGER,
         next_column INTEGER,
-        win INTEGER,                -- 1 = acierto (el 4to nº está en el par opuesto)
-        pair TEXT                   -- par apostado
+        win INTEGER,
+        pair TEXT
     )""")
     conn.commit()
     return conn
@@ -219,18 +219,13 @@ def _tg_call(fn, *a, **kw):
             delay = min(delay * 2, 60)
     return None
 
-# ─── CACHÉ ANTI-DUPLICADOS DE MENSAJES SALIENTES ──────────────────────────────
 _RECENT_MESSAGES = {}
-_DEDUP_WINDOW = 5  # segundos
+_DEDUP_WINDOW = 5
 
 def tg_send(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
-    """Envía al canal secundario SIEMPRE, y al principal solo si signal_sending_enabled=True.
-    Retorna el ID del mensaje en el canal principal (si se envió), o None.
-    """
     if not text: return None
     now = time.time()
     key = hash(text)
-    # limpiar entradas viejas
     for k in list(_RECENT_MESSAGES.keys()):
         if now - _RECENT_MESSAGES[k] > _DEDUP_WINDOW:
             del _RECENT_MESSAGES[k]
@@ -246,7 +241,6 @@ def tg_send(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
     except Exception as e:
         logger.error(f"❌ Error enviando a secundario: {e}")
 
-    # Enviar al principal solo si las señales están activadas
     main_msg_id = None
     if signal_sending_enabled:
         try:
@@ -265,7 +259,6 @@ def tg_delete(chat_id: int, message_id: int):
     except Exception as e:
         logger.warning(f"⚠️ Error borrando mensaje: {e}")
 
-# ─── CACHÉ ANTI-DUPLICADOS WEBHOOK ────────────────────────────────────────────
 PROCESSED_UPDATE_IDS = set()
 MAX_UPDATE_IDS = 500
 
@@ -763,7 +756,6 @@ class ImmersiveRouletteEngine:
     def __init__(self, sc: StatsClient):
         self.sc = sc
 
-        # Historial general
         self.spin_history: List[dict] = []
         self.dozen_seq: List[int] = []
         self.column_seq: List[int] = []
@@ -776,40 +768,33 @@ class ImmersiveRouletteEngine:
         self._last_doc_inc: float = 0
         self._last_col_inc: float = 0
 
-        # After-number local (docena y columna)
         self.after_number_dozen = defaultdict(lambda: defaultdict(int))
         self.after_number_column = defaultdict(lambda: defaultdict(int))
 
-        # ML docenas
         self.markov_d = SmoothedMarkovPredictor()
         self.ensemble_d = OnlineEnsemblePredictor()
         self.spins_since_train_d = 0
 
-        # ML columnas
         self.markov_col = SmoothedMarkovPredictor()
         self.ensemble_col = OnlineEnsemblePredictor()
         self.spins_since_train_col = 0
 
-        # Máximos intentos
         self.MAX_INTENTOS_DOCENA  = 2
         self.MAX_INTENTOS_COLOR   = 2
         self.MAX_INTENTOS_ZONA    = 2
-        self.MAX_INTENTOS_COLUMNA = 2  # unificado
+        self.MAX_INTENTOS_COLUMNA = 2
 
-        # Señal activa unificada
         self.signal_active = False
         self.active_strategy = None
         self.active_pair = ()
         self.active_missing = 0
         self.active_signal_msg_id_main = None
         self.active_intento = 1
-        self.active_type = None  # 'dozen' o 'column'
+        self.active_type = None
 
-        # Señales color y zona (dict por pid)
         self.color_signals: Dict[str, dict] = {}
         self.zone_signals: Dict[str, dict] = {}
 
-        # DB y aprendizaje
         self._db = _get_db()
         self.learner = SignalLearner(self._db)
 
@@ -820,7 +805,6 @@ class ImmersiveRouletteEngine:
 
         self._scoreboard_dirty = False
 
-        # Control de triples pendientes
         self._pending_triple_dozen_id = None
         self._pending_triple_dozen_pair = None
         self._pending_triple_column_id = None
@@ -831,7 +815,6 @@ class ImmersiveRouletteEngine:
         self.warmup_done = live_loaded >= WARMUP_SPINS
         logger.info(f"[ImmersiveDC] 📦 Pre-cargados: {live_loaded} | Warmup: {'✅' if self.warmup_done else '⏳'} | Learner: {len(self.learner.history)}")
 
-    # ── DB local ──────────────────────────────────────────────────────────────
     def _load_processed_ids(self):
         try:
             cutoff = int(time.time()) - 3600
@@ -917,7 +900,6 @@ class ImmersiveRouletteEngine:
                     self.markov_col.update(self.column_seq)
                     self.spins_since_train_col = 0
 
-        # Niveles doc_levels y col_levels (similares)
         inc_d = 1 if d == 1 else (-1 if d == 3 else (1 if number != 0 and number <= 18 else -1))
         if number == 0: inc_d = self._last_doc_inc
         else: self._last_doc_inc = inc_d
@@ -935,7 +917,7 @@ class ImmersiveRouletteEngine:
         if persist:
             self._persist(number, color, zone)
 
-    # ── PF / PH / PHF para docenas (originales) ────────────────────────────────
+    # ── PF / PH / PHF para docenas ─────────────────────────────────────────────
     def _get_pf(self):
         if len(self.spin_history) < 5: return None
         counts = {1:0,2:0,3:0}
@@ -993,7 +975,7 @@ class ImmersiveRouletteEngine:
         if total == 0: return None
         return {1: d1/total, 2: d2/total, 3: d3/total}
 
-    # ── PF / PH / PHF para columnas (análogos) ─────────────────────────────────
+    # ── PF / PH / PHF para columnas ────────────────────────────────────────────
     def _get_col_pf(self):
         if len(self.spin_history) < 5: return None
         counts = {1:0,2:0,3:0}
@@ -1011,7 +993,6 @@ class ImmersiveRouletteEngine:
             if not self.spin_history: return None
             number = self.spin_history[-1]["number"]
         if number == 0: return None
-        # Podríamos usar servidor si existiera, pero por ahora local
         counts = self.after_number_column.get(number, {})
         total = sum(counts.values())
         if total < 10: return None
@@ -1027,7 +1008,7 @@ class ImmersiveRouletteEngine:
         ph = self._get_col_ph(number)
         if not pf or not ph: return None
         base = PF_W_NORM * pf["prob"] + PH_W_NORM * ph["prob"]
-        pair = pf["pair"]  # asumimos que coinciden (similar a docenas)
+        pair = pf["pair"]
         missing = list({1,2,3} - set(pair))[0]
         return {"pair": pair, "missing": missing, "prob": base}
 
@@ -1060,7 +1041,7 @@ class ImmersiveRouletteEngine:
             elif ema_signal(levels, "moderado"): ml_miss *= 0.92
         return 1.0 - ml_miss
 
-    # ── E1 / E2 / E3 para docenas (originales + nuevo E2) ──────────────────────
+    # ── E1 / E2 / E3 docenas ───────────────────────────────────────────────────
     def _detect_e1_dozen(self):
         if not self.warmup_done or not self.spin_history: return None
         last_num = self.spin_history[-1]["number"]
@@ -1083,7 +1064,6 @@ class ImmersiveRouletteEngine:
                 "type": "dozen"}
 
     def _detect_e2_dozen(self):
-        """Nuevo E2 docenas: triple histórico con efectividad ponderada."""
         if not self.warmup_done or not self.spin_history: return None
         non_zero = [s["number"] for s in self.spin_history if s["number"] != 0]
         if len(non_zero) < 3: return None
@@ -1141,7 +1121,7 @@ class ImmersiveRouletteEngine:
             elif ema_signal(levels, "moderado"): ema_adj = -0.04
         return round(max(0.35, min(0.97, base_prob + streak_bst + brk_adj + ema_adj)), 4)
 
-    # ── E1 / E2 / E3 para columnas (análogos) ──────────────────────────────────
+    # ── E1 / E2 / E3 columnas ──────────────────────────────────────────────────
     def _detect_e1_column(self):
         if not self.warmup_done or not self.spin_history: return None
         last_num = self.spin_history[-1]["number"]
@@ -1164,7 +1144,6 @@ class ImmersiveRouletteEngine:
                 "type": "column"}
 
     def _detect_e2_column(self):
-        """E2 columna: triple histórico."""
         if not self.warmup_done: return None
         non_zero = [s["number"] for s in self.spin_history if s["number"] != 0]
         if len(non_zero) < 3: return None
@@ -1194,7 +1173,6 @@ class ImmersiveRouletteEngine:
         for n in reversed(non_zero[:-1]):
             if get_column(n) in pair: streak += 1
             else: break
-        # en columna no tenemos phf del servidor, usamos pf local
         pf_break = self._get_col_pf()
         if pf_break is None or set(pf_break["pair"]) != set(pair): return None
         return_prob = self._calc_return_prob_column(pair, streak, last_n)
@@ -1227,7 +1205,7 @@ class ImmersiveRouletteEngine:
     def _get_triple_prob(self, typ: str, triple_str: str) -> float:
         MIN_SAMPLES = 5
         DEFAULT_PROB = 0.80
-        LAMBDA = 0.01  # factor de decaimiento
+        LAMBDA = 0.01
         try:
             rows = self._db.execute(
                 "SELECT ts, win FROM triple_history WHERE type=? AND triple=? AND win IS NOT NULL",
@@ -1253,7 +1231,6 @@ class ImmersiveRouletteEngine:
     # ─── Selección unificada de señal ──────────────────────────────────────────
     def _select_best_signal(self):
         candidates = []
-        # Docenas
         e1 = self._detect_e1_dozen()
         e2_d = self._detect_e2_dozen()
         e3_d = self._detect_e3_dozen()
@@ -1261,7 +1238,6 @@ class ImmersiveRouletteEngine:
             if sig and sig["prob"] >= MIN_PROB:
                 sig["type"] = "dozen"
                 candidates.append(sig)
-        # Columnas
         e1_c = self._detect_e1_column()
         e2_c = self._detect_e2_column()
         e3_c = self._detect_e3_column()
@@ -1271,11 +1247,9 @@ class ImmersiveRouletteEngine:
                 candidates.append(sig)
         if not candidates:
             return None
-        # ordenar por probabilidad descendente
         candidates.sort(key=lambda x: x["prob"], reverse=True)
         return candidates[0]
 
-    # ─── Formateo y envío de señal ─────────────────────────────────────────────
     def _signal_text(self, typ, pair, intento):
         last5 = self._fmt_last_numbers(5)
         if typ == "dozen":
@@ -1314,7 +1288,6 @@ class ImmersiveRouletteEngine:
             self.sc.post_column_signal(sig["strategy"], list(p), sig["missing"], sig["prob"], sig.get("last_number",0))
         logger.info(f"[ImmersiveDC] 🎯 SEÑAL {t.upper()} {sig['label']}: {p} ({sig['prob']:.0%})")
 
-    # ─── Resolución de señal activa ────────────────────────────────────────────
     def _resolve_signal(self, number):
         if not self.signal_active: return
         if self.active_type == "dozen":
@@ -1358,7 +1331,7 @@ class ImmersiveRouletteEngine:
         self.active_intento = 1
         self.active_type = None
 
-    # ─── Color y Zona (casi sin cambios, solo adaptación de tg_send) ───────────
+    # ─── Color y Zona ──────────────────────────────────────────────────────────
     def _color_signal_text(self, bet, intento, sequence=None):
         apuesta_txt = {"Negro": "NEGRO ⚫", "Rojo": "ROJO 🔴"}.get(bet, bet)
         pat = self._color_seq_str(sequence) if sequence else "—"
@@ -1475,20 +1448,22 @@ class ImmersiveRouletteEngine:
     def _resolve_pending_triples(self, number):
         d = get_dozen(number)
         col = get_column(number)
-        if self._pending_triple_dozen_id:
+        if self._pending_triple_dozen_id and self._pending_triple_dozen_pair:
             pair = self._pending_triple_dozen_pair
             win = 1 if d in pair else 0
             self._db.execute("UPDATE triple_history SET next_dozen=?, win=? WHERE id=?",
                              (d, win, self._pending_triple_dozen_id))
             self._db.commit()
             self._pending_triple_dozen_id = None
-        if self._pending_triple_column_id:
+            self._pending_triple_dozen_pair = None
+        if self._pending_triple_column_id and self._pending_triple_column_pair:
             pair = self._pending_triple_column_pair
             win = 1 if col in pair else 0
             self._db.execute("UPDATE triple_history SET next_column=?, win=? WHERE id=?",
                              (col, win, self._pending_triple_column_id))
             self._db.commit()
             self._pending_triple_column_id = None
+            self._pending_triple_column_pair = None
 
     def _check_new_triples(self, number):
         non_zero = [s["number"] for s in self.spin_history if s["number"] != 0]
@@ -1505,6 +1480,7 @@ class ImmersiveRouletteEngine:
             )
             self._db.commit()
             self._pending_triple_dozen_id = cur.lastrowid
+            self._pending_triple_dozen_pair = pair
             logger.info(f"[TRIPLE] Dozen: {triple_str} nums: {numbers_str}")
         # Triple columna
         last3_c = [get_column(n) for n in non_zero[-3:]]
@@ -1518,9 +1494,10 @@ class ImmersiveRouletteEngine:
             )
             self._db.commit()
             self._pending_triple_column_id = cur.lastrowid
+            self._pending_triple_column_pair = pair   # <-- CORREGIDO
             logger.info(f"[TRIPLE] Column: {triple_str} nums: {numbers_str}")
 
-    # ─── Procesamiento de batch ────────────────────────────────────────────────
+    # ─── Process batch ─────────────────────────────────────────────────────────
     def process_batch(self, batch):
         new_spins = []
         seen_in_batch = set()
@@ -1559,11 +1536,7 @@ class ImmersiveRouletteEngine:
         d = get_dozen(number)
         col = get_column(number)
         logger.info(f"[ImmersiveDC] 🎰 #{len(self.spin_history)+1}: {number} D{d} C{col} {get_color(number)}/{get_zone(number)}")
-
-        # Resolver triples pendientes (resultado del giro anterior)
         self._resolve_pending_triples(number)
-
-        # Actualizar estado (agrega el nuevo número)
         self._update_state(number)
 
         if not self.warmup_done:
@@ -1572,11 +1545,9 @@ class ImmersiveRouletteEngine:
             self.warmup_done = True
             tg_send("🟢 <b>Immersive Roulette DC v36</b> — Sistema listo.\n🎡 Señales: Docenas/Columnas (E1/E2/E3), Color, Zona")
 
-        # Color y Zona (independientes)
         self._check_color_signal(number)
         self._check_zone_signal(number)
 
-        # Señal unificada (docena o columna)
         if self.signal_active:
             self._resolve_signal(number)
         else:
@@ -1584,7 +1555,6 @@ class ImmersiveRouletteEngine:
             if best:
                 self._activate_signal(best)
 
-        # Registrar nuevos triples (con los últimos 3 números)
         self._check_new_triples(number)
 
         if self._scoreboard_dirty:
@@ -1667,11 +1637,10 @@ def health():
         "spins": len(engine.spin_history),
         "stats_connected": engine.sc.connected,
         "polls": engine.sc.poll_count,
-        "dozen_signal": engine.signal_active,
-        "color_signal": engine.color_signal_active if hasattr(engine, 'color_signal_active') else False,
-        "zone_signal": engine.zone_signal_active if hasattr(engine, 'zone_signal_active') else False,
-        "column_signal": engine.signal_active and engine.active_type == "column",
-        "scoreboard": scoreboard.get_text().replace("<b>", "").replace("</b>", ""),
+        "signal_active": engine.signal_active,
+        "color_signals": len(engine.color_signals),
+        "zone_signals": len(engine.zone_signals),
+        "scoreboard": scoreboard.get_text().replace("<b>","").replace("</b>",""),
         "art_time": art_now,
         "learner_signals": len(engine.learner.history),
         "learner_wr": f"{wins_r/len(recent)*100:.1f}%" if recent else "—",
@@ -1682,16 +1651,16 @@ def health():
 def cmd_detener(m):
     global signal_sending_enabled
     signal_sending_enabled = False
-    bot.reply_to(m, "🔕 Señales <b>DETENIDAS</b> para el canal principal. El secundario sigue recibiendo.", parse_mode="HTML")
+    bot.reply_to(m, "🔕 Señales <b>DETENIDAS</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=["encendersenal"])
 def cmd_encender(m):
     global signal_sending_enabled
     signal_sending_enabled = True
-    bot.reply_to(m, "🔔 Señales <b>ACTIVADAS</b> para el canal principal.", parse_mode="HTML")
+    bot.reply_to(m, "🔔 Señales <b>ACTIVADAS</b>.", parse_mode="HTML")
 
-@bot.message_handler(commands=["start", "help"])
-def cmd_start(m):
+@bot.message_handler(commands=["help"])
+def cmd_help(m):
     bot.reply_to(m,
         "<b>🎡 Immersive Roulette DC v36</b>\n\n"
         "Señales sin gestión de apuesta\n"
@@ -1720,14 +1689,16 @@ def cmd_status(m):
     if engine.signal_active:
         t = engine.active_type
         p = engine.active_pair
-        d_st = f"🟢 {'Docena' if t=='dozen' else 'Columna'} D{p[0]}+D{p[1]}" if t=="dozen" else f"🟢 Columna C{p[0]}+C{p[1]}"
-    col_st = "⚪" if not engine.column_signal_active else "🟡"
+        if t == "dozen":
+            d_st = f"🟢 Docena D{p[0]}+D{p[1]}"
+        else:
+            d_st = f"🟢 Columna C{p[0]}+C{p[1]}"
     conn = "🟢 OK" if engine.sc.connected else "🔴 Desc."
     ago = time.time() - engine.sc.last_poll_ok if engine.sc.last_poll_ok > 0 else 0
     art_now = datetime.now(ART).strftime("%H:%M ART")
     bot.reply_to(m,
         f"<b>🎡 Immersive Roulette DC v36</b>\n"
-        f"<b>Señal actual:</b> {d_st}\n"
+        f"<b>Señal:</b> {d_st}\n"
         f"<b>Color:</b> {'🟡' if engine.color_signals else '⚪'}\n"
         f"<b>Zona:</b> {'🟡' if engine.zone_signals else '⚪'}\n"
         f"<b>Giros:</b> {len(engine.spin_history)}\n"
@@ -1776,9 +1747,8 @@ def cmd_reset_learning(m):
 
 def setup_commands():
     commands = [
-        telebot.types.BotCommand("detenersenal", "Detener envío de señales al principal"),
-        telebot.types.BotCommand("encendersenal", "Activar envío de señales al principal"),
-        telebot.types.BotCommand("start", "Reiniciar bot"),
+        telebot.types.BotCommand("detenersenal", "Detener envío de señales"),
+        telebot.types.BotCommand("encendersenal", "Activar envío de señales"),
         telebot.types.BotCommand("resetearmarcador", "Resetear marcador diario"),
     ]
     try:
@@ -1847,7 +1817,7 @@ async def main():
     engine = ImmersiveRouletteEngine(sc)
     setup_webhook()
     setup_commands()
-    logger.info("[ImmersiveDC] 🎡 v36 iniciada")
+    logger.info("[ImmersiveDC] 🎡 v36.1 iniciada")
     await asyncio.gather(
         asyncio.create_task(engine.poll_loop()),
         asyncio.create_task(self_ping_loop()),
