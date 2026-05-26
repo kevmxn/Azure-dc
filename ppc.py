@@ -107,7 +107,7 @@ DOZEN_HIST_MIN   = 5
 DOZEN_HIST_SCALE = 0.12
 
 # Peso del ajuste de winrate del servidor sobre la prob local
-SERVER_HIST_W    = 0.20   # 20 % del ajuste viene del servidor si hay ≥ MIN_HIST registros
+SERVER_HIST_W    = 0.40    # 20 % del ajuste viene del servidor si hay ≥ MIN_HIST registros
 SERVER_HIST_MIN  = 5
 
 ART = timezone(timedelta(hours=-3))
