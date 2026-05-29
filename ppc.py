@@ -816,15 +816,20 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
 
-                    # ── 429: respetar el header Retry-After del servidor ──
+                    # ── 429: backoff propio, ignorar Retry-After excesivos ──
                     if resp.status == 429:
                         raw_ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
                         try:
-                            wait = int(raw_ra) + 1 if raw_ra else recon
+                            server_wait = int(raw_ra) if raw_ra else recon
                         except (ValueError, TypeError):
-                            wait = recon
-                        wait = max(wait, recon)   # nunca esperar menos que el backoff propio
-                        log.warning(f"⚠️ API HTTP 429 — reintento en {wait}s")
+                            server_wait = recon
+                        # Limitar a 60s: el servidor puede pedir cientos de
+                        # segundos pero necesitamos seguir operativos
+                        wait = min(max(server_wait, recon), 60)
+                        log.warning(
+                            f"⚠️ API HTTP 429 (server pidió {server_wait}s) "
+                            f"— reintentando en {wait}s"
+                        )
                         await asyncio.sleep(wait)
                         recon = min(recon * 2, 60)
                         recon_ok_streak = 0
