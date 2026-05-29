@@ -847,24 +847,37 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                         recon_ok_streak = 0
 
                     game_id = str(payload.get("id", ""))
-                    if not game_id or game_id == last_id:
+                    if not game_id:
+                        log.warning(f"[Poller] ⚠️ Respuesta sin 'id' — keys: {list(payload.keys())}")
+                        await asyncio.sleep(poll_secs)
+                        continue
+                    if game_id == last_id:
                         await asyncio.sleep(poll_secs)
                         continue
 
+                    log.debug(f"[Poller] 🆕 game_id={game_id}")
                     data   = payload.get("data", {})
                     status = data.get("status", "")
                     if status != "Resolved":
+                        log.info(f"[Poller] ⏭️ Saltando — status='{status}' (esperando 'Resolved')")
                         await asyncio.sleep(poll_secs)
                         continue
 
-                    outcome = data.get("result", {}).get("outcome", {})
-                    number  = outcome.get("number")
+                    result_block = data.get("result", {})
+                    outcome      = result_block.get("outcome", {})
+                    number       = outcome.get("number")
                     if number is None:
+                        log.warning(
+                            f"[Poller] ⚠️ 'number' ausente — "
+                            f"result keys: {list(result_block.keys())} | "
+                            f"outcome keys: {list(outcome.keys())}"
+                        )
                         await asyncio.sleep(poll_secs)
                         continue
 
                     number = int(number)
                     if not (0 <= number <= 36):
+                        log.warning(f"[Poller] ⚠️ Número fuera de rango: {number}")
                         await asyncio.sleep(poll_secs)
                         continue
 
@@ -884,6 +897,7 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                     await processor.process(number)
 
                     if spin_interval > 5:
+                        # Intervalo calibrado (≥ 2 giros) → sleep adaptativo
                         poll_secs  = POLL_SECS
                         elapsed    = time.time() - current_settled_ts
                         safe_sleep = max(spin_interval * 0.80 - elapsed, 0.0)
@@ -891,8 +905,10 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                             log.debug(f"[Poller] 😴 Sleep adaptativo {safe_sleep:.1f}s")
                             await asyncio.sleep(safe_sleep)
                     else:
-                        log.info(f"[Poller] 🔰 Primer giro — esperando {DEFAULT_WAIT}s")
-                        await asyncio.sleep(DEFAULT_WAIT)
+                        # Aún no hay intervalo calculado (1er o 2do giro) →
+                        # polling cada 2s hasta que llegue el siguiente giro
+                        log.info("[Poller] 🔰 Sin intervalo aún — polling cada 2s")
+                        await asyncio.sleep(DEFAULT_POLL)
                     continue
 
             except aiohttp.ClientError as e:
