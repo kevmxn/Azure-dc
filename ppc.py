@@ -799,11 +799,12 @@ def _parse_settled_at(s: str) -> float:
 
 
 async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
-    recon           = 5
-    last_id         = state.last_game_id
-    last_settled_ts = 0.0
-    spin_interval   = 0.0
-    poll_secs       = DEFAULT_POLL
+    recon            = 5
+    recon_ok_streak  = 0   # respuestas 200 consecutivas; recon solo se resetea tras 3 éxitos
+    last_id          = state.last_game_id
+    last_settled_ts  = 0.0
+    spin_interval    = 0.0
+    poll_secs        = DEFAULT_POLL
 
     log.info(f"🎰 Poller IMMERSIVE iniciado → {EVOLUTION_URL}")
 
@@ -814,14 +815,36 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                     EVOLUTION_URL,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
+
+                    # ── 429: respetar el header Retry-After del servidor ──
+                    if resp.status == 429:
+                        raw_ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                        try:
+                            wait = int(raw_ra) + 1 if raw_ra else recon
+                        except (ValueError, TypeError):
+                            wait = recon
+                        wait = max(wait, recon)   # nunca esperar menos que el backoff propio
+                        log.warning(f"⚠️ API HTTP 429 — reintento en {wait}s")
+                        await asyncio.sleep(wait)
+                        recon = min(recon * 2, 60)
+                        recon_ok_streak = 0
+                        continue
+
+                    # ── Otros errores HTTP ────────────────────────────────
                     if resp.status != 200:
                         log.warning(f"⚠️ API HTTP {resp.status} — reintento en {recon}s")
                         await asyncio.sleep(recon)
                         recon = min(recon * 2, 60)
+                        recon_ok_streak = 0
                         continue
 
                     payload = await resp.json(content_type=None)
-                    recon   = 5
+
+                    # Recuperar recon gradualmente: solo tras 3 respuestas 200 seguidas
+                    recon_ok_streak += 1
+                    if recon_ok_streak >= 3:
+                        recon           = 5
+                        recon_ok_streak = 0
 
                     game_id = str(payload.get("id", ""))
                     if not game_id or game_id == last_id:
