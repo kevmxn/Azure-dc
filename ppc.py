@@ -33,6 +33,9 @@ SECONDARY_CHAT_ID = -1003613599867   # Canal secundario (historial 100 giros)
 # Archivo para persistir el ID del mensaje de historial entre reinicios
 HISTORY_ID_FILE = "history_msg_id.json"
 
+# Archivo para persistir el último game_id procesado entre reinicios
+GAME_STATE_FILE = "game_state.json"
+
 # ══════════════════════════════════════════════════════════════
 #  CONSTANTES DEL SISTEMA
 # ══════════════════════════════════════════════════════════════
@@ -141,6 +144,30 @@ def save_history_msg_id(msg_id: int | None) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+#  PERSISTENCIA DEL ÚLTIMO GAME_ID
+#  Evita reprocesar el último giro tras un reinicio (igual que
+#  main.py lo hace con SELECT game_id FROM spins ORDER BY id DESC).
+# ══════════════════════════════════════════════════════════════
+
+def load_last_game_id() -> str:
+    """Carga el último game_id procesado para evitar duplicados al reiniciar."""
+    try:
+        with open(GAME_STATE_FILE, "r") as f:
+            return str(json.load(f).get("last_game_id", ""))
+    except Exception:
+        return ""
+
+
+def save_last_game_id(game_id: str) -> None:
+    """Persiste el último game_id procesado."""
+    try:
+        with open(GAME_STATE_FILE, "w") as f:
+            json.dump({"last_game_id": game_id}, f)
+    except Exception as e:
+        log.warning(f"⚠️ No se pudo guardar game_state: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
 #  CLASES DEL SISTEMA DE SEÑALES
 # ══════════════════════════════════════════════════════════════
 
@@ -213,7 +240,7 @@ class SignalManager:
 class BotState:
     def __init__(self):
         self.signal_manager  = SignalManager()
-        self.last_game_id    : str = ""
+        self.last_game_id    : str = load_last_game_id()  # persiste entre reinicios
 
         self.last_spin_num   : int = 0
         self.last_spin_color : str = "NEGRO"
@@ -275,6 +302,44 @@ class BotState:
 _bot = tba.AsyncTeleBot(BOT_TOKEN)
 
 
+_TG_MAX_RETRIES = 12   # intentos máximos por llamada
+
+
+async def _tg_call_async(fn, *args, **kwargs):
+    """
+    Wrapper async con retry idéntico al de ppc.py:
+    - Lee el tiempo exacto del header 'retry after' de Telegram (HTTP 429)
+    - Reintento con backoff exponencial para HTTP 500 y otros errores
+    - Máx 12 intentos antes de rendir
+    """
+    delay = 2.0
+    for attempt in range(1, _TG_MAX_RETRIES + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            err = str(e).lower()
+
+            # ── 429 Rate-limit: Telegram dice cuánto esperar ──────────────
+            if "retry after" in err or "429" in err:
+                try:
+                    wait = int("".join(filter(str.isdigit, err))) + 1
+                except Exception:
+                    wait = 30
+                log.warning(f"⏳ Rate limited (429). Esperando {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+
+            # ── 500 / errores transitorios: backoff exponencial ───────────
+            if attempt == _TG_MAX_RETRIES:
+                log.error(f"❌ TG falló tras {_TG_MAX_RETRIES} intentos: {e}")
+                return None
+            log.warning(f"⚠️ TG error (intento {attempt}): {e} — reintentando en {delay:.0f}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    return None
+
+
 class TelegramClient:
     def __init__(self, chat_id: int):
         self._chat_id = chat_id
@@ -284,19 +349,19 @@ class TelegramClient:
         text    : str,
         keyboard: types.InlineKeyboardMarkup | None = None,
     ) -> int | None:
-        try:
-            msg = await _bot.send_message(
-                self._chat_id, text,
-                parse_mode   = "HTML",
-                reply_markup = keyboard,
-            )
+        msg = await _tg_call_async(
+            _bot.send_message,
+            self._chat_id, text,
+            parse_mode   = "HTML",
+            reply_markup = keyboard,
+        )
+        if msg:
             log.info(
                 f"📤 [{self._chat_id}] Enviado (id={msg.message_id}): "
                 f"{text[:60].replace(chr(10), ' ')}"
             )
             return msg.message_id
-        except Exception as e:
-            log.error(f"❌ [{self._chat_id}] Error enviando: {e}")
+        log.error(f"❌ [{self._chat_id}] No se pudo enviar tras reintentos")
         return None
 
     async def edit(
@@ -306,6 +371,7 @@ class TelegramClient:
         keyboard  : types.InlineKeyboardMarkup | None = None,
     ) -> bool:
         try:
+            # "not modified" no es error real — no merece reintentos
             await _bot.edit_message_text(
                 text,
                 chat_id      = self._chat_id,
@@ -317,10 +383,28 @@ class TelegramClient:
             return True
         except Exception as e:
             err = str(e).lower()
-            # "not modified" no es un error real: el contenido es idéntico
             if "not modified" in err:
                 return True
-            log.debug(f"No se pudo editar {message_id}: {e}")
+            if "retry after" in err or "429" in err:
+                try:    wait = int("".join(filter(str.isdigit, err))) + 1
+                except: wait = 30
+                log.warning(f"⏳ Rate limited al editar. Esperando {wait}s...")
+                await asyncio.sleep(wait)
+                # un solo reintento tras el rate-limit
+                try:
+                    await _bot.edit_message_text(
+                        text,
+                        chat_id      = self._chat_id,
+                        message_id   = message_id,
+                        parse_mode   = "HTML",
+                        reply_markup = keyboard,
+                    )
+                    log.info(f"✏️  [{self._chat_id}] Editado (reintento, id={message_id})")
+                    return True
+                except Exception as e2:
+                    log.warning(f"⚠️ Edición fallida tras espera: {e2}")
+            else:
+                log.debug(f"No se pudo editar {message_id}: {e}")
             return False
 
     async def delete(self, message_id: int | None) -> None:
@@ -772,6 +856,7 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                     last_settled_ts    = current_settled_ts
                     last_id            = game_id
                     state.last_game_id = game_id
+                    save_last_game_id(game_id)   # persiste para sobrevivir reinicios
 
                     await processor.process(number)
 
@@ -830,6 +915,9 @@ async def main() -> None:
 
     log.info(
         f"💾 Parte actual: {state.batch_count + 1} | msg_id={state.batch_msg_id or 'nuevo'}"
+    )
+    log.info(
+        f"🎲 Último game_id restaurado: {state.last_game_id or '(ninguno — primer arranque)'}"
     )
 
     ar_now = datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M:%S")
