@@ -41,32 +41,15 @@ GAME_STATE_FILE = "game_state.json"
 # ══════════════════════════════════════════════════════════════
 ROULETTE_NAME = "IMMERSIVE ROULETTE"
 
-EVOLUTION_URL = (
-    "https://api-cs.casino.org/svc-evolution-game-events"
-    "/api/immersiveroulette/latest"
-)
-EVOLUTION_HEADERS = {
-    "origin":          "https://www.casino.org",
-    "referer":         "https://www.casino.org/",
-    "user-agent":      (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/148.0.0.0 Safari/537.36"
-    ),
-    "accept":          "*/*",
-    "accept-language": "es,en;q=0.9",
-    "sec-fetch-dest":  "empty",
-    "sec-fetch-mode":  "cors",
-    "sec-fetch-site":  "same-site",
-}
+STATS_URL     = "https://crashstake-ulmx.onrender.com"   # mismo servidor que usa ppc.py
+STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
 MAX_ATTEMPTS  = 6     # 6 intentos totales: 1/6 … 6/6 → LOSS si falla 6/6
 WAIT_SPINS    = 9     # Giros de espera tras resolver una señal
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
-DEFAULT_WAIT  = 20    # Espera fija tras el primer giro registrado
-DEFAULT_POLL  = 2     # Polling inicial (s)
-POLL_SECS     = 1     # Polling rápido una vez calibrado
+DEFAULT_POLL  = 2     # Polling al servidor propio (s)
+POLL_SECS     = 2     # Polling estable
 
 AR_TZ = timezone(timedelta(hours=-3))
 
@@ -799,121 +782,88 @@ def _parse_settled_at(s: str) -> float:
 
 
 async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
-    recon            = 5
-    recon_ok_streak  = 0   # respuestas 200 consecutivas; recon solo se resetea tras 3 éxitos
-    last_id          = state.last_game_id
-    last_settled_ts  = 0.0
-    spin_interval    = 0.0
-    poll_secs        = DEFAULT_POLL
+    """
+    Consume crashstake-ulmx.onrender.com/latest/IMMERSIVE (igual que ppc.py).
+    Nunca toca la API de Evolution directamente → sin 429.
+    """
+    recon           = 5
+    last_id         = state.last_game_id
+    first_poll_done = False
+    poll_secs       = DEFAULT_POLL
 
-    log.info(f"🎰 Poller IMMERSIVE iniciado → {EVOLUTION_URL}")
+    log.info(f"🎰 Poller IMMERSIVE iniciado → {STATS_LATEST}")
 
-    async with aiohttp.ClientSession(headers=EVOLUTION_HEADERS) as session:
+    async with aiohttp.ClientSession() as session:
         while True:
             try:
                 async with session.get(
-                    EVOLUTION_URL,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    STATS_LATEST,
+                    timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
 
-                    # ── 429: backoff propio, ignorar Retry-After excesivos ──
-                    if resp.status == 429:
-                        raw_ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
-                        try:
-                            server_wait = int(raw_ra) if raw_ra else recon
-                        except (ValueError, TypeError):
-                            server_wait = recon
-                        # Limitar a 60s: el servidor puede pedir cientos de
-                        # segundos pero necesitamos seguir operativos
-                        wait = min(max(server_wait, recon), 60)
-                        log.warning(
-                            f"⚠️ API HTTP 429 (server pidió {server_wait}s) "
-                            f"— reintentando en {wait}s"
-                        )
-                        await asyncio.sleep(wait)
-                        recon = min(recon * 2, 60)
-                        recon_ok_streak = 0
-                        continue
-
-                    # ── Otros errores HTTP ────────────────────────────────
                     if resp.status != 200:
-                        log.warning(f"⚠️ API HTTP {resp.status} — reintento en {recon}s")
+                        log.warning(f"⚠️ Servidor HTTP {resp.status} — reintento en {recon}s")
                         await asyncio.sleep(recon)
                         recon = min(recon * 2, 60)
-                        recon_ok_streak = 0
                         continue
 
-                    payload = await resp.json(content_type=None)
+                    payload  = await resp.json(content_type=None)
+                    recon    = 5
+                    last_20  = payload.get("last_20", [])
 
-                    # Recuperar recon gradualmente: solo tras 3 respuestas 200 seguidas
-                    recon_ok_streak += 1
-                    if recon_ok_streak >= 3:
-                        recon           = 5
-                        recon_ok_streak = 0
-
-                    game_id = str(payload.get("id", ""))
-                    if not game_id:
-                        log.warning(f"[Poller] ⚠️ Respuesta sin 'id' — keys: {list(payload.keys())}")
-                        await asyncio.sleep(poll_secs)
-                        continue
-                    if game_id == last_id:
+                    if not isinstance(last_20, list) or not last_20:
                         await asyncio.sleep(poll_secs)
                         continue
 
-                    log.debug(f"[Poller] 🆕 game_id={game_id}")
-                    data   = payload.get("data", {})
-                    status = data.get("status", "")
-                    if status != "Resolved":
-                        log.info(f"[Poller] ⏭️ Saltando — status='{status}' (esperando 'Resolved')")
-                        await asyncio.sleep(poll_secs)
-                        continue
-
-                    result_block = data.get("result", {})
-                    outcome      = result_block.get("outcome", {})
-                    number       = outcome.get("number")
-                    if number is None:
-                        log.warning(
-                            f"[Poller] ⚠️ 'number' ausente — "
-                            f"result keys: {list(result_block.keys())} | "
-                            f"outcome keys: {list(outcome.keys())}"
+                    # ── Primera poll: marcar giros ya conocidos, no procesar ──
+                    if not first_poll_done:
+                        for spin in last_20:
+                            gid = spin.get("game_id")
+                            if gid:
+                                last_id = gid   # el más reciente queda como último
+                        state.last_game_id = last_id
+                        save_last_game_id(last_id)
+                        first_poll_done = True
+                        log.info(
+                            f"[Poller] 🔒 Primera poll: {len(last_20)} giros marcados "
+                            f"| último game_id={last_id[:12] if last_id else '—'}"
                         )
                         await asyncio.sleep(poll_secs)
                         continue
 
-                    number = int(number)
-                    if not (0 <= number <= 36):
-                        log.warning(f"[Poller] ⚠️ Número fuera de rango: {number}")
+                    # ── Polls siguientes: detectar giros nuevos (orden desc→asc) ──
+                    nuevos = []
+                    for spin in last_20:
+                        gid = spin.get("game_id", "")
+                        if gid and gid != last_id:
+                            nuevos.append(spin)
+                        else:
+                            break   # el resto ya fueron procesados
+
+                    if not nuevos:
                         await asyncio.sleep(poll_secs)
                         continue
 
-                    current_settled_ts = _parse_settled_at(data.get("settledAt", ""))
-                    if current_settled_ts == 0.0:
-                        current_settled_ts = time.time()
+                    # Procesar en orden cronológico (el más viejo primero)
+                    for spin in reversed(nuevos):
+                        number = spin.get("number")
+                        gid    = spin.get("game_id", "")
+                        if number is None or not gid:
+                            continue
+                        number = int(number)
+                        if not (0 <= number <= 36):
+                            continue
 
-                    if last_settled_ts > 0 and current_settled_ts > last_settled_ts:
-                        spin_interval = current_settled_ts - last_settled_ts
-                        log.info(f"[Poller] ⏱️ Intervalo: {spin_interval:.1f}s")
+                        log.debug(f"[Poller] 🆕 number={number} game_id={gid[:12]}...")
+                        last_id            = gid
+                        state.last_game_id = gid
+                        save_last_game_id(gid)
+                        await processor.process(number)
 
-                    last_settled_ts    = current_settled_ts
-                    last_id            = game_id
-                    state.last_game_id = game_id
-                    save_last_game_id(game_id)   # persiste para sobrevivir reinicios
-
-                    await processor.process(number)
-
-                    if spin_interval > 5:
-                        # Intervalo calibrado (≥ 2 giros) → sleep adaptativo
-                        poll_secs  = POLL_SECS
-                        elapsed    = time.time() - current_settled_ts
-                        safe_sleep = max(spin_interval * 0.80 - elapsed, 0.0)
-                        if safe_sleep > 1:
-                            log.debug(f"[Poller] 😴 Sleep adaptativo {safe_sleep:.1f}s")
-                            await asyncio.sleep(safe_sleep)
-                    else:
-                        # Aún no hay intervalo calculado (1er o 2do giro) →
-                        # polling cada 2s hasta que llegue el siguiente giro
-                        log.info("[Poller] 🔰 Sin intervalo aún — polling cada 2s")
-                        await asyncio.sleep(DEFAULT_POLL)
+                    # Sleep adaptativo: esperar ~80% del intervalo típico (≈30s)
+                    # El servidor ya tiene el dato procesado; no necesitamos
+                    # consultar muy seguido.
+                    await asyncio.sleep(poll_secs)
                     continue
 
             except aiohttp.ClientError as e:
