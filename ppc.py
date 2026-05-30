@@ -46,6 +46,7 @@ STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
 MAX_ATTEMPTS  = 6     # 6 intentos totales: 1/6 … 6/6 → LOSS si falla 6/6
 WAIT_SPINS    = 9     # Giros de espera tras resolver una señal
+WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
 DEFAULT_POLL  = 2     # Polling al servidor propio (s)
@@ -172,6 +173,32 @@ class SignalManager:
         self.active_signal  : SignalData | None = None
         self.waiting_spins  : int = 0
         self.sequence_index : int = 0
+        self.warmup_done    : bool = False   # True tras WARMUP_SPINS giros reales
+        self.spins_count    : int = 0        # contador de giros procesados
+
+    def set_sequence_from_last_black(self, last_20: list) -> None:
+        """
+        Busca el último negro en los last_20 del servidor (orden desc) y
+        posiciona sequence_index para que el siguiente giro real use el
+        lugar correcto de la SEQUENCE como disparador.
+        Los last_20 vienen ordenados del más reciente al más antiguo.
+        """
+        for spin in last_20:
+            num = spin.get("number")
+            if num is None:
+                continue
+            if REAL_COLORS.get(int(num)) == "NEGRO":
+                # Cuántos giros han pasado desde ese negro (su posición en la lista)
+                idx = last_20.index(spin)
+                # sequence_index apunta al slot que usaría el PRÓXIMO giro real.
+                # Avanzamos idx posiciones desde 0 para quedar sincronizados.
+                self.sequence_index = idx % len(SEQUENCE)
+                log.info(
+                    f"[SignalManager] 🎯 Sync secuencia desde último NEGRO "
+                    f"(número {num}, posición {idx} en last_20) → seq_index={self.sequence_index}"
+                )
+                return
+        log.warning("[SignalManager] ⚠️ No se encontró NEGRO en last_20 — sequence_index=0")
 
     def advance_sequence(self) -> None:
         self.sequence_index = (self.sequence_index + 1) % len(SEQUENCE)
@@ -180,7 +207,7 @@ class SignalManager:
         return SEQUENCE[self.sequence_index]
 
     def can_generate_signal(self) -> bool:
-        return self.active_signal is None and self.waiting_spins == 0
+        return self.active_signal is None and self.waiting_spins == 0 and self.warmup_done
 
     def start_signal(self, trigger_number: int, signal_color: str) -> None:
         self.active_signal = SignalData(trigger_number, signal_color)
@@ -572,6 +599,20 @@ class SpinProcessor:
         # Añadir al historial
         s.current_batch.append(number)
 
+        # ── WARMUP: contar giros hasta habilitar señales ──────────────────────
+        if not sm.warmup_done:
+            sm.spins_count += 1
+            remaining_wu = WARMUP_SPINS - sm.spins_count
+            log.info(
+                f"🎰 {number} | {real_color} | warmup {sm.spins_count}/{WARMUP_SPINS}"
+                + (f" ({remaining_wu} restantes)" if remaining_wu > 0 else " → ¡LISTO!")
+            )
+            if sm.spins_count >= WARMUP_SPINS:
+                sm.warmup_done = True
+                log.info("✅ Warmup completado — señales habilitadas")
+            await self._update_history()
+            return
+
         log.info(
             f"🎰 {number} | {real_color} | seq={seq_color} | "
             f"espera={sm.waiting_spins} | señal={'SI' if sm.active_signal else 'NO'}"
@@ -823,6 +864,8 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                                 last_id = gid   # el más reciente queda como último
                         state.last_game_id = last_id
                         save_last_game_id(last_id)
+                        # Sincronizar secuencia desde el último NEGRO de los last_20
+                        state.signal_manager.set_sequence_from_last_black(last_20)
                         first_poll_done = True
                         log.info(
                             f"[Poller] 🔒 Primera poll: {len(last_20)} giros marcados "
