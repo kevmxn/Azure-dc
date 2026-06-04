@@ -316,6 +316,18 @@ _bot = tba.AsyncTeleBot(BOT_TOKEN)
 _TG_MAX_RETRIES = 12   # intentos máximos por llamada
 
 
+def _parse_retry_after(err: str, default: int = 30) -> int:
+    """Extrae el número de segundos del mensaje 'retry after N' de Telegram."""
+    m = re.search(r"retry after\s+(\d+)", err)
+    if m:
+        return int(m.group(1)) + 1
+    # fallback: buscar solo dígitos cortos (≤4 cifras) para evitar chat_ids
+    m = re.search(r"\b(\d{1,4})\b", err)
+    if m:
+        return int(m.group(1)) + 1
+    return default
+
+
 async def _tg_call_async(fn, *args, **kwargs):
     """
     Wrapper async con retry idéntico al de ppc.py:
@@ -332,10 +344,7 @@ async def _tg_call_async(fn, *args, **kwargs):
 
             # ── 429 Rate-limit: Telegram dice cuánto esperar ──────────────
             if "retry after" in err or "429" in err:
-                try:
-                    wait = int("".join(filter(str.isdigit, err))) + 1
-                except Exception:
-                    wait = 30
+                wait = _parse_retry_after(err)
                 log.warning(f"⏳ Rate limited (429). Esperando {wait}s...")
                 await asyncio.sleep(wait)
                 continue
@@ -397,8 +406,7 @@ class TelegramClient:
             if "not modified" in err:
                 return True
             if "retry after" in err or "429" in err:
-                try:    wait = int("".join(filter(str.isdigit, err))) + 1
-                except: wait = 30
+                wait = _parse_retry_after(err)
                 log.warning(f"⏳ Rate limited al editar. Esperando {wait}s...")
                 await asyncio.sleep(wait)
                 # un solo reintento tras el rate-limit
