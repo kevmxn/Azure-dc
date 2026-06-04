@@ -44,8 +44,8 @@ ROULETTE_NAME = "IMMERSIVE ROULETTE"
 STATS_URL     = "https://crashstake-ulmx.onrender.com"   # mismo servidor que usa ppc.py
 STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
-MAX_ATTEMPTS  = 6     # 6 intentos totales: 1/6 … 6/6 → LOSS si falla 6/6
-WAIT_SPINS    = 9     # Giros de espera tras resolver una señal
+MAX_ATTEMPTS  = 2     # 2 intentos totales: 1/2 … 2/2 → LOSS si falla 2/2
+WAIT_SPINS    = 6     # Giros de espera tras resolver una señal
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
@@ -468,9 +468,7 @@ class MessageBuilder:
             f"📆 MARCADOR DIARIO\n"
             f"✅ GANADAS: {state.won_signals}\n"
             f"❌ PERDIDAS: {state.lost_signals}\n\n"
-            f"📍 C1: {state.c1_wins} GANADAS — {pct(state.c1_wins)}\n"
-            f"📍 C2: {state.c2_wins} GANADAS — {pct(state.c2_wins)}\n"
-            f"📍 C3: {state.c3_wins} GANADAS — {pct(state.c3_wins)}\n\n"
+            f"📍 C1: {state.c1_wins} GANADAS — {pct(state.c1_wins)}\n\n"
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
@@ -486,9 +484,7 @@ class MessageBuilder:
             f"📆 MARCADOR DIARIO 00:00 (ARG) — {ROULETTE_NAME}\n"
             f"✅ GANADAS: {state.won_signals}\n"
             f"❌ PERDIDAS: {state.lost_signals}\n\n"
-            f"📍 C1: {state.c1_wins} GANADAS — {pct(state.c1_wins)}\n"
-            f"📍 C2: {state.c2_wins} GANADAS — {pct(state.c2_wins)}\n"
-            f"📍 C3: {state.c3_wins} GANADAS — {pct(state.c3_wins)}\n\n"
+            f"📍 C1: {state.c1_wins} GANADAS — {pct(state.c1_wins)}\n\n"
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
@@ -933,7 +929,7 @@ async def main() -> None:
     log.info(f"  {ROULETTE_NAME} — BOT DE SEÑALES TELEGRAM (Render-ready)")
     log.info(f"  Canal principal  : {MAIN_CHAT_ID}")
     log.info(f"  Canal secundario : {SECONDARY_CHAT_ID}")
-    log.info(f"  Intentos         : {MAX_ATTEMPTS} (1 señal + {MAX_ATTEMPTS-1} gales)")
+    log.info(f"  Intentos         : {MAX_ATTEMPTS} (1 señal + {MAX_ATTEMPTS-1} gale) — solo C1")
     log.info(f"  Espera           : {WAIT_SPINS} giros tras resolver señal")
     log.info(f"  Ping             : cada {PING_INTERVAL}s (anti-sleep Render)")
     log.info(f"  Zona AR          : UTC-3 | Hoy: {datetime.now(AR_TZ).date()}")
