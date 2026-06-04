@@ -44,8 +44,8 @@ ROULETTE_NAME = "IMMERSIVE ROULETTE"
 STATS_URL     = "https://crashstake-ulmx.onrender.com"   # mismo servidor que usa ppc.py
 STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
-MAX_ATTEMPTS  = 2     # 2 intentos totales: 1/2 … 2/2 → LOSS si falla 2/2
-WAIT_SPINS    = 6     # Giros de espera tras resolver una señal
+MAX_ATTEMPTS  = 3     # 2 intentos totales: 1/2 … 2/2 → LOSS si falla 2/2
+WAIT_SPINS    = 1     # Giros de espera tras resolver una señal
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
