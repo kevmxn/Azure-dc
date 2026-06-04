@@ -693,12 +693,13 @@ class SpinProcessor:
             sig             = sm.active_signal
             check_color     = sig.check_color
             next_gale_color = seq_color
+            bet_fichas_snap = sig.bet_fichas   # capturar ANTES de process_result (que puede nullificar active_signal)
 
             result = sm.process_result(number, real_color, check_color, next_gale_color)
 
             if result["type"] == "win":
                 s.won_signals      += 1
-                s.daily_capital    += sm.active_signal.bet_fichas * CHIP_VALUE
+                s.daily_capital    += bet_fichas_snap * CHIP_VALUE
                 s.labouchere.on_win()
                 s.consecutive_wins += 1
                 attempt = result["attempt"]
@@ -723,7 +724,7 @@ class SpinProcessor:
             elif result["type"] == "loss":
                 s.lost_signals    += 1
                 s.consecutive_wins = 0
-                s.daily_capital    -= sm.active_signal.bet_fichas * CHIP_VALUE
+                s.daily_capital    -= bet_fichas_snap * CHIP_VALUE
                 s.labouchere.on_loss()
                 s.signal_msg_id   = None
                 await self.tg.send(self.builder.loss(number, real_color))
@@ -739,14 +740,15 @@ class SpinProcessor:
                 new_color   = result["signal_color"]
                 new_attempt = result["attempt"]
                 attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
-                # Apuesta del gale = Labouchère.bet actual (suma extremos de la secuencia)
+                # Avanzar Labouchère: agrega la apuesta perdida al final, luego leer la nueva
+                s.labouchere.on_loss()
                 new_bet = s.labouchere.bet
                 sm.active_signal.bet_fichas = new_bet
                 await self.tg.delete(s.signal_msg_id)
                 s.signal_msg_id = await self.tg.send(
                     self.builder.signal(number, real_color, new_color, attempt_str, bet_fichas=new_bet)
                 )
-                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | bet={new_bet} fichas (Labouchère)")
+                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | seq={s.labouchere.sequence} | bet={new_bet} fichas")
 
         # ── SIN SEÑAL ACTIVA → DETECTAR NUEVA ────────────────────────────────
         elif sm.can_generate_signal():
