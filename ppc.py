@@ -175,6 +175,7 @@ class SignalManager:
         self.sequence_index : int = 0
         self.warmup_done    : bool = False   # True tras WARMUP_SPINS giros reales
         self.spins_count    : int = 0        # contador de giros procesados
+        self.warmup_msg_sent: bool = False   # True tras enviar el mensaje de inicio una sola vez
 
     def set_sequence_from_last_black(self, last_20: list) -> None:
         """
@@ -603,6 +604,14 @@ class SpinProcessor:
                 f"🎰 {number} | {real_color} | warmup {sm.spins_count}/{WARMUP_SPINS}"
                 + (f" ({remaining_wu} restantes)" if remaining_wu > 0 else " → ¡LISTO!")
             )
+            # Enviar mensaje de inicio UNA SOLA VEZ al primer giro
+            if not sm.warmup_msg_sent:
+                sm.warmup_msg_sent = True
+                await self.tg.send(
+                    f"⏳ <b>Analizando mesa...</b>\n"
+                    f"🎰 {ROULETTE_NAME}\n"
+                    f"📊 Procesando {WARMUP_SPINS} giros antes de activar señales."
+                )
             if sm.spins_count >= WARMUP_SPINS:
                 sm.warmup_done = True
                 log.info("✅ Warmup completado — señales habilitadas")
@@ -867,6 +876,24 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                             f"[Poller] 🔒 Primera poll: {len(last_20)} giros marcados "
                             f"| último game_id={last_id[:12] if last_id else '—'}"
                         )
+                        # Cargar números iniciales en orden cronológico (desc → reversed = asc)
+                        initial_numbers = []
+                        for spin in reversed(last_20):
+                            num = spin.get("number")
+                            if num is not None and 0 <= int(num) <= 36:
+                                initial_numbers.append(int(num))
+                        if initial_numbers:
+                            state.current_batch = initial_numbers
+                            text = processor.builder.history_text(
+                                state.current_batch, state.batch_count + 1, complete=False
+                            )
+                            mid = await processor.tg_sec.send(text)
+                            state.batch_msg_id = mid
+                            save_history_state(mid, state.batch_count)
+                            log.info(
+                                f"[Poller] 📋 Historial inicial enviado con "
+                                f"{len(initial_numbers)} giros | msg_id={mid}"
+                            )
                         await asyncio.sleep(poll_secs)
                         continue
 
