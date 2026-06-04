@@ -739,12 +739,14 @@ class SpinProcessor:
                 new_color   = result["signal_color"]
                 new_attempt = result["attempt"]
                 attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
-                bet         = sm.active_signal.bet_fichas   # mismo bet que la señal inicial
+                # Apuesta del gale = Labouchère.bet actual (suma extremos de la secuencia)
+                new_bet = s.labouchere.bet
+                sm.active_signal.bet_fichas = new_bet
                 await self.tg.delete(s.signal_msg_id)
                 s.signal_msg_id = await self.tg.send(
-                    self.builder.signal(number, real_color, new_color, attempt_str, bet_fichas=bet)
+                    self.builder.signal(number, real_color, new_color, attempt_str, bet_fichas=new_bet)
                 )
-                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | bet={bet}")
+                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | bet={new_bet} fichas (Labouchère)")
 
         # ── SIN SEÑAL ACTIVA → DETECTAR NUEVA ────────────────────────────────
         elif sm.can_generate_signal():
