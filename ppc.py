@@ -165,6 +165,7 @@ class SignalData:
         self.current_attempt = 0
         self.last_trigger_num: int | None = None
         self.bet_fichas      : int = bet_fichas   # apuesta Labouchère al iniciar
+        self.lost_fichas     : int = 0            # fichas acumuladas en intentos fallidos
 
     @property
     def display_attempt(self) -> str:
@@ -696,11 +697,14 @@ class SpinProcessor:
             next_gale_color = seq_color
             bet_fichas_snap = sig.bet_fichas   # capturar ANTES de process_result (que puede nullificar active_signal)
 
+            lost_fichas_snap = sig.lost_fichas   # fichas perdidas en intentos anteriores de esta señal
             result = sm.process_result(number, real_color, check_color, next_gale_color)
 
             if result["type"] == "win":
                 s.won_signals      += 1
-                s.daily_capital    += bet_fichas_snap * CHIP_VALUE
+                # ganancia neta = fichas ganadas - fichas perdidas en intentos anteriores
+                net_fichas = bet_fichas_snap - lost_fichas_snap
+                s.daily_capital    += net_fichas * CHIP_VALUE
                 s.labouchere.on_win()
                 s.consecutive_wins += 1
                 attempt = result["attempt"]
@@ -725,7 +729,9 @@ class SpinProcessor:
             elif result["type"] == "loss":
                 s.lost_signals    += 1
                 s.consecutive_wins = 0
-                s.daily_capital    -= bet_fichas_snap * CHIP_VALUE
+                # pérdida total = último intento + todos los intentos anteriores ya acumulados
+                total_lost = bet_fichas_snap + lost_fichas_snap
+                s.daily_capital    -= total_lost * CHIP_VALUE
                 s.labouchere.on_loss()
                 s.signal_msg_id   = None
                 await self.tg.send(self.builder.loss(number, real_color))
@@ -741,6 +747,7 @@ class SpinProcessor:
                 new_color   = result["signal_color"]
                 new_attempt = result["attempt"]
                 attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
+                sm.active_signal.lost_fichas += bet_fichas_snap   # acumular fichas perdidas en este intento
                 # Avanzar Labouchère: agrega la apuesta perdida al final, luego leer la nueva
                 s.labouchere.on_loss()
                 new_bet = s.labouchere.bet
