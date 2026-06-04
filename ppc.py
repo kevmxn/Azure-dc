@@ -908,16 +908,21 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
     recon           = 5
     last_id         = state.last_game_id
     first_poll_done = False
-    poll_secs       = DEFAULT_POLL
 
     log.info(f"🎰 Poller IMMERSIVE iniciado → {STATS_LATEST}")
 
-    async with aiohttp.ClientSession() as session:
+    # Connector con keep-alive: reutiliza la conexión TCP entre polls
+    connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers={"Connection": "keep-alive"},
+    ) as session:
         while True:
+            t_start = asyncio.get_event_loop().time()
             try:
                 async with session.get(
                     STATS_LATEST,
-                    timeout=aiohttp.ClientTimeout(total=8),
+                    timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
 
                     if resp.status != 200:
@@ -926,12 +931,12 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                         recon = min(recon * 2, 60)
                         continue
 
-                    payload  = await resp.json(content_type=None)
-                    recon    = 5
-                    last_20  = payload.get("last_20", [])
+                    payload = await resp.json(content_type=None)
+                    recon   = 5
+                    last_20 = payload.get("last_20", [])
 
                     if not isinstance(last_20, list) or not last_20:
-                        await asyncio.sleep(poll_secs)
+                        await asyncio.sleep(POLL_SECS)
                         continue
 
                     # ── Primera poll: marcar giros ya conocidos, no procesar ──
@@ -939,22 +944,20 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                         for spin in last_20:
                             gid = spin.get("game_id")
                             if gid:
-                                last_id = gid   # el más reciente queda como último
+                                last_id = gid
                         state.last_game_id = last_id
                         save_last_game_id(last_id)
-                        # Sincronizar secuencia desde el último NEGRO de los last_20
                         state.signal_manager.set_sequence_from_last_black(last_20)
                         first_poll_done = True
                         log.info(
                             f"[Poller] 🔒 Primera poll: {len(last_20)} giros marcados "
                             f"| último game_id={last_id[:12] if last_id else '—'}"
                         )
-                        # Cargar números iniciales en orden cronológico (desc → reversed = asc)
-                        initial_numbers = []
-                        for spin in reversed(last_20):
-                            num = spin.get("number")
-                            if num is not None and 0 <= int(num) <= 36:
-                                initial_numbers.append(int(num))
+                        initial_numbers = [
+                            int(spin["number"])
+                            for spin in reversed(last_20)
+                            if spin.get("number") is not None and 0 <= int(spin["number"]) <= 36
+                        ]
                         if initial_numbers:
                             state.current_batch = initial_numbers
                             text = processor.builder.history_text(
@@ -967,7 +970,7 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                                 f"[Poller] 📋 Historial inicial enviado con "
                                 f"{len(initial_numbers)} giros | msg_id={mid}"
                             )
-                        await asyncio.sleep(poll_secs)
+                        # no sleep aquí — volver a pollear inmediatamente
                         continue
 
                     # ── Polls siguientes: detectar giros nuevos (orden desc→asc) ──
@@ -977,10 +980,10 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                         if gid and gid != last_id:
                             nuevos.append(spin)
                         else:
-                            break   # el resto ya fueron procesados
+                            break
 
                     if not nuevos:
-                        await asyncio.sleep(poll_secs)
+                        await asyncio.sleep(POLL_SECS)
                         continue
 
                     # Procesar en orden cronológico (el más viejo primero)
@@ -993,28 +996,25 @@ async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
                         if not (0 <= number <= 36):
                             continue
 
-                        log.debug(f"[Poller] 🆕 number={number} game_id={gid[:12]}...")
+                        log.info(f"[Poller] 🆕 number={number} game_id={gid[:12]}...")
                         last_id            = gid
                         state.last_game_id = gid
                         save_last_game_id(gid)
                         await processor.process(number)
 
-                    # Sleep adaptativo: esperar ~80% del intervalo típico (≈30s)
-                    # El servidor ya tiene el dato procesado; no necesitamos
-                    # consultar muy seguido.
-                    await asyncio.sleep(poll_secs)
-                    continue
+                    # Compensar el tiempo ya consumido para mantener intervalo estable
+                    elapsed = asyncio.get_event_loop().time() - t_start
+                    sleep   = max(0.0, POLL_SECS - elapsed)
+                    if sleep > 0:
+                        await asyncio.sleep(sleep)
 
             except aiohttp.ClientError as e:
                 log.warning(f"⚠️ Error de red: {e} — reintento en {recon}s")
                 await asyncio.sleep(recon)
                 recon = min(recon * 2, 60)
-                continue
             except Exception as e:
                 log.error(f"❌ Error inesperado en poller: {e}")
                 await asyncio.sleep(recon)
-
-            await asyncio.sleep(POLL_SECS)
 
 
 
