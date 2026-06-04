@@ -44,7 +44,8 @@ ROULETTE_NAME = "IMMERSIVE ROULETTE"
 STATS_URL     = "https://crashstake-ulmx.onrender.com"   # mismo servidor que usa ppc.py
 STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
-MAX_ATTEMPTS  = 3     # 2 intentos totales: 1/2 … 2/2 → LOSS si falla 2/2
+MAX_ATTEMPTS  = 3
+CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 2 intentos totales: 1/2 … 2/2 → LOSS si falla 2/2
 WAIT_SPINS    = 1     # Giros de espera tras resolver una señal
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
@@ -156,12 +157,13 @@ def save_last_game_id(game_id: str) -> None:
 # ══════════════════════════════════════════════════════════════
 
 class SignalData:
-    def __init__(self, trigger_number: int, signal_color: str):
+    def __init__(self, trigger_number: int, signal_color: str, bet_fichas: int = 0):
         self.trigger_number  = trigger_number
         self.signal_color    = signal_color
         self.check_color     = signal_color
         self.current_attempt = 0
         self.last_trigger_num: int | None = None
+        self.bet_fichas      : int = bet_fichas   # apuesta Labouchère al iniciar
 
     @property
     def display_attempt(self) -> str:
@@ -210,8 +212,8 @@ class SignalManager:
     def can_generate_signal(self) -> bool:
         return self.active_signal is None and self.waiting_spins == 0 and self.warmup_done
 
-    def start_signal(self, trigger_number: int, signal_color: str) -> None:
-        self.active_signal = SignalData(trigger_number, signal_color)
+    def start_signal(self, trigger_number: int, signal_color: str, bet_fichas: int = 0) -> None:
+        self.active_signal = SignalData(trigger_number, signal_color, bet_fichas)
 
     def tick_wait(self) -> None:
         if self.waiting_spins > 0:
@@ -248,9 +250,45 @@ class SignalManager:
         return {"type": "loss", "attempt": attempt, "check_color": check_color}
 
 
+class Labouchere:
+    """
+    Sistema de gestión Labouchère: secuencia 1-2-3 por eliminación de extremos.
+      · Apuesta  = primero + último  (o único si queda solo un elemento)
+      · Victoria → eliminar primero y último
+      · Derrota  → agregar la apuesta al final
+      · Secuencia vacía → reiniciar a [1, 2, 3]
+    """
+    INITIAL: list[int] = [1, 2, 1]
+
+    def __init__(self) -> None:
+        self.sequence: list[int] = list(self.INITIAL)
+
+    @property
+    def bet(self) -> int:
+        if not self.sequence:
+            return self.INITIAL[0] + self.INITIAL[-1]
+        if len(self.sequence) == 1:
+            return self.sequence[0]
+        return self.sequence[0] + self.sequence[-1]
+
+    def on_win(self) -> None:
+        """Elimina los extremos. Si queda vacío, reinicia."""
+        if len(self.sequence) <= 2:
+            self.sequence = list(self.INITIAL)
+        else:
+            self.sequence = self.sequence[1:-1]
+        log.info(f"[Labouchere] WIN → secuencia={self.sequence} | próxima apuesta={self.bet}")
+
+    def on_loss(self) -> None:
+        """Agrega la apuesta al final de la secuencia."""
+        self.sequence.append(self.bet)
+        log.info(f"[Labouchere] LOSS → secuencia={self.sequence} | próxima apuesta={self.bet}")
+
+
 class BotState:
     def __init__(self):
         self.signal_manager  = SignalManager()
+        self.labouchere      = Labouchere()
         self.last_game_id    : str = load_last_game_id()  # persiste entre reinicios
 
         self.last_spin_num   : int = 0
@@ -268,6 +306,7 @@ class BotState:
         self.c1_wins          : int = 0
         self.c2_wins          : int = 0
         self.c3_wins          : int = 0
+        self.daily_capital    : float = 0.0   # Acumulado USD del día
 
         self.last_spin_ts     : float = 0.0
 
@@ -288,6 +327,7 @@ class BotState:
         self.lost_signals     = 0
         self.consecutive_wins = 0
         self.c1_wins = self.c2_wins = self.c3_wins = 0
+        self.daily_capital    = 0.0
 
     def check_daily_reset(self) -> None:
         if self._ar_date() != self.stats_date:
@@ -446,12 +486,14 @@ class MessageBuilder:
     def _ce(color: str) -> str:
         return COLOR_EMOJI.get(color, "⚪")
 
-    def signal(self, last_num: int, last_color: str, signal_color: str, attempt_str: str) -> str:
+    def signal(self, last_num: int, last_color: str, signal_color: str, attempt_str: str, bet_fichas: int = 0) -> str:
+        usd = bet_fichas * CHIP_VALUE
         return (
             f"✅ RULETA — {ROULETTE_NAME} ✅\n"
             f"⚪ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
             f"🟡 SEÑAL PARA: {signal_color} {self._ce(signal_color)}\n"
-            f"🔵 INTENTO: {attempt_str}"
+            f"🇺🇲 APUESTA USD: ${usd:.2f}\n"
+            f"♻️ INTENTO: {attempt_str}"
         )
 
     def win(self, number: int, color: str) -> str:
@@ -473,10 +515,12 @@ class MessageBuilder:
                 return "0.00%"
             return f"{wins / st * 100:.2f}%"
 
+        sign = "+" if state.daily_capital >= 0 else ""
         return (
             f"📆 MARCADOR DIARIO\n"
             f"✅ GANADAS: {state.won_signals}\n"
-            f"❌ PERDIDAS: {state.lost_signals}\n\n"
+            f"❌ PERDIDAS: {state.lost_signals}\n"
+            f"🇺🇲 USD: {sign}${state.daily_capital:.2f}\n\n"
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
@@ -488,10 +532,12 @@ class MessageBuilder:
                 return "0.00%"
             return f"{wins / st * 100:.2f}%"
 
+        sign = "+" if state.daily_capital >= 0 else ""
         return (
             f"📆 MARCADOR DIARIO 00:00 (ARG) — {ROULETTE_NAME}\n"
             f"✅ GANADAS: {state.won_signals}\n"
-            f"❌ PERDIDAS: {state.lost_signals}\n\n"
+            f"❌ PERDIDAS: {state.lost_signals}\n"
+            f"🇺🇲 USD: {sign}${state.daily_capital:.2f}\n\n"
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
@@ -652,6 +698,8 @@ class SpinProcessor:
 
             if result["type"] == "win":
                 s.won_signals      += 1
+                s.daily_capital    += sm.active_signal.bet_fichas * CHIP_VALUE
+                s.labouchere.on_win()
                 s.consecutive_wins += 1
                 attempt = result["attempt"]
                 if attempt <= 1:
@@ -675,6 +723,8 @@ class SpinProcessor:
             elif result["type"] == "loss":
                 s.lost_signals    += 1
                 s.consecutive_wins = 0
+                s.daily_capital    -= sm.active_signal.bet_fichas * CHIP_VALUE
+                s.labouchere.on_loss()
                 s.signal_msg_id   = None
                 await self.tg.send(self.builder.loss(number, real_color))
                 await asyncio.sleep(0.4)
@@ -689,21 +739,23 @@ class SpinProcessor:
                 new_color   = result["signal_color"]
                 new_attempt = result["attempt"]
                 attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
+                bet         = sm.active_signal.bet_fichas   # mismo bet que la señal inicial
                 await self.tg.delete(s.signal_msg_id)
                 s.signal_msg_id = await self.tg.send(
-                    self.builder.signal(number, real_color, new_color, attempt_str)
+                    self.builder.signal(number, real_color, new_color, attempt_str, bet_fichas=bet)
                 )
-                log.info(f"🔁 Gale {new_attempt} | apostar {new_color}")
+                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | bet={bet}")
 
         # ── SIN SEÑAL ACTIVA → DETECTAR NUEVA ────────────────────────────────
         elif sm.can_generate_signal():
-            sm.start_signal(number, seq_color)
+            bet = s.labouchere.bet
+            sm.start_signal(number, seq_color, bet_fichas=bet)
             await self.tg.delete(s.waiting_msg_id)
             s.waiting_msg_id = None
             s.signal_msg_id  = await self.tg.send(
-                self.builder.signal(number, real_color, seq_color, f"1/{MAX_ATTEMPTS}")
+                self.builder.signal(number, real_color, seq_color, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
             )
-            log.info(f"🟡 Nueva señal: {number} → apostar {seq_color}")
+            log.info(f"🟡 Nueva señal: {number} → apostar {seq_color} | Labouchère bet={bet}")
 
         # Actualizar historial (siempre al final del giro)
         await self._update_history()
