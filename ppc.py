@@ -448,7 +448,7 @@ class MessageBuilder:
 
     def signal(self, last_num: int, last_color: str, signal_color: str, attempt_str: str) -> str:
         return (
-            f"🆔 RULETA — {ROULETTE_NAME}\n"
+            f"✅ RULETA — {ROULETTE_NAME} ✅\n"
             f"⚪ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
             f"🟡 SEÑAL PARA: {signal_color} {self._ce(signal_color)}\n"
             f"🔵 INTENTO: {attempt_str}"
@@ -462,8 +462,8 @@ class MessageBuilder:
 
     def consecutive(self, count: int) -> str:
         if count == 0:
-            return "☑️ 0 SEÑALES GANADAS SEGUIDAS ☑️"
-        return f"☑️ {count} SEÑALES GANADAS SEGUIDAS ☑️"
+            return f"⛔ SE CORTO LA RACHA POSITIVA ⛔"
+        return f"🤑 {count} SEÑALES GANADAS CONSECUTIVAS 🤑"
 
     def stats(self, state: BotState) -> str:
         st = state.total_signals
@@ -477,7 +477,6 @@ class MessageBuilder:
             f"📆 MARCADOR DIARIO\n"
             f"✅ GANADAS: {state.won_signals}\n"
             f"❌ PERDIDAS: {state.lost_signals}\n\n"
-            f"📍 C1: {state.c1_wins} GANADAS — {pct(state.c1_wins)}\n\n"
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
@@ -493,7 +492,6 @@ class MessageBuilder:
             f"📆 MARCADOR DIARIO 00:00 (ARG) — {ROULETTE_NAME}\n"
             f"✅ GANADAS: {state.won_signals}\n"
             f"❌ PERDIDAS: {state.lost_signals}\n\n"
-            f"📍 C1: {state.c1_wins} GANADAS — {pct(state.c1_wins)}\n\n"
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
@@ -638,8 +636,11 @@ class SpinProcessor:
             if remaining > 0:
                 await self.tg.delete(s.waiting_msg_id)
                 s.waiting_msg_id = await self.tg.send(self.builder.waiting(remaining))
-            await self._update_history()
-            return
+                await self._update_history()
+                return
+            # remaining == 0: limpiar mensaje y caer a generar señal este mismo giro
+            await self.tg.delete(s.waiting_msg_id)
+            s.waiting_msg_id = None
 
         # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
         if sm.active_signal:
