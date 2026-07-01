@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║       IMMERSIVE ROULETTE — BOT DE SEÑALES TELEGRAM          ║
@@ -399,7 +398,6 @@ class BotState:
         self.last_spin_color : str = "NEGRO"
 
         self.signal_msg_id      : int | None = None
-        self.waiting_msg_id     : int | None = None
         self.pre_signal_msg_id  : int | None = None   # aviso "POSIBLE SEÑAL A CONFIRMAR"
         self.stats_msg_id       : int | None = None
         self.consecutive_msg_id : int | None = None
@@ -664,9 +662,6 @@ class MessageBuilder:
             f"📈 ACIERTO: {state.win_rate:.2f}%"
         )
 
-    def waiting(self, spins_left: int) -> str:
-        return self._bold_lines(f"⚠️ SIGUIENTE SEÑAL EN {spins_left} GIROS... ⚠️")
-
     def history_text(self, batch: list, batch_num: int, complete: bool = False) -> str:
         """
         Texto del historial — canal secundario.
@@ -802,21 +797,13 @@ class SpinProcessor:
             f"espera={sm.waiting_spins} | señal={'SI' if sm.active_signal else 'NO'}"
         )
 
-        # ── PERÍODO DE ESPERA POST-SEÑAL ──────────────────────────────────────
+        # ── PERÍODO DE ESPERA POST-SEÑAL (silencioso, sin mensajes) ───────────
         if sm.waiting_spins > 0:
             sm.tick_wait()
             remaining = sm.waiting_spins
             if remaining > 0:
-                await self.tg.delete(s.waiting_msg_id)
-                s.waiting_msg_id = await self.tg.send(self.builder.waiting(remaining))
                 await self._update_history()
                 return
-            # remaining == 0: se registró el 2º giro de espera. Limpiar
-            # mensaje y disparar la señal en ESTE mismo giro — la señal
-            # queda armada con la secuencia de este giro y se verifica
-            # contra el resultado del giro SIGUIENTE.
-            await self.tg.delete(s.waiting_msg_id)
-            s.waiting_msg_id = None
 
         # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
         if sm.active_signal:
@@ -901,8 +888,6 @@ class SpinProcessor:
                 bet          = s.martingala.bet
                 signal_value = sm.get_sequence_value(ready_cat)
                 sm.start_signal(number, ready_cat, signal_value, bet_fichas=bet)
-                await self.tg.delete(s.waiting_msg_id)
-                s.waiting_msg_id = None
                 s.signal_msg_id  = await self.tg.send(
                     self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
                 )
