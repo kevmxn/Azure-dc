@@ -11,6 +11,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -36,6 +37,17 @@ HISTORY_ID_FILE = "history_msg_id.json"
 
 # Archivo para persistir el último game_id procesado entre reinicios
 GAME_STATE_FILE = "game_state.json"
+
+# Archivo para persistir los pesos del modelo de Machine Learning entre reinicios
+ML_STATE_FILE = "ml_state.json"
+
+# ══════════════════════════════════════════════════════════════
+#  MACHINE LEARNING — CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════
+ML_MIN_CONFIDENCE    = 0.60   # Confianza mínima (60%) para confirmar una señal
+ML_MIN_TRAIN_SAMPLES = 20     # Señales resueltas necesarias antes de exigir el
+                               # umbral de confianza (mientras aprende, deja pasar)
+ML_LEARNING_RATE     = 0.08
 
 # ══════════════════════════════════════════════════════════════
 #  CONSTANTES DEL SISTEMA
@@ -223,11 +235,111 @@ def save_last_game_id(game_id: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+#  MACHINE LEARNING — REGRESIÓN LOGÍSTICA ONLINE
+#  Aprende, señal a señal (WIN=1 / LOSS=0), qué combinaciones de
+#  condiciones (categoría, racha de sincronía, rendimiento reciente,
+#  etc.) tienden a terminar en victoria. Antes de confirmar una señal
+#  nueva se le pide una probabilidad de éxito; si no llega al 60% de
+#  confianza mínima, la señal se descarta y el bot sigue esperando.
+# ══════════════════════════════════════════════════════════════
+
+FEATURE_NAMES: list[str] = [
+    "cat_color", "cat_paridad", "cat_zona",   # categoría (one-hot)
+    "streak_norm",                             # racha de sincronía al confirmar
+    "overall_winrate",                         # % de aciertos general reciente
+    "cat_winrate",                             # % de aciertos de esa categoría
+    "losing_streak_norm",                      # rachas de derrotas consecutivas
+]
+N_FEATURES = len(FEATURE_NAMES)
+
+
+class MLPredictor:
+    """Regresión logística entrenada online (SGD), sin dependencias externas."""
+
+    def __init__(self, state_file: str = ML_STATE_FILE):
+        self.state_file    = state_file
+        self.weights        : list[float] = [0.0] * N_FEATURES
+        self.bias            : float = 0.0
+        self.samples_seen    : int = 0
+        self._load()
+
+    @staticmethod
+    def _sigmoid(z: float) -> float:
+        try:
+            return 1.0 / (1.0 + math.exp(-z))
+        except OverflowError:
+            return 0.0 if z < 0 else 1.0
+
+    def predict_proba(self, features: list[float]) -> float:
+        z = self.bias + sum(w * f for w, f in zip(self.weights, features))
+        return self._sigmoid(z)
+
+    def is_warmed_up(self) -> bool:
+        return self.samples_seen >= ML_MIN_TRAIN_SAMPLES
+
+    def fit_one(self, features: list[float], label: float) -> None:
+        """label: 1.0 = WIN, 0.0 = LOSS. Un paso de descenso por gradiente estocástico."""
+        pred  = self.predict_proba(features)
+        error = label - pred
+        self.bias += ML_LEARNING_RATE * error
+        for i in range(N_FEATURES):
+            self.weights[i] += ML_LEARNING_RATE * error * features[i]
+        self.samples_seen += 1
+        self._save()
+
+    def _load(self) -> None:
+        try:
+            with open(self.state_file, "r") as f:
+                data = json.load(f)
+            w = data.get("weights")
+            if isinstance(w, list) and len(w) == N_FEATURES:
+                self.weights = [float(x) for x in w]
+            self.bias         = float(data.get("bias", 0.0))
+            self.samples_seen = int(data.get("samples_seen", 0))
+            log.info(f"[ML] 🧠 Modelo cargado — {self.samples_seen} señales aprendidas")
+        except Exception:
+            log.info("[ML] 🧠 Sin modelo previo — empieza a aprender desde cero")
+
+    def _save(self) -> None:
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(
+                    {"weights": self.weights, "bias": self.bias, "samples_seen": self.samples_seen},
+                    f,
+                )
+        except Exception as e:
+            log.warning(f"⚠️ No se pudo guardar ml_state: {e}")
+
+
+def build_ml_features(state: "BotState", category: str) -> list[float]:
+    """Arma el vector de características para la categoría que se va a confirmar."""
+    sm = state.signal_manager
+
+    cat_color   = 1.0 if category == "color"   else 0.0
+    cat_paridad = 1.0 if category == "paridad" else 0.0
+    cat_zona    = 1.0 if category == "zona"    else 0.0
+
+    streak_norm = min(sm.sync_streak.get(category, 0), 10) / 10.0
+
+    overall_total = state.won_signals + state.lost_signals
+    overall_wr    = (state.won_signals / overall_total) if overall_total else 0.5
+
+    cw, cl    = state.cat_wins[category], state.cat_losses[category]
+    cat_total = cw + cl
+    cat_wr    = (cw / cat_total) if cat_total else 0.5
+
+    losing_streak_norm = min(state.consecutive_losses, 10) / 10.0
+
+    return [cat_color, cat_paridad, cat_zona, streak_norm, overall_wr, cat_wr, losing_streak_norm]
+
+
+# ══════════════════════════════════════════════════════════════
 #  CLASES DEL SISTEMA DE SEÑALES
 # ══════════════════════════════════════════════════════════════
 
 class SignalData:
-    def __init__(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0):
+    def __init__(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0,
+                 ml_features: list[float] | None = None, ml_confidence: float | None = None):
         self.trigger_number  = trigger_number
         self.category        = category      # "color" | "paridad" | "zona"
         self.signal_value    = signal_value   # ej. "ROJO", "PAR", "ALTOS"
@@ -236,6 +348,8 @@ class SignalData:
         self.last_trigger_num: int | None = None
         self.bet_fichas      : int = bet_fichas   # apuesta Martingala al iniciar
         self.lost_fichas     : int = 0            # fichas acumuladas en intentos fallidos
+        self.ml_features     : list[float] | None = ml_features    # features usadas para confirmar
+        self.ml_confidence   : float | None = ml_confidence        # confianza (0-1) al confirmar
 
     @property
     def display_attempt(self) -> str:
@@ -336,8 +450,10 @@ class SignalManager:
             and self.ready_category() is not None
         )
 
-    def start_signal(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0) -> None:
-        self.active_signal = SignalData(trigger_number, category, signal_value, bet_fichas)
+    def start_signal(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0,
+                      ml_features: list[float] | None = None, ml_confidence: float | None = None) -> None:
+        self.active_signal = SignalData(trigger_number, category, signal_value, bet_fichas,
+                                         ml_features=ml_features, ml_confidence=ml_confidence)
 
     def tick_wait(self) -> None:
         if self.waiting_spins > 0:
@@ -420,10 +536,17 @@ class BotState:
         self.won_signals      : int = 0
         self.lost_signals     : int = 0
         self.consecutive_wins : int = 0
+        self.consecutive_losses: int = 0
         self.c1_wins          : int = 0
         self.c2_wins          : int = 0
         self.c3_wins          : int = 0
         self.daily_capital    : float = 0.0   # Acumulado USD del día
+
+        # Machine Learning: aprende de cada señal resuelta (WIN/LOSS) y exige
+        # ML_MIN_CONFIDENCE (60%) para confirmar señales nuevas.
+        self.ml               = MLPredictor()
+        self.cat_wins         : dict[str, int] = {cat: 0 for cat in SEQUENCES}
+        self.cat_losses       : dict[str, int] = {cat: 0 for cat in SEQUENCES}
 
         self.last_spin_ts     : float = 0.0
 
@@ -621,15 +744,15 @@ class MessageBuilder:
         usd      = bet_fichas * CHIP_VALUE
         jugar_en = SIGNAL_DISPLAY.get((category, signal_value), signal_value)
         return self._bold_lines(
-            f"✅ SEÑAL DETECTADA ✅\n\n"
+            f"✅ SEÑAL DETECTADA  ✅\n\n"
             f"♦️ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
-            f"🧨 JUGAR EN: {jugar_en}\n"
+            f"🧨 JUGAR EN:  {jugar_en}\n"
             f"🇺🇲 APUESTA USD: ${usd:.2f}\n"
             f"♻️ INTENTO: {attempt_str}"
         )
 
     def pre_signal(self) -> str:
-        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar...")
+        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar")
 
     def win(self, number: int, color: str) -> str:
         return self._bold_lines(f"✅ GANADA {number} {self._ce(color)} {color} ✅")
@@ -830,6 +953,7 @@ class SpinProcessor:
             bet_fichas_snap = sig.bet_fichas   # capturar ANTES de process_result (que puede nullificar active_signal)
 
             lost_fichas_snap = sig.lost_fichas   # fichas perdidas en intentos anteriores de esta señal
+            ml_features_snap = sig.ml_features   # features usadas al confirmar (para entrenar al resolver)
             result = sm.process_result(number, real_value, check_value, next_gale_value)
 
             if result["type"] == "win":
@@ -847,6 +971,10 @@ class SpinProcessor:
                 else:
                     s.c3_wins += 1
                 s.signal_msg_id = None
+                if ml_features_snap is not None:
+                    s.ml.fit_one(ml_features_snap, 1.0)
+                s.cat_wins[category]  += 1
+                s.consecutive_losses   = 0
                 await self.tg.send(self.builder.win(number, real_color))
                 await asyncio.sleep(0.4)
                 await self.tg.delete(s.consecutive_msg_id)
@@ -866,6 +994,10 @@ class SpinProcessor:
                 s.daily_capital    -= total_lost * CHIP_VALUE
                 s.martingala.on_loss()
                 s.signal_msg_id   = None
+                if ml_features_snap is not None:
+                    s.ml.fit_one(ml_features_snap, 0.0)
+                s.cat_losses[category] += 1
+                s.consecutive_losses   += 1
                 await self.tg.send(self.builder.loss(number, real_color))
                 await asyncio.sleep(0.4)
                 await self.tg.delete(s.consecutive_msg_id)
@@ -895,19 +1027,37 @@ class SpinProcessor:
             ready_cat = sm.ready_category()
 
             if ready_cat and sm.waiting_spins == 0:
-                # Se confirma la señal en este giro (sin espera): si había
-                # aviso previo, se borra.
-                if s.pre_signal_msg_id:
-                    await self.tg.delete(s.pre_signal_msg_id)
-                    s.pre_signal_msg_id = None
+                # ── Machine Learning: pedir confianza antes de confirmar ────────
+                features   = build_ml_features(s, ready_cat)
+                confidence = s.ml.predict_proba(features)
+                ml_ready   = s.ml.is_warmed_up()
 
-                bet          = s.martingala.bet
-                signal_value = sm.get_sequence_value(ready_cat)
-                sm.start_signal(number, ready_cat, signal_value, bet_fichas=bet)
-                s.signal_msg_id  = await self.tg.send(
-                    self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
-                )
-                log.info(f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet}")
+                if ml_ready and confidence < ML_MIN_CONFIDENCE:
+                    log.info(
+                        f"🧠 Señal [{ready_cat}] descartada por baja confianza IA: "
+                        f"{confidence*100:.1f}% (mínimo {ML_MIN_CONFIDENCE*100:.0f}%)"
+                    )
+                    if s.pre_signal_msg_id:
+                        await self.tg.delete(s.pre_signal_msg_id)
+                        s.pre_signal_msg_id = None
+                else:
+                    # Se confirma la señal en este giro (sin espera): si había
+                    # aviso previo, se borra.
+                    if s.pre_signal_msg_id:
+                        await self.tg.delete(s.pre_signal_msg_id)
+                        s.pre_signal_msg_id = None
+
+                    bet          = s.martingala.bet
+                    signal_value = sm.get_sequence_value(ready_cat)
+                    sm.start_signal(
+                        number, ready_cat, signal_value, bet_fichas=bet,
+                        ml_features=features, ml_confidence=confidence,
+                    )
+                    s.signal_msg_id  = await self.tg.send(
+                        self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
+                    )
+                    tag = f"{confidence*100:.1f}%" if ml_ready else f"{confidence*100:.1f}% (aprendiendo, {s.ml.samples_seen}/{ML_MIN_TRAIN_SAMPLES})"
+                    log.info(f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet} | 🧠 Confianza IA={tag}")
 
             elif sm.about_to_confirm() or (ready_cat and sm.waiting_spins > 0):
                 # Falta un giro para que alguna categoría alcance la racha mínima:
@@ -979,6 +1129,11 @@ def health():
         "history_count"   : len(_state.current_batch),
         "batch_count"     : _state.batch_count,
         "batch_msg_id"    : _state.batch_msg_id,
+        "ml_samples_seen" : _state.ml.samples_seen,
+        "ml_warmed_up"    : _state.ml.is_warmed_up(),
+        "ml_min_confidence": ML_MIN_CONFIDENCE,
+        "cat_wins"        : _state.cat_wins,
+        "cat_losses"      : _state.cat_losses,
     })
 
 
@@ -1185,6 +1340,7 @@ async def main() -> None:
     log.info(f"  Canal secundario : {SECONDARY_CHAT_ID}")
     log.info(f"  Intentos         : {MAX_ATTEMPTS} (1 señal + {MAX_ATTEMPTS-1} gale) — solo C1")
     log.info(f"  Espera           : sin espera tras resolver señal (WAIT_SPINS={WAIT_SPINS})")
+    log.info(f"  Machine Learning : confianza mínima {ML_MIN_CONFIDENCE*100:.0f}% (aprende tras {ML_MIN_TRAIN_SAMPLES} señales)")
     log.info(f"  Ping             : cada {PING_INTERVAL}s (anti-sleep Render)")
     log.info(f"  Zona AR          : UTC-3 | Hoy: {datetime.now(AR_TZ).date()}")
     log.info("═" * 60)
