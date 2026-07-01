@@ -44,10 +44,27 @@ ML_STATE_FILE = "ml_state.json"
 # ══════════════════════════════════════════════════════════════
 #  MACHINE LEARNING — CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
-ML_MIN_CONFIDENCE    = 0.60   # Confianza mínima (60%) para confirmar una señal
+ML_MIN_CONFIDENCE    = 0.75   # Confianza mínima (75%) para confirmar una señal — más estricto
 ML_MIN_TRAIN_SAMPLES = 20     # Señales resueltas necesarias antes de exigir el
                                # umbral de confianza (mientras aprende, deja pasar)
 ML_LEARNING_RATE     = 0.08
+
+# Intentos (gale) dinámicos según la confianza de la IA al confirmar la señal:
+# a mayor confianza, MENOS intentos permitidos (más selectivo — si una señal
+# "muy segura" no gana rápido, se corta antes en vez de seguir doblando).
+# Se evalúa de arriba hacia abajo; el primer umbral que cumpla la confianza gana.
+CONFIDENCE_ATTEMPT_TIERS: list[tuple[float, int]] = [
+    (0.90, 2),   # confianza ≥ 90% → máx. 2 intentos (1 señal + 1 gale)
+    (0.80, 3),   # confianza ≥ 80% → máx. 3 intentos
+    (0.00, 4),   # confianza ≥ 75% (mínimo del filtro) → máx. 4 intentos
+]
+
+
+def dynamic_max_attempts(confidence: float) -> int:
+    for threshold, attempts in CONFIDENCE_ATTEMPT_TIERS:
+        if confidence >= threshold:
+            return attempts
+    return MAX_ATTEMPTS   # fallback (no debería llegar acá si ya pasó el filtro de 75%)
 
 # ══════════════════════════════════════════════════════════════
 #  CONSTANTES DEL SISTEMA
@@ -339,7 +356,8 @@ def build_ml_features(state: "BotState", category: str) -> list[float]:
 
 class SignalData:
     def __init__(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0,
-                 ml_features: list[float] | None = None, ml_confidence: float | None = None):
+                 ml_features: list[float] | None = None, ml_confidence: float | None = None,
+                 max_attempts: int | None = None):
         self.trigger_number  = trigger_number
         self.category        = category      # "color" | "paridad" | "zona"
         self.signal_value    = signal_value   # ej. "ROJO", "PAR", "ALTOS"
@@ -350,10 +368,11 @@ class SignalData:
         self.lost_fichas     : int = 0            # fichas acumuladas en intentos fallidos
         self.ml_features     : list[float] | None = ml_features    # features usadas para confirmar
         self.ml_confidence   : float | None = ml_confidence        # confianza (0-1) al confirmar
+        self.max_attempts    : int = max_attempts or MAX_ATTEMPTS  # tope dinámico según confianza IA
 
     @property
     def display_attempt(self) -> str:
-        return f"{self.current_attempt + 1}/{MAX_ATTEMPTS}"
+        return f"{self.current_attempt + 1}/{self.max_attempts}"
 
 
 class SignalManager:
@@ -452,8 +471,10 @@ class SignalManager:
 
     def start_signal(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0,
                       ml_features: list[float] | None = None, ml_confidence: float | None = None) -> None:
+        max_attempts = dynamic_max_attempts(ml_confidence) if ml_confidence is not None else MAX_ATTEMPTS
         self.active_signal = SignalData(trigger_number, category, signal_value, bet_fichas,
-                                         ml_features=ml_features, ml_confidence=ml_confidence)
+                                         ml_features=ml_features, ml_confidence=ml_confidence,
+                                         max_attempts=max_attempts)
 
     def tick_wait(self) -> None:
         if self.waiting_spins > 0:
@@ -479,7 +500,7 @@ class SignalManager:
         s.current_attempt += 1
         attempt = s.current_attempt
 
-        if attempt < MAX_ATTEMPTS:
+        if attempt < s.max_attempts:
             s.last_trigger_num = spin_number
             new_value          = next_gale_value or check_value
             s.check_value       = new_value
@@ -1010,7 +1031,7 @@ class SpinProcessor:
             else:   # gale
                 new_value   = result["signal_value"]
                 new_attempt = result["attempt"]
-                attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
+                attempt_str = f"{new_attempt + 1}/{sm.active_signal.max_attempts}"
                 sm.active_signal.lost_fichas += bet_fichas_snap   # acumular fichas perdidas en este intento
                 # Avanzar Martingala: duplicar la apuesta tras la derrota parcial
                 s.martingala.on_loss()
@@ -1053,11 +1074,15 @@ class SpinProcessor:
                         number, ready_cat, signal_value, bet_fichas=bet,
                         ml_features=features, ml_confidence=confidence,
                     )
+                    max_att = sm.active_signal.max_attempts
                     s.signal_msg_id  = await self.tg.send(
-                        self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
+                        self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{max_att}", bet_fichas=bet)
                     )
                     tag = f"{confidence*100:.1f}%" if ml_ready else f"{confidence*100:.1f}% (aprendiendo, {s.ml.samples_seen}/{ML_MIN_TRAIN_SAMPLES})"
-                    log.info(f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet} | 🧠 Confianza IA={tag}")
+                    log.info(
+                        f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet} | "
+                        f"🧠 Confianza IA={tag} | máx. intentos={max_att}"
+                    )
 
             elif sm.about_to_confirm() or (ready_cat and sm.waiting_spins > 0):
                 # Falta un giro para que alguna categoría alcance la racha mínima:
@@ -1338,9 +1363,13 @@ async def main() -> None:
     log.info(f"  {ROULETTE_NAME} — BOT DE SEÑALES TELEGRAM (Render-ready)")
     log.info(f"  Canal principal  : {MAIN_CHAT_ID}")
     log.info(f"  Canal secundario : {SECONDARY_CHAT_ID}")
-    log.info(f"  Intentos         : {MAX_ATTEMPTS} (1 señal + {MAX_ATTEMPTS-1} gale) — solo C1")
+    log.info(f"  Intentos         : dinámicos según confianza IA (máx. {MAX_ATTEMPTS}) — ver CONFIDENCE_ATTEMPT_TIERS")
     log.info(f"  Espera           : sin espera tras resolver señal (WAIT_SPINS={WAIT_SPINS})")
     log.info(f"  Machine Learning : confianza mínima {ML_MIN_CONFIDENCE*100:.0f}% (aprende tras {ML_MIN_TRAIN_SAMPLES} señales)")
+    log.info(
+        "  Tramos intentos  : "
+        + " | ".join(f"≥{th*100:.0f}%→{att} int." for th, att in CONFIDENCE_ATTEMPT_TIERS)
+    )
     log.info(f"  Ping             : cada {PING_INTERVAL}s (anti-sleep Render)")
     log.info(f"  Zona AR          : UTC-3 | Hoy: {datetime.now(AR_TZ).date()}")
     log.info("═" * 60)
