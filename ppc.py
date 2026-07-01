@@ -682,13 +682,12 @@ class SpinProcessor:
                 s.waiting_msg_id = await self.tg.send(self.builder.waiting(remaining))
                 await self._update_history()
                 return
-            # remaining == 0: se registraron los 2 giros nuevos de espera.
-            # Limpiar mensaje y NO generar señal todavía — recién en el
-            # próximo giro (el 3º giro nuevo) se habilita la nueva señal.
+            # remaining == 0: se registró el 2º giro de espera. Limpiar
+            # mensaje y disparar la señal en ESTE mismo giro — la señal
+            # queda armada con la secuencia de este giro y se verifica
+            # contra el resultado del giro SIGUIENTE.
             await self.tg.delete(s.waiting_msg_id)
             s.waiting_msg_id = None
-            await self._update_history()
-            return
 
         # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
         if sm.active_signal:
