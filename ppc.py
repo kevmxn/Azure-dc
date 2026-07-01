@@ -195,12 +195,15 @@ class SignalManager:
             if REAL_COLORS.get(int(num)) == "NEGRO":
                 # Cuántos giros han pasado desde ese negro (su posición en la lista)
                 idx = last_20.index(spin)
-                # sequence_index apunta al slot que usaría el PRÓXIMO giro real.
-                # Avanzamos idx posiciones desde 0 para quedar sincronizados.
-                self.sequence_index = idx % len(SEQUENCE)
+                # process() SIEMPRE llama advance_sequence() antes de leer
+                # get_sequence_color() en cada giro nuevo. Por eso dejamos el
+                # índice en (idx - 1): así el primer giro real que llegue lo
+                # avanza exactamente a "idx", que es el slot correcto.
+                self.sequence_index = (idx - 1) % len(SEQUENCE)
                 log.info(
                     f"[SignalManager] 🎯 Sync secuencia desde último NEGRO "
-                    f"(número {num}, posición {idx} en last_20) → seq_index={self.sequence_index}"
+                    f"(número {num}, posición {idx} en last_20) → "
+                    f"próximo giro real usará seq_index={idx % len(SEQUENCE)}"
                 )
                 return
         log.warning("[SignalManager] ⚠️ No se encontró NEGRO en last_20 — sequence_index=0")
@@ -232,9 +235,10 @@ class SignalManager:
 
         if real_color == check_color:
             attempt    = s.current_attempt
-            spins_used = attempt + 1
             self.active_signal = None
-            self.waiting_spins = max(0, WAIT_SPINS - spins_used)
+            # Espera siempre WAIT_SPINS giros NUEVOS completos tras ganar,
+            # sin importar en qué intento se resolvió la señal.
+            self.waiting_spins = WAIT_SPINS
             return {"type": "win", "attempt": attempt, "check_color": check_color}
 
         s.current_attempt += 1
@@ -246,9 +250,9 @@ class SignalManager:
             s.check_color      = new_color
             return {"type": "gale", "attempt": attempt, "signal_color": new_color}
 
-        spins_used = attempt
         self.active_signal = None
-        self.waiting_spins = max(0, WAIT_SPINS - spins_used)
+        # Misma lógica de espera completa tras una pérdida total.
+        self.waiting_spins = WAIT_SPINS
         return {"type": "loss", "attempt": attempt, "check_color": check_color}
 
 
@@ -678,9 +682,13 @@ class SpinProcessor:
                 s.waiting_msg_id = await self.tg.send(self.builder.waiting(remaining))
                 await self._update_history()
                 return
-            # remaining == 0: limpiar mensaje y caer a generar señal este mismo giro
+            # remaining == 0: se registraron los 2 giros nuevos de espera.
+            # Limpiar mensaje y NO generar señal todavía — recién en el
+            # próximo giro (el 3º giro nuevo) se habilita la nueva señal.
             await self.tg.delete(s.waiting_msg_id)
             s.waiting_msg_id = None
+            await self._update_history()
+            return
 
         # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
         if sm.active_signal:
