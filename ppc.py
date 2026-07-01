@@ -765,15 +765,15 @@ class MessageBuilder:
         usd      = bet_fichas * CHIP_VALUE
         jugar_en = SIGNAL_DISPLAY.get((category, signal_value), signal_value)
         return self._bold_lines(
-            f"✅ SEÑAL DETECTADA  ✅\n\n"
+            f"🎯SEÑAL DETECTADA🎯\n\n"
             f"♦️ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
-            f"🧨 JUGAR EN:  {jugar_en}\n"
+            f"🧨 JUGAR EN: {jugar_en}\n"
             f"🇺🇲 APUESTA USD: ${usd:.2f}\n"
             f"♻️ INTENTO: {attempt_str}"
         )
 
     def pre_signal(self) -> str:
-        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar")
+        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar...")
 
     def win(self, number: int, color: str) -> str:
         return self._bold_lines(f"✅ GANADA {number} {self._ce(color)} {color} ✅")
