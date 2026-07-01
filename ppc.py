@@ -47,7 +47,8 @@ STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
 MAX_ATTEMPTS  = 5
 CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 5 intentos totales: 1/5 … 5/5 → LOSS si falla 5/5
-WAIT_SPINS    = 2     # Giros de espera tras resolver una señal
+WAIT_SPINS    = 0     # Sin espera: tras resolver una señal se vuelve a
+                       # evaluar la sincronía desde el giro siguiente
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
 SYNC_MIN_STREAK = 2   # Giros consecutivos que deben respetar la SEQUENCE de una
                        # categoría (color/paridad/zona) antes de habilitar señal.
@@ -100,6 +101,17 @@ SEQUENCES: dict[str, list[str]] = {
     "color"  : SEQUENCE_COLOR,
     "paridad": SEQUENCE_PARIDAD,
     "zona"   : SEQUENCE_ZONA,
+}
+
+# Valor de referencia que se busca en los últimos 20 giros (al iniciar) para
+# sincronizar el sequence_index de cada categoría:
+#   · color   → último NEGRO  (segundo valor de SEQUENCE_COLOR)
+#   · paridad → último IMPAR  (primer valor de SEQUENCE_PARIDAD)
+#   · zona    → último ALTOS  (números altos, primer valor de SEQUENCE_ZONA)
+SYNC_REF_VALUE: dict[str, str] = {
+    "color"  : SEQUENCE_COLOR[1],    # "NEGRO"
+    "paridad": "IMPAR",
+    "zona"   : "ALTOS",
 }
 
 # Orden de prioridad si más de una categoría queda sincronizada en el mismo giro.
@@ -242,15 +254,17 @@ class SignalManager:
 
     def set_sequence_from_last_black(self, last_20: list) -> None:
         """
-        Para cada categoría (color/paridad/zona) busca en los last_20 del
-        servidor (orden desc) la última aparición del segundo valor de su
-        SEQUENCE (NEGRO / PAR / BAJOS — equivalente al "NEGRO" original) y
+        Para cada categoría busca en los last_20 del servidor (orden desc)
+        la última aparición de su valor de referencia (SYNC_REF_VALUE) y
         posiciona su sequence_index para que el siguiente giro real quede
-        alineado al lugar correcto de esa secuencia.
+        alineado al lugar correcto de esa secuencia:
+          · color   → último NEGRO
+          · paridad → último IMPAR
+          · zona    → último ALTOS (números altos)
         Los last_20 vienen ordenados del más reciente al más antiguo.
         """
         for cat, seq in SEQUENCES.items():
-            ref_value = seq[1]
+            ref_value = SYNC_REF_VALUE[cat]
             value_fn  = CATEGORY_VALUE_FN[cat]
             found     = False
             for spin in last_20:
@@ -341,8 +355,8 @@ class SignalManager:
         if real_value == check_value:
             attempt    = s.current_attempt
             self.active_signal = None
-            # Espera siempre WAIT_SPINS giros NUEVOS completos tras ganar,
-            # sin importar en qué intento se resolvió la señal.
+            # Con WAIT_SPINS=0 no hay espera tras ganar: se vuelve a evaluar
+            # sincronía desde el próximo giro.
             self.waiting_spins = WAIT_SPINS
             return {"type": "win", "attempt": attempt, "check_value": check_value}
 
@@ -356,7 +370,7 @@ class SignalManager:
             return {"type": "gale", "attempt": attempt, "signal_value": new_value}
 
         self.active_signal = None
-        # Misma lógica de espera completa tras una pérdida total.
+        # Con WAIT_SPINS=0, tampoco hay espera tras una pérdida total.
         self.waiting_spins = WAIT_SPINS
         return {"type": "loss", "attempt": attempt, "check_value": check_value}
 
@@ -615,7 +629,7 @@ class MessageBuilder:
         )
 
     def pre_signal(self) -> str:
-        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar")
+        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar...")
 
     def win(self, number: int, color: str) -> str:
         return self._bold_lines(f"✅ GANADA {number} {self._ce(color)} {color} ✅")
@@ -797,13 +811,14 @@ class SpinProcessor:
             f"espera={sm.waiting_spins} | señal={'SI' if sm.active_signal else 'NO'}"
         )
 
-        # ── PERÍODO DE ESPERA POST-SEÑAL (silencioso, sin mensajes) ───────────
+        # ── SIN ESPERA POST-SEÑAL ───────────────────────────────────────────────
+        # WAIT_SPINS = 0 → apenas se resuelve una señal (WIN/LOSS), el bot
+        # vuelve a evaluar la sincronía normalmente desde el giro siguiente,
+        # sin ningún período de espera. (waiting_spins queda siempre en 0;
+        # se conserva el mecanismo por si se quisiera reactivar una espera
+        # más adelante.)
         if sm.waiting_spins > 0:
             sm.tick_wait()
-            remaining = sm.waiting_spins
-            if remaining > 0:
-                await self._update_history()
-                return
 
         # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
         if sm.active_signal:
@@ -879,8 +894,9 @@ class SpinProcessor:
         else:
             ready_cat = sm.ready_category()
 
-            if ready_cat:
-                # Se confirma la señal en este giro: si había aviso previo, se borra.
+            if ready_cat and sm.waiting_spins == 0:
+                # Se confirma la señal en este giro (sin espera): si había
+                # aviso previo, se borra.
                 if s.pre_signal_msg_id:
                     await self.tg.delete(s.pre_signal_msg_id)
                     s.pre_signal_msg_id = None
@@ -893,8 +909,9 @@ class SpinProcessor:
                 )
                 log.info(f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet}")
 
-            elif sm.about_to_confirm():
-                # Falta un giro para que alguna categoría alcance la racha mínima.
+            elif sm.about_to_confirm() or (ready_cat and sm.waiting_spins > 0):
+                # Falta un giro para que alguna categoría alcance la racha mínima:
+                # se muestra/mantiene el aviso de posible señal a confirmar.
                 if not s.pre_signal_msg_id:
                     s.pre_signal_msg_id = await self.tg.send(self.builder.pre_signal())
                     log.info("🚨 Aviso previo enviado — posible señal a confirmar en el próximo giro")
@@ -1167,7 +1184,7 @@ async def main() -> None:
     log.info(f"  Canal principal  : {MAIN_CHAT_ID}")
     log.info(f"  Canal secundario : {SECONDARY_CHAT_ID}")
     log.info(f"  Intentos         : {MAX_ATTEMPTS} (1 señal + {MAX_ATTEMPTS-1} gale) — solo C1")
-    log.info(f"  Espera           : {WAIT_SPINS} giros tras resolver señal")
+    log.info(f"  Espera           : sin espera tras resolver señal (WAIT_SPINS={WAIT_SPINS})")
     log.info(f"  Ping             : cada {PING_INTERVAL}s (anti-sleep Render)")
     log.info(f"  Zona AR          : UTC-3 | Hoy: {datetime.now(AR_TZ).date()}")
     log.info("═" * 60)
