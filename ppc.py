@@ -49,6 +49,10 @@ MAX_ATTEMPTS  = 5
 CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 5 intentos totales: 1/5 … 5/5 → LOSS si falla 5/5
 WAIT_SPINS    = 2     # Giros de espera tras resolver una señal
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
+SYNC_MIN_STREAK = 1   # Giros consecutivos que deben respetar la SEQUENCE
+                       # (real_color == color que predice la secuencia) antes
+                       # de habilitar el envío de una señal. En 1 = alcanza con
+                       # que el giro que acaba de salir esté sincronizado.
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
 DEFAULT_POLL  = 2     # Polling al servidor propio (s)
@@ -180,6 +184,7 @@ class SignalManager:
         self.warmup_done    : bool = False   # True tras WARMUP_SPINS giros reales
         self.spins_count    : int = 0        # contador de giros procesados
         self.warmup_msg_sent: bool = False   # True tras enviar el mensaje de inicio una sola vez
+        self.sync_streak    : int = 0        # giros consecutivos que respetan la SEQUENCE en vivo
 
     def set_sequence_from_last_black(self, last_20: list) -> None:
         """
@@ -214,8 +219,26 @@ class SignalManager:
     def get_sequence_color(self) -> str:
         return SEQUENCE[self.sequence_index]
 
+    def update_sync(self, real_color: str, seq_color: str) -> None:
+        """
+        Lleva la racha de giros consecutivos donde la mesa respeta la
+        SEQUENCE en tiempo real (el color real coincide con el color que
+        la secuencia predice para ese giro). Si se rompe, la racha vuelve
+        a cero — la mesa se "desincronizó" y hay que esperar a que retome
+        el patrón antes de volver a confiar en la secuencia.
+        """
+        if real_color == seq_color:
+            self.sync_streak += 1
+        else:
+            self.sync_streak = 0
+
     def can_generate_signal(self) -> bool:
-        return self.active_signal is None and self.waiting_spins == 0 and self.warmup_done
+        return (
+            self.active_signal is None
+            and self.waiting_spins == 0
+            and self.warmup_done
+            and self.sync_streak >= SYNC_MIN_STREAK
+        )
 
     def start_signal(self, trigger_number: int, signal_color: str, bet_fichas: int = 0) -> None:
         self.active_signal = SignalData(trigger_number, signal_color, bet_fichas)
@@ -668,8 +691,14 @@ class SpinProcessor:
             await self._update_history()
             return
 
+        # ── SINCRONÍA CON LA SECUENCIA ─────────────────────────────────────────
+        # Se actualiza en CADA giro real (haya o no señal activa) para saber
+        # si la mesa está respetando el patrón de la SEQUENCE en vivo.
+        sm.update_sync(real_color, seq_color)
+
         log.info(
             f"🎰 {number} | {real_color} | seq={seq_color} | "
+            f"sync={sm.sync_streak}/{SYNC_MIN_STREAK} | "
             f"espera={sm.waiting_spins} | señal={'SI' if sm.active_signal else 'NO'}"
         )
 
@@ -816,6 +845,8 @@ def health():
         "last_spin_color" : _state.last_spin_color,
         "last_spin_ago_s" : ago,
         "active_signal"   : sm.active_signal is not None,
+        "sync_streak"     : sm.sync_streak,
+        "sync_min_streak" : SYNC_MIN_STREAK,
         "waiting_spins"   : sm.waiting_spins,
         "won_signals"     : _state.won_signals,
         "lost_signals"    : _state.lost_signals,
