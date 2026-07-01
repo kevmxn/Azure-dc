@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║       IMMERSIVE ROULETTE — BOT DE SEÑALES TELEGRAM          ║
@@ -49,10 +50,10 @@ MAX_ATTEMPTS  = 5
 CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 5 intentos totales: 1/5 … 5/5 → LOSS si falla 5/5
 WAIT_SPINS    = 2     # Giros de espera tras resolver una señal
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
-SYNC_MIN_STREAK = 1   # Giros consecutivos que deben respetar la SEQUENCE
-                       # (real_color == color que predice la secuencia) antes
-                       # de habilitar el envío de una señal. En 1 = alcanza con
-                       # que el giro que acaba de salir esté sincronizado.
+SYNC_MIN_STREAK = 2   # Giros consecutivos que deben respetar la SEQUENCE de una
+                       # categoría (color/paridad/zona) antes de habilitar señal.
+                       # Con 2: necesita 1 giro ya sincronizado + el aviso previo
+                       # confirmado por el giro siguiente. Ajustable.
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
 DEFAULT_POLL  = 2     # Polling al servidor propio (s)
@@ -75,13 +76,66 @@ REAL_COLORS: dict[int, str] = {
     36: "ROJO" ,
 }
 
-SEQUENCE: list[str] = [
+SEQUENCE_COLOR: list[str] = [
     "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO",
     "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO",
     "ROJO", "NEGRO", "ROJO",
 ]
 
+# Misma cadencia que SEQUENCE_COLOR, pero para paridades — empieza en IMPAR
+# (equivalente al ROJO que abre la secuencia de color).
+SEQUENCE_PARIDAD: list[str] = [
+    "IMPAR", "PAR", "IMPAR", "IMPAR", "PAR", "PAR",
+    "IMPAR", "PAR", "IMPAR", "IMPAR", "PAR", "PAR",
+    "IMPAR", "PAR", "IMPAR",
+]
+
+# Misma cadencia, para zonas — empieza en ALTOS (19-36).
+SEQUENCE_ZONA: list[str] = [
+    "ALTOS", "BAJOS", "ALTOS", "ALTOS", "BAJOS", "BAJOS",
+    "ALTOS", "BAJOS", "ALTOS", "ALTOS", "BAJOS", "BAJOS",
+    "ALTOS", "BAJOS", "ALTOS",
+]
+
+SEQUENCES: dict[str, list[str]] = {
+    "color"  : SEQUENCE_COLOR,
+    "paridad": SEQUENCE_PARIDAD,
+    "zona"   : SEQUENCE_ZONA,
+}
+
+# Orden de prioridad si más de una categoría queda sincronizada en el mismo giro.
+CATEGORY_PRIORITY: list[str] = ["color", "paridad", "zona"]
+
+
+def _get_paridad(number: int) -> str:
+    if number == 0:
+        return "VERDE"
+    return "PAR" if number % 2 == 0 else "IMPAR"
+
+
+def _get_zona(number: int) -> str:
+    if number == 0:
+        return "VERDE"
+    return "BAJOS" if 1 <= number <= 18 else "ALTOS"
+
+
+CATEGORY_VALUE_FN = {
+    "color"  : lambda n: REAL_COLORS.get(n, "VERDE"),
+    "paridad": _get_paridad,
+    "zona"   : _get_zona,
+}
+
 COLOR_EMOJI = {"ROJO": "🔴", "NEGRO": "⚫", "VERDE": "🟢"}
+
+# Texto "JUGAR EN:" que se muestra en el mensaje de señal, por categoría/valor.
+SIGNAL_DISPLAY: dict[tuple[str, str], str] = {
+    ("color", "ROJO")    : "ROJO 🔴",
+    ("color", "NEGRO")   : "NEGRO ⚫",
+    ("paridad", "PAR")   : "N° PARES 🔵",
+    ("paridad", "IMPAR") : "N° IMPARES 🟡",
+    ("zona", "BAJOS")    : "N° BAJOS(1-18)",
+    ("zona", "ALTOS")    : "N° ALTOS (19-36)",
+}
 
 # ══════════════════════════════════════════════════════════════
 #  LOGGING
@@ -162,10 +216,11 @@ def save_last_game_id(game_id: str) -> None:
 # ══════════════════════════════════════════════════════════════
 
 class SignalData:
-    def __init__(self, trigger_number: int, signal_color: str, bet_fichas: int = 0):
+    def __init__(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0):
         self.trigger_number  = trigger_number
-        self.signal_color    = signal_color
-        self.check_color     = signal_color
+        self.category        = category      # "color" | "paridad" | "zona"
+        self.signal_value    = signal_value   # ej. "ROJO", "PAR", "ALTOS"
+        self.check_value     = signal_value
         self.current_attempt = 0
         self.last_trigger_num: int | None = None
         self.bet_fichas      : int = bet_fichas   # apuesta Martingala al iniciar
@@ -180,68 +235,96 @@ class SignalManager:
     def __init__(self):
         self.active_signal  : SignalData | None = None
         self.waiting_spins  : int = 0
-        self.sequence_index : int = 0
+        self.sequence_index : dict[str, int] = {cat: 0 for cat in SEQUENCES}
+        self.sync_streak    : dict[str, int] = {cat: 0 for cat in SEQUENCES}
         self.warmup_done    : bool = False   # True tras WARMUP_SPINS giros reales
         self.spins_count    : int = 0        # contador de giros procesados
         self.warmup_msg_sent: bool = False   # True tras enviar el mensaje de inicio una sola vez
-        self.sync_streak    : int = 0        # giros consecutivos que respetan la SEQUENCE en vivo
 
     def set_sequence_from_last_black(self, last_20: list) -> None:
         """
-        Busca el último negro en los last_20 del servidor (orden desc) y
-        posiciona sequence_index para que el siguiente giro real use el
-        lugar correcto de la SEQUENCE como disparador.
+        Para cada categoría (color/paridad/zona) busca en los last_20 del
+        servidor (orden desc) la última aparición del segundo valor de su
+        SEQUENCE (NEGRO / PAR / BAJOS — equivalente al "NEGRO" original) y
+        posiciona su sequence_index para que el siguiente giro real quede
+        alineado al lugar correcto de esa secuencia.
         Los last_20 vienen ordenados del más reciente al más antiguo.
         """
-        for spin in last_20:
-            num = spin.get("number")
-            if num is None:
-                continue
-            if REAL_COLORS.get(int(num)) == "NEGRO":
-                # Cuántos giros han pasado desde ese negro (su posición en la lista)
-                idx = last_20.index(spin)
-                # process() SIEMPRE llama advance_sequence() antes de leer
-                # get_sequence_color() en cada giro nuevo. Por eso dejamos el
-                # índice en (idx - 1): así el primer giro real que llegue lo
-                # avanza exactamente a "idx", que es el slot correcto.
-                self.sequence_index = (idx - 1) % len(SEQUENCE)
-                log.info(
-                    f"[SignalManager] 🎯 Sync secuencia desde último NEGRO "
-                    f"(número {num}, posición {idx} en last_20) → "
-                    f"próximo giro real usará seq_index={idx % len(SEQUENCE)}"
-                )
-                return
-        log.warning("[SignalManager] ⚠️ No se encontró NEGRO en last_20 — sequence_index=0")
+        for cat, seq in SEQUENCES.items():
+            ref_value = seq[1]
+            value_fn  = CATEGORY_VALUE_FN[cat]
+            found     = False
+            for spin in last_20:
+                num = spin.get("number")
+                if num is None:
+                    continue
+                if value_fn(int(num)) == ref_value:
+                    # Cuántos giros han pasado desde esa referencia (su posición en la lista)
+                    idx = last_20.index(spin)
+                    # process() SIEMPRE llama advance_sequences() antes de leer
+                    # get_sequence_value() en cada giro nuevo. Por eso dejamos el
+                    # índice en (idx - 1): así el primer giro real que llegue lo
+                    # avanza exactamente a "idx", que es el slot correcto.
+                    self.sequence_index[cat] = (idx - 1) % len(seq)
+                    log.info(
+                        f"[SignalManager] 🎯 Sync '{cat}' desde último {ref_value} "
+                        f"(número {num}, posición {idx} en last_20) → "
+                        f"próximo giro real usará seq_index={idx % len(seq)}"
+                    )
+                    found = True
+                    break
+            if not found:
+                self.sequence_index[cat] = 0
+                log.warning(f"[SignalManager] ⚠️ No se encontró {ref_value} en last_20 para '{cat}' — sequence_index=0")
 
-    def advance_sequence(self) -> None:
-        self.sequence_index = (self.sequence_index + 1) % len(SEQUENCE)
+    def advance_sequences(self) -> None:
+        for cat, seq in SEQUENCES.items():
+            self.sequence_index[cat] = (self.sequence_index[cat] + 1) % len(seq)
 
-    def get_sequence_color(self) -> str:
-        return SEQUENCE[self.sequence_index]
+    def get_sequence_value(self, category: str) -> str:
+        return SEQUENCES[category][self.sequence_index[category]]
 
-    def update_sync(self, real_color: str, seq_color: str) -> None:
+    def update_sync(self, number: int) -> None:
         """
-        Lleva la racha de giros consecutivos donde la mesa respeta la
-        SEQUENCE en tiempo real (el color real coincide con el color que
-        la secuencia predice para ese giro). Si se rompe, la racha vuelve
-        a cero — la mesa se "desincronizó" y hay que esperar a que retome
-        el patrón antes de volver a confiar en la secuencia.
+        Lleva, por cada categoría, la racha de giros consecutivos donde la
+        mesa respeta su SEQUENCE en tiempo real (el valor real —color,
+        paridad o zona— coincide con el que predice esa secuencia). Si se
+        rompe, la racha de esa categoría vuelve a cero.
         """
-        if real_color == seq_color:
-            self.sync_streak += 1
-        else:
-            self.sync_streak = 0
+        for cat in SEQUENCES:
+            real_value = CATEGORY_VALUE_FN[cat](number)
+            seq_value  = self.get_sequence_value(cat)
+            if real_value == seq_value:
+                self.sync_streak[cat] += 1
+            else:
+                self.sync_streak[cat] = 0
+
+    def ready_category(self) -> str | None:
+        """Primera categoría (según CATEGORY_PRIORITY) que ya cumple la racha mínima de sincronía."""
+        for cat in CATEGORY_PRIORITY:
+            if self.sync_streak[cat] >= SYNC_MIN_STREAK:
+                return cat
+        return None
+
+    def about_to_confirm(self) -> bool:
+        """True si alguna categoría está exactamente un giro antes de alcanzar la racha mínima."""
+        if SYNC_MIN_STREAK < 2:
+            return False
+        return any(
+            self.sync_streak[cat] == SYNC_MIN_STREAK - 1
+            for cat in CATEGORY_PRIORITY
+        )
 
     def can_generate_signal(self) -> bool:
         return (
             self.active_signal is None
             and self.waiting_spins == 0
             and self.warmup_done
-            and self.sync_streak >= SYNC_MIN_STREAK
+            and self.ready_category() is not None
         )
 
-    def start_signal(self, trigger_number: int, signal_color: str, bet_fichas: int = 0) -> None:
-        self.active_signal = SignalData(trigger_number, signal_color, bet_fichas)
+    def start_signal(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0) -> None:
+        self.active_signal = SignalData(trigger_number, category, signal_value, bet_fichas)
 
     def tick_wait(self) -> None:
         if self.waiting_spins > 0:
@@ -250,33 +333,33 @@ class SignalManager:
     def process_result(
         self,
         spin_number    : int,
-        real_color     : str,
-        check_color    : str,
-        next_gale_color: str | None,
+        real_value     : str,
+        check_value    : str,
+        next_gale_value: str | None,
     ) -> dict:
         s = self.active_signal
 
-        if real_color == check_color:
+        if real_value == check_value:
             attempt    = s.current_attempt
             self.active_signal = None
             # Espera siempre WAIT_SPINS giros NUEVOS completos tras ganar,
             # sin importar en qué intento se resolvió la señal.
             self.waiting_spins = WAIT_SPINS
-            return {"type": "win", "attempt": attempt, "check_color": check_color}
+            return {"type": "win", "attempt": attempt, "check_value": check_value}
 
         s.current_attempt += 1
         attempt = s.current_attempt
 
         if attempt < MAX_ATTEMPTS:
             s.last_trigger_num = spin_number
-            new_color          = next_gale_color or check_color
-            s.check_color      = new_color
-            return {"type": "gale", "attempt": attempt, "signal_color": new_color}
+            new_value          = next_gale_value or check_value
+            s.check_value       = new_value
+            return {"type": "gale", "attempt": attempt, "signal_value": new_value}
 
         self.active_signal = None
         # Misma lógica de espera completa tras una pérdida total.
         self.waiting_spins = WAIT_SPINS
-        return {"type": "loss", "attempt": attempt, "check_color": check_color}
+        return {"type": "loss", "attempt": attempt, "check_value": check_value}
 
 
 class Martingale:
@@ -317,6 +400,7 @@ class BotState:
 
         self.signal_msg_id      : int | None = None
         self.waiting_msg_id     : int | None = None
+        self.pre_signal_msg_id  : int | None = None   # aviso "POSIBLE SEÑAL A CONFIRMAR"
         self.stats_msg_id       : int | None = None
         self.consecutive_msg_id : int | None = None
 
@@ -504,29 +588,47 @@ class TelegramClient:
 class MessageBuilder:
 
     @staticmethod
+    def _bold_lines(text: str) -> str:
+        """Envuelve cada línea no vacía en <b>...</b> (las líneas vacías se
+        dejan como separador, sin tag, para no romper el render en Telegram)."""
+        return "\n".join(f"<b>{line}</b>" if line else "" for line in text.split("\n"))
+
+    @staticmethod
     def _ce(color: str) -> str:
         return COLOR_EMOJI.get(color, "⚪")
 
-    def signal(self, last_num: int, last_color: str, signal_color: str, attempt_str: str, bet_fichas: int = 0) -> str:
-        usd = bet_fichas * CHIP_VALUE
-        return (
-            f"✅ RULETA — {ROULETTE_NAME} ✅\n"
-            f"⚪ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
-            f"🟡 SEÑAL PARA: {signal_color} {self._ce(signal_color)}\n"
+    def signal(
+        self,
+        last_num    : int,
+        last_color  : str,
+        category    : str,
+        signal_value: str,
+        attempt_str : str,
+        bet_fichas  : int = 0,
+    ) -> str:
+        usd      = bet_fichas * CHIP_VALUE
+        jugar_en = SIGNAL_DISPLAY.get((category, signal_value), signal_value)
+        return self._bold_lines(
+            f"✅ SEÑAL DETECTADA ✅\n\n"
+            f"♦️ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
+            f"🧨 JUGAR EN: {jugar_en}\n"
             f"🇺🇲 APUESTA USD: ${usd:.2f}\n"
             f"♻️ INTENTO: {attempt_str}"
         )
 
+    def pre_signal(self) -> str:
+        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar")
+
     def win(self, number: int, color: str) -> str:
-        return f"✅ GANADA {number} {self._ce(color)} {color} ✅"
+        return self._bold_lines(f"✅ GANADA {number} {self._ce(color)} {color} ✅")
 
     def loss(self, number: int, color: str) -> str:
-        return f"❌ PERDIMOS {number} {self._ce(color)} {color} ❌"
+        return self._bold_lines(f"❌ PERDIMOS {number} {self._ce(color)} {color} ❌")
 
     def consecutive(self, count: int) -> str:
         if count == 0:
-            return f"⛔ SE CORTO LA RACHA POSITIVA ⛔"
-        return f"🤑 {count} SEÑALES GANADAS CONSECUTIVAS 🤑"
+            return self._bold_lines("⛔ SE CORTO LA RACHA POSITIVA ⛔")
+        return self._bold_lines(f"🤑 {count} SEÑALES GANADAS CONSECUTIVAS 🤑")
 
     def stats(self, state: BotState) -> str:
         st = state.total_signals
@@ -537,7 +639,7 @@ class MessageBuilder:
             return f"{wins / st * 100:.2f}%"
 
         sign = "+" if state.daily_capital >= 0 else ""
-        return (
+        return self._bold_lines(
             f"📆 MARCADOR DIARIO\n"
             f"✅ GANADAS: {state.won_signals}\n"
             f"❌ PERDIDAS: {state.lost_signals}\n"
@@ -554,7 +656,7 @@ class MessageBuilder:
             return f"{wins / st * 100:.2f}%"
 
         sign = "+" if state.daily_capital >= 0 else ""
-        return (
+        return self._bold_lines(
             f"📆 MARCADOR DIARIO 00:00 (ARG) — {ROULETTE_NAME}\n"
             f"✅ GANADAS: {state.won_signals}\n"
             f"❌ PERDIDAS: {state.lost_signals}\n"
@@ -563,23 +665,22 @@ class MessageBuilder:
         )
 
     def waiting(self, spins_left: int) -> str:
-        if spins_left == 1:
-            return "⚠️ PRÓXIMO GIRO HAY SEÑAL ⚠️"
-        return f"⚠️ SIGUIENTE SEÑAL EN {spins_left} GIROS... ⚠️"
+        return self._bold_lines(f"⚠️ SIGUIENTE SEÑAL EN {spins_left} GIROS... ⚠️")
 
     def history_text(self, batch: list, batch_num: int, complete: bool = False) -> str:
         """
         Texto del historial — canal secundario.
         Cada mensaje contiene exactamente 100 giros (o los que lleva el lote actual).
         <pre> genera bloque de código con botón nativo de copiar en Telegram.
+        El encabezado va en negrita; los números dentro de <pre> se dejan tal
+        cual (ya se muestran en bloque monoespaciado con botón de copiar, y
+        Telegram no combina negrita con <pre> de forma útil ahí).
         """
         count    = len(batch)
         nums_str = "\n".join(str(n) for n in batch)
         status   = "✅ COMPLETO" if complete else f"{count}/100"
-        return (
-            f"🆔 PARTE {batch_num} — {ROULETTE_NAME} [{status}]\n"
-            f"<pre>{nums_str}</pre>"
-        )
+        header   = self._bold_lines(f"🆔 PARTE {batch_num} — {ROULETTE_NAME} [{status}]")
+        return f"{header}\n<pre>{nums_str}</pre>"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -657,9 +758,8 @@ class SpinProcessor:
 
         s.check_daily_reset()
 
-        # Avance de secuencia — siempre, en CADA giro
-        sm.advance_sequence()
-        seq_color = sm.get_sequence_color()
+        # Avance de las 3 secuencias (color/paridad/zona) — siempre, en CADA giro
+        sm.advance_sequences()
 
         real_color        = REAL_COLORS.get(number, "VERDE")
         s.last_spin_num   = number
@@ -681,9 +781,9 @@ class SpinProcessor:
             if not sm.warmup_msg_sent:
                 sm.warmup_msg_sent = True
                 await self.tg.send(
-                    f"⏳ <b>Analizando mesa...</b>\n"
-                    f"🎰 {ROULETTE_NAME}\n"
-                    f"📊 Procesando {WARMUP_SPINS} giros antes de activar señales."
+                    f"<b>⏳ Analizando mesa...</b>\n"
+                    f"<b>🎰 {ROULETTE_NAME}</b>\n"
+                    f"<b>📊 Procesando {WARMUP_SPINS} giros antes de activar señales.</b>"
                 )
             if sm.spins_count >= WARMUP_SPINS:
                 sm.warmup_done = True
@@ -691,14 +791,14 @@ class SpinProcessor:
             await self._update_history()
             return
 
-        # ── SINCRONÍA CON LA SECUENCIA ─────────────────────────────────────────
+        # ── SINCRONÍA CON LAS 3 SECUENCIAS ─────────────────────────────────────
         # Se actualiza en CADA giro real (haya o no señal activa) para saber
-        # si la mesa está respetando el patrón de la SEQUENCE en vivo.
-        sm.update_sync(real_color, seq_color)
+        # si la mesa está respetando el patrón de cada categoría en vivo.
+        sm.update_sync(number)
 
+        sync_str = " ".join(f"{cat}={sm.sync_streak[cat]}" for cat in CATEGORY_PRIORITY)
         log.info(
-            f"🎰 {number} | {real_color} | seq={seq_color} | "
-            f"sync={sm.sync_streak}/{SYNC_MIN_STREAK} | "
+            f"🎰 {number} | {real_color} | {sync_str} (min={SYNC_MIN_STREAK}) | "
             f"espera={sm.waiting_spins} | señal={'SI' if sm.active_signal else 'NO'}"
         )
 
@@ -721,12 +821,14 @@ class SpinProcessor:
         # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
         if sm.active_signal:
             sig             = sm.active_signal
-            check_color     = sig.check_color
-            next_gale_color = seq_color
+            category        = sig.category
+            check_value     = sig.check_value
+            next_gale_value = sm.get_sequence_value(category)
+            real_value      = CATEGORY_VALUE_FN[category](number)
             bet_fichas_snap = sig.bet_fichas   # capturar ANTES de process_result (que puede nullificar active_signal)
 
             lost_fichas_snap = sig.lost_fichas   # fichas perdidas en intentos anteriores de esta señal
-            result = sm.process_result(number, real_color, check_color, next_gale_color)
+            result = sm.process_result(number, real_value, check_value, next_gale_value)
 
             if result["type"] == "win":
                 s.won_signals      += 1
@@ -752,7 +854,7 @@ class SpinProcessor:
                 await asyncio.sleep(0.4)
                 await self.tg.delete(s.stats_msg_id)
                 s.stats_msg_id = await self.tg.send(self.builder.stats(s))
-                log.info(f"✅ GANADA intento {result['attempt']+1} | racha={s.consecutive_wins}")
+                log.info(f"✅ GANADA [{category}] intento {result['attempt']+1} | racha={s.consecutive_wins}")
 
             elif result["type"] == "loss":
                 s.lost_signals    += 1
@@ -769,10 +871,10 @@ class SpinProcessor:
                 await asyncio.sleep(0.4)
                 await self.tg.delete(s.stats_msg_id)
                 s.stats_msg_id = await self.tg.send(self.builder.stats(s))
-                log.info(f"❌ PERDIDA en intento {result['attempt']}")
+                log.info(f"❌ PERDIDA [{category}] en intento {result['attempt']}")
 
             else:   # gale
-                new_color   = result["signal_color"]
+                new_value   = result["signal_value"]
                 new_attempt = result["attempt"]
                 attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
                 sm.active_signal.lost_fichas += bet_fichas_snap   # acumular fichas perdidas en este intento
@@ -782,20 +884,40 @@ class SpinProcessor:
                 sm.active_signal.bet_fichas = new_bet
                 await self.tg.delete(s.signal_msg_id)
                 s.signal_msg_id = await self.tg.send(
-                    self.builder.signal(number, real_color, new_color, attempt_str, bet_fichas=new_bet)
+                    self.builder.signal(number, real_color, category, new_value, attempt_str, bet_fichas=new_bet)
                 )
-                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | bet={new_bet} fichas (Martingala)")
+                log.info(f"🔁 Gale {new_attempt} [{category}] | apostar {new_value} | bet={new_bet} fichas (Martingala)")
 
-        # ── SIN SEÑAL ACTIVA → DETECTAR NUEVA ────────────────────────────────
-        elif sm.can_generate_signal():
-            bet = s.martingala.bet
-            sm.start_signal(number, seq_color, bet_fichas=bet)
-            await self.tg.delete(s.waiting_msg_id)
-            s.waiting_msg_id = None
-            s.signal_msg_id  = await self.tg.send(
-                self.builder.signal(number, real_color, seq_color, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
-            )
-            log.info(f"🟡 Nueva señal: {number} → apostar {seq_color} | Martingala bet={bet}")
+        # ── SIN SEÑAL ACTIVA → CONFIRMAR NUEVA O EVALUAR AVISO PREVIO ─────────
+        else:
+            ready_cat = sm.ready_category()
+
+            if ready_cat:
+                # Se confirma la señal en este giro: si había aviso previo, se borra.
+                if s.pre_signal_msg_id:
+                    await self.tg.delete(s.pre_signal_msg_id)
+                    s.pre_signal_msg_id = None
+
+                bet          = s.martingala.bet
+                signal_value = sm.get_sequence_value(ready_cat)
+                sm.start_signal(number, ready_cat, signal_value, bet_fichas=bet)
+                await self.tg.delete(s.waiting_msg_id)
+                s.waiting_msg_id = None
+                s.signal_msg_id  = await self.tg.send(
+                    self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
+                )
+                log.info(f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet}")
+
+            elif sm.about_to_confirm():
+                # Falta un giro para que alguna categoría alcance la racha mínima.
+                if not s.pre_signal_msg_id:
+                    s.pre_signal_msg_id = await self.tg.send(self.builder.pre_signal())
+                    log.info("🚨 Aviso previo enviado — posible señal a confirmar en el próximo giro")
+
+            elif s.pre_signal_msg_id:
+                # Ya no está "a un giro" de confirmar (se rompió la sincronía) → borrar aviso.
+                await self.tg.delete(s.pre_signal_msg_id)
+                s.pre_signal_msg_id = None
 
         # Actualizar historial (siempre al final del giro)
         await self._update_history()
@@ -1085,9 +1207,9 @@ async def main() -> None:
 
     ar_now = datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M:%S")
     await tg_main.send(
-        f"🤖 <b>Bot de Señales iniciado</b>\n"
-        f"🎰 Mesa: {ROULETTE_NAME}\n"
-        f"🕐 {ar_now} (AR)"
+        f"<b>🤖 Bot de Señales iniciado</b>\n"
+        f"<b>🎰 Mesa: {ROULETTE_NAME}</b>\n"
+        f"<b>🕐 {ar_now} (AR)</b>"
     )
 
     await asyncio.gather(
