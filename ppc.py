@@ -45,9 +45,9 @@ ROULETTE_NAME = "IMMERSIVE ROULETTE"
 STATS_URL     = "https://crashstake-ulmx.onrender.com"   # mismo servidor que usa ppc.py
 STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
 
-MAX_ATTEMPTS  = 3
-CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 2 intentos totales: 1/2 … 2/2 → LOSS si falla 2/2
-WAIT_SPINS    = 1     # Giros de espera tras resolver una señal
+MAX_ATTEMPTS  = 5
+CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 5 intentos totales: 1/5 … 5/5 → LOSS si falla 5/5
+WAIT_SPINS    = 2     # Giros de espera tras resolver una señal
 WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
 PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
 
@@ -164,7 +164,7 @@ class SignalData:
         self.check_color     = signal_color
         self.current_attempt = 0
         self.last_trigger_num: int | None = None
-        self.bet_fichas      : int = bet_fichas   # apuesta Labouchère al iniciar
+        self.bet_fichas      : int = bet_fichas   # apuesta Martingala al iniciar
         self.lost_fichas     : int = 0            # fichas acumuladas en intentos fallidos
 
     @property
@@ -252,45 +252,37 @@ class SignalManager:
         return {"type": "loss", "attempt": attempt, "check_color": check_color}
 
 
-class Labouchere:
+class Martingale:
     """
-    Sistema de gestión Labouchère: secuencia 1-2-3 por eliminación de extremos.
-      · Apuesta  = primero + último  (o único si queda solo un elemento)
-      · Victoria → eliminar primero y último
-      · Derrota  → agregar la apuesta al final
-      · Secuencia vacía → reiniciar a [1, 2, 3]
+    Sistema de gestión Martingala clásica:
+      · Apuesta base al iniciar (BASE_BET fichas)
+      · Derrota  → duplicar la apuesta
+      · Victoria → volver a la apuesta base
     """
-    INITIAL: list[int] = [1, 2, 1]
+    BASE_BET: int = 1
 
     def __init__(self) -> None:
-        self.sequence: list[int] = list(self.INITIAL)
+        self.current_bet: int = self.BASE_BET
 
     @property
     def bet(self) -> int:
-        if not self.sequence:
-            return self.INITIAL[0] + self.INITIAL[-1]
-        if len(self.sequence) == 1:
-            return self.sequence[0]
-        return self.sequence[0] + self.sequence[-1]
+        return self.current_bet
 
     def on_win(self) -> None:
-        """Elimina los extremos. Si queda vacío, reinicia."""
-        if len(self.sequence) <= 2:
-            self.sequence = list(self.INITIAL)
-        else:
-            self.sequence = self.sequence[1:-1]
-        log.info(f"[Labouchere] WIN → secuencia={self.sequence} | próxima apuesta={self.bet}")
+        """Reinicia la apuesta al valor base."""
+        self.current_bet = self.BASE_BET
+        log.info(f"[Martingala] WIN → apuesta reiniciada a {self.current_bet}")
 
     def on_loss(self) -> None:
-        """Agrega la apuesta al final de la secuencia."""
-        self.sequence.append(self.bet)
-        log.info(f"[Labouchere] LOSS → secuencia={self.sequence} | próxima apuesta={self.bet}")
+        """Duplica la apuesta."""
+        self.current_bet *= 2
+        log.info(f"[Martingala] LOSS → apuesta duplicada a {self.current_bet}")
 
 
 class BotState:
     def __init__(self):
         self.signal_manager  = SignalManager()
-        self.labouchere      = Labouchere()
+        self.martingala      = Martingale()
         self.last_game_id    : str = load_last_game_id()  # persiste entre reinicios
 
         self.last_spin_num   : int = 0
@@ -705,7 +697,7 @@ class SpinProcessor:
                 # ganancia neta = fichas ganadas - fichas perdidas en intentos anteriores
                 net_fichas = bet_fichas_snap - lost_fichas_snap
                 s.daily_capital    += net_fichas * CHIP_VALUE
-                s.labouchere.on_win()
+                s.martingala.on_win()
                 s.consecutive_wins += 1
                 attempt = result["attempt"]
                 if attempt <= 1:
@@ -732,7 +724,7 @@ class SpinProcessor:
                 # pérdida total = último intento + todos los intentos anteriores ya acumulados
                 total_lost = bet_fichas_snap + lost_fichas_snap
                 s.daily_capital    -= total_lost * CHIP_VALUE
-                s.labouchere.on_loss()
+                s.martingala.on_loss()
                 s.signal_msg_id   = None
                 await self.tg.send(self.builder.loss(number, real_color))
                 await asyncio.sleep(0.4)
@@ -748,26 +740,26 @@ class SpinProcessor:
                 new_attempt = result["attempt"]
                 attempt_str = f"{new_attempt + 1}/{MAX_ATTEMPTS}"
                 sm.active_signal.lost_fichas += bet_fichas_snap   # acumular fichas perdidas en este intento
-                # Avanzar Labouchère: agrega la apuesta perdida al final, luego leer la nueva
-                s.labouchere.on_loss()
-                new_bet = s.labouchere.bet
+                # Avanzar Martingala: duplicar la apuesta tras la derrota parcial
+                s.martingala.on_loss()
+                new_bet = s.martingala.bet
                 sm.active_signal.bet_fichas = new_bet
                 await self.tg.delete(s.signal_msg_id)
                 s.signal_msg_id = await self.tg.send(
                     self.builder.signal(number, real_color, new_color, attempt_str, bet_fichas=new_bet)
                 )
-                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | seq={s.labouchere.sequence} | bet={new_bet} fichas")
+                log.info(f"🔁 Gale {new_attempt} | apostar {new_color} | bet={new_bet} fichas (Martingala)")
 
         # ── SIN SEÑAL ACTIVA → DETECTAR NUEVA ────────────────────────────────
         elif sm.can_generate_signal():
-            bet = s.labouchere.bet
+            bet = s.martingala.bet
             sm.start_signal(number, seq_color, bet_fichas=bet)
             await self.tg.delete(s.waiting_msg_id)
             s.waiting_msg_id = None
             s.signal_msg_id  = await self.tg.send(
                 self.builder.signal(number, real_color, seq_color, f"1/{MAX_ATTEMPTS}", bet_fichas=bet)
             )
-            log.info(f"🟡 Nueva señal: {number} → apostar {seq_color} | Labouchère bet={bet}")
+            log.info(f"🟡 Nueva señal: {number} → apostar {seq_color} | Martingala bet={bet}")
 
         # Actualizar historial (siempre al final del giro)
         await self._update_history()
