@@ -1150,6 +1150,8 @@ class RouletteTable:
         self.prev_number = None
         self.last_update_time = time.time()
         self.color_history = []
+        self.zone_history = []          # <--- CORREGIDO: añadido
+        self.paridad_history = []       # <--- CORREGIDO: añadido
         self.total_spins_seen = 0
         self.live_spins_seen = 0
         self.daily_marker = DailyMarker()
@@ -1232,7 +1234,7 @@ class RouletteTable:
             return
         lab_state = self.labouchere.get_state()
         sign = '+' if lab_state['balance'] >= 0 else '-'
-        msg = (f"🎉🎉 CICLO #{self.cycle_number} COMPLETO 🎉🎉\n"
+        msg = (f"🎉🎉 CICLO #{self.cycle_number} COMPLETA 🎉🎉\n"
                f"📈 Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\n"
                f"🇨🇴 Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
         await send_msg(msg, THREAD_SIGNALS)
@@ -1452,20 +1454,20 @@ class RouletteTable:
             "key": self.key,
             "spin_history": hist,
             "color_history": self.color_history[-limit:],
+            "zone_history": self.zone_history[-limit:],
+            "paridad_history": self.paridad_history[-limit:],
             "agent1": self.agent1.get_state(),
             "agent2": self.agent2.get_state(),
             "agent3": self.agent3.get_state(),
             "agent4": self.agent4.get_state(),
             "agent5": self.agent5.get_state(),
             "agent6": self.agent6.get_state(),
-            "zone_history": self.zone_history[-limit:],
             "zone_agent1": self.zone_agent1.get_state(),
             "zone_agent2": self.zone_agent2.get_state(),
             "zone_agent3": self.zone_agent3.get_state(),
             "zone_agent4": self.zone_agent4.get_state(),
             "zone_agent5": self.zone_agent5.get_state(),
             "zone_agent6": self.zone_agent6.get_state(),
-            "paridad_history": self.paridad_history[-limit:],
             "paridad_agent1": self.paridad_agent1.get_state(),
             "paridad_agent2": self.paridad_agent2.get_state(),
             "paridad_agent3": self.paridad_agent3.get_state(),
