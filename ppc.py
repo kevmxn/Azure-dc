@@ -122,7 +122,7 @@ TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pr
 # vivo. Solo se ejecuta una vez por mesa: queda marcado en model_<mesa>.json
 # ("history_seed_trained") para no reprocesar el mismo historial en cada
 # reinicio del servidor.
-HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure_db.sql")
+HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
 
 # ──────────────────────────────────────────────
