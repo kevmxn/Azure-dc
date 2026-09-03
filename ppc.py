@@ -48,6 +48,8 @@ ROULETTE_KEYS = {227: 227}
 # ── Gestión Labouchère ──
 LABOUCHERE_BASE_AMOUNT = 500  # Unidad base en COP
 LABOUCHERE_INITIAL_SEQUENCE = [1, 1, 1, 1, 1]
+LABOUCHERE_INFINITE_MODE   = True    # Al completar el ciclo la secuencia se reinicia sola y sigue (base fija)
+LABOUCHERE_INITIAL_CAPITAL = 0  # El "capital" es el acumulado real desde que inició el bot
 
 COLOR_MAX_ATTEMPTS = 2  # Señales a 2 intentos
 COLOR_BACKTEST_WINDOW = 60
@@ -256,19 +258,24 @@ def amx_strength(level_history, periods):
 # ══════════════════════════════════════════════
 class LabouchereManager:
     """
-    Sistema Labouchère idéntico al HTML de referencia.
-    
-    Reglas:
+    Sistema Labouchère idéntico al HTML de referencia (MODO INFINITO).
+
+    Reglas (copiadas del HTML):
     - Apuesta = (extremo_izq + extremo_der) × base_amount
-    - WIN: elimina los dos extremos
-    - LOSS: agrega la apuesta al final de la secuencia
-    - Secuencia vacía → reinicia a secuencia inicial
-    - CERO (0): se trata como pérdida (NO reinicia)
+    - WIN: elimina los dos extremos (si quedan ≤2 elementos, la secuencia queda vacía)
+    - LOSS: agrega la apuesta (en unidades) al final de la secuencia
+    - CERO (0): se trata como pérdida
+    - Ciclo completado (secuencia vacía):
+        · Modo infinito: capital = balance, base = 1% del capital (mín. 100 COP),
+          secuencia = inicial, y se CONTINÚA apostando automáticamente.
     """
-    def __init__(self, base_amount: int = LABOUCHERE_BASE_AMOUNT, 
-                 initial_sequence: List[int] = None):
-        self.base_amount = base_amount
+    def __init__(self, base_amount: int = LABOUCHERE_BASE_AMOUNT,
+                 initial_sequence: List[int] = None,
+                 initial_capital: int = LABOUCHERE_INITIAL_CAPITAL):
         self.initial_sequence = list(initial_sequence if initial_sequence else LABOUCHERE_INITIAL_SEQUENCE)
+        self.capital = 0                   # siempre 0: no hay capital virtual, solo acumulado real
+        self.balance = 0                   # acumulado desde que inició el bot (win suma, loss resta)
+        self.base_amount = base_amount
         self.sequence = list(self.initial_sequence)
         self.current_bet = self._calculate_bet()
         self.cycles_completed = 0
@@ -285,45 +292,61 @@ class LabouchereManager:
     def get_bet(self) -> int:
         return self.current_bet
 
+    def seq_str(self) -> str:
+        return ",".join(str(x) for x in self.sequence)
+
     def reset(self):
-        """Reinicia la secuencia al estado inicial."""
+        """Reinicia la secuencia al estado inicial (misma base)."""
         self.sequence = list(self.initial_sequence)
         self.current_bet = self._calculate_bet()
 
+    def _restart_cycle(self):
+        """Reinicio de ciclo: la secuencia vuelve a la inicial y se CONTINÚA
+        apostando automáticamente (modo infinito). La base NUNCA cambia."""
+        self.base_amount = LABOUCHERE_BASE_AMOUNT  # base fija: siempre 500 COP
+        self.sequence = list(self.initial_sequence)
+        self.current_bet = self._calculate_bet()
+        log.info(f"♾️ GESTIÓN REINICIADA · Acumulado: {'+' if self.balance >= 0 else '-'}"
+                 f"{format_cop(abs(self.balance))} · "
+                 f"Base: {format_cop(self.base_amount)} · Secuencia: [{self.seq_str()}] · "
+                 f"Apuesta: {format_cop(self.current_bet)}")
+
     def update(self, win: bool):
         """
-        Actualiza la secuencia Labouchère.
+        Actualiza la secuencia en CADA intento (giro).
         - WIN: elimina extremos
         - LOSS: agrega apuesta al final
-        - Secuencia vacía: reinicia y cuenta ciclo completado
+        - Secuencia vacía → ciclo completado → reinicio automático (modo infinito)
         """
         if not self.sequence:
-            self.reset()
+            self._restart_cycle()
             return
-        
+
         bet_amount = self.current_bet
         self.total_bet += bet_amount
-        
+
         if win:
             self.total_won += bet_amount
+            self.balance += bet_amount
             if len(self.sequence) >= 2:
                 self.sequence.pop(0)
                 self.sequence.pop()
-            elif len(self.sequence) == 1:
+            else:
                 self.sequence.pop()
         else:
             # LOSS (incluye cuando sale 0)
+            self.balance -= bet_amount
             if len(self.sequence) == 1:
                 bet_units = self.sequence[0]
             else:
                 bet_units = self.sequence[0] + self.sequence[-1]
             self.sequence.append(bet_units)
-        
-        # Si la secuencia queda vacía → ciclo completado, reiniciar
+
         if not self.sequence:
+            # Ciclo completado → reinicio infinito (igual que el HTML)
             self.cycles_completed += 1
             log.info(f"💰 CICLO LABOUCHÈRE COMPLETADO #{self.cycles_completed}")
-            self.reset()
+            self._restart_cycle()
         else:
             self.current_bet = self._calculate_bet()
 
@@ -334,10 +357,13 @@ class LabouchereManager:
             "base_amount": self.base_amount,
             "initial_sequence": self.initial_sequence,
             "cycles_completed": self.cycles_completed,
+            "capital": self.capital,
+            "balance": self.balance,
             "total_bet": self.total_bet,
             "total_won": self.total_won,
-            "profit": self.total_won - self.total_bet,
+            "profit": self.balance,  # acumulado desde el inicio del bot
         }
+
 
 # ══════════════════════════════════════════════
 # TELEGRAM
@@ -391,7 +417,7 @@ async def delete_msg(msg_id: int) -> bool:
 # ──────────────────────────────────────────────
 # FORMATO DE MENSAJES (ajustado al ejemplo)
 # ──────────────────────────────────────────────
-def build_entry_message(last_number, bet_colors, bet_amount=None, start_attempt=1) -> str:
+def build_entry_message(last_number, bet_colors, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
     numero_emoji = COLOR_EMOJI.get(color_of(last_number), "🟢") if last_number is not None else ""
     color = bet_colors[0] if bet_colors else "-"
@@ -401,6 +427,7 @@ def build_entry_message(last_number, bet_colors, bet_amount=None, start_attempt=
         apuesta_line = f"\n🇨🇴 APUESTA: {format_cop(bet_amount)}"
     else:
         apuesta_line = ""
+    seq_line = f"\n📋 Secuencia: [{sequence_str}]" if sequence_str else ""
     
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
     
@@ -410,7 +437,7 @@ def build_entry_message(last_number, bet_colors, bet_amount=None, start_attempt=
             f"{apuesta_line}\n\n"
             f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
-def build_entry_message_zone(last_number, bet_zones, bet_amount=None, start_attempt=1) -> str:
+def build_entry_message_zone(last_number, bet_zones, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
     numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "🟢") if last_number is not None else ""
     zone = bet_zones[0] if bet_zones else "-"
@@ -436,7 +463,7 @@ def build_entry_message_zone(last_number, bet_zones, bet_amount=None, start_atte
             f"{apuesta_line}\n\n"
             f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
-def build_entry_message_paridad(last_number, bet_paridad, bet_amount=None, start_attempt=1) -> str:
+def build_entry_message_paridad(last_number, bet_paridad, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
     numero_emoji = PARIDAD_EMOJI.get(paridad_of(last_number), "🟢") if last_number is not None else ""
     paridad = bet_paridad[0] if bet_paridad else "-"
@@ -466,17 +493,16 @@ def attempt_win_label(attempt: int) -> str:
 
 ATTEMPT_LOSS_LABEL = "🚫 LOSS"
 
-def build_follow_up_message(new_bet: int, next_attempt: int) -> str:
+def build_follow_up_message(new_bet: int, next_attempt: int, sequence_str: str = "") -> str:
     """
     Mensaje de seguimiento cuando se pierde un intento.
-    Formato exacto según ejemplo:
-    🧠 SEGUIR CON LA GESTIÓN
-    🇨🇴 APUESTA: $1,500 COP
-    🎯 INTENTO 2
+    La gestión ya fue actualizada: se muestra el monto NUEVO y la secuencia.
     """
+    if sequence_str:
+        return (f"🧠 SEGUIR CON LA GESTIÓN\n"
+                f"🇨🇴 APUESTA: {format_cop(new_bet)}\n")
     return (f"🧠 SEGUIR CON LA GESTIÓN\n"
-            f"🇨🇴 APUESTA: {format_cop(new_bet)}\n"
-            f"🎯 INTENTO {next_attempt}")
+            f"🇨🇴 APUESTA: {format_cop(new_bet)}\n")
 
 def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) -> str:
     body = " | ".join(str(v) for v in attempt_results)
@@ -498,7 +524,8 @@ def build_status_message(server_state) -> str:
         lines.append(f"🎲 Mesa {key}")
         lab_state = table.labouchere.get_state()
         seq_str = ','.join(str(x) for x in lab_state['sequence'])
-        lines.append(f"💹 GESTIÓN LABOUCHÈRE\nSecuencia: [{seq_str}]\nPróxima apuesta: {format_cop(lab_state['bet_amount'])}\nCiclos completados: {lab_state['cycles_completed']}")
+        sign = '+' if lab_state['balance'] >= 0 else '-'
+        lines.append(f"💹 GESTIÓN LABOUCHÈRE (♾️ infinita)\n📈 Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\nSecuencia: [{seq_str}]\nPróxima apuesta: {format_cop(lab_state['bet_amount'])}\nCiclos completados: {lab_state['cycles_completed']}")
         
         for akey in agent_keys + zone_agent_keys + paridad_agent_keys:
             agente = getattr(table, akey, None)
@@ -907,12 +934,15 @@ class ColorPatternAgent:
                 else:
                     self.state["attempts_left"] -= 1
                     if self.state["attempts_left"] > 0:
-                        # Recalcular la nueva apuesta después de la pérdida
+                        # Labouchère YA actualizado → enviar monto nuevo + secuencia
                         if self.table is not None:
                             new_bet = self.table.labouchere.get_bet()
+                            seq_txt = self.table.labouchere.seq_str()
                             self.state["bet_amount"] = new_bet
+                        else:
+                            new_bet, seq_txt = self.state.get("bet_amount", 0), ""
                         next_attempt = attempt + 1
-                        msg = build_follow_up_message(new_bet, next_attempt)
+                        msg = build_follow_up_message(new_bet, next_attempt, seq_txt)
                         asyncio.create_task(send_msg(msg, self.thread_signals))
                     else:
                         asyncio.create_task(send_msg(ATTEMPT_LOSS_LABEL, self.thread_stats))
@@ -981,11 +1011,17 @@ class ColorPatternAgent:
                     "context_signature": context_signature, "filters": current_filters,
                 }
                 
+                # Refrescar la apuesta al momento de activar la señal (gestión siempre actualizada)
+                if self.table is not None:
+                    bet_amount = self.table.labouchere.get_bet()
                 if not blocked and self.live_enabled:
                     self.state = new_state
+                    self.state["bet_amount"] = bet_amount
                     self.attempt_results = []
-                    entry_text = self.entry_builder(self._last_raw_number, self.state["bet_colors"], 
-                                                   bet_amount=bet_amount, start_attempt=start_attempt)
+                    seq_txt = self.table.labouchere.seq_str() if self.table is not None else ""
+                    entry_text = self.entry_builder(self._last_raw_number, self.state["bet_colors"],
+                                                   bet_amount=bet_amount, start_attempt=start_attempt,
+                                                   sequence_str=seq_txt)
                     self.entry_text = entry_text
                     log.info(f"🔔 {self.name} NUEVA SEÑAL: {pattern} -> {bet_colors} (apuesta {format_cop(bet_amount)})")
                     asyncio.create_task(self._dispatch_entry(entry_text))
@@ -1173,14 +1209,24 @@ class RouletteTable:
 
     async def _resolve_signal(self, win: bool, number: int = None):
         """
-        Actualiza la gestión Labouchère.
-        El cero (0) se trata como pérdida (aumenta la secuencia).
-        Solo reinicia cuando la secuencia queda vacía.
+        Actualiza la gestión Labouchère en CADA intento.
+        El cero (0) se trata como pérdida. Al completarse el ciclo (secuencia vacía)
+        la gestión se reinicia automáticamente en modo infinito (igual que el HTML):
+        capital = balance, base = 1% del capital, secuencia inicial.
         """
+        prev_cycles = self.labouchere.cycles_completed
         self.labouchere.update(win)
         lab_state = self.labouchere.get_state()
-        seq_str = ','.join(str(x) for x in lab_state['sequence'])
-        log.info(f"💹 Labouchère: {'✅' if win else '❌'} → [{seq_str}] {format_cop(lab_state['bet_amount'])}")
+        seq_str = ",".join(str(x) for x in lab_state["sequence"])
+        lab_bet = lab_state["bet_amount"]
+        log.info(f"💹 Labouchère: {'✅' if win else '❌'} → [{seq_str}] {format_cop(lab_bet)}")
+        if self.labouchere.cycles_completed > prev_cycles:
+            # Ciclo completado → gestión reiniciada (modo infinito)
+            msg = (f"♾️ CICLO #{self.labouchere.cycles_completed} COMPLETA\n"
+                   f"📈 Acumulado: {'+' if lab_state['balance'] >= 0 else '-'}"
+                   f"{format_cop(abs(lab_state['balance']))}\n"
+                   f"🇨🇴 Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
+            await send_msg(msg, THREAD_SIGNALS)
 
     def _level_change(self, real_color_num: int) -> int:
         if real_color_num == 1: return 1
@@ -1266,7 +1312,7 @@ class RouletteTable:
         color_category_ready = table_ready and color_processed >= CATEGORY_MIN_PROCESSED_LIVE
         zone_category_ready = table_ready and zone_processed >= CATEGORY_MIN_PROCESSED_LIVE
         paridad_category_ready = table_ready and paridad_processed >= CATEGORY_MIN_PROCESSED_LIVE
-        bet_amount = self.labouchere.get_bet() if not any(a.state["active"] for a in all_agents) else 0
+        bet_amount = self.labouchere.get_bet()  # siempre la apuesta real (nunca $0 en una entrada)
         
         # ── 1) ZONA ──
         for agente, key in zip(zone_agent_list, zone_agent_keys):
