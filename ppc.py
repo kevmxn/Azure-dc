@@ -18,6 +18,7 @@
 ║   - Señales solo después de 21 giros EN VIVO                ║
 ║   - Espera un giro tras resolución para nueva señal         ║
 ║   - Mensajes: señal -> intento 2 -> resolución -> marcador diario -> ciclo║
+║   - Cada agente busca un símbolo fijo (a o b) en el patrón ║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -588,13 +589,15 @@ class DailyMarker:
         self.stats["won" if win else "lost"] += 1
 
 # ══════════════════════════════════════════════
-# AGENTE DE PATRÓN CON ML Y LABOUCHERE
+# AGENTE DE PATRÓN CON ML Y LABOUCHERE (target fijo)
 # ══════════════════════════════════════════════
 class ColorPatternAgent:
     def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
                  values=None, num_map=None, zero_label="VERDE", entry_builder=None,
-                 thread_signals=None, thread_stats=None, dynamic_bet: bool = True,
-                 fixed_target: str = None):
+                 thread_signals=None, thread_stats=None, target_symbol: str = 'b'):
+        """
+        target_symbol: 'a' o 'b' — indica qué elemento del patrón (a,b) se debe apostar.
+        """
         self.pattern_len = pattern_len
         self.name = name
         self.label = label
@@ -606,8 +609,7 @@ class ColorPatternAgent:
         self.entry_builder = entry_builder if entry_builder is not None else build_entry_message
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
         self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS
-        self.dynamic_bet = dynamic_bet
-        self.fixed_target = fixed_target
+        self.target_symbol = target_symbol  # 'a' o 'b'
         self.table = None
 
         self.state = {
@@ -640,7 +642,6 @@ class ColorPatternAgent:
         self.trained = False
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
-        # NUEVO: contador de giros que deben transcurrir tras resolver una señal real
         self.wait_spins_after_resolution = 0
 
     def _match(self, window):
@@ -670,9 +671,12 @@ class ColorPatternAgent:
             return None
         return (a, b)
 
-    @staticmethod
-    def _bet_colors(pattern):
-        return (pattern[1],)
+    def _bet_colors(self, pattern):
+        """Devuelve el valor (color/zona/paridad) correspondiente al target_symbol."""
+        if self.target_symbol == 'a':
+            return (pattern[0],)
+        else:
+            return (pattern[1],)
 
     @staticmethod
     def _key(pattern):
@@ -846,33 +850,10 @@ class ColorPatternAgent:
             return None
         return "repeat" if rep_rate >= chg_rate else "change"
 
-    def _resolve_dynamic_target(self, pattern, trend_colors):
-        a, b = pattern
-        if trend_colors is None:
-            return None, None
-        change_ok = self.num_map.get(b) in trend_colors
-        repeat_ok = self.num_map.get(a) in trend_colors
-        if change_ok and repeat_ok:
-            pref = self._preferred_direction()
-            if pref == "repeat":
-                return (b, a), "repeat"
-            elif pref == "change":
-                return (a, b), "change"
-            else:
-                return (a, b), "change"
-        if change_ok:
-            return (a, b), "change"
-        if repeat_ok:
-            return (b, a), "repeat"
-        return None, None
-
     def _ml_should_signal(self, pattern, trend_colors, amx_strength_val):
         if self.cooldown_remaining > 0:
             return False
-        if self.dynamic_bet and trend_colors is not None:
-            expected_num = self.num_map.get(pattern[-1])
-            if expected_num not in trend_colors:
-                return False
+        # Ya no se usa dynamic_bet, el target es fijo, así que no filtramos por tendencia
         base_rate = COLOR_MIN_WIN_RATE
         if amx_strength_val >= AMX_STRENGTH_THRESHOLDS["strong"]:
             required_rate = base_rate * AMX_ADJUST_FACTOR_STRONG
@@ -989,15 +970,7 @@ class ColorPatternAgent:
                 and len(color_history) >= self.pattern_len
                 and len(color_history) >= COLOR_MIN_SPIN_TO_SIGNAL):
             pattern = self._match(color_history[-self.pattern_len:])
-            direction = None
-            if pattern and self.dynamic_bet:
-                pattern, direction = self._resolve_dynamic_target(pattern, trend_colors)
-            elif pattern and not self.dynamic_bet and self.fixed_target == "repeat":
-                a, b = pattern
-                pattern, direction = (b, a), "repeat"
-            elif pattern:
-                direction = "change"
-            
+            direction = "change"  # fijo, porque el target es fijo
             if pattern and self._ml_should_signal(pattern, trend_colors, amx_strength_val):
                 bet_colors = self._bet_colors(pattern)
                 context = list(color_history[-COLOR_CONTEXT_WINDOW:])
@@ -1184,34 +1157,53 @@ class RouletteTable:
         self.cycle_pending = False
         self.cycle_number = 0
 
-        self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba", daily_marker=self.daily_marker, dynamic_bet=False, fixed_target="repeat")
-        self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_2", label="PATRON V2 💎", mode="aaaba", daily_marker=self.daily_marker, dynamic_bet=False, fixed_target="repeat")
-        self.agent3 = ColorPatternAgent(pattern_len=6, name="AGENTE_3", label="PATRON V3 💎", mode="aabbaa", daily_marker=self.daily_marker)
-        self.agent4 = ColorPatternAgent(pattern_len=7, name="AGENTE_4", label="PATRON V4 💎", mode="aaabbaa", daily_marker=self.daily_marker)
-        self.agent5 = ColorPatternAgent(pattern_len=5, name="AGENTE_5", label="PATRON V5 💎", mode="ababa", daily_marker=self.daily_marker)
-        self.agent6 = ColorPatternAgent(pattern_len=6, name="AGENTE_6", label="PATRON V6 💎", mode="aaabbb", daily_marker=self.daily_marker)
+        # Agentes de COLOR con targets fijos
+        self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba",
+                                        daily_marker=self.daily_marker, target_symbol='a')
+        self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_2", label="PATRON V2 💎", mode="aaaba",
+                                        daily_marker=self.daily_marker, target_symbol='a')
+        self.agent3 = ColorPatternAgent(pattern_len=6, name="AGENTE_3", label="PATRON V3 💎", mode="aabbaa",
+                                        daily_marker=self.daily_marker, target_symbol='b')
+        self.agent4 = ColorPatternAgent(pattern_len=7, name="AGENTE_4", label="PATRON V4 💎", mode="aaabbaa",
+                                        daily_marker=self.daily_marker, target_symbol='a')
+        self.agent5 = ColorPatternAgent(pattern_len=5, name="AGENTE_5", label="PATRON V5 💎", mode="ababa",
+                                        daily_marker=self.daily_marker, target_symbol='b')
+        self.agent6 = ColorPatternAgent(pattern_len=6, name="AGENTE_6", label="PATRON V6 💎", mode="aaabbb",
+                                        daily_marker=self.daily_marker, target_symbol='a')
         
-        self.zone_history = []
+        # Agentes de ZONA
         zone_kwargs = dict(values=ZONE_VALUES, num_map=ZONE_NUM, zero_label="VERDE",
                            entry_builder=build_entry_message_zone,
                            thread_signals=THREAD_SIGNALS_ZONE, thread_stats=THREAD_STATS_ZONE)
-        self.zone_agent1 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_1", label="PATRON ZONA V1 💎", mode="aaaaba", daily_marker=self.daily_marker, **zone_kwargs)
-        self.zone_agent2 = ColorPatternAgent(pattern_len=5, name="ZONA_AGENTE_2", label="PATRON ZONA V2 💎", mode="aaaba", daily_marker=self.daily_marker, **zone_kwargs)
-        self.zone_agent3 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_3", label="PATRON ZONA V3 💎", mode="aabbaa", daily_marker=self.daily_marker, **zone_kwargs)
-        self.zone_agent4 = ColorPatternAgent(pattern_len=7, name="ZONA_AGENTE_4", label="PATRON ZONA V4 💎", mode="aaabbaa", daily_marker=self.daily_marker, **zone_kwargs)
-        self.zone_agent5 = ColorPatternAgent(pattern_len=5, name="ZONA_AGENTE_5", label="PATRON ZONA V5 💎", mode="ababa", daily_marker=self.daily_marker, **zone_kwargs)
-        self.zone_agent6 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_6", label="PATRON ZONA V6 💎", mode="aaabbb", daily_marker=self.daily_marker, **zone_kwargs)
+        self.zone_agent1 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_1", label="PATRON ZONA V1 💎", mode="aaaaba",
+                                             daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
+        self.zone_agent2 = ColorPatternAgent(pattern_len=5, name="ZONA_AGENTE_2", label="PATRON ZONA V2 💎", mode="aaaba",
+                                             daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
+        self.zone_agent3 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_3", label="PATRON ZONA V3 💎", mode="aabbaa",
+                                             daily_marker=self.daily_marker, target_symbol='b', **zone_kwargs)
+        self.zone_agent4 = ColorPatternAgent(pattern_len=7, name="ZONA_AGENTE_4", label="PATRON ZONA V4 💎", mode="aaabbaa",
+                                             daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
+        self.zone_agent5 = ColorPatternAgent(pattern_len=5, name="ZONA_AGENTE_5", label="PATRON ZONA V5 💎", mode="ababa",
+                                             daily_marker=self.daily_marker, target_symbol='b', **zone_kwargs)
+        self.zone_agent6 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_6", label="PATRON ZONA V6 💎", mode="aaabbb",
+                                             daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
         
-        self.paridad_history = []
+        # Agentes de PARIDAD
         paridad_kwargs = dict(values=PARIDAD_VALUES, num_map=PARIDAD_NUM, zero_label="VERDE",
                               entry_builder=build_entry_message_paridad,
                               thread_signals=THREAD_SIGNALS_PARIDAD, thread_stats=THREAD_STATS_PARIDAD)
-        self.paridad_agent1 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_1", label="PATRON PARIDAD V1 💎", mode="aaaaba", daily_marker=self.daily_marker, **paridad_kwargs)
-        self.paridad_agent2 = ColorPatternAgent(pattern_len=5, name="PARIDAD_AGENTE_2", label="PATRON PARIDAD V2 💎", mode="aaaba", daily_marker=self.daily_marker, **paridad_kwargs)
-        self.paridad_agent3 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_3", label="PATRON PARIDAD V3 💎", mode="aabbaa", daily_marker=self.daily_marker, **paridad_kwargs)
-        self.paridad_agent4 = ColorPatternAgent(pattern_len=7, name="PARIDAD_AGENTE_4", label="PATRON PARIDAD V4 💎", mode="aaabbaa", daily_marker=self.daily_marker, **paridad_kwargs)
-        self.paridad_agent5 = ColorPatternAgent(pattern_len=5, name="PARIDAD_AGENTE_5", label="PATRON PARIDAD V5 💎", mode="ababa", daily_marker=self.daily_marker, **paridad_kwargs)
-        self.paridad_agent6 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_6", label="PATRON PARIDAD V6 💎", mode="aaabbb", daily_marker=self.daily_marker, **paridad_kwargs)
+        self.paridad_agent1 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_1", label="PATRON PARIDAD V1 💎", mode="aaaaba",
+                                                daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
+        self.paridad_agent2 = ColorPatternAgent(pattern_len=5, name="PARIDAD_AGENTE_2", label="PATRON PARIDAD V2 💎", mode="aaaba",
+                                                daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
+        self.paridad_agent3 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_3", label="PATRON PARIDAD V3 💎", mode="aabbaa",
+                                                daily_marker=self.daily_marker, target_symbol='b', **paridad_kwargs)
+        self.paridad_agent4 = ColorPatternAgent(pattern_len=7, name="PARIDAD_AGENTE_4", label="PATRON PARIDAD V4 💎", mode="aaabbaa",
+                                                daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
+        self.paridad_agent5 = ColorPatternAgent(pattern_len=5, name="PARIDAD_AGENTE_5", label="PATRON PARIDAD V5 💎", mode="ababa",
+                                                daily_marker=self.daily_marker, target_symbol='b', **paridad_kwargs)
+        self.paridad_agent6 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_6", label="PATRON PARIDAD V6 💎", mode="aaabbb",
+                                                daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
         
         for attr in dir(self):
             obj = getattr(self, attr)
