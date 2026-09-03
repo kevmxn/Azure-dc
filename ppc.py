@@ -1364,7 +1364,7 @@ class RouletteTable:
         paridad_category_ready = table_ready and (paridad_processed >= CATEGORY_MIN_PROCESSED_LIVE or training)
         bet_amount = self.labouchere.get_bet()
 
-        # ZONA
+        # ── ZONA ──
         for agente, key in zip(zone_agent_list, zone_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1393,10 +1393,10 @@ class RouletteTable:
                           trend_colors=favored, amx_strength_val=amx_strength_val,
                           last_number=number,
                           live_enabled=live_ok,
-                          bet_amount=bet_amount if not blocked else 0,
+                          bet_amount=bet_amount,  # CORREGIDO: se elimina referencia a 'blocked'
                           trend=trend, direction=None)
 
-        # PARIDAD
+        # ── PARIDAD ──
         for agente, key in zip(paridad_agent_list, paridad_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1425,10 +1425,10 @@ class RouletteTable:
                           trend_colors=favored, amx_strength_val=amx_strength_val,
                           last_number=number,
                           live_enabled=live_ok,
-                          bet_amount=bet_amount if not blocked else 0,
+                          bet_amount=bet_amount,  # CORREGIDO
                           trend=trend, direction=None)
 
-        # COLOR
+        # ── COLOR ──
         for agente, key in zip(agent_list, agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1457,7 +1457,7 @@ class RouletteTable:
                           trend_colors=favored, amx_strength_val=amx_strength_val,
                           last_number=number,
                           live_enabled=live_ok,
-                          bet_amount=bet_amount if not blocked else 0,
+                          bet_amount=bet_amount,  # CORREGIDO
                           trend=trend, direction=None)
 
         if not training:
