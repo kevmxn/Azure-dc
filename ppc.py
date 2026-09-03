@@ -9,6 +9,7 @@
 ║   - Filtros más estrictos: win_rate 0.55, muestras 10      ║
 ║   - Agente 5 (ababa) se desactiva tras 3 victorias         ║
 ║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
+║   - Comando /status acortado para evitar límite de Telegram║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -44,13 +45,13 @@ LABOUCHERE_INFINITE_MODE   = True
 LABOUCHERE_INITIAL_CAPITAL = 0
 
 COLOR_MAX_ATTEMPTS = 2
-COLOR_BACKTEST_WINDOW = 80              # Aumentado para mejor backtest
+COLOR_BACKTEST_WINDOW = 80
 COLOR_CONTEXT_WINDOW = 20
-COLOR_MIN_SAMPLES_GATE = 10             # Subido de 6 a 10
-COLOR_MIN_WIN_RATE = 0.55               # Subido de 0.30 a 0.55
+COLOR_MIN_SAMPLES_GATE = 10
+COLOR_MIN_WIN_RATE = 0.55
 COLOR_MIN_SPIN_TO_SIGNAL = 21
-COLOR_ANALYSIS_WINDOW = 3               # Reducido de 5 a 3
-CONTEXT_SIMILARITY_THRESHOLD = 0.85     # Subido de 0.7 a 0.85
+COLOR_ANALYSIS_WINDOW = 3
+CONTEXT_SIMILARITY_THRESHOLD = 0.85
 
 LIVE_MIN_SPINS_TO_SIGNAL = 21
 ML_MIN_SIGNALS_TO_TRAIN = 50
@@ -61,8 +62,8 @@ LIVE_FASTTRACK_MIN_SAMPLES = 10
 LIVE_FASTTRACK_MIN_WIN_RATE = 0.90
 
 AMX_STRENGTH_THRESHOLDS = {"strong": 1.0, "weak": 0.5}
-AMX_ADJUST_FACTOR_STRONG = 0.7          # Más restrictivo (antes 0.8)
-AMX_ADJUST_FACTOR_WEAK = 0.9            # Más restrictivo (antes 1.2)
+AMX_ADJUST_FACTOR_STRONG = 0.7
+AMX_ADJUST_FACTOR_WEAK = 0.9
 
 COLOR_COOLDOWN_AFTER_LOSSES = 3
 COLOR_COOLDOWN_ROUNDS = 5
@@ -476,7 +477,7 @@ def build_status_message(server_state) -> str:
         lab_state = table.labouchere.get_state()
         seq_str = ','.join(str(x) for x in lab_state['sequence'])
         sign = '+' if lab_state['balance'] >= 0 else '-'
-        lines.append(f"💹 GESTIÓN LABOUCHÈRE (♾️ infinita)\n📈 Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\nSecuencia: [{seq_str}]\nPróxima apuesta: {format_cop(lab_state['bet_amount'])}\nCiclos completados: {lab_state['cycles_completed']}")
+        lines.append(f"💹 Labouchère | Acum: {sign}{format_cop(abs(lab_state['balance']))} | Sec: [{seq_str}] | Sig: {format_cop(lab_state['bet_amount'])} | Ciclos: {lab_state['cycles_completed']}")
         for akey in agent_keys + zone_agent_keys + paridad_agent_keys:
             agente = getattr(table, akey, None)
             if agente is None:
@@ -484,22 +485,13 @@ def build_status_message(server_state) -> str:
             s = agente.stats
             total = s.get("total", 0)
             won = s.get("won", 0)
-            lost = s.get("lost", 0)
             rate = round((won / total) * 100, 1) if total else 0.0
-            estado = "🟢 activa" if agente.state["active"] else ("🌘 sombra" if agente.train_state["active"] else "⚪ inactiva")
-            live = "📡 EN VIVO" if agente.live_enabled else "🧪 segundo plano (no envía)"
-            rec_attempt, rec_pct = agente.overall_recommended_attempt()
-            rec_line = (f"🧠 Inicio recomendado: intento {rec_attempt} ({rec_pct}% de aciertos)"
-                       if rec_attempt else "🧠 Inicio recomendado: aún sin datos suficientes")
-            if agente.trained:
-                modelo_line = "🤖 Modelo: entrenado"
-            elif agente.is_fasttrack_ready():
-                modelo_line = f"🤖 Modelo: fast-track ⚡ ({rate}% efectividad, {total} señales) — aún acumulando hacia {ML_MIN_SIGNALS_TO_TRAIN}"
-            else:
-                modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
-            signal_status = "🔇 DESACTIVADO (3 wins)" if not agente.signal_enabled else "🔊 activo"
-            lines.append(f"{agente.label}  {live}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado} {signal_status}\n{modelo_line}\n{rec_line}")
-    return "\n\n".join(lines)
+            estado = "🟢" if agente.state["active"] else ("🌘" if agente.train_state["active"] else "⚪")
+            live = "📡" if agente.live_enabled else "🧪"
+            trained = "🤖" if agente.trained else ("⚡" if agente.is_fasttrack_ready() else "⏳")
+            signal = "🔇" if not agente.signal_enabled else "🔊"
+            lines.append(f"{agente.label} {live}{trained}{signal} {estado} {total} ({rate}%)")
+    return "\n".join(lines)
 
 if bot is not None:
     @bot.message_handler(commands=["status"])
@@ -639,7 +631,7 @@ class ColorPatternAgent:
         if len(parts1) != len(parts2):
             return 0.0
         similarity = 0.0
-        weights = [0.6, 0.15, 0.15, 0.10]  # [secuencia, tendencia, amx, dirección]
+        weights = [0.6, 0.15, 0.15, 0.10]
         for i, (p1, p2) in enumerate(zip(parts1, parts2)):
             if p1 == p2:
                 similarity += weights[i]
