@@ -11,8 +11,9 @@
 ║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
 ║   - Todas las señales a 3 intentos                          ║
 ║   - Selección de la mejor señal en CADA intento             ║
-║   - Mensajes: señal1 -> (si falla) señal2 -> (si falla) señal3 -> resultado -> marcador -> ciclo║
+║   - Mensajes: señal1 -> (se elimina) señal2 -> (se elimina) señal3 -> resolución -> marcador -> ciclo║
 ║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
+║   - Marcador diario con desglose por intento                ║
 ║   - Comando /status acortado                                ║
 ╚══════════════════════════════════════════════════════════════
 """
@@ -249,7 +250,7 @@ def amx_strength(level_history, periods):
     return abs(amx)
 
 # ══════════════════════════════════════════════
-# LABOUCHERE MANAGER (ahora sin envío directo de mensajes)
+# LABOUCHERE MANAGER
 # ══════════════════════════════════════════════
 class LabouchereManager:
     def __init__(self, base_amount: int = LABOUCHERE_BASE_AMOUNT,
@@ -292,9 +293,6 @@ class LabouchereManager:
                  f"Apuesta: {format_cop(self.current_bet)}")
 
     def update(self, win: bool) -> bool:
-        """
-        Actualiza la secuencia y retorna True si se completó un ciclo.
-        """
         if not self.sequence:
             self._restart_cycle()
             return False
@@ -451,9 +449,6 @@ def build_entry_message_paridad(last_number, bet_paridad, bet_amount=None, start
             f"{apuesta_line}\n\n"
             f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
-def attempt_win_label(attempt: int) -> str:
-    return f"✅ WIN INTENTO {attempt}"
-
 def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) -> str:
     body = " | ".join(str(v) for v in attempt_results)
     header = "✅✅✅ 👍🏻" if win else "🚫🚫🚫👎🏻"
@@ -464,11 +459,25 @@ def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) 
     return f"{header} ({body}){apuesta_line}"
 
 def build_daily_marker_message(stats: dict) -> str:
-    total = stats.get("total", 0)
-    won = stats.get("won", 0)
-    lost = stats.get("lost", 0)
-    rate = round((won / total) * 100, 1) if total else 0.0
-    return f"📆 MARCADOR DIARIO 💎\n✅ Ganadas: {won}\n❌ Perdidas: {lost}\n🎯 Total señales: {total}\n📈 Efectividad: {rate}%"
+    win1 = stats.get("win1", 0)
+    win2 = stats.get("win2", 0)
+    win3 = stats.get("win3", 0)
+    loss = stats.get("loss", 0)
+    total = win1 + win2 + win3 + loss
+    if total == 0:
+        return "📆 MARCADOR DIARIO\nSin señales aún."
+    win1_pct = (win1 / total) * 100
+    win2_pct = (win2 / total) * 100
+    win3_pct = (win3 / total) * 100
+    loss_pct = (loss / total) * 100
+    global_pct = ((win1 + win2 + win3) / total) * 100
+    return (f"📆 MARCADOR DIARIO\n"
+            f"✅ Win 1: {win1} | Acierto: {win1_pct:.2f}%\n"
+            f"✅ Win 2: {win2} | Acierto: {win2_pct:.2f}%\n"
+            f"✅ Win 3: {win3} | Acierto: {win3_pct:.2f}%\n"
+            f"❌ Loss: {loss} | Fallos: {loss_pct:.2f}%\n"
+            f"🎯 Total señales: {total}\n"
+            f"📈 Efectividad Global: {global_pct:.2f}%")
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", "agent7", "agent8"]
@@ -508,16 +517,19 @@ if bot is not None:
             log.warning(f"[Telegram] Error respondiendo /status: {e}")
 
 # ──────────────────────────────────────────────
-# DAILY MARKER
+# DAILY MARKER (con desglose por intento)
 # ──────────────────────────────────────────────
 class DailyMarker:
     def __init__(self, thread_signals=None):
-        self.stats = {"total": 0, "won": 0, "lost": 0}
+        self.stats = {"win1": 0, "win2": 0, "win3": 0, "loss": 0}
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
 
-    async def record(self, win: bool):
-        self.stats["total"] += 1
-        self.stats["won" if win else "lost"] += 1
+    async def record(self, win: bool, attempt: int = None):
+        if win and attempt in (1, 2, 3):
+            key = f"win{attempt}"
+            self.stats[key] = self.stats.get(key, 0) + 1
+        elif not win:
+            self.stats["loss"] = self.stats.get("loss", 0) + 1
 
 # ══════════════════════════════════════════════
 # AGENTE DE PATRÓN (solo genera candidatos)
@@ -540,7 +552,6 @@ class ColorPatternAgent:
         self.target_symbol = target_symbol
         self.table = None
 
-        # Estado para sombra (entrenamiento en segundo plano)
         self.train_state = {
             "active": False, "pattern": None, "bet_colors": None,
             "attempts_left": 0, "total_attempts": COLOR_MAX_ATTEMPTS,
@@ -564,11 +575,9 @@ class ColorPatternAgent:
         self.trained = False
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
-        # Para V5: conteo de selecciones consecutivas
         self.consecutive_signals = 0
         self.signal_enabled = True
-        # Candidato para selección
-        self.candidate_signal = None  # dict o None
+        self.candidate_signal = None
 
     def _match(self, window):
         if len(window) != self.pattern_len:
@@ -783,7 +792,6 @@ class ColorPatternAgent:
     def update(self, color_history, timestamp, blocked: bool = False,
                trend_colors=None, amx_strength_val=0.0, last_number=None,
                live_enabled: bool = True, bet_amount: int = 0, trend=None, direction=None):
-        """Genera candidatos sin activar señales."""
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
         self.candidate_signal = None
@@ -791,7 +799,6 @@ class ColorPatternAgent:
             return
         last = color_history[-1]
 
-        # ── Resolución de señal de SOMBRA (entrenamiento) ──
         if self.train_state["active"]:
             if self.train_state["waiting_for_start"]:
                 self.train_state["spins_until_start"] -= 1
@@ -815,7 +822,6 @@ class ColorPatternAgent:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        # ── Detectar nuevo patrón y generar candidato ──
         if (not self.train_state["active"]
                 and len(color_history) >= self.pattern_len
                 and len(color_history) >= COLOR_MIN_SPIN_TO_SIGNAL):
@@ -845,7 +851,6 @@ class ColorPatternAgent:
                     "amx_strength": amx_strength_val,
                     "score": self._win_rate(pattern) or 0.0,
                 }
-                # Lógica V5: si el agente está desactivado y genera candidato, se reactiva
                 if self.mode == "ababa" and not self.signal_enabled:
                     self.signal_enabled = True
                     self.consecutive_signals = 0
@@ -887,7 +892,6 @@ class ColorPatternAgent:
         self.train_attempt_results = []
 
     def mark_selected(self):
-        """Marca que este agente ha sido seleccionado para un intento (para V5)."""
         if self.mode == "ababa":
             self.consecutive_signals += 1
             if self.consecutive_signals >= 3:
@@ -973,13 +977,13 @@ class RouletteTable:
         self.live_spins_seen = 0
         self.daily_marker = DailyMarker()
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
-        self.cycle_pending = 0  # número de ciclo completado pendiente de notificar
+        self.cycle_pending = 0
 
-        # Estado de la secuencia de señales
-        self.signal_sequence = []      # lista de dicts con {candidate, agent}
-        self.current_attempt_index = 0 # 0-based
-        self.signal_status = None      # None, 'active', 'won', 'lost'
-        self.attempt_numbers = []      # números de cada intento (para mensaje de resolución)
+        self.signal_sequence = []
+        self.current_attempt_index = 0
+        self.signal_status = None
+        self.attempt_numbers = []
+        self.entry_msg_ids = []
 
         # Agentes de COLOR (8)
         self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba",
@@ -1060,15 +1064,12 @@ class RouletteTable:
     # ── Gestión de señales secuenciales ──
 
     def _select_best_candidate(self, candidates):
-        """Elige el candidato con mayor score."""
         if not candidates:
             return None, None
         best_agent, best_score, best_candidate = max(candidates, key=lambda x: x[1])
         return best_agent, best_candidate
 
     async def _send_entry(self, agent, candidate, bet_amount, attempt_number):
-        """Envía mensaje de entrada con el formato personalizado para el intento."""
-        # Generar el mensaje original usando el builder del agente
         seq_txt = self.labouchere.seq_str()
         original = agent.entry_builder(
             agent._last_raw_number,
@@ -1077,24 +1078,34 @@ class RouletteTable:
             start_attempt=1,
             sequence_str=seq_txt
         )
-        # Reemplazar el encabezado original por el nuevo formato
         parts = original.split("\n\n", 1)
-        if len(parts) == 2:
-            body = parts[1]
-        else:
-            body = original
+        body = parts[1] if len(parts) == 2 else original
         new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
         entry_text = f"{new_header}\n\n{body}"
-        await send_msg(entry_text, agent.thread_signals)
+        msg_id = await send_msg(entry_text, agent.thread_signals)
+        if len(self.entry_msg_ids) >= attempt_number:
+            self.entry_msg_ids[attempt_number - 1] = msg_id
+        else:
+            self.entry_msg_ids.append(msg_id)
+        if attempt_number > 1 and len(self.entry_msg_ids) >= attempt_number - 1:
+            prev_id = self.entry_msg_ids[attempt_number - 2]
+            if prev_id:
+                await delete_msg(prev_id)
+        return msg_id
 
-    async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int):
-        """Envía mensaje de resolución (win/loss)."""
+    async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int, winning_attempt: int = None):
         res_text = build_resolution_message(win, attempt_numbers, bet_amount)
-        await send_msg(res_text, THREAD_STATS)
+        await send_msg(res_text, THREAD_SIGNALS)
+        if win and winning_attempt is not None:
+            simple = f"✅ WIN INTENTO {winning_attempt}"
+        elif win:
+            simple = "✅ WIN"
+        else:
+            simple = "🚫 LOSS"
+        await send_msg(simple, THREAD_STATS)
 
     async def _send_daily_marker_and_cycle(self):
-        """Envía marcador diario y ciclo completado si corresponde."""
-        if self.daily_marker.stats["total"] > 0:
+        if self.daily_marker.stats.get("win1", 0) + self.daily_marker.stats.get("win2", 0) + self.daily_marker.stats.get("win3", 0) + self.daily_marker.stats.get("loss", 0) > 0:
             text = build_daily_marker_message(self.daily_marker.stats)
             await send_msg(text, self.daily_marker.thread_signals)
         if self.cycle_pending > 0:
@@ -1106,24 +1117,16 @@ class RouletteTable:
             await send_msg(msg, THREAD_SIGNALS)
             self.cycle_pending = 0
 
-    def _finalize_sequence(self, win: bool):
-        """Finaliza la secuencia y envía marcador y ciclo."""
-        # Actualizar estadísticas del marcador
-        asyncio.create_task(self.daily_marker.record(win))
-        # Enviar marcador y ciclo
+    def _finalize_sequence(self, win: bool, winning_attempt: int = None):
+        asyncio.create_task(self.daily_marker.record(win, winning_attempt))
         asyncio.create_task(self._send_daily_marker_and_cycle())
-        # Resetear estado de secuencia
         self.signal_sequence = []
         self.current_attempt_index = 0
         self.signal_status = None
         self.attempt_numbers = []
+        self.entry_msg_ids = []
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
-        """
-        Maneja la lógica de secuencia de intentos.
-        Retorna True si se gestionó alguna señal (para evitar logging duplicado).
-        """
-        # Recoger candidatos de todos los agentes
         candidates = []
         for agente in all_agents:
             if agente.candidate_signal is not None:
@@ -1133,7 +1136,6 @@ class RouletteTable:
                 score = win_rate * (1 + amx_str)
                 candidates.append((agente, score, agente.candidate_signal))
 
-        # Si no hay secuencia activa, iniciar una
         if self.signal_status is None:
             if not candidates:
                 return False
@@ -1141,95 +1143,75 @@ class RouletteTable:
             if best_agent is None:
                 return False
 
-            # Marcar agente como seleccionado (para V5)
             best_agent.mark_selected()
-
-            # Iniciar secuencia
             self.signal_sequence = [{"agent": best_agent, "candidate": best_candidate}]
             self.current_attempt_index = 0
             self.signal_status = "active"
             self.attempt_numbers = []
+            self.entry_msg_ids = []
 
-            # Enviar mensaje de entrada para el intento 1
             asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 1))
             log.info(f"🔔 INICIO SECUENCIA: {best_agent.name} -> {best_candidate['bet_colors']} (apuesta {format_cop(bet_amount)})")
             return True
 
-        # Si hay secuencia activa, procesar el intento actual
         if self.signal_status == "active":
             current_entry = self.signal_sequence[self.current_attempt_index]
             agent = current_entry["agent"]
             candidate = current_entry["candidate"]
             bet_colors = candidate["bet_colors"]
 
-            # Verificar si el número actual coincide
             is_win = (last_number is not None and any(
                 self._color_match(last_number, color) for color in bet_colors
             ))
 
-            # Almacenar el número del intento actual
             self.attempt_numbers.append(last_number if last_number is not None else 0)
 
-            # Actualizar Labouchère con el resultado
             cycle_completed = self.labouchere.update(is_win)
             if cycle_completed:
                 self.cycle_pending = self.labouchere.cycles_completed
 
             if is_win:
-                # Victoria en este intento
                 self.signal_status = "won"
-                # Enviar resolución de victoria
-                asyncio.create_task(self._send_resolution(True, self.attempt_numbers, bet_amount))
-                log.info(f"✅ SECUENCIA GANADA en intento {self.current_attempt_index+1}")
-                self._finalize_sequence(True)
+                winning_attempt = self.current_attempt_index + 1
+                asyncio.create_task(self._send_resolution(True, self.attempt_numbers, bet_amount, winning_attempt))
+                log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt}")
+                self._finalize_sequence(True, winning_attempt)
                 return True
             else:
-                # Pérdida en este intento
-                if self.current_attempt_index < 2:  # aún quedan intentos (0,1,2)
-                    # Pasamos al siguiente intento
+                if self.current_attempt_index < 2:
                     self.current_attempt_index += 1
 
-                    # Seleccionar nuevo candidato para el siguiente intento
                     if not candidates:
-                        # No hay candidatos disponibles, finalizar como pérdida
                         self.signal_status = "lost"
                         asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
                         log.info(f"❌ SECUENCIA PERDIDA (sin candidatos)")
-                        self._finalize_sequence(False)
+                        self._finalize_sequence(False, None)
                         return True
 
                     best_agent, best_candidate = self._select_best_candidate(candidates)
                     if best_agent is None:
-                        # No hay candidato, finalizar pérdida
                         self.signal_status = "lost"
                         asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
                         log.info(f"❌ SECUENCIA PERDIDA (sin candidato válido)")
-                        self._finalize_sequence(False)
+                        self._finalize_sequence(False, None)
                         return True
 
-                    # Marcar nuevo agente como seleccionado
                     best_agent.mark_selected()
-
-                    # Agregar a la secuencia
                     self.signal_sequence.append({"agent": best_agent, "candidate": best_candidate})
-
-                    # Enviar mensaje de entrada para el nuevo intento
                     new_bet = self.labouchere.get_bet()
                     asyncio.create_task(self._send_entry(best_agent, best_candidate, new_bet, self.current_attempt_index+1))
                     log.info(f"🔄 NUEVO INTENTO {self.current_attempt_index+1}: {best_agent.name} -> {best_candidate['bet_colors']} (apuesta {format_cop(new_bet)})")
                     return True
                 else:
-                    # Se agotaron los intentos (3 fallos)
                     self.signal_status = "lost"
                     asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
                     log.info(f"❌ SECUENCIA PERDIDA (3 intentos fallidos)")
-                    self._finalize_sequence(False)
+                    self._finalize_sequence(False, None)
                     return True
 
         return False
 
     def _color_match(self, number, color_label):
-        """Compara si el número corresponde a la etiqueta de color/zona/paridad."""
         if color_label in ("ROJO", "NEGRO"):
             return color_of(number) == color_label
         elif color_label in ("BAJA", "ALTA"):
@@ -1307,7 +1289,6 @@ class RouletteTable:
         if paridad_num != 0:
             self.last_paridad_num = paridad_num
 
-        # ── Actualizar agentes (generan candidatos) ──
         agent_list = [self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6, self.agent7, self.agent8]
         agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", "agent7", "agent8"]
         zone_agent_list = [self.zone_agent1, self.zone_agent2, self.zone_agent3,
@@ -1326,7 +1307,6 @@ class RouletteTable:
         paridad_category_ready = table_ready and paridad_processed >= CATEGORY_MIN_PROCESSED_LIVE
         bet_amount = self.labouchere.get_bet()
 
-        # ── 1) ZONA ──
         for agente, key in zip(zone_agent_list, zone_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1342,14 +1322,14 @@ class RouletteTable:
                                   strictness=config.get("strictness", "relaxed"),
                                   min_diff=config.get("min_diff", 0.0))
                 amx_strength_val = 0.0
-            else:  # amx
+            else:
                 periods = config.get("amx_periods", [5, 10, 20])
                 trend = amx_trend(self.zone_level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   threshold=config.get("threshold", 0.5))
                 amx_strength_val = amx_strength(self.zone_level_history, periods)
             favored = trend_favored_zones(trend)
-            blocked = False  # ya no se usa bloqueo
+            blocked = False
             live_ok = (not training) and zone_category_ready and (agente.trained or agente.is_fasttrack_ready())
             live_ok = live_ok and (self.live_spins_seen >= LIVE_MIN_SPINS_TO_SIGNAL)
             agente.update(self.zone_history, timestamp, blocked=False,
@@ -1359,7 +1339,6 @@ class RouletteTable:
                           bet_amount=bet_amount if not blocked else 0,
                           trend=trend, direction=None)
 
-        # ── 2) PARIDAD ──
         for agente, key in zip(paridad_agent_list, paridad_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1392,7 +1371,6 @@ class RouletteTable:
                           bet_amount=bet_amount if not blocked else 0,
                           trend=trend, direction=None)
 
-        # ── 3) COLOR ──
         for agente, key in zip(agent_list, agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1425,11 +1403,9 @@ class RouletteTable:
                           bet_amount=bet_amount if not blocked else 0,
                           trend=trend, direction=None)
 
-        # ── Manejar secuencia de señales (solo en modo live) ──
         if not training:
             self._handle_signal_sequence(all_agents, number, bet_amount)
 
-        # ── Logging ──
         if training:
             return
         lab_state = self.labouchere.get_state()
