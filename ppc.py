@@ -16,6 +16,7 @@
 ║   - Mensajes de seguimiento con nueva apuesta               ║
 ║   - Entrenamiento inicial con historial SQLite              ║
 ║   - Señales solo después de 21 giros EN VIVO                ║
+║   - Espera un giro tras resolución para nueva señal         ║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -932,9 +933,12 @@ class ColorPatternAgent:
                 is_win = (last in self.state["bet_colors"])
                 self.attempt_results.append(last_number)
                 
-                # Actualizar Labouchere con el resultado de este intento
+                # Actualizar Labouchere SÍNCRONAMENTE
                 if self.table is not None:
-                    asyncio.create_task(self.table._resolve_signal(is_win, last_number))
+                    self.table.labouchere.update(is_win)
+                    # Si se completó un ciclo, notificar (asíncrono)
+                    if self.table.labouchere.cycles_completed > 0:
+                        asyncio.create_task(self.table._notify_cycle_completed())
                 
                 if is_win:
                     asyncio.create_task(send_msg(attempt_win_label(attempt), self.thread_stats))
@@ -942,7 +946,7 @@ class ColorPatternAgent:
                 else:
                     self.state["attempts_left"] -= 1
                     if self.state["attempts_left"] > 0:
-                        # Labouchère YA actualizado → enviar monto nuevo + secuencia
+                        # Labouchère ya actualizado → obtener nueva apuesta
                         if self.table is not None:
                             new_bet = self.table.labouchere.get_bet()
                             seq_txt = self.table.labouchere.seq_str()
@@ -1219,26 +1223,14 @@ class RouletteTable:
         self.last_color_num = None
         self.trend = "neutral"
 
-    async def _resolve_signal(self, win: bool, number: int = None):
-        """
-        Actualiza la gestión Labouchère en CADA intento.
-        El cero (0) se trata como pérdida. Al completarse el ciclo (secuencia vacía)
-        la gestión se reinicia automáticamente en modo infinito (igual que el HTML):
-        capital = balance, base = 1% del capital, secuencia inicial.
-        """
-        prev_cycles = self.labouchere.cycles_completed
-        self.labouchere.update(win)
+    async def _notify_cycle_completed(self):
+        """Envía mensaje de ciclo completado de forma asíncrona."""
         lab_state = self.labouchere.get_state()
-        seq_str = ",".join(str(x) for x in lab_state["sequence"])
-        lab_bet = lab_state["bet_amount"]
-        log.info(f"💹 Labouchère: {'✅' if win else '❌'} → [{seq_str}] {format_cop(lab_bet)}")
-        if self.labouchere.cycles_completed > prev_cycles:
-            # Ciclo completado → gestión reiniciada (modo infinito)
-            msg = (f"♾️ CICLO #{self.labouchere.cycles_completed} COMPLETA\n"
-                   f"📈 Acumulado: {'+' if lab_state['balance'] >= 0 else '-'}"
-                   f"{format_cop(abs(lab_state['balance']))}\n"
-                   f"🇨🇴 Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
-            await send_msg(msg, THREAD_SIGNALS)
+        msg = (f"♾️ CICLO #{self.labouchere.cycles_completed} COMPLETA\n"
+               f"📈 Acumulado: {'+' if lab_state['balance'] >= 0 else '-'}"
+               f"{format_cop(abs(lab_state['balance']))}\n"
+               f"🇨🇴 Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
+        await send_msg(msg, THREAD_SIGNALS)
 
     def _level_change(self, real_color_num: int) -> int:
         if real_color_num == 1: return 1
