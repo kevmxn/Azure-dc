@@ -8,9 +8,11 @@
 ║   - Gestión Labouchere GLOBAL compartida por todas las señales║
 ║   - Persistencia y aprendizaje continuo                    ║
 ║   - Telegram, WebSocket, HTTP, self-ping                  ║
-║   - CERO (0) es considerado FALLO (no acierto)              ║
+║   - CERO (0) es considerado FALLO y REINICIA la gestión    ║
 ║   - Labouchere se actualiza en CADA intento (giro)          ║
 ║   - Mensajes de seguimiento con nueva apuesta               ║
+║   - Entrenamiento inicial con historial SQLite              ║
+║   - Señales solo después de 21 giros EN VIVO                ║
 ╚══════════════════════════════════════════════════════════════
 """
 
@@ -50,6 +52,9 @@ COLOR_CONTEXT_WINDOW = 20
 COLOR_MIN_SAMPLES_GATE = 6
 COLOR_MIN_WIN_RATE = 0.30
 COLOR_MIN_SPIN_TO_SIGNAL = 21
+
+# ── Mínimo de giros EN VIVO para empezar a emitir señales ──
+LIVE_MIN_SPINS_TO_SIGNAL = 21
 
 ML_MIN_SIGNALS_TO_TRAIN = 50
 ML_RETRAIN_INTERVAL_SECONDS = 30 * 60
@@ -117,12 +122,7 @@ THREAD_STATS_PARIDAD   = int(os.environ.get("THREAD_STATS_PARIDAD", str(THREAD_S
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:roulette1")
 
 # ── Entrenamiento inicial con historial (dump SQLite) ──
-# Al arrancar, si existe este archivo, se usa para pre-entrenar los modelos
-# de todos los agentes (color/zona/paridad) ANTES de abrir la conexión en
-# vivo. Solo se ejecuta una vez por mesa: queda marcado en model_<mesa>.json
-# ("history_seed_trained") para no reprocesar el mismo historial en cada
-# reinicio del servidor.
-HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
+HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure_db.sql")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
 
 # ──────────────────────────────────────────────
@@ -353,7 +353,10 @@ def build_entry_message(last_number, bet_colors, bet_amount=None) -> str:
     numero_emoji = COLOR_EMOJI.get(color_of(last_number), "🟢") if last_number is not None else ""
     color = bet_colors[0] if bet_colors else "-"
     emoji = COLOR_EMOJI.get(color, "")
-    apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP" if bet_amount else ""
+    if bet_amount is not None:
+        apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP"
+    else:
+        apuesta_line = ""
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
     return (f"🚨🚨 ENTRADA PARA COLOR 🚨🚨\n\n👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"🧨 COLOR: {color} ({emoji})\n"
@@ -371,7 +374,10 @@ def build_entry_message_zone(last_number, bet_zones, bet_amount=None) -> str:
         zone_line = f"🧨 ZONA ALTA: 19-36 ({emoji})"
     else:
         zone_line = f"🧨 ZONA: -"
-    apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP" if bet_amount else ""
+    if bet_amount is not None:
+        apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP"
+    else:
+        apuesta_line = ""
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
     return (f"🚨🚨 ENTRADA PARA ZONA 🚨🚨\n\n👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"{zone_line}\n"
@@ -388,7 +394,10 @@ def build_entry_message_paridad(last_number, bet_paridad, bet_amount=None) -> st
         paridad_line = f"🧨 NUMEROS IMPARES ({PARIDAD_EMOJI['IMPAR']})"
     else:
         paridad_line = f"🧨 NUMEROS: -"
-    apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP" if bet_amount else ""
+    if bet_amount is not None:
+        apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP"
+    else:
+        apuesta_line = ""
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
     return (f"🚨🚨 ENTRADA PARIDAD 🚨🚨\n\n👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"{paridad_line}\n"
@@ -402,7 +411,10 @@ ATTEMPT_LOSS_LABEL = "🚫 LOSS"
 def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) -> str:
     body = " | ".join(str(v) for v in attempt_results)
     header = "✅✅✅ 👍🏻" if win else "🚫🚫🚫👎🏻"
-    apuesta_line = f" | Apuesta: ${bet_amount:,}" if bet_amount else ""
+    if bet_amount is not None:
+        apuesta_line = f" | Apuesta: ${bet_amount:,}"
+    else:
+        apuesta_line = ""
     return f"{header} ({body}){apuesta_line}"
 
 def build_status_message(server_state) -> str:
@@ -712,7 +724,7 @@ class ColorPatternAgent:
 
             # Actualizar Labouchere con el resultado de este intento
             if self.table is not None:
-                asyncio.create_task(self.table._resolve_signal(is_win))
+                asyncio.create_task(self.table._resolve_signal(is_win, last_number))
 
             if is_win:
                 # Enviar mensaje de win del intento
@@ -911,6 +923,7 @@ class RouletteTable:
 
         self.color_history = []
         self.total_spins_seen = 0
+        self.live_spins_seen = 0          # contador de giros en vivo (training=False)
         self.daily_marker = DailyMarker()
         self.labouchere = LabouchereManager(base_amount=500)
 
@@ -961,7 +974,13 @@ class RouletteTable:
         self.last_color_num = None
         self.trend = "neutral"
 
-    async def _resolve_signal(self, win: bool):
+    async def _resolve_signal(self, win: bool, number: int = None):
+        # Si el número es 0, reiniciamos la gestión
+        if number == 0:
+            self.labouchere.reset()
+            log.info(f"🔄 CERO detectado, gestión reiniciada a [1,1,1,1,1]")
+            return
+        # Actualizar normalmente
         self.labouchere.update(win)
         lab_state = self.labouchere.get_state()
         seq_str = ','.join(str(x) for x in lab_state['sequence'])
@@ -995,6 +1014,8 @@ class RouletteTable:
         if len(self.spin_history) > 200: self.spin_history.pop(0)
         self.prev_number = number
         self.total_spins_seen += 1
+        if not training:
+            self.live_spins_seen += 1
 
         dz = real_color
         self.color_history.append(dz)
@@ -1031,6 +1052,12 @@ class RouletteTable:
         if len(self.paridad_level_history) > 100: self.paridad_level_history.pop(0)
         if paridad_num != 0:
             self.last_paridad_num = paridad_num
+
+        # ── Si es CERO (0), reiniciamos la gestión (además de tratarlo como fallo) ──
+        if number == 0:
+            self.labouchere.reset()
+            log.info(f"🔄 CERO en giro #{len(self.color_history)}, gestión reiniciada a [1,1,1,1,1]")
+            # No retornamos, seguimos procesando agentes para que aprendan
 
         # ── Actualizar agentes ──
         agent_list = [self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6]
@@ -1071,10 +1098,13 @@ class RouletteTable:
 
             blocked = any(a.state["active"] for a in all_agents if a is not agente)
 
+            live_ok = (not training) and zone_category_ready and (agente.trained or agente.is_fasttrack_ready())
+            live_ok = live_ok and (self.live_spins_seen >= LIVE_MIN_SPINS_TO_SIGNAL)
+
             agente.update(self.zone_history, timestamp, blocked=blocked,
                           trend_colors=favored, amx_strength_val=amx_strength_val,
                           last_number=number,
-                          live_enabled=(not training) and zone_category_ready and (agente.trained or agente.is_fasttrack_ready()),
+                          live_enabled=live_ok,
                           bet_amount=bet_amount if not blocked else 0)
 
         # ── 2) PARIDAD ──
@@ -1095,10 +1125,13 @@ class RouletteTable:
 
             blocked = any(a.state["active"] for a in all_agents if a is not agente)
 
+            live_ok = (not training) and paridad_category_ready and (agente.trained or agente.is_fasttrack_ready())
+            live_ok = live_ok and (self.live_spins_seen >= LIVE_MIN_SPINS_TO_SIGNAL)
+
             agente.update(self.paridad_history, timestamp, blocked=blocked,
                           trend_colors=favored, amx_strength_val=amx_strength_val,
                           last_number=number,
-                          live_enabled=(not training) and paridad_category_ready and (agente.trained or agente.is_fasttrack_ready()),
+                          live_enabled=live_ok,
                           bet_amount=bet_amount if not blocked else 0)
 
         # ── 3) COLOR ──
@@ -1119,10 +1152,13 @@ class RouletteTable:
 
             blocked = any(a.state["active"] for a in all_agents if a is not agente)
 
+            live_ok = (not training) and color_category_ready and (agente.trained or agente.is_fasttrack_ready())
+            live_ok = live_ok and (self.live_spins_seen >= LIVE_MIN_SPINS_TO_SIGNAL)
+
             agente.update(self.color_history, timestamp, blocked=blocked,
                           trend_colors=favored, amx_strength_val=amx_strength_val,
                           last_number=number,
-                          live_enabled=(not training) and color_category_ready and (agente.trained or agente.is_fasttrack_ready()),
+                          live_enabled=live_ok,
                           bet_amount=bet_amount if not blocked else 0)
 
         # ── Logging ──
@@ -1146,7 +1182,8 @@ class RouletteTable:
             f"Live: color={color_category_ready} zona={zone_category_ready} paridad={paridad_category_ready} "
             f"(giros={self.total_spins_seen}/{TABLE_MIN_SPINS_LIVE}, "
             f"procesadas color={color_processed} zona={zone_processed} paridad={paridad_processed} de {CATEGORY_MIN_PROCESSED_LIVE}) | "
-            f"Lab: [{lab_seq}] ${lab_bet:,} | Últimos 10 colores: [{last10}] | Señales activas: {activos_txt}"
+            f"Lab: [{lab_seq}] ${lab_bet:,} | Últimos 10 colores: [{last10}] | Señales activas: {activos_txt} | "
+            f"Live spins: {self.live_spins_seen}/{LIVE_MIN_SPINS_TO_SIGNAL}"
         )
 
     def get_state(self, limit: int = 40):
@@ -1179,6 +1216,7 @@ class RouletteTable:
             "trend_favored_colors": sorted(NUM_COLOR[d] for d in trend_favored_colors(self.trend)),
             "level_current": self.level_current,
             "labouchere": self.labouchere.get_state(),
+            "live_spins_seen": self.live_spins_seen,
         }
 
 
@@ -1186,10 +1224,6 @@ class RouletteTable:
 #  ENTRENAMIENTO CON HISTORIAL (arranque)
 # ══════════════════════════════════════════════
 def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_SEED_TABLE) -> list:
-    """Lee un dump SQL (formato sqlite, como el exportado por la app) y
-    devuelve los spin_number de `table_name` en orden cronológico (por id).
-    Si el archivo no existe o falla el parseo, devuelve [] y el servidor
-    arranca igual, simplemente sin pre-entrenamiento."""
     if not path or not os.path.exists(path):
         log.warning(f"[Historial] No se encontró '{path}'; se arranca sin pre-entrenamiento.")
         return []
@@ -1208,13 +1242,6 @@ def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_S
 
 
 async def train_table_from_history(table: "RouletteTable", spins: list) -> None:
-    """Recorre el historial en modo entrenamiento: alimenta a los 18 agentes
-    (color/zona/paridad) para que acumulen estadística y contexto de patrón,
-    pero SIEMPRE en modo sombra (nunca envía señales reales a Telegram ni
-    mueve la gestión Labouchere). Al terminar, total_spins_seen y las señales
-    procesadas por categoría ya están "calentadas", así que en cuanto lleguen
-    giros reales el servidor puede activar señales en vivo de inmediato si
-    los umbrales ya se cumplieron."""
     if not spins:
         return
     log.info(f"[Entrenamiento] Mesa {table.key}: procesando {len(spins)} giros históricos…")
@@ -1224,7 +1251,7 @@ async def train_table_from_history(table: "RouletteTable", spins: list) -> None:
             continue
         table.update(number, color_of(number), timestamp=now, training=True)
         if i % 1000 == 0:
-            await asyncio.sleep(0)   # cede el loop, no bloquea el resto del servidor
+            await asyncio.sleep(0)
     log.info(
         f"[Entrenamiento] Mesa {table.key}: listo. giros_vistos={table.total_spins_seen} "
         f"nivel_color={table.level_current} nivel_zona={table.zone_level_current} "
@@ -1249,13 +1276,13 @@ class ServerState:
         if mode in ("tendencia", "moderado"):
             self.signal_mode = mode
 
-    async def update_mesa(self, key: int, number: int, broadcast: bool = True):
+    async def update_mesa(self, key: int, number: int, broadcast: bool = True, training: bool = False):
         if key not in self.tables:
             return
         table = self.tables[key]
         real_color = color_of(number)
-        table.update(number, real_color, signal_mode=self.signal_mode)
-        if broadcast and self.ws_server:
+        table.update(number, real_color, signal_mode=self.signal_mode, training=training)
+        if broadcast and self.ws_server and not training:
             state = table.get_state(limit=40)
             state["signal_mode"] = self.signal_mode
             await self.ws_server.broadcast_to_mesa(str(key), "update", state)
@@ -1339,10 +1366,6 @@ class ServerState:
             log.warning(f"Error guardando modelo mesa {key}: {e}")
 
     async def train_from_history(self):
-        """Se llama una única vez al arrancar (antes de conectar el WS en
-        vivo). Para cada mesa que todavía no fue entrenada con el historial,
-        carga el dump SQL y alimenta a los agentes en modo sombra. Queda
-        marcado por mesa para no repetirlo en reinicios posteriores."""
         spins_cache = None
         for key, table in self.tables.items():
             if self.history_seed_trained.get(key):
@@ -1437,7 +1460,7 @@ class WebSocketServer:
 #  WEBSOCKET HANDLER (conexión a Pragmatic Play)
 # ══════════════════════════════════════════════
 class PragmaticWebSocketHandler:
-    def __init__(self, key: int, on_spin_callback: Callable[[int, bool], Awaitable[None]]):
+    def __init__(self, key: int, on_spin_callback: Callable[[int, bool, bool], Awaitable[None]]):
         self.key = key
         self.on_spin_callback = on_spin_callback
         self.seen = set()
@@ -1484,7 +1507,8 @@ class PragmaticWebSocketHandler:
         if len(self.seen) > 3000:
             self.seen.clear()
         if self.on_spin_callback:
-            await self.on_spin_callback(num, emit)
+            # Los giros con emit=False son históricos (training=True)
+            await self.on_spin_callback(num, emit, training=not emit)
 
 
 # ══════════════════════════════════════════════
@@ -1614,12 +1638,12 @@ async def main():
             await asyncio.sleep(SAVE_INTERVAL)
             server_state.save_all_models()
 
-    async def on_spin(key: int, num: int, emit: bool):
-        await server_state.update_mesa(key, num, broadcast=emit)
+    async def on_spin(key: int, num: int, emit: bool, training: bool = False):
+        await server_state.update_mesa(key, num, broadcast=emit, training=training)
 
     tasks = []
     for key in ROULETTE_KEYS.values():
-        handler = PragmaticWebSocketHandler(key, lambda num, emit, k=key: on_spin(k, num, emit))
+        handler = PragmaticWebSocketHandler(key, lambda num, emit, training=False, k=key: on_spin(k, num, emit, training))
         tasks.append(asyncio.create_task(handler.run()))
 
     tasks.append(asyncio.create_task(save_loop()))
