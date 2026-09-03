@@ -1,24 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   SERVIDOR ADAPTATIVO — AZURE ROULETTE (key 227)              ║
-║   - 6 agentes de patrones de COLOR (ROJO/NEGRO)               ║
-║   - 6 agentes de ZONA (BAJA/ALTA)                            ║
-║   - 6 agentes de PARIDAD (PAR/IMPAR)                        ║
-║   - ML adaptativo con tendencia AMX (umbral dinámico)      ║
+║   - 8 agentes de COLOR, 8 de ZONA, 8 de PARIDAD              ║
+║   - ML adaptativo con tendencia AMX y EMA (50,70,200)       ║
 ║   - Gestión Labouchere GLOBAL (base 500 COP)                ║
 ║   - Persistencia y aprendizaje continuo                    ║
-║   - Telegram, WebSocket, HTTP, self-ping                  ║
-║   - CERO (0) se trata como PÉRDIDA (aumenta secuencia)     ║
-║   - Labouchere se actualiza en CADA intento (giro)          ║
-║   - Señales a 2 intentos                                    ║
-║   - Análisis contextual completo para determinar mejor intento║
-║   - Considera: patrón + contexto + filtros + situaciones similares║
-║   - Mensajes de seguimiento con nueva apuesta               ║
-║   - Entrenamiento inicial con historial SQLite              ║
-║   - Señales solo después de 21 giros EN VIVO                ║
-║   - Espera un giro tras resolución para nueva señal         ║
-║   - Mensajes: señal -> intento 2 -> resolución -> marcador diario -> ciclo║
-║   - Cada agente busca un símbolo fijo (a o b) en el patrón ║
+║   - Parámetros ajustados para efectividad ~85%             ║
+║   - Filtros más estrictos: win_rate 0.55, muestras 10      ║
+║   - Agente 5 (ababa) se desactiva tras 3 victorias         ║
+║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -39,7 +29,7 @@ except ImportError:
     TELEBOT_OK = False
 
 # ──────────────────────────────────────────────
-# CONFIGURACIÓN
+# CONFIGURACIÓN (AJUSTADA PARA MAYOR EFECTIVIDAD)
 # ──────────────────────────────────────────────
 WS_URL        = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID     = "ppcdk00000005349"
@@ -48,22 +38,20 @@ PING_INTERVAL = 240
 SAVE_INTERVAL = 30
 ROULETTE_KEYS = {227: 227}
 
-# ── Gestión Labouchère ──
-LABOUCHERE_BASE_AMOUNT = 500  # Unidad base en COP
+LABOUCHERE_BASE_AMOUNT = 500
 LABOUCHERE_INITIAL_SEQUENCE = [1, 1, 1, 1, 1]
-LABOUCHERE_INFINITE_MODE   = True    # Al completar el ciclo la secuencia se reinicia sola y sigue (base fija)
-LABOUCHERE_INITIAL_CAPITAL = 0  # El "capital" es el acumulado real desde que inició el bot
+LABOUCHERE_INFINITE_MODE   = True
+LABOUCHERE_INITIAL_CAPITAL = 0
 
-COLOR_MAX_ATTEMPTS = 2  # Señales a 2 intentos
-COLOR_BACKTEST_WINDOW = 60
+COLOR_MAX_ATTEMPTS = 2
+COLOR_BACKTEST_WINDOW = 80              # Aumentado para mejor backtest
 COLOR_CONTEXT_WINDOW = 20
-COLOR_MIN_SAMPLES_GATE = 6
-COLOR_MIN_WIN_RATE = 0.30
+COLOR_MIN_SAMPLES_GATE = 10             # Subido de 6 a 10
+COLOR_MIN_WIN_RATE = 0.55               # Subido de 0.30 a 0.55
 COLOR_MIN_SPIN_TO_SIGNAL = 21
-COLOR_ANALYSIS_WINDOW = 5  # Analiza las próximas 5 rondas para determinar mejor intento
-CONTEXT_SIMILARITY_THRESHOLD = 0.7  # Umbral de similitud para considerar contextos similares
+COLOR_ANALYSIS_WINDOW = 3               # Reducido de 5 a 3
+CONTEXT_SIMILARITY_THRESHOLD = 0.85     # Subido de 0.7 a 0.85
 
-# ── Mínimo de giros EN VIVO para empezar a emitir señales ──
 LIVE_MIN_SPINS_TO_SIGNAL = 21
 ML_MIN_SIGNALS_TO_TRAIN = 50
 ML_RETRAIN_INTERVAL_SECONDS = 30 * 60
@@ -73,8 +61,8 @@ LIVE_FASTTRACK_MIN_SAMPLES = 10
 LIVE_FASTTRACK_MIN_WIN_RATE = 0.90
 
 AMX_STRENGTH_THRESHOLDS = {"strong": 1.0, "weak": 0.5}
-AMX_ADJUST_FACTOR_STRONG = 0.8
-AMX_ADJUST_FACTOR_WEAK = 1.2
+AMX_ADJUST_FACTOR_STRONG = 0.7          # Más restrictivo (antes 0.8)
+AMX_ADJUST_FACTOR_WEAK = 0.9            # Más restrictivo (antes 1.2)
 
 COLOR_COOLDOWN_AFTER_LOSSES = 3
 COLOR_COOLDOWN_ROUNDS = 5
@@ -110,11 +98,13 @@ TREND_FAVORED_COLORS = {"bullish": {1}, "bearish": {2}, "neutral": {1, 2}}
 
 AGENT_TREND_CONFIG = {
     "agent1": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
-    "agent2": {"method": "ema", "strictness": "strict", "min_diff": 0.5, "amx_periods": None},
-    "agent3": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
-    "agent4": {"method": "amx", "strictness": "very_strict", "min_diff": None, "amx_periods": [3, 8, 15]},
+    "agent2": {"method": "ema", "strictness": "strict", "min_diff": 0.5, "ema_periods": [4, 8, 20]},
+    "agent3": {"method": "ema_long", "strictness": "strict", "min_diff": 0.5, "ema_periods": [50, 70, 200]},
+    "agent4": {"method": "ema_long", "strictness": "strict", "min_diff": 0.5, "ema_periods": [50, 70, 200]},
     "agent5": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
     "agent6": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
+    "agent7": {"method": "ema_long", "strictness": "strict", "min_diff": 0.5, "ema_periods": [50, 70, 200]},
+    "agent8": {"method": "ema_long", "strictness": "strict", "min_diff": 0.5, "ema_periods": [50, 70, 200]},
 }
 
 # ── Telegram ──
@@ -128,7 +118,6 @@ THREAD_SIGNALS_PARIDAD = int(os.environ.get("THREAD_SIGNALS_PARIDAD", str(THREAD
 THREAD_STATS_PARIDAD   = int(os.environ.get("THREAD_STATS_PARIDAD", str(THREAD_STATS)))
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:roulette1")
 
-# ── Entrenamiento inicial con historial (dump SQLite) ──
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
 
@@ -157,7 +146,6 @@ def paridad_of(n):
     return "PAR" if n % 2 == 0 else "IMPAR"
 
 def format_cop(amount: int) -> str:
-    """Formatea monto en COP con separadores de miles."""
     return f"${amount:,} COP"
 
 def calc_ema(data, period):
@@ -171,40 +159,39 @@ def calc_ema(data, period):
         result.append(ema)
     return result
 
-def ema_trend(level_history, strictness="relaxed", min_diff=0.0):
-    if len(level_history) < EMA_TREND_MIN_HISTORY:
+def ema_trend(level_history, periods, strictness="relaxed", min_diff=0.0):
+    if len(level_history) < max(periods):
         return None if strictness in ("strict", "very_strict") else "neutral"
-    ema4 = calc_ema(level_history, 4)
-    ema8 = calc_ema(level_history, 8)
-    ema20 = calc_ema(level_history, 20)
-    if not ema4 or not ema8 or not ema20:
+    emas = [calc_ema(level_history, p) for p in periods]
+    if any(not ema for ema in emas):
         return None if strictness != "relaxed" else "neutral"
-    cur, e4, e8, e20 = level_history[-1], ema4[-1], ema8[-1], ema20[-1]
-    if any(v is None for v in (e4, e8, e20)):
+    ema_vals = [ema[-1] for ema in emas]
+    cur = level_history[-1]
+    if any(v is None for v in ema_vals):
         return None if strictness != "relaxed" else "neutral"
-    bullish = cur > e4 > e8 > e20
-    bearish = cur < e4 < e8 < e20
+    bullish = cur > ema_vals[0] and all(ema_vals[i] > ema_vals[i-1] for i in range(1, len(ema_vals)))
+    bearish = cur < ema_vals[0] and all(ema_vals[i] < ema_vals[i-1] for i in range(1, len(ema_vals)))
     if strictness == "relaxed":
         if bullish: return "bullish"
         if bearish: return "bearish"
         return "neutral"
     elif strictness == "strict":
         if bullish:
-            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+            if abs(cur - ema_vals[0]) > min_diff and all(abs(ema_vals[i] - ema_vals[i-1]) > min_diff for i in range(1, len(ema_vals))):
                 return "bullish"
             return "neutral"
         if bearish:
-            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+            if abs(cur - ema_vals[0]) > min_diff and all(abs(ema_vals[i] - ema_vals[i-1]) > min_diff for i in range(1, len(ema_vals))):
                 return "bearish"
             return "neutral"
         return "neutral"
     elif strictness == "very_strict":
         if bullish:
-            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+            if abs(cur - ema_vals[0]) > min_diff and all(abs(ema_vals[i] - ema_vals[i-1]) > min_diff for i in range(1, len(ema_vals))):
                 return "bullish"
             return None
         if bearish:
-            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+            if abs(cur - ema_vals[0]) > min_diff and all(abs(ema_vals[i] - ema_vals[i-1]) > min_diff for i in range(1, len(ema_vals))):
                 return "bearish"
             return None
         return None
@@ -257,27 +244,15 @@ def amx_strength(level_history, periods):
     return abs(amx)
 
 # ══════════════════════════════════════════════
-# LABOUCHERE MANAGER (GLOBAL)
+# LABOUCHERE MANAGER
 # ══════════════════════════════════════════════
 class LabouchereManager:
-    """
-    Sistema Labouchère idéntico al HTML de referencia (MODO INFINITO).
-
-    Reglas (copiadas del HTML):
-    - Apuesta = (extremo_izq + extremo_der) × base_amount
-    - WIN: elimina los dos extremos (si quedan ≤2 elementos, la secuencia queda vacía)
-    - LOSS: agrega la apuesta (en unidades) al final de la secuencia
-    - CERO (0): se trata como pérdida
-    - Ciclo completado (secuencia vacía):
-        · Modo infinito: capital = balance, base = 1% del capital (mín. 100 COP),
-          secuencia = inicial, y se CONTINÚA apostando automáticamente.
-    """
     def __init__(self, base_amount: int = LABOUCHERE_BASE_AMOUNT,
                  initial_sequence: List[int] = None,
                  initial_capital: int = LABOUCHERE_INITIAL_CAPITAL):
         self.initial_sequence = list(initial_sequence if initial_sequence else LABOUCHERE_INITIAL_SEQUENCE)
-        self.capital = 0                   # siempre 0: no hay capital virtual, solo acumulado real
-        self.balance = 0                   # acumulado desde que inició el bot (win suma, loss resta)
+        self.capital = 0
+        self.balance = 0
         self.base_amount = base_amount
         self.sequence = list(self.initial_sequence)
         self.current_bet = self._calculate_bet()
@@ -299,14 +274,11 @@ class LabouchereManager:
         return ",".join(str(x) for x in self.sequence)
 
     def reset(self):
-        """Reinicia la secuencia al estado inicial (misma base)."""
         self.sequence = list(self.initial_sequence)
         self.current_bet = self._calculate_bet()
 
     def _restart_cycle(self):
-        """Reinicio de ciclo: la secuencia vuelve a la inicial y se CONTINÚA
-        apostando automáticamente (modo infinito). La base NUNCA cambia."""
-        self.base_amount = LABOUCHERE_BASE_AMOUNT  # base fija: siempre 500 COP
+        self.base_amount = LABOUCHERE_BASE_AMOUNT
         self.sequence = list(self.initial_sequence)
         self.current_bet = self._calculate_bet()
         log.info(f"♾️ GESTIÓN REINICIADA · Acumulado: {'+' if self.balance >= 0 else '-'}"
@@ -315,19 +287,11 @@ class LabouchereManager:
                  f"Apuesta: {format_cop(self.current_bet)}")
 
     def update(self, win: bool):
-        """
-        Actualiza la secuencia en CADA intento (giro).
-        - WIN: elimina extremos
-        - LOSS: agrega apuesta al final
-        - Secuencia vacía → ciclo completado → reinicio automático (modo infinito)
-        """
         if not self.sequence:
             self._restart_cycle()
             return
-
         bet_amount = self.current_bet
         self.total_bet += bet_amount
-
         if win:
             self.total_won += bet_amount
             self.balance += bet_amount
@@ -337,16 +301,13 @@ class LabouchereManager:
             else:
                 self.sequence.pop()
         else:
-            # LOSS (incluye cuando sale 0)
             self.balance -= bet_amount
             if len(self.sequence) == 1:
                 bet_units = self.sequence[0]
             else:
                 bet_units = self.sequence[0] + self.sequence[-1]
             self.sequence.append(bet_units)
-
         if not self.sequence:
-            # Ciclo completado → reinicio infinito (igual que el HTML)
             self.cycles_completed += 1
             log.info(f"💰 CICLO LABOUCHÈRE COMPLETADO #{self.cycles_completed}")
             self._restart_cycle()
@@ -364,9 +325,8 @@ class LabouchereManager:
             "balance": self.balance,
             "total_bet": self.total_bet,
             "total_won": self.total_won,
-            "profit": self.balance,  # acumulado desde el inicio del bot
+            "profit": self.balance,
         }
-
 
 # ══════════════════════════════════════════════
 # TELEGRAM
@@ -417,23 +377,18 @@ async def delete_msg(msg_id: int) -> bool:
         log.debug(f"[Telegram] Error eliminando mensaje {msg_id}: {e}")
         return False
 
-# ──────────────────────────────────────────────
-# FORMATO DE MENSAJES (ajustado al ejemplo)
-# ──────────────────────────────────────────────
+# ── Formatos de mensaje ──
 def build_entry_message(last_number, bet_colors, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
     numero_emoji = COLOR_EMOJI.get(color_of(last_number), "🟢") if last_number is not None else ""
     color = bet_colors[0] if bet_colors else "-"
     emoji = COLOR_EMOJI.get(color, "")
-    
     if bet_amount is not None:
         apuesta_line = f"\n🇨🇴 APUESTA: {format_cop(bet_amount)}"
     else:
         apuesta_line = ""
     seq_line = f"\n📋 Secuencia: [{sequence_str}]" if sequence_str else ""
-    
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
-    
     return (f"🚨🚨 ENTRADA PARA COLOR 🚨🚨\n\n"
             f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"🧨 COLOR: {color} ({emoji})\n"
@@ -445,21 +400,17 @@ def build_entry_message_zone(last_number, bet_zones, bet_amount=None, start_atte
     numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "🟢") if last_number is not None else ""
     zone = bet_zones[0] if bet_zones else "-"
     emoji = ZONE_EMOJI.get(zone, "")
-    
     if zone == "BAJA":
         zone_line = f"🧨 ZONA BAJA: 1-18 ({emoji})"
     elif zone == "ALTA":
         zone_line = f"🧨 ZONA ALTA: 19-36 ({emoji})"
     else:
         zone_line = f"🧨 ZONA: -"
-    
     if bet_amount is not None:
         apuesta_line = f"\n🇨🇴 APUESTA: {format_cop(bet_amount)}"
     else:
         apuesta_line = ""
-    
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
-    
     return (f"🚨🚨 ENTRADA PARA ZONA 🚨🚨\n\n"
             f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"{zone_line}\n"
@@ -470,21 +421,17 @@ def build_entry_message_paridad(last_number, bet_paridad, bet_amount=None, start
     numero = last_number if last_number is not None else "-"
     numero_emoji = PARIDAD_EMOJI.get(paridad_of(last_number), "🟢") if last_number is not None else ""
     paridad = bet_paridad[0] if bet_paridad else "-"
-    
     if paridad == "PAR":
         paridad_line = f"🧨 NUMEROS PARES ({PARIDAD_EMOJI['PAR']})"
     elif paridad == "IMPAR":
         paridad_line = f"🧨 NUMEROS IMPARES ({PARIDAD_EMOJI['IMPAR']})"
     else:
         paridad_line = f"🧨 NUMEROS: -"
-    
     if bet_amount is not None:
         apuesta_line = f"\n🇨🇴 APUESTA: {format_cop(bet_amount)}"
     else:
         apuesta_line = ""
-    
     link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
-    
     return (f"🚨🚨 ENTRADA PARIDAD 🚨🚨\n\n"
             f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"{paridad_line}\n"
@@ -497,10 +444,6 @@ def attempt_win_label(attempt: int) -> str:
 ATTEMPT_LOSS_LABEL = "🚫 LOSS"
 
 def build_follow_up_message(new_bet: int, next_attempt: int, sequence_str: str = "") -> str:
-    """
-    Mensaje de seguimiento cuando se pierde un intento.
-    La gestión ya fue actualizada: se muestra el monto NUEVO y la secuencia.
-    """
     if sequence_str:
         return (f"🧠 SEGUIR CON LA GESTIÓN\n"
                 f"🇨🇴 APUESTA: {format_cop(new_bet)}\n")
@@ -524,19 +467,16 @@ def build_daily_marker_message(stats: dict) -> str:
     return f"📆 MARCADOR DIARIO 💎\n✅ Ganadas: {won}\n❌ Perdidas: {lost}\n🎯 Total señales: {total}\n📈 Efectividad: {rate}%"
 
 def build_status_message(server_state) -> str:
-    agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
-    zone_agent_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent5", "zone_agent6"]
-    paridad_agent_keys = ["paridad_agent1", "paridad_agent2", "paridad_agent3", "paridad_agent4", "paridad_agent5", "paridad_agent6"]
-    
+    agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", "agent7", "agent8"]
+    zone_agent_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent5", "zone_agent6", "zone_agent7", "zone_agent8"]
+    paridad_agent_keys = ["paridad_agent1", "paridad_agent2", "paridad_agent3", "paridad_agent4", "paridad_agent5", "paridad_agent6", "paridad_agent7", "paridad_agent8"]
     lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
-    
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key}")
         lab_state = table.labouchere.get_state()
         seq_str = ','.join(str(x) for x in lab_state['sequence'])
         sign = '+' if lab_state['balance'] >= 0 else '-'
         lines.append(f"💹 GESTIÓN LABOUCHÈRE (♾️ infinita)\n📈 Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\nSecuencia: [{seq_str}]\nPróxima apuesta: {format_cop(lab_state['bet_amount'])}\nCiclos completados: {lab_state['cycles_completed']}")
-        
         for akey in agent_keys + zone_agent_keys + paridad_agent_keys:
             agente = getattr(table, akey, None)
             if agente is None:
@@ -548,20 +488,17 @@ def build_status_message(server_state) -> str:
             rate = round((won / total) * 100, 1) if total else 0.0
             estado = "🟢 activa" if agente.state["active"] else ("🌘 sombra" if agente.train_state["active"] else "⚪ inactiva")
             live = "📡 EN VIVO" if agente.live_enabled else "🧪 segundo plano (no envía)"
-            
             rec_attempt, rec_pct = agente.overall_recommended_attempt()
             rec_line = (f"🧠 Inicio recomendado: intento {rec_attempt} ({rec_pct}% de aciertos)"
                        if rec_attempt else "🧠 Inicio recomendado: aún sin datos suficientes")
-            
             if agente.trained:
                 modelo_line = "🤖 Modelo: entrenado"
             elif agente.is_fasttrack_ready():
                 modelo_line = f"🤖 Modelo: fast-track ⚡ ({rate}% efectividad, {total} señales) — aún acumulando hacia {ML_MIN_SIGNALS_TO_TRAIN}"
             else:
                 modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
-            
-            lines.append(f"{agente.label}  {live}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}")
-    
+            signal_status = "🔇 DESACTIVADO (3 wins)" if not agente.signal_enabled else "🔊 activo"
+            lines.append(f"{agente.label}  {live}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado} {signal_status}\n{modelo_line}\n{rec_line}")
     return "\n\n".join(lines)
 
 if bot is not None:
@@ -576,7 +513,7 @@ if bot is not None:
             log.warning(f"[Telegram] Error respondiendo /status: {e}")
 
 # ──────────────────────────────────────────────
-# DAILY MARKER (solo estadísticas, sin envío automático)
+# DAILY MARKER
 # ──────────────────────────────────────────────
 class DailyMarker:
     def __init__(self, thread_signals=None):
@@ -584,20 +521,16 @@ class DailyMarker:
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
 
     async def record(self, win: bool):
-        """Solo actualiza estadísticas; el mensaje se envía desde el servidor cuando no hay señales."""
         self.stats["total"] += 1
         self.stats["won" if win else "lost"] += 1
 
 # ══════════════════════════════════════════════
-# AGENTE DE PATRÓN CON ML Y LABOUCHERE (target fijo)
+# AGENTE DE PATRÓN CON ML
 # ══════════════════════════════════════════════
 class ColorPatternAgent:
     def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
                  values=None, num_map=None, zero_label="VERDE", entry_builder=None,
                  thread_signals=None, thread_stats=None, target_symbol: str = 'b'):
-        """
-        target_symbol: 'a' o 'b' — indica qué elemento del patrón (a,b) se debe apostar.
-        """
         self.pattern_len = pattern_len
         self.name = name
         self.label = label
@@ -609,7 +542,7 @@ class ColorPatternAgent:
         self.entry_builder = entry_builder if entry_builder is not None else build_entry_message
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
         self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS
-        self.target_symbol = target_symbol  # 'a' o 'b'
+        self.target_symbol = target_symbol
         self.table = None
 
         self.state = {
@@ -630,7 +563,7 @@ class ColorPatternAgent:
         self.history_log = []
         self.history_counter = 0
         self.stats = {"total": 0, "won": 0, "lost": 0}
-        self.pattern_context = {}  # {pattern_key: [{"hit_attempt": 1-5 o 0, "context_signature": "...", "filters": {...}}]}
+        self.pattern_context = {}
         self.backtest = {"triggers": 0, "hits": 0, "accuracy": None}
         self.consecutive_losses = 0
         self.cooldown_remaining = 0
@@ -643,6 +576,8 @@ class ColorPatternAgent:
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
         self.wait_spins_after_resolution = 0
+        self.consecutive_wins = 0
+        self.signal_enabled = True
 
     def _match(self, window):
         if len(window) != self.pattern_len:
@@ -665,6 +600,12 @@ class ColorPatternAgent:
         elif self.mode == "aaaaba":
             a, b = window[0], window[4]
             ok = (window[1] == a and window[2] == a and window[3] == a and window[5] == a)
+        elif self.mode == "aaabaaa":
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[4] == b and window[5] == a and window[6] == a)
+        elif self.mode == "aaabaa":
+            a, b = window[0], window[2]
+            ok = (window[1] == a and window[3] == b and window[4] == a and window[5] == a)
         else:
             return None
         if not (ok and a in self.values and b in self.values and a != b):
@@ -672,7 +613,6 @@ class ColorPatternAgent:
         return (a, b)
 
     def _bet_colors(self, pattern):
-        """Devuelve el valor (color/zona/paridad) correspondiente al target_symbol."""
         if self.target_symbol == 'a':
             return (pattern[0],)
         else:
@@ -683,53 +623,35 @@ class ColorPatternAgent:
         return ">".join(pattern)
 
     def _get_context_signature(self, color_history, trend, amx_strength_val, direction):
-        """
-        Genera una firma del contexto actual para buscar situaciones similares.
-        Incluye: últimos 5 giros, tendencia, fuerza AMX, dirección
-        """
         recent = color_history[-5:] if len(color_history) >= 5 else color_history
         recent_str = ",".join(recent)
-        
         if amx_strength_val >= AMX_STRENGTH_THRESHOLDS["strong"]:
             strength_cat = "strong"
         elif amx_strength_val < AMX_STRENGTH_THRESHOLDS["weak"]:
             strength_cat = "weak"
         else:
             strength_cat = "medium"
-        
-        signature = f"{recent_str}|{trend}|{strength_cat}|{direction}"
-        return signature
+        return f"{recent_str}|{trend}|{strength_cat}|{direction}"
 
     def _calculate_context_similarity(self, sig1: str, sig2: str) -> float:
-        """
-        Calcula la similitud entre dos firmas de contexto.
-        Retorna un valor entre 0 y 1.
-        """
         parts1 = sig1.split("|")
         parts2 = sig2.split("|")
-        
         if len(parts1) != len(parts2):
             return 0.0
-        
         similarity = 0.0
-        weights = [0.5, 0.2, 0.15, 0.15]  # Pesos: contexto, tendencia, amx, dirección
-        
+        weights = [0.6, 0.15, 0.15, 0.10]  # [secuencia, tendencia, amx, dirección]
         for i, (p1, p2) in enumerate(zip(parts1, parts2)):
             if p1 == p2:
                 similarity += weights[i]
-            elif i == 0:  # Contexto (últimos giros)
+            elif i == 0:
                 seq1 = p1.split(",")
                 seq2 = p2.split(",")
                 if len(seq1) == len(seq2):
                     matches = sum(1 for a, b in zip(seq1, seq2) if a == b)
                     similarity += weights[i] * (matches / len(seq1))
-        
         return similarity
 
     def _record_context(self, pattern, hit_attempt: int, context_signature: str, filters: dict):
-        """
-        Registra en qué intento acertó el patrón junto con el contexto completo.
-        """
         key = self._key(pattern)
         arr = self.pattern_context.setdefault(key, [])
         arr.append({
@@ -766,43 +688,30 @@ class ColorPatternAgent:
         return rate < required_win_rate
 
     def _recommended_start_attempt(self, pattern, current_context_signature: str, current_filters: dict):
-        """
-        Analiza situaciones similares en el historial y determina el mejor intento de inicio.
-        """
         if not self.trained:
             return 1, 0.0
-        
         arr = self.trained_snapshot.get(self._key(pattern), [])
         if len(arr) < COLOR_MIN_SAMPLES_GATE:
             return 1, 0.0
-        
-        # Buscar situaciones similares
         similar_cases = []
         for case in arr:
             similarity = self._calculate_context_similarity(current_context_signature, case["context_signature"])
             if similarity >= CONTEXT_SIMILARITY_THRESHOLD:
                 similar_cases.append((case, similarity))
-        
-        # Si no hay suficientes casos similares, usar todos los casos del patrón
         if len(similar_cases) < 3:
             similar_cases = [(case, 1.0) for case in arr]
-        
-        # Para cada posible inicio (1-5), cuenta cuántas veces acertaría en los 2 intentos siguientes
         start_effectiveness = {}
         for start in range(1, COLOR_ANALYSIS_WINDOW + 1):
             hits = 0
             for case, similarity in similar_cases:
                 hit = case["hit_attempt"]
-                # Si el patrón acertó en el intento 'hit', y 'hit' está en el rango [start, start+1]
                 if start <= hit <= start + 1:
-                    hits += similarity  # Ponderar por similitud
+                    hits += similarity
             start_effectiveness[start] = hits
-        
         best_start = max(start_effectiveness, key=start_effectiveness.get)
         best_hits = start_effectiveness[best_start]
         total_weight = sum(s for _, s in similar_cases)
         best_pct = round((best_hits / total_weight) * 100, 1) if total_weight > 0 else 0.0
-        
         return best_start, best_pct
 
     def is_fasttrack_ready(self):
@@ -815,10 +724,8 @@ class ColorPatternAgent:
     def overall_recommended_attempt(self):
         if not self.trained:
             return None, 0.0
-        
         start_effectiveness = {i: 0 for i in range(1, COLOR_ANALYSIS_WINDOW + 1)}
         total_patterns = 0
-        
         for arr in self.trained_snapshot.values():
             for case in arr:
                 total_patterns += 1
@@ -827,14 +734,11 @@ class ColorPatternAgent:
                     for start in range(1, COLOR_ANALYSIS_WINDOW + 1):
                         if start <= hit <= start + 1:
                             start_effectiveness[start] += 1
-        
         if total_patterns < COLOR_MIN_SAMPLES_GATE:
             return None, 0.0
-        
         best_start = max(start_effectiveness, key=start_effectiveness.get)
         best_hits = start_effectiveness[best_start]
         best_pct = round((best_hits / total_patterns) * 100, 1)
-        
         return best_start, best_pct
 
     def _preferred_direction(self, min_samples: int = 10):
@@ -851,9 +755,10 @@ class ColorPatternAgent:
         return "repeat" if rep_rate >= chg_rate else "change"
 
     def _ml_should_signal(self, pattern, trend_colors, amx_strength_val):
+        if not self.signal_enabled:
+            return False
         if self.cooldown_remaining > 0:
             return False
-        # Ya no se usa dynamic_bet, el target es fijo, así que no filtramos por tendencia
         base_rate = COLOR_MIN_WIN_RATE
         if amx_strength_val >= AMX_STRENGTH_THRESHOLDS["strong"]:
             required_rate = base_rate * AMX_ADJUST_FACTOR_STRONG
@@ -861,7 +766,7 @@ class ColorPatternAgent:
             required_rate = base_rate * AMX_ADJUST_FACTOR_WEAK
         else:
             required_rate = base_rate
-        required_rate = max(0.20, min(0.60, required_rate))
+        required_rate = max(0.45, min(0.75, required_rate))
         if self._gated(pattern, required_rate):
             return False
         return True
@@ -893,7 +798,6 @@ class ColorPatternAgent:
             return
         last = color_history[-1]
 
-        # ── Manejo del giro de espera tras resolución de señal ──
         allow_new_signal = True
         if self.wait_spins_after_resolution > 0:
             self.wait_spins_after_resolution -= 1
@@ -912,22 +816,19 @@ class ColorPatternAgent:
                 attempt = self.state["start_attempt"] + self.state["current_attempt"] - 1
                 is_win = (last in self.state["bet_colors"])
                 self.attempt_results.append(last_number)
-                
-                # Actualizar Labouchère SÍNCRONAMENTE
+
                 if self.table is not None:
                     prev_cycles = self.table.labouchere.cycles_completed
                     self.table.labouchere.update(is_win)
-                    # Si se completó un ciclo, marcar pendiente
                     if self.table.labouchere.cycles_completed > prev_cycles:
                         self.table._mark_cycle_pending(self.table.labouchere.cycles_completed)
-                
+
                 if is_win:
                     asyncio.create_task(send_msg(attempt_win_label(attempt), self.thread_stats))
                     self._close(True, last, attempt, timestamp, self.state, dispatch=True)
                 else:
                     self.state["attempts_left"] -= 1
                     if self.state["attempts_left"] > 0:
-                        # Labouchère ya actualizado → obtener nueva apuesta
                         if self.table is not None:
                             new_bet = self.table.labouchere.get_bet()
                             seq_txt = self.table.labouchere.seq_str()
@@ -965,17 +866,15 @@ class ColorPatternAgent:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        # ── Detectar nuevo patrón (solo si se permite) ──
+        # ── Detectar nuevo patrón ──
         if allow_new_signal and (not self.state["active"] and not self.train_state["active"]
                 and len(color_history) >= self.pattern_len
                 and len(color_history) >= COLOR_MIN_SPIN_TO_SIGNAL):
             pattern = self._match(color_history[-self.pattern_len:])
-            direction = "change"  # fijo, porque el target es fijo
+            direction = "change"
             if pattern and self._ml_should_signal(pattern, trend_colors, amx_strength_val):
                 bet_colors = self._bet_colors(pattern)
                 context = list(color_history[-COLOR_CONTEXT_WINDOW:])
-                
-                # Generar firma del contexto actual
                 context_signature = self._get_context_signature(color_history, trend, amx_strength_val, direction)
                 current_filters = {
                     "trend": trend,
@@ -983,10 +882,7 @@ class ColorPatternAgent:
                     "direction": direction,
                     "trend_colors": list(trend_colors) if trend_colors else []
                 }
-                
-                # Determinar el intento de inicio basado en el contexto completo
                 start_attempt, start_pct = self._recommended_start_attempt(pattern, context_signature, current_filters)
-                
                 new_state = {
                     "active": True, "pattern": list(pattern), "bet_colors": list(bet_colors),
                     "attempts_left": COLOR_MAX_ATTEMPTS, "total_attempts": COLOR_MAX_ATTEMPTS,
@@ -995,15 +891,12 @@ class ColorPatternAgent:
                     "spins_until_start": start_attempt - 1, "start_attempt": start_attempt,
                     "context_signature": context_signature, "filters": current_filters,
                 }
-                
-                # Refrescar la apuesta al momento de activar la señal (gestión siempre actualizada)
                 if self.table is not None:
                     bet_amount = self.table.labouchere.get_bet()
                 if not blocked and self.live_enabled:
                     self.state = new_state
                     self.state["bet_amount"] = bet_amount
                     self.attempt_results = []
-                    # Limpiar el flag de espera porque se ha emitido una nueva señal
                     self.wait_spins_after_resolution = 0
                     seq_txt = self.table.labouchere.seq_str() if self.table is not None else ""
                     entry_text = self.entry_builder(self._last_raw_number, self.state["bet_colors"],
@@ -1022,10 +915,8 @@ class ColorPatternAgent:
     async def _dispatch_resolution(self, win: bool, attempt_results: list, bet_amount: int):
         resolution_text = build_resolution_message(win, attempt_results, bet_amount)
         await send_msg(resolution_text, self.thread_signals)
-        # Registrar en el marcador diario (solo estadísticas)
         if self.daily_marker is not None:
             await self.daily_marker.record(win)
-        # Intentar enviar marcador y ciclo si no hay señales activas
         if self.table is not None:
             await self.table.maybe_send_daily_marker_and_cycle()
 
@@ -1037,7 +928,7 @@ class ColorPatternAgent:
         hit_attempt = attempt if win else 0
         context_signature = state.get("context_signature", "")
         filters = state.get("filters", {})
-        
+
         self.history_counter += 1
         self.history_log.append({
             "n": self.history_counter, "pattern": ">".join(pattern),
@@ -1052,17 +943,27 @@ class ColorPatternAgent:
         self._record_context(pattern, hit_attempt, context_signature, filters)
         self.total_processed += 1
         self._maybe_train(timestamp)
-        
+
         if direction in ("repeat", "change"):
             self.direction_stats[direction]["wins" if win else "losses"] += 1
-        
+
+        if self.mode == "ababa":
+            if win:
+                self.consecutive_wins += 1
+                if self.consecutive_wins >= 3:
+                    self.signal_enabled = False
+                    log.info(f"🔇 {self.name} desactivado por 3 victorias consecutivas")
+            else:
+                self.consecutive_wins = 0
+                self.signal_enabled = True
+
         reset_state = {
             "active": False, "pattern": None, "bet_colors": None,
             "attempts_left": 0, "total_attempts": COLOR_MAX_ATTEMPTS,
             "context": None, "direction": None, "bet_amount": 0,
             "current_attempt": 0, "waiting_for_start": False, "spins_until_start": 0, "start_attempt": 1,
         }
-        
+
         if dispatch:
             if win:
                 self.consecutive_losses = 0
@@ -1071,7 +972,6 @@ class ColorPatternAgent:
                 if self.consecutive_losses >= COLOR_COOLDOWN_AFTER_LOSSES:
                     self.cooldown_remaining = COLOR_COOLDOWN_ROUNDS
             self.state = reset_state
-            # Se activa la espera de un giro antes de permitir nueva señal
             self.wait_spins_after_resolution = 1
             attempt_results = list(self.attempt_results)
             asyncio.create_task(self._dispatch_resolution(win, attempt_results, bet_amount))
@@ -1090,7 +990,6 @@ class ColorPatternAgent:
             rec, pct = self._recommended_start_attempt(pattern_tuple, "", {})
             if rec is not None:
                 pattern_recommendations[key] = {"start_attempt": rec, "pct": pct}
-        
         return {
             "name": self.name,
             "pattern_len": self.pattern_len,
@@ -1104,6 +1003,8 @@ class ColorPatternAgent:
             "recommended_start_attempt": rec_attempt,
             "recommended_start_attempt_pct": rec_pct,
             "pattern_recommendations": pattern_recommendations,
+            "signal_enabled": self.signal_enabled,
+            "consecutive_wins": self.consecutive_wins,
             "ml_model": {
                 "trained": self.trained,
                 "total_processed": self.total_processed,
@@ -1125,6 +1026,8 @@ class ColorPatternAgent:
             "last_train_ts": self.last_train_ts,
             "trained_snapshot": self.trained_snapshot,
             "direction_stats": self.direction_stats,
+            "consecutive_wins": self.consecutive_wins,
+            "signal_enabled": self.signal_enabled,
         }
 
     def load_persist(self, data):
@@ -1139,6 +1042,8 @@ class ColorPatternAgent:
         self.last_train_ts = data.get("last_train_ts", 0.0)
         self.trained_snapshot = data.get("trained_snapshot", {})
         self.direction_stats = data.get("direction_stats", self.direction_stats)
+        self.consecutive_wins = data.get("consecutive_wins", 0)
+        self.signal_enabled = data.get("signal_enabled", True)
 
 # ══════════════════════════════════════════════
 # ROULETTE TABLE
@@ -1150,8 +1055,8 @@ class RouletteTable:
         self.prev_number = None
         self.last_update_time = time.time()
         self.color_history = []
-        self.zone_history = []          # <--- CORREGIDO: añadido
-        self.paridad_history = []       # <--- CORREGIDO: añadido
+        self.zone_history = []
+        self.paridad_history = []
         self.total_spins_seen = 0
         self.live_spins_seen = 0
         self.daily_marker = DailyMarker()
@@ -1159,7 +1064,7 @@ class RouletteTable:
         self.cycle_pending = False
         self.cycle_number = 0
 
-        # Agentes de COLOR con targets fijos
+        # Agentes de COLOR (8)
         self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba",
                                         daily_marker=self.daily_marker, target_symbol='a')
         self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_2", label="PATRON V2 💎", mode="aaaba",
@@ -1172,8 +1077,12 @@ class RouletteTable:
                                         daily_marker=self.daily_marker, target_symbol='b')
         self.agent6 = ColorPatternAgent(pattern_len=6, name="AGENTE_6", label="PATRON V6 💎", mode="aaabbb",
                                         daily_marker=self.daily_marker, target_symbol='a')
-        
-        # Agentes de ZONA
+        self.agent7 = ColorPatternAgent(pattern_len=7, name="AGENTE_7", label="PATRON V7 💎", mode="aaabaaa",
+                                        daily_marker=self.daily_marker, target_symbol='a')
+        self.agent8 = ColorPatternAgent(pattern_len=6, name="AGENTE_8", label="PATRON V8 💎", mode="aaabaa",
+                                        daily_marker=self.daily_marker, target_symbol='a')
+
+        # Agentes de ZONA (8)
         zone_kwargs = dict(values=ZONE_VALUES, num_map=ZONE_NUM, zero_label="VERDE",
                            entry_builder=build_entry_message_zone,
                            thread_signals=THREAD_SIGNALS_ZONE, thread_stats=THREAD_STATS_ZONE)
@@ -1189,8 +1098,12 @@ class RouletteTable:
                                              daily_marker=self.daily_marker, target_symbol='b', **zone_kwargs)
         self.zone_agent6 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_6", label="PATRON ZONA V6 💎", mode="aaabbb",
                                              daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
-        
-        # Agentes de PARIDAD
+        self.zone_agent7 = ColorPatternAgent(pattern_len=7, name="ZONA_AGENTE_7", label="PATRON ZONA V7 💎", mode="aaabaaa",
+                                             daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
+        self.zone_agent8 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_8", label="PATRON ZONA V8 💎", mode="aaabaa",
+                                             daily_marker=self.daily_marker, target_symbol='a', **zone_kwargs)
+
+        # Agentes de PARIDAD (8)
         paridad_kwargs = dict(values=PARIDAD_VALUES, num_map=PARIDAD_NUM, zero_label="VERDE",
                               entry_builder=build_entry_message_paridad,
                               thread_signals=THREAD_SIGNALS_PARIDAD, thread_stats=THREAD_STATS_PARIDAD)
@@ -1206,12 +1119,16 @@ class RouletteTable:
                                                 daily_marker=self.daily_marker, target_symbol='b', **paridad_kwargs)
         self.paridad_agent6 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_6", label="PATRON PARIDAD V6 💎", mode="aaabbb",
                                                 daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
-        
+        self.paridad_agent7 = ColorPatternAgent(pattern_len=7, name="PARIDAD_AGENTE_7", label="PATRON PARIDAD V7 💎", mode="aaabaaa",
+                                                daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
+        self.paridad_agent8 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_8", label="PATRON PARIDAD V8 💎", mode="aaabaa",
+                                                daily_marker=self.daily_marker, target_symbol='a', **paridad_kwargs)
+
         for attr in dir(self):
             obj = getattr(self, attr)
             if isinstance(obj, ColorPatternAgent):
                 obj.table = self
-        
+
         self.zone_level_history = []
         self.zone_level_current = 0
         self.last_zone_num = None
@@ -1224,12 +1141,10 @@ class RouletteTable:
         self.trend = "neutral"
 
     def _mark_cycle_pending(self, num: int):
-        """Marca que un ciclo de Labouchère se ha completado y debe notificarse."""
         self.cycle_pending = True
         self.cycle_number = num
 
     async def _send_cycle_message(self):
-        """Envía el mensaje de ciclo completado con el formato solicitado."""
         if not self.cycle_pending:
             return
         lab_state = self.labouchere.get_state()
@@ -1242,23 +1157,19 @@ class RouletteTable:
         self.cycle_number = 0
 
     async def maybe_send_daily_marker_and_cycle(self):
-        """Envía el marcador diario y el ciclo pendiente si no hay señales activas."""
-        # Verificar señales activas en todos los agentes
         active = any(
             a.state["active"] for a in [
-                self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6,
+                self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6, self.agent7, self.agent8,
                 self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4,
-                self.zone_agent5, self.zone_agent6,
+                self.zone_agent5, self.zone_agent6, self.zone_agent7, self.zone_agent8,
                 self.paridad_agent1, self.paridad_agent2, self.paridad_agent3, self.paridad_agent4,
-                self.paridad_agent5, self.paridad_agent6
+                self.paridad_agent5, self.paridad_agent6, self.paridad_agent7, self.paridad_agent8
             ]
         )
         if not active:
-            # Enviar marcador diario si hay estadísticas
             if self.daily_marker.stats["total"] > 0:
                 text = build_daily_marker_message(self.daily_marker.stats)
                 await send_msg(text, self.daily_marker.thread_signals)
-            # Enviar ciclo pendiente
             if self.cycle_pending:
                 await self._send_cycle_message()
 
@@ -1292,19 +1203,19 @@ class RouletteTable:
         self.total_spins_seen += 1
         if not training:
             self.live_spins_seen += 1
-        
+
         dz = real_color
         self.color_history.append(dz)
         if len(self.color_history) > 300: self.color_history = self.color_history[-300:]
-        
+
         zdz = zone_of(number)
         self.zone_history.append(zdz)
         if len(self.zone_history) > 300: self.zone_history = self.zone_history[-300:]
-        
+
         pdz = paridad_of(number)
         self.paridad_history.append(pdz)
         if len(self.paridad_history) > 300: self.paridad_history = self.paridad_history[-300:]
-        
+
         real_color_num = COLOR_NUM[dz]
         change = self._level_change(real_color_num)
         self.level_current += change
@@ -1312,7 +1223,7 @@ class RouletteTable:
         if len(self.level_history) > 100: self.level_history.pop(0)
         if real_color_num != 0:
             self.last_color_num = real_color_num
-        
+
         zone_num = ZONE_NUM[zdz]
         zone_change = self._zone_level_change(zone_num)
         self.zone_level_current += zone_change
@@ -1320,7 +1231,7 @@ class RouletteTable:
         if len(self.zone_level_history) > 100: self.zone_level_history.pop(0)
         if zone_num != 0:
             self.last_zone_num = zone_num
-        
+
         paridad_num = PARIDAD_NUM[pdz]
         paridad_change = self._paridad_level_change(paridad_num)
         self.paridad_level_current += paridad_change
@@ -1328,16 +1239,16 @@ class RouletteTable:
         if len(self.paridad_level_history) > 100: self.paridad_level_history.pop(0)
         if paridad_num != 0:
             self.last_paridad_num = paridad_num
-        
+
         # ── Actualizar agentes ──
-        agent_list = [self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6]
-        agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+        agent_list = [self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6, self.agent7, self.agent8]
+        agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", "agent7", "agent8"]
         zone_agent_list = [self.zone_agent1, self.zone_agent2, self.zone_agent3,
-                           self.zone_agent4, self.zone_agent5, self.zone_agent6]
-        zone_agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+                           self.zone_agent4, self.zone_agent5, self.zone_agent6, self.zone_agent7, self.zone_agent8]
+        zone_agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", "agent7", "agent8"]
         paridad_agent_list = [self.paridad_agent1, self.paridad_agent2, self.paridad_agent3,
-                              self.paridad_agent4, self.paridad_agent5, self.paridad_agent6]
-        paridad_agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+                              self.paridad_agent4, self.paridad_agent5, self.paridad_agent6, self.paridad_agent7, self.paridad_agent8]
+        paridad_agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", "agent7", "agent8"]
         all_agents = agent_list + zone_agent_list + paridad_agent_list
         table_ready = self.total_spins_seen >= TABLE_MIN_SPINS_LIVE
         color_processed = sum(a.total_processed for a in agent_list)
@@ -1346,18 +1257,26 @@ class RouletteTable:
         color_category_ready = table_ready and color_processed >= CATEGORY_MIN_PROCESSED_LIVE
         zone_category_ready = table_ready and zone_processed >= CATEGORY_MIN_PROCESSED_LIVE
         paridad_category_ready = table_ready and paridad_processed >= CATEGORY_MIN_PROCESSED_LIVE
-        bet_amount = self.labouchere.get_bet()  # siempre la apuesta real (nunca $0 en una entrada)
-        
+        bet_amount = self.labouchere.get_bet()
+
         # ── 1) ZONA ──
         for agente, key in zip(zone_agent_list, zone_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
-            if config.get("method") == "ema":
-                trend = ema_trend(self.zone_level_history,
+            method = config.get("method", "amx")
+            if method == "ema":
+                periods = config.get("ema_periods", [4, 8, 20])
+                trend = ema_trend(self.zone_level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   min_diff=config.get("min_diff", 0.0))
                 amx_strength_val = 0.0
-            else:
-                periods = config.get("amx_periods", [5,10,20])
+            elif method == "ema_long":
+                periods = config.get("ema_periods", [50, 70, 200])
+                trend = ema_trend(self.zone_level_history, periods,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  min_diff=config.get("min_diff", 0.0))
+                amx_strength_val = 0.0
+            else:  # amx
+                periods = config.get("amx_periods", [5, 10, 20])
                 trend = amx_trend(self.zone_level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   threshold=config.get("threshold", 0.5))
@@ -1372,17 +1291,25 @@ class RouletteTable:
                           live_enabled=live_ok,
                           bet_amount=bet_amount if not blocked else 0,
                           trend=trend, direction=None)
-        
+
         # ── 2) PARIDAD ──
         for agente, key in zip(paridad_agent_list, paridad_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
-            if config.get("method") == "ema":
-                trend = ema_trend(self.paridad_level_history,
+            method = config.get("method", "amx")
+            if method == "ema":
+                periods = config.get("ema_periods", [4, 8, 20])
+                trend = ema_trend(self.paridad_level_history, periods,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  min_diff=config.get("min_diff", 0.0))
+                amx_strength_val = 0.0
+            elif method == "ema_long":
+                periods = config.get("ema_periods", [50, 70, 200])
+                trend = ema_trend(self.paridad_level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   min_diff=config.get("min_diff", 0.0))
                 amx_strength_val = 0.0
             else:
-                periods = config.get("amx_periods", [5,10,20])
+                periods = config.get("amx_periods", [5, 10, 20])
                 trend = amx_trend(self.paridad_level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   threshold=config.get("threshold", 0.5))
@@ -1397,17 +1324,25 @@ class RouletteTable:
                           live_enabled=live_ok,
                           bet_amount=bet_amount if not blocked else 0,
                           trend=trend, direction=None)
-        
+
         # ── 3) COLOR ──
         for agente, key in zip(agent_list, agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
-            if config.get("method") == "ema":
-                trend = ema_trend(self.level_history,
+            method = config.get("method", "amx")
+            if method == "ema":
+                periods = config.get("ema_periods", [4, 8, 20])
+                trend = ema_trend(self.level_history, periods,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  min_diff=config.get("min_diff", 0.0))
+                amx_strength_val = 0.0
+            elif method == "ema_long":
+                periods = config.get("ema_periods", [50, 70, 200])
+                trend = ema_trend(self.level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   min_diff=config.get("min_diff", 0.0))
                 amx_strength_val = 0.0
             else:
-                periods = config.get("amx_periods", [5,10,20])
+                periods = config.get("amx_periods", [5, 10, 20])
                 trend = amx_trend(self.level_history, periods,
                                   strictness=config.get("strictness", "relaxed"),
                                   threshold=config.get("threshold", 0.5))
@@ -1422,7 +1357,7 @@ class RouletteTable:
                           live_enabled=live_ok,
                           bet_amount=bet_amount if not blocked else 0,
                           trend=trend, direction=None)
-        
+
         # ── Logging ──
         if training:
             return
@@ -1462,18 +1397,24 @@ class RouletteTable:
             "agent4": self.agent4.get_state(),
             "agent5": self.agent5.get_state(),
             "agent6": self.agent6.get_state(),
+            "agent7": self.agent7.get_state(),
+            "agent8": self.agent8.get_state(),
             "zone_agent1": self.zone_agent1.get_state(),
             "zone_agent2": self.zone_agent2.get_state(),
             "zone_agent3": self.zone_agent3.get_state(),
             "zone_agent4": self.zone_agent4.get_state(),
             "zone_agent5": self.zone_agent5.get_state(),
             "zone_agent6": self.zone_agent6.get_state(),
+            "zone_agent7": self.zone_agent7.get_state(),
+            "zone_agent8": self.zone_agent8.get_state(),
             "paridad_agent1": self.paridad_agent1.get_state(),
             "paridad_agent2": self.paridad_agent2.get_state(),
             "paridad_agent3": self.paridad_agent3.get_state(),
             "paridad_agent4": self.paridad_agent4.get_state(),
             "paridad_agent5": self.paridad_agent5.get_state(),
             "paridad_agent6": self.paridad_agent6.get_state(),
+            "paridad_agent7": self.paridad_agent7.get_state(),
+            "paridad_agent8": self.paridad_agent8.get_state(),
             "trend": self.trend,
             "trend_favored_colors": sorted(NUM_COLOR[d] for d in trend_favored_colors(self.trend)),
             "level_current": self.level_current,
@@ -1571,18 +1512,24 @@ class ServerState:
                 table.agent4.load_persist(data.get("agent4"))
                 table.agent5.load_persist(data.get("agent5"))
                 table.agent6.load_persist(data.get("agent6"))
+                table.agent7.load_persist(data.get("agent7"))
+                table.agent8.load_persist(data.get("agent8"))
                 table.zone_agent1.load_persist(data.get("zone_agent1"))
                 table.zone_agent2.load_persist(data.get("zone_agent2"))
                 table.zone_agent3.load_persist(data.get("zone_agent3"))
                 table.zone_agent4.load_persist(data.get("zone_agent4"))
                 table.zone_agent5.load_persist(data.get("zone_agent5"))
                 table.zone_agent6.load_persist(data.get("zone_agent6"))
+                table.zone_agent7.load_persist(data.get("zone_agent7"))
+                table.zone_agent8.load_persist(data.get("zone_agent8"))
                 table.paridad_agent1.load_persist(data.get("paridad_agent1"))
                 table.paridad_agent2.load_persist(data.get("paridad_agent2"))
                 table.paridad_agent3.load_persist(data.get("paridad_agent3"))
                 table.paridad_agent4.load_persist(data.get("paridad_agent4"))
                 table.paridad_agent5.load_persist(data.get("paridad_agent5"))
                 table.paridad_agent6.load_persist(data.get("paridad_agent6"))
+                table.paridad_agent7.load_persist(data.get("paridad_agent7"))
+                table.paridad_agent8.load_persist(data.get("paridad_agent8"))
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
                 log.info(f"Modelo cargado para mesa {key}")
@@ -1602,18 +1549,24 @@ class ServerState:
             "agent4": table.agent4.to_persist(),
             "agent5": table.agent5.to_persist(),
             "agent6": table.agent6.to_persist(),
+            "agent7": table.agent7.to_persist(),
+            "agent8": table.agent8.to_persist(),
             "zone_agent1": table.zone_agent1.to_persist(),
             "zone_agent2": table.zone_agent2.to_persist(),
             "zone_agent3": table.zone_agent3.to_persist(),
             "zone_agent4": table.zone_agent4.to_persist(),
             "zone_agent5": table.zone_agent5.to_persist(),
             "zone_agent6": table.zone_agent6.to_persist(),
+            "zone_agent7": table.zone_agent7.to_persist(),
+            "zone_agent8": table.zone_agent8.to_persist(),
             "paridad_agent1": table.paridad_agent1.to_persist(),
             "paridad_agent2": table.paridad_agent2.to_persist(),
             "paridad_agent3": table.paridad_agent3.to_persist(),
             "paridad_agent4": table.paridad_agent4.to_persist(),
             "paridad_agent5": table.paridad_agent5.to_persist(),
             "paridad_agent6": table.paridad_agent6.to_persist(),
+            "paridad_agent7": table.paridad_agent7.to_persist(),
+            "paridad_agent8": table.paridad_agent8.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
             "history_seed_trained": self.history_seed_trained.get(key, False),
         }
