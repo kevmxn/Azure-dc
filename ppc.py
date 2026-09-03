@@ -640,6 +640,8 @@ class ColorPatternAgent:
         self.trained = False
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
+        # NUEVO: contador de giros que deben transcurrir tras resolver una señal real
+        self.wait_spins_after_resolution = 0
 
     def _match(self, window):
         if len(window) != self.pattern_len:
@@ -910,6 +912,12 @@ class ColorPatternAgent:
             return
         last = color_history[-1]
 
+        # ── Manejo del giro de espera tras resolución de señal ──
+        allow_new_signal = True
+        if self.wait_spins_after_resolution > 0:
+            self.wait_spins_after_resolution -= 1
+            allow_new_signal = False
+
         # ── Resolución de señal REAL activa ──
         if self.state["active"]:
             if self.state["waiting_for_start"]:
@@ -972,8 +980,8 @@ class ColorPatternAgent:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        # ── Detectar nuevo patrón ──
-        if (not self.state["active"] and not self.train_state["active"]
+        # ── Detectar nuevo patrón (solo si se permite) ──
+        if allow_new_signal and (not self.state["active"] and not self.train_state["active"]
                 and len(color_history) >= self.pattern_len
                 and len(color_history) >= COLOR_MIN_SPIN_TO_SIGNAL):
             pattern = self._match(color_history[-self.pattern_len:])
@@ -1018,6 +1026,8 @@ class ColorPatternAgent:
                     self.state = new_state
                     self.state["bet_amount"] = bet_amount
                     self.attempt_results = []
+                    # Limpiar el flag de espera porque se ha emitido una nueva señal
+                    self.wait_spins_after_resolution = 0
                     seq_txt = self.table.labouchere.seq_str() if self.table is not None else ""
                     entry_text = self.entry_builder(self._last_raw_number, self.state["bet_colors"],
                                                    bet_amount=bet_amount, start_attempt=start_attempt,
@@ -1080,6 +1090,8 @@ class ColorPatternAgent:
                 if self.consecutive_losses >= COLOR_COOLDOWN_AFTER_LOSSES:
                     self.cooldown_remaining = COLOR_COOLDOWN_ROUNDS
             self.state = reset_state
+            # Se activa la espera de un giro antes de permitir nueva señal
+            self.wait_spins_after_resolution = 1
             attempt_results = list(self.attempt_results)
             asyncio.create_task(self._dispatch_resolution(win, attempt_results, bet_amount))
             self.msg_id = None
