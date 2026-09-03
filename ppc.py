@@ -15,6 +15,7 @@
 ║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
 ║   - Marcador diario con desglose por intento                ║
 ║   - Mensaje de espera "⏳ Calculando siguiente intento..."  ║
+║   - Loss solo se contabiliza al fallar el intento 3        ║
 ║   - Comando /status acortado                                ║
 ╚══════════════════════════════════════════════════════════════
 """
@@ -980,9 +981,10 @@ class RouletteTable:
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
         self.cycle_pending = 0
 
+        # Nuevos estados para la secuencia
         self.signal_sequence = []
         self.current_attempt_index = 0
-        self.signal_status = None
+        self.signal_status = None  # None, 'active', 'waiting_for_candidate', 'won', 'lost'
         self.attempt_numbers = []
         self.entry_msg_ids = []
         self.waiting_msg_id = None
@@ -1137,6 +1139,7 @@ class RouletteTable:
             self.waiting_msg_id = None
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
+        # Recolectar candidatos de todos los agentes
         candidates = []
         for agente in all_agents:
             if agente.candidate_signal is not None:
@@ -1146,6 +1149,7 @@ class RouletteTable:
                 score = win_rate * (1 + amx_str)
                 candidates.append((agente, score, agente.candidate_signal))
 
+        # Si no hay secuencia activa, iniciar una nueva
         if self.signal_status is None:
             if not candidates:
                 return False
@@ -1164,6 +1168,29 @@ class RouletteTable:
             log.info(f"🔔 INICIO SECUENCIA: {best_agent.name} -> {best_candidate['bet_colors']} (apuesta {format_cop(bet_amount)})")
             return True
 
+        # Si está esperando candidato para el siguiente intento
+        if self.signal_status == "waiting_for_candidate":
+            if not candidates:
+                # Sin candidatos, seguir esperando
+                return True  # no hacemos nada, el mensaje de espera sigue visible
+            # Hay candidatos, seleccionar el mejor y enviar el siguiente intento
+            best_agent, best_candidate = self._select_best_candidate(candidates)
+            if best_agent is None:
+                return True
+            best_agent.mark_selected()
+            self.signal_sequence.append({"agent": best_agent, "candidate": best_candidate})
+            # Enviar el mensaje del siguiente intento (esto eliminará automáticamente el mensaje anterior)
+            new_bet = self.labouchere.get_bet()
+            asyncio.create_task(self._send_entry(best_agent, best_candidate, new_bet, self.current_attempt_index+1))
+            # Eliminar el mensaje de espera (ya que enviamos el siguiente intento)
+            if self.waiting_msg_id:
+                asyncio.create_task(delete_msg(self.waiting_msg_id))
+                self.waiting_msg_id = None
+            self.signal_status = "active"
+            log.info(f"🔄 ENVIADO INTENTO {self.current_attempt_index+1}: {best_agent.name} -> {best_candidate['bet_colors']} (apuesta {format_cop(new_bet)})")
+            return True
+
+        # Si hay secuencia activa, procesar el intento actual
         if self.signal_status == "active":
             current_entry = self.signal_sequence[self.current_attempt_index]
             agent = current_entry["agent"]
@@ -1181,6 +1208,7 @@ class RouletteTable:
                 self.cycle_pending = self.labouchere.cycles_completed
 
             if is_win:
+                # Ganó → finalizar como victoria
                 self.signal_status = "won"
                 winning_attempt = self.current_attempt_index + 1
                 asyncio.create_task(self._send_resolution(True, self.attempt_numbers, bet_amount, winning_attempt))
@@ -1188,38 +1216,18 @@ class RouletteTable:
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
+                # Falló el intento actual
                 if self.current_attempt_index < 2:
+                    # Aún quedan intentos (1 o 2 fallaron, pasamos al siguiente)
                     self.current_attempt_index += 1
-
+                    # Enviar mensaje de espera
                     asyncio.create_task(self._send_waiting_message())
-
-                    if not candidates:
-                        self.signal_status = "lost"
-                        asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
-                        log.info(f"❌ SECUENCIA PERDIDA (sin candidatos)")
-                        self._finalize_sequence(False, None)
-                        return True
-
-                    best_agent, best_candidate = self._select_best_candidate(candidates)
-                    if best_agent is None:
-                        self.signal_status = "lost"
-                        asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
-                        log.info(f"❌ SECUENCIA PERDIDA (sin candidato válido)")
-                        self._finalize_sequence(False, None)
-                        return True
-
-                    best_agent.mark_selected()
-                    self.signal_sequence.append({"agent": best_agent, "candidate": best_candidate})
-                    new_bet = self.labouchere.get_bet()
-
-                    asyncio.create_task(self._send_entry(best_agent, best_candidate, new_bet, self.current_attempt_index+1))
-                    if self.waiting_msg_id:
-                        asyncio.create_task(delete_msg(self.waiting_msg_id))
-                        self.waiting_msg_id = None
-
-                    log.info(f"🔄 NUEVO INTENTO {self.current_attempt_index+1}: {best_agent.name} -> {best_candidate['bet_colors']} (apuesta {format_cop(new_bet)})")
+                    # Cambiar a estado de espera de candidato
+                    self.signal_status = "waiting_for_candidate"
+                    log.info(f"⏳ Esperando candidato para intento {self.current_attempt_index+1}")
                     return True
                 else:
+                    # Falló el intento 3 → pérdida definitiva
                     self.signal_status = "lost"
                     asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
                     log.info(f"❌ SECUENCIA PERDIDA (3 intentos fallidos)")
@@ -1473,7 +1481,7 @@ class RouletteTable:
             "labouchere": self.labouchere.get_state(),
             "live_spins_seen": self.live_spins_seen,
             "signal_status": self.signal_status,
-            "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
+            "current_attempt": self.current_attempt_index + 1 if self.signal_status in ("active", "waiting_for_candidate") else 0,
             "total_attempts": len(self.signal_sequence),
         }
 
