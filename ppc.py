@@ -1,1418 +1,1649 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║       IMMERSIVE ROULETTE — BOT DE SEÑALES TELEGRAM          ║
-║       Sistema completo de señales, gales y estadísticas     ║
-║       Fuente: Evolution API (polling adaptativo)            ║
-║       Flask HTTP — Render-ready (anti-sleep + /health)      ║
-║       Canal secundario: historial 100 giros + botón copiar  ║
+║   SERVIDOR ADAPTATIVO — AZURE ROULETTE (key 227)              ║
+║   - 6 agentes de patrones de COLOR (ROJO/NEGRO)               ║
+║   - 6 agentes de ZONA (BAJA/ALTA)                            ║
+║   - 6 agentes de PARIDAD (PAR/IMPAR)                        ║
+║   - ML adaptativo con tendencia AMX (umbral dinámico)      ║
+║   - Gestión Labouchere GLOBAL compartida por todas las señales║
+║   - Persistencia y aprendizaje continuo                    ║
+║   - Telegram, WebSocket, HTTP, self-ping                  ║
+║   - CERO (0) es considerado FALLO (no acierto)              ║
+║   - Labouchere se actualiza en CADA intento (giro)          ║
+║   - Mensajes de seguimiento con nueva apuesta               ║
 ╚══════════════════════════════════════════════════════════════
 """
 
 import asyncio
 import json
 import logging
-import math
 import os
-import re
+import sqlite3
 import sys
-import threading
 import time
-from collections import deque
-from datetime import date, datetime, timedelta, timezone
+from typing import Optional, Callable, Awaitable, List
 
-import aiohttp
-import telebot.async_telebot as tba
-import telebot.types as types
-from flask import Flask, jsonify
+import websockets
+from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 
-# ══════════════════════════════════════════════════════════════
-#  CONFIGURACIÓN ← EDITAR AQUÍ
-# ══════════════════════════════════════════════════════════════
-BOT_TOKEN         = "8657427877:AAG9E5JozV40mm3IQoREIHvTnBFEFPgRSQo"    # Token de @BotFather
-MAIN_CHAT_ID      = -1003610988961    # Canal principal (señales + stats)
-SECONDARY_CHAT_ID = -1003613599867   # Canal secundario (historial 100 giros)
+try:
+    from telebot.async_telebot import AsyncTeleBot
+    TELEBOT_OK = True
+except ImportError:
+    AsyncTeleBot = None
+    TELEBOT_OK = False
 
-# Archivo para persistir el ID del mensaje de historial entre reinicios
-HISTORY_ID_FILE = "history_msg_id.json"
+# ──────────────────────────────────────────────
+#  CONFIGURACIÓN
+# ──────────────────────────────────────────────
+WS_URL        = "wss://dga.pragmaticplaylive.net/ws"
+CASINO_ID     = "ppcdk00000005349"
+CURRENCY_ID   = "BRL"
+PING_INTERVAL = 240
+SAVE_INTERVAL = 30
 
-# Archivo para persistir el último game_id procesado entre reinicios
-GAME_STATE_FILE = "game_state.json"
+ROULETTE_KEYS = {227: 227}
 
-# Archivo para persistir los pesos del modelo de Machine Learning entre reinicios
-ML_STATE_FILE = "ml_state.json"
+COLOR_MAX_ATTEMPTS = 3
+COLOR_BACKTEST_WINDOW = 60
+COLOR_CONTEXT_WINDOW = 20
+COLOR_MIN_SAMPLES_GATE = 6
+COLOR_MIN_WIN_RATE = 0.30
+COLOR_MIN_SPIN_TO_SIGNAL = 21
 
-# ══════════════════════════════════════════════════════════════
-#  MACHINE LEARNING — CONFIGURACIÓN
-# ══════════════════════════════════════════════════════════════
-ML_MIN_CONFIDENCE    = 0.75   # Confianza mínima (75%) para confirmar una señal — más estricto
-ML_MIN_TRAIN_SAMPLES = 20     # Señales resueltas necesarias antes de exigir el
-                               # umbral de confianza (mientras aprende, deja pasar)
-ML_LEARNING_RATE     = 0.08
+ML_MIN_SIGNALS_TO_TRAIN = 50
+ML_RETRAIN_INTERVAL_SECONDS = 30 * 60
 
-# Intentos (gale) dinámicos según la confianza de la IA al confirmar la señal:
-# a mayor confianza, MENOS intentos permitidos (más selectivo — si una señal
-# "muy segura" no gana rápido, se corta antes en vez de seguir doblando).
-# Se evalúa de arriba hacia abajo; el primer umbral que cumpla la confianza gana.
-CONFIDENCE_ATTEMPT_TIERS: list[tuple[float, int]] = [
-    (0.90, 2),   # confianza ≥ 90% → máx. 2 intentos (1 señal + 1 gale)
-    (0.80, 3),   # confianza ≥ 80% → máx. 3 intentos
-    (0.00, 4),   # confianza ≥ 75% (mínimo del filtro) → máx. 4 intentos
-]
+TABLE_MIN_SPINS_LIVE = 500
+CATEGORY_MIN_PROCESSED_LIVE = 120
 
+LIVE_FASTTRACK_MIN_SAMPLES = 10
+LIVE_FASTTRACK_MIN_WIN_RATE = 0.90
 
-def dynamic_max_attempts(confidence: float) -> int:
-    for threshold, attempts in CONFIDENCE_ATTEMPT_TIERS:
-        if confidence >= threshold:
-            return attempts
-    return MAX_ATTEMPTS   # fallback (no debería llegar acá si ya pasó el filtro de 75%)
+AMX_STRENGTH_THRESHOLDS = {"strong": 1.0, "weak": 0.5}
+AMX_ADJUST_FACTOR_STRONG = 0.8
+AMX_ADJUST_FACTOR_WEAK = 1.2
 
-# ══════════════════════════════════════════════════════════════
-#  CONSTANTES DEL SISTEMA
-# ══════════════════════════════════════════════════════════════
-ROULETTE_NAME = "IMMERSIVE ROULETTE"
+COLOR_COOLDOWN_AFTER_LOSSES = 3
+COLOR_COOLDOWN_ROUNDS = 5
 
-STATS_URL     = "https://crashstake-ulmx.onrender.com"   # mismo servidor que usa ppc.py
-STATS_LATEST  = f"{STATS_URL}/latest/IMMERSIVE"
-
-MAX_ATTEMPTS  = 5
-CHIP_VALUE    = 0.50  # Valor de cada ficha en USD     # 5 intentos totales: 1/5 … 5/5 → LOSS si falla 5/5
-WAIT_SPINS    = 0     # Sin espera: tras resolver una señal se vuelve a
-                       # evaluar la sincronía desde el giro siguiente
-WARMUP_SPINS  = 20    # Giros reales necesarios antes de enviar señales
-SYNC_MIN_STREAK = 2   # Giros consecutivos que deben respetar la SEQUENCE de una
-                       # categoría (color/paridad/zona) antes de habilitar señal.
-                       # Con 2: necesita 1 giro ya sincronizado + el aviso previo
-                       # confirmado por el giro siguiente. Ajustable.
-PING_INTERVAL = 240   # Segundos entre auto-pings (anti-sleep Render)
-
-DEFAULT_POLL  = 2     # Polling al servidor propio (s)
-POLL_SECS     = 2     # Polling estable
-
-AR_TZ = timezone(timedelta(hours=-3))
-
-# ──────────────────────────────────────────────────────────────
-#  COLORES REALES — RULETA EUROPEA
-# ──────────────────────────────────────────────────────────────
-REAL_COLORS: dict[int, str] = {
-    0 : "VERDE",
-    1 : "ROJO" , 2 : "NEGRO", 3 : "ROJO" , 4 : "NEGRO", 5 : "ROJO" ,
-    6 : "NEGRO", 7 : "ROJO" , 8 : "NEGRO", 9 : "ROJO" , 10: "NEGRO",
-    11: "NEGRO", 12: "ROJO" , 13: "NEGRO", 14: "ROJO" , 15: "NEGRO",
-    16: "ROJO" , 17: "NEGRO", 18: "ROJO" , 19: "ROJO" , 20: "NEGRO",
-    21: "ROJO" , 22: "NEGRO", 23: "ROJO" , 24: "NEGRO", 25: "ROJO" ,
-    26: "NEGRO", 27: "ROJO" , 28: "NEGRO", 29: "NEGRO", 30: "ROJO" ,
-    31: "NEGRO", 32: "ROJO" , 33: "NEGRO", 34: "ROJO" , 35: "NEGRO",
-    36: "ROJO" ,
+REAL_COLOR_MAP = {
+    0: "VERDE", 1: "ROJO", 2: "NEGRO", 3: "ROJO", 4: "NEGRO", 5: "ROJO", 6: "NEGRO",
+    7: "ROJO", 8: "NEGRO", 9: "ROJO", 10: "NEGRO", 11: "NEGRO", 12: "ROJO", 13: "NEGRO",
+    14: "ROJO", 15: "NEGRO", 16: "ROJO", 17: "NEGRO", 18: "ROJO", 19: "ROJO", 20: "NEGRO",
+    21: "ROJO", 22: "NEGRO", 23: "ROJO", 24: "NEGRO", 25: "ROJO", 26: "NEGRO", 27: "ROJO",
+    28: "NEGRO", 29: "NEGRO", 30: "ROJO", 31: "NEGRO", 32: "ROJO", 33: "NEGRO", 34: "ROJO",
+    35: "NEGRO", 36: "ROJO"
 }
 
-SEQUENCE_COLOR: list[str] = [
-    "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO",
-    "ROJO", "NEGRO", "ROJO", "ROJO", "NEGRO", "NEGRO",
-    "ROJO", "NEGRO", "ROJO",
-]
-
-# Misma cadencia que SEQUENCE_COLOR, pero para paridades — empieza en IMPAR
-# (equivalente al ROJO que abre la secuencia de color).
-SEQUENCE_PARIDAD: list[str] = [
-    "IMPAR", "PAR", "IMPAR", "IMPAR", "PAR", "PAR",
-    "IMPAR", "PAR", "IMPAR", "IMPAR", "PAR", "PAR",
-    "IMPAR", "PAR", "IMPAR",
-]
-
-# Misma cadencia, para zonas — empieza en ALTOS (19-36).
-SEQUENCE_ZONA: list[str] = [
-    "ALTOS", "BAJOS", "ALTOS", "ALTOS", "BAJOS", "BAJOS",
-    "ALTOS", "BAJOS", "ALTOS", "ALTOS", "BAJOS", "BAJOS",
-    "ALTOS", "BAJOS", "ALTOS",
-]
-
-SEQUENCES: dict[str, list[str]] = {
-    "color"  : SEQUENCE_COLOR,
-    "paridad": SEQUENCE_PARIDAD,
-    "zona"   : SEQUENCE_ZONA,
-}
-
-# Valor de referencia que se busca en los últimos 20 giros (al iniciar) para
-# sincronizar el sequence_index de cada categoría:
-#   · color   → último NEGRO  (segundo valor de SEQUENCE_COLOR)
-#   · paridad → último IMPAR  (primer valor de SEQUENCE_PARIDAD)
-#   · zona    → último ALTOS  (números altos, primer valor de SEQUENCE_ZONA)
-SYNC_REF_VALUE: dict[str, str] = {
-    "color"  : SEQUENCE_COLOR[1],    # "NEGRO"
-    "paridad": "IMPAR",
-    "zona"   : "ALTOS",
-}
-
-# Orden de prioridad si más de una categoría queda sincronizada en el mismo giro.
-CATEGORY_PRIORITY: list[str] = ["color", "paridad", "zona"]
-
-
-def _get_paridad(number: int) -> str:
-    if number == 0:
-        return "VERDE"
-    return "PAR" if number % 2 == 0 else "IMPAR"
-
-
-def _get_zona(number: int) -> str:
-    if number == 0:
-        return "VERDE"
-    return "BAJOS" if 1 <= number <= 18 else "ALTOS"
-
-
-CATEGORY_VALUE_FN = {
-    "color"  : lambda n: REAL_COLORS.get(n, "VERDE"),
-    "paridad": _get_paridad,
-    "zona"   : _get_zona,
-}
-
+COLOR_VALUES = ("ROJO", "NEGRO")
 COLOR_EMOJI = {"ROJO": "🔴", "NEGRO": "⚫", "VERDE": "🟢"}
+COLOR_NUM = {"ROJO": 1, "NEGRO": 2, "VERDE": 0}
+NUM_COLOR = {1: "ROJO", 2: "NEGRO"}
 
-# Texto "JUGAR EN:" que se muestra en el mensaje de señal, por categoría/valor.
-SIGNAL_DISPLAY: dict[tuple[str, str], str] = {
-    ("color", "ROJO")    : "ROJO 🔴",
-    ("color", "NEGRO")   : "NEGRO ⚫",
-    ("paridad", "PAR")   : "N° PARES 🔵",
-    ("paridad", "IMPAR") : "N° IMPARES 🟡",
-    ("zona", "BAJOS")    : "N° BAJOS(1-18)",
-    ("zona", "ALTOS")    : "N° ALTOS (19-36)",
+ZONE_VALUES = ("BAJA", "ALTA")
+ZONE_EMOJI = {"BAJA": "🔵", "ALTA": "🟠"}
+ZONE_NUM = {"BAJA": 1, "ALTA": 2, "VERDE": 0}
+NUM_ZONE = {1: "BAJA", 2: "ALTA"}
+TREND_FAVORED_ZONES = {"bullish": {1}, "bearish": {2}, "neutral": {1, 2}}
+
+PARIDAD_VALUES = ("PAR", "IMPAR")
+PARIDAD_EMOJI = {"PAR": "🟣", "IMPAR": "🟤"}
+PARIDAD_NUM = {"PAR": 1, "IMPAR": 2, "VERDE": 0}
+NUM_PARIDAD = {1: "PAR", 2: "IMPAR"}
+TREND_FAVORED_PARIDAD = {"bullish": {1}, "bearish": {2}, "neutral": {1, 2}}
+
+EMA_TREND_MIN_HISTORY = 20
+TREND_FAVORED_COLORS = {"bullish": {1}, "bearish": {2}, "neutral": {1, 2}}
+
+AGENT_TREND_CONFIG = {
+    "agent1": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
+    "agent2": {"method": "ema", "strictness": "strict", "min_diff": 0.5, "amx_periods": None},
+    "agent3": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
+    "agent4": {"method": "amx", "strictness": "very_strict", "min_diff": None, "amx_periods": [3, 8, 15]},
+    "agent5": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
+    "agent6": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
 }
 
-# ══════════════════════════════════════════════════════════════
+# ── Telegram ──
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
+CHAT_ID_BASE   = int(os.environ.get("CHAT_ID_BASE", "-1003965615775"))
+THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "5589"))
+THREAD_STATS   = int(os.environ.get("THREAD_STATS", "5593"))
+THREAD_SIGNALS_ZONE = int(os.environ.get("THREAD_SIGNALS_ZONE", str(THREAD_SIGNALS)))
+THREAD_STATS_ZONE   = int(os.environ.get("THREAD_STATS_ZONE", str(THREAD_STATS)))
+THREAD_SIGNALS_PARIDAD = int(os.environ.get("THREAD_SIGNALS_PARIDAD", str(THREAD_SIGNALS)))
+THREAD_STATS_PARIDAD   = int(os.environ.get("THREAD_STATS_PARIDAD", str(THREAD_STATS)))
+TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:roulette1")
+
+# ── Entrenamiento inicial con historial (dump SQLite) ──
+# Al arrancar, si existe este archivo, se usa para pre-entrenar los modelos
+# de todos los agentes (color/zona/paridad) ANTES de abrir la conexión en
+# vivo. Solo se ejecuta una vez por mesa: queda marcado en model_<mesa>.json
+# ("history_seed_trained") para no reprocesar el mismo historial en cada
+# reinicio del servidor.
+HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure_db.sql")
+HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
+
+# ──────────────────────────────────────────────
 #  LOGGING
-# ══════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level    = logging.INFO,
-    format   = "%(asctime)s | %(levelname)s | %(message)s",
-    datefmt  = "%H:%M:%S",
-    handlers = [logging.StreamHandler(sys.stdout)],
-)
+# ──────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%H:%M:%S", handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger(__name__)
 
-for _ln in ["werkzeug", "flask.app", "flask"]:
-    logging.getLogger(_ln).setLevel(logging.ERROR)
 
+# ══════════════════════════════════════════════
+#  FUNCIONES AUXILIARES
+# ══════════════════════════════════════════════
+def color_of(n):
+    return REAL_COLOR_MAP.get(n, "VERDE")
 
-# ══════════════════════════════════════════════════════════════
-#  PERSISTENCIA DEL ID DEL MENSAJE DE HISTORIAL
-#  Sobrevive reinicios del bot en Render.
-# ══════════════════════════════════════════════════════════════
+def zone_of(n):
+    if n is None or n == 0:
+        return "VERDE"
+    return "BAJA" if 1 <= n <= 18 else "ALTA"
 
-def load_history_state() -> tuple[int | None, int]:
-    """Carga msg_id del batch activo y número de batches completados."""
-    try:
-        with open(HISTORY_ID_FILE, "r") as f:
-            data = json.load(f)
-            msg_id = int(data["msg_id"]) if data.get("msg_id") else None
-            batch_count = int(data.get("batch_count", 0))
-            return msg_id, batch_count
-    except Exception:
-        return None, 0
+def paridad_of(n):
+    if n is None or n == 0:
+        return "VERDE"
+    return "PAR" if n % 2 == 0 else "IMPAR"
 
+def calc_ema(data, period):
+    if not data or len(data) < period: return []
+    k = 2 / (period + 1)
+    result = [None] * (period - 1)
+    ema = sum(data[:period]) / period
+    result.append(ema)
+    for i in range(period, len(data)):
+        ema = data[i] * k + ema * (1 - k)
+        result.append(ema)
+    return result
 
-def load_history_msg_id() -> int | None:
-    msg_id, _ = load_history_state()
-    return msg_id
-
-
-def save_history_state(msg_id: int | None, batch_count: int) -> None:
-    try:
-        with open(HISTORY_ID_FILE, "w") as f:
-            json.dump({"msg_id": msg_id, "batch_count": batch_count}, f)
-    except Exception as e:
-        log.warning(f"⚠️ No se pudo guardar history_state: {e}")
-
-
-def save_history_msg_id(msg_id: int | None) -> None:
-    _, bc = load_history_state()
-    save_history_state(msg_id, bc)
-
-
-# ══════════════════════════════════════════════════════════════
-#  PERSISTENCIA DEL ÚLTIMO GAME_ID
-#  Evita reprocesar el último giro tras un reinicio (igual que
-#  main.py lo hace con SELECT game_id FROM spins ORDER BY id DESC).
-# ══════════════════════════════════════════════════════════════
-
-def load_last_game_id() -> str:
-    """Carga el último game_id procesado para evitar duplicados al reiniciar."""
-    try:
-        with open(GAME_STATE_FILE, "r") as f:
-            return str(json.load(f).get("last_game_id", ""))
-    except Exception:
-        return ""
-
-
-def save_last_game_id(game_id: str) -> None:
-    """Persiste el último game_id procesado."""
-    try:
-        with open(GAME_STATE_FILE, "w") as f:
-            json.dump({"last_game_id": game_id}, f)
-    except Exception as e:
-        log.warning(f"⚠️ No se pudo guardar game_state: {e}")
-
-
-# ══════════════════════════════════════════════════════════════
-#  MACHINE LEARNING — REGRESIÓN LOGÍSTICA ONLINE
-#  Aprende, señal a señal (WIN=1 / LOSS=0), qué combinaciones de
-#  condiciones (categoría, racha de sincronía, rendimiento reciente,
-#  etc.) tienden a terminar en victoria. Antes de confirmar una señal
-#  nueva se le pide una probabilidad de éxito; si no llega al 60% de
-#  confianza mínima, la señal se descarta y el bot sigue esperando.
-# ══════════════════════════════════════════════════════════════
-
-FEATURE_NAMES: list[str] = [
-    "cat_color", "cat_paridad", "cat_zona",   # categoría (one-hot)
-    "streak_norm",                             # racha de sincronía al confirmar
-    "overall_winrate",                         # % de aciertos general reciente
-    "cat_winrate",                             # % de aciertos de esa categoría
-    "losing_streak_norm",                      # rachas de derrotas consecutivas
-]
-N_FEATURES = len(FEATURE_NAMES)
-
-
-class MLPredictor:
-    """Regresión logística entrenada online (SGD), sin dependencias externas."""
-
-    def __init__(self, state_file: str = ML_STATE_FILE):
-        self.state_file    = state_file
-        self.weights        : list[float] = [0.0] * N_FEATURES
-        self.bias            : float = 0.0
-        self.samples_seen    : int = 0
-        self._load()
-
-    @staticmethod
-    def _sigmoid(z: float) -> float:
-        try:
-            return 1.0 / (1.0 + math.exp(-z))
-        except OverflowError:
-            return 0.0 if z < 0 else 1.0
-
-    def predict_proba(self, features: list[float]) -> float:
-        z = self.bias + sum(w * f for w, f in zip(self.weights, features))
-        return self._sigmoid(z)
-
-    def is_warmed_up(self) -> bool:
-        return self.samples_seen >= ML_MIN_TRAIN_SAMPLES
-
-    def fit_one(self, features: list[float], label: float) -> None:
-        """label: 1.0 = WIN, 0.0 = LOSS. Un paso de descenso por gradiente estocástico."""
-        pred  = self.predict_proba(features)
-        error = label - pred
-        self.bias += ML_LEARNING_RATE * error
-        for i in range(N_FEATURES):
-            self.weights[i] += ML_LEARNING_RATE * error * features[i]
-        self.samples_seen += 1
-        self._save()
-
-    def _load(self) -> None:
-        try:
-            with open(self.state_file, "r") as f:
-                data = json.load(f)
-            w = data.get("weights")
-            if isinstance(w, list) and len(w) == N_FEATURES:
-                self.weights = [float(x) for x in w]
-            self.bias         = float(data.get("bias", 0.0))
-            self.samples_seen = int(data.get("samples_seen", 0))
-            log.info(f"[ML] 🧠 Modelo cargado — {self.samples_seen} señales aprendidas")
-        except Exception:
-            log.info("[ML] 🧠 Sin modelo previo — empieza a aprender desde cero")
-
-    def _save(self) -> None:
-        try:
-            with open(self.state_file, "w") as f:
-                json.dump(
-                    {"weights": self.weights, "bias": self.bias, "samples_seen": self.samples_seen},
-                    f,
-                )
-        except Exception as e:
-            log.warning(f"⚠️ No se pudo guardar ml_state: {e}")
-
-
-def build_ml_features(state: "BotState", category: str) -> list[float]:
-    """Arma el vector de características para la categoría que se va a confirmar."""
-    sm = state.signal_manager
-
-    cat_color   = 1.0 if category == "color"   else 0.0
-    cat_paridad = 1.0 if category == "paridad" else 0.0
-    cat_zona    = 1.0 if category == "zona"    else 0.0
-
-    streak_norm = min(sm.sync_streak.get(category, 0), 10) / 10.0
-
-    overall_total = state.won_signals + state.lost_signals
-    overall_wr    = (state.won_signals / overall_total) if overall_total else 0.5
-
-    cw, cl    = state.cat_wins[category], state.cat_losses[category]
-    cat_total = cw + cl
-    cat_wr    = (cw / cat_total) if cat_total else 0.5
-
-    losing_streak_norm = min(state.consecutive_losses, 10) / 10.0
-
-    return [cat_color, cat_paridad, cat_zona, streak_norm, overall_wr, cat_wr, losing_streak_norm]
-
-
-# ══════════════════════════════════════════════════════════════
-#  CLASES DEL SISTEMA DE SEÑALES
-# ══════════════════════════════════════════════════════════════
-
-class SignalData:
-    def __init__(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0,
-                 ml_features: list[float] | None = None, ml_confidence: float | None = None,
-                 max_attempts: int | None = None):
-        self.trigger_number  = trigger_number
-        self.category        = category      # "color" | "paridad" | "zona"
-        self.signal_value    = signal_value   # ej. "ROJO", "PAR", "ALTOS"
-        self.check_value     = signal_value
-        self.current_attempt = 0
-        self.last_trigger_num: int | None = None
-        self.bet_fichas      : int = bet_fichas   # apuesta Martingala al iniciar
-        self.lost_fichas     : int = 0            # fichas acumuladas en intentos fallidos
-        self.ml_features     : list[float] | None = ml_features    # features usadas para confirmar
-        self.ml_confidence   : float | None = ml_confidence        # confianza (0-1) al confirmar
-        self.max_attempts    : int = max_attempts or MAX_ATTEMPTS  # tope dinámico según confianza IA
-
-    @property
-    def display_attempt(self) -> str:
-        return f"{self.current_attempt + 1}/{self.max_attempts}"
-
-
-class SignalManager:
-    def __init__(self):
-        self.active_signal  : SignalData | None = None
-        self.waiting_spins  : int = 0
-        self.sequence_index : dict[str, int] = {cat: 0 for cat in SEQUENCES}
-        self.sync_streak    : dict[str, int] = {cat: 0 for cat in SEQUENCES}
-        self.warmup_done    : bool = False   # True tras WARMUP_SPINS giros reales
-        self.spins_count    : int = 0        # contador de giros procesados
-        self.warmup_msg_sent: bool = False   # True tras enviar el mensaje de inicio una sola vez
-
-    def set_sequence_from_last_black(self, last_20: list) -> None:
-        """
-        Para cada categoría busca en los last_20 del servidor (orden desc)
-        la última aparición de su valor de referencia (SYNC_REF_VALUE) y
-        posiciona su sequence_index para que el siguiente giro real quede
-        alineado al lugar correcto de esa secuencia:
-          · color   → último NEGRO
-          · paridad → último IMPAR
-          · zona    → último ALTOS (números altos)
-        Los last_20 vienen ordenados del más reciente al más antiguo.
-        """
-        for cat, seq in SEQUENCES.items():
-            ref_value = SYNC_REF_VALUE[cat]
-            value_fn  = CATEGORY_VALUE_FN[cat]
-            found     = False
-            for spin in last_20:
-                num = spin.get("number")
-                if num is None:
-                    continue
-                if value_fn(int(num)) == ref_value:
-                    # Cuántos giros han pasado desde esa referencia (su posición en la lista)
-                    idx = last_20.index(spin)
-                    # process() SIEMPRE llama advance_sequences() antes de leer
-                    # get_sequence_value() en cada giro nuevo. Por eso dejamos el
-                    # índice en (idx - 1): así el primer giro real que llegue lo
-                    # avanza exactamente a "idx", que es el slot correcto.
-                    self.sequence_index[cat] = (idx - 1) % len(seq)
-                    log.info(
-                        f"[SignalManager] 🎯 Sync '{cat}' desde último {ref_value} "
-                        f"(número {num}, posición {idx} en last_20) → "
-                        f"próximo giro real usará seq_index={idx % len(seq)}"
-                    )
-                    found = True
-                    break
-            if not found:
-                self.sequence_index[cat] = 0
-                log.warning(f"[SignalManager] ⚠️ No se encontró {ref_value} en last_20 para '{cat}' — sequence_index=0")
-
-    def advance_sequences(self) -> None:
-        for cat, seq in SEQUENCES.items():
-            self.sequence_index[cat] = (self.sequence_index[cat] + 1) % len(seq)
-
-    def get_sequence_value(self, category: str) -> str:
-        return SEQUENCES[category][self.sequence_index[category]]
-
-    def update_sync(self, number: int) -> None:
-        """
-        Lleva, por cada categoría, la racha de giros consecutivos donde la
-        mesa respeta su SEQUENCE en tiempo real (el valor real —color,
-        paridad o zona— coincide con el que predice esa secuencia). Si se
-        rompe, la racha de esa categoría vuelve a cero.
-        """
-        for cat in SEQUENCES:
-            real_value = CATEGORY_VALUE_FN[cat](number)
-            seq_value  = self.get_sequence_value(cat)
-            if real_value == seq_value:
-                self.sync_streak[cat] += 1
-            else:
-                self.sync_streak[cat] = 0
-
-    def ready_category(self) -> str | None:
-        """Primera categoría (según CATEGORY_PRIORITY) que ya cumple la racha mínima de sincronía."""
-        for cat in CATEGORY_PRIORITY:
-            if self.sync_streak[cat] >= SYNC_MIN_STREAK:
-                return cat
+def ema_trend(level_history, strictness="relaxed", min_diff=0.0):
+    if len(level_history) < EMA_TREND_MIN_HISTORY:
+        return None if strictness in ("strict", "very_strict") else "neutral"
+    ema4 = calc_ema(level_history, 4)
+    ema8 = calc_ema(level_history, 8)
+    ema20 = calc_ema(level_history, 20)
+    if not ema4 or not ema8 or not ema20:
+        return None if strictness != "relaxed" else "neutral"
+    cur, e4, e8, e20 = level_history[-1], ema4[-1], ema8[-1], ema20[-1]
+    if any(v is None for v in (e4, e8, e20)):
+        return None if strictness != "relaxed" else "neutral"
+    bullish = cur > e4 > e8 > e20
+    bearish = cur < e4 < e8 < e20
+    if strictness == "relaxed":
+        if bullish: return "bullish"
+        if bearish: return "bearish"
+        return "neutral"
+    elif strictness == "strict":
+        if bullish:
+            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+                return "bullish"
+            return "neutral"
+        if bearish:
+            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+                return "bearish"
+            return "neutral"
+        return "neutral"
+    elif strictness == "very_strict":
+        if bullish:
+            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+                return "bullish"
+            return None
+        if bearish:
+            if abs(cur - e4) > min_diff and abs(e4 - e8) > min_diff and abs(e8 - e20) > min_diff:
+                return "bearish"
+            return None
         return None
+    return "neutral"
 
-    def about_to_confirm(self) -> bool:
-        """True si alguna categoría está exactamente un giro antes de alcanzar la racha mínima."""
-        if SYNC_MIN_STREAK < 2:
-            return False
-        return any(
-            self.sync_streak[cat] == SYNC_MIN_STREAK - 1
-            for cat in CATEGORY_PRIORITY
-        )
+def calc_momentum(history, period):
+    if len(history) < period + 1:
+        return 0
+    return history[-1] - history[-period-1]
 
-    def can_generate_signal(self) -> bool:
-        return (
-            self.active_signal is None
-            and self.waiting_spins == 0
-            and self.warmup_done
-            and self.ready_category() is not None
-        )
+def amx_trend(level_history, periods, strictness="relaxed", threshold=0.5):
+    if len(level_history) < max(periods) + 1:
+        return None if strictness == "very_strict" else "neutral"
+    momentum_values = [calc_momentum(level_history, p) for p in periods]
+    amx = sum(momentum_values) / len(periods)
+    if strictness == "relaxed":
+        if amx > 0: return "bullish"
+        if amx < 0: return "bearish"
+        return "neutral"
+    elif strictness == "strict":
+        if amx > threshold: return "bullish"
+        if amx < -threshold: return "bearish"
+        return "neutral"
+    elif strictness == "very_strict":
+        if amx > threshold: return "bullish"
+        if amx < -threshold: return "bearish"
+        return None
+    return "neutral"
 
-    def start_signal(self, trigger_number: int, category: str, signal_value: str, bet_fichas: int = 0,
-                      ml_features: list[float] | None = None, ml_confidence: float | None = None) -> None:
-        max_attempts = dynamic_max_attempts(ml_confidence) if ml_confidence is not None else MAX_ATTEMPTS
-        self.active_signal = SignalData(trigger_number, category, signal_value, bet_fichas,
-                                         ml_features=ml_features, ml_confidence=ml_confidence,
-                                         max_attempts=max_attempts)
+def trend_favored_colors(trend):
+    if trend is None:
+        return set()
+    return TREND_FAVORED_COLORS.get(trend, TREND_FAVORED_COLORS["neutral"])
 
-    def tick_wait(self) -> None:
-        if self.waiting_spins > 0:
-            self.waiting_spins -= 1
+def trend_favored_zones(trend):
+    if trend is None:
+        return set()
+    return TREND_FAVORED_ZONES.get(trend, TREND_FAVORED_ZONES["neutral"])
 
-    def process_result(
-        self,
-        spin_number    : int,
-        real_value     : str,
-        check_value    : str,
-        next_gale_value: str | None,
-    ) -> dict:
-        s = self.active_signal
+def trend_favored_paridad(trend):
+    if trend is None:
+        return set()
+    return TREND_FAVORED_PARIDAD.get(trend, TREND_FAVORED_PARIDAD["neutral"])
 
-        if real_value == check_value:
-            attempt    = s.current_attempt
-            self.active_signal = None
-            # Con WAIT_SPINS=0 no hay espera tras ganar: se vuelve a evaluar
-            # sincronía desde el próximo giro.
-            self.waiting_spins = WAIT_SPINS
-            return {"type": "win", "attempt": attempt, "check_value": check_value}
-
-        s.current_attempt += 1
-        attempt = s.current_attempt
-
-        if attempt < s.max_attempts:
-            s.last_trigger_num = spin_number
-            new_value          = next_gale_value or check_value
-            s.check_value       = new_value
-            return {"type": "gale", "attempt": attempt, "signal_value": new_value}
-
-        self.active_signal = None
-        # Con WAIT_SPINS=0, tampoco hay espera tras una pérdida total.
-        self.waiting_spins = WAIT_SPINS
-        return {"type": "loss", "attempt": attempt, "check_value": check_value}
+def amx_strength(level_history, periods):
+    if len(level_history) < max(periods) + 1:
+        return 0.0
+    momentum_values = [calc_momentum(level_history, p) for p in periods]
+    amx = sum(momentum_values) / len(periods)
+    return abs(amx)
 
 
-class Martingale:
-    """
-    Sistema de gestión Martingala clásica:
-      · Apuesta base al iniciar (BASE_BET fichas)
-      · Derrota  → duplicar la apuesta
-      · Victoria → volver a la apuesta base
-    """
-    BASE_BET: int = 1
+# ══════════════════════════════════════════════
+#  LABOUCHERE MANAGER (GLOBAL)
+# ══════════════════════════════════════════════
+class LabouchereManager:
+    def __init__(self, base_amount: int = 500, initial_sequence: List[int] = None):
+        self.base_amount = base_amount
+        self.sequence = initial_sequence if initial_sequence else [1, 1, 1, 1, 1]
+        self.current_bet = self._calculate_bet()
 
-    def __init__(self) -> None:
-        self.current_bet: int = self.BASE_BET
+    def _calculate_bet(self) -> int:
+        if not self.sequence:
+            return 0
+        if len(self.sequence) == 1:
+            return self.sequence[0] * self.base_amount
+        return (self.sequence[0] + self.sequence[-1]) * self.base_amount
 
-    @property
-    def bet(self) -> int:
+    def get_bet(self) -> int:
         return self.current_bet
 
-    def on_win(self) -> None:
-        """Reinicia la apuesta al valor base."""
-        self.current_bet = self.BASE_BET
-        log.info(f"[Martingala] WIN → apuesta reiniciada a {self.current_bet}")
+    def reset(self):
+        self.sequence = [1, 1, 1, 1, 1]
+        self.current_bet = self._calculate_bet()
 
-    def on_loss(self) -> None:
-        """Duplica la apuesta."""
-        self.current_bet *= 2
-        log.info(f"[Martingala] LOSS → apuesta duplicada a {self.current_bet}")
+    def update(self, win: bool):
+        if not self.sequence:
+            self.reset()
+            return
+        if win:
+            if len(self.sequence) >= 2:
+                self.sequence.pop(0)
+                self.sequence.pop()
+            elif len(self.sequence) == 1:
+                self.sequence.pop()
+        else:
+            if len(self.sequence) == 1:
+                bet_units = self.sequence[0]
+            else:
+                bet_units = self.sequence[0] + self.sequence[-1]
+            self.sequence.append(bet_units)
+        if not self.sequence:
+            self.reset()
+        else:
+            self.current_bet = self._calculate_bet()
+
+    def get_state(self) -> dict:
+        return {
+            "sequence": self.sequence,
+            "bet_amount": self.current_bet,
+            "base_amount": self.base_amount,
+        }
 
 
-class BotState:
-    def __init__(self):
-        self.signal_manager  = SignalManager()
-        self.martingala      = Martingale()
-        self.last_game_id    : str = load_last_game_id()  # persiste entre reinicios
+# ══════════════════════════════════════════════
+#  TELEGRAM
+# ══════════════════════════════════════════════
+bot = AsyncTeleBot(BOT_TOKEN, parse_mode="HTML") if (TELEBOT_OK and BOT_TOKEN) else None
+if bot is None:
+    log.warning("Telegram deshabilitado (falta BOT_TOKEN o la librería 'telebot').")
 
-        self.last_spin_num   : int = 0
-        self.last_spin_color : str = "NEGRO"
+async def send_msg(text: str, thread_id: int, retries: int = 3) -> Optional[int]:
+    if bot is None: return None
+    delay = 1.0
+    for attempt in range(1, retries + 1):
+        try:
+            msg = await bot.send_message(chat_id=CHAT_ID_BASE, text=text, parse_mode="HTML",
+                                         disable_web_page_preview=True, message_thread_id=thread_id)
+            return msg.message_id
+        except Exception as e:
+            retry_after = None
+            try:
+                retry_after = e.result_json.get("parameters", {}).get("retry_after")
+            except Exception:
+                pass
+            wait = retry_after if retry_after else delay
+            if attempt < retries:
+                log.warning(f"[Telegram] Error enviando mensaje (thread={thread_id}, intento {attempt}/{retries}): {e} -> reintentando en {wait}s")
+                await asyncio.sleep(wait)
+                delay *= 2
+            else:
+                log.error(f"[Telegram] Fallo definitivo enviando mensaje (thread={thread_id}) tras {retries} intentos: {e}")
+    return None
 
-        self.signal_msg_id      : int | None = None
-        self.pre_signal_msg_id  : int | None = None   # aviso "POSIBLE SEÑAL A CONFIRMAR"
-        self.stats_msg_id       : int | None = None
-        self.consecutive_msg_id : int | None = None
+async def edit_msg(msg_id: int, text: str) -> bool:
+    if bot is None or msg_id is None: return False
+    try:
+        await bot.edit_message_text(chat_id=CHAT_ID_BASE, message_id=msg_id, text=text,
+                                    parse_mode="HTML", disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        log.debug(f"[Telegram] Error editando mensaje {msg_id}: {e}")
+        return False
 
-        self.stats_date       : date = self._ar_date()
-        self.won_signals      : int = 0
-        self.lost_signals     : int = 0
-        self.consecutive_wins : int = 0
-        self.consecutive_losses: int = 0
-        self.c1_wins          : int = 0
-        self.c2_wins          : int = 0
-        self.c3_wins          : int = 0
-        self.daily_capital    : float = 0.0   # Acumulado USD del día
+async def delete_msg(msg_id: int) -> bool:
+    if bot is None or msg_id is None: return False
+    try:
+        await bot.delete_message(chat_id=CHAT_ID_BASE, message_id=msg_id)
+        return True
+    except Exception as e:
+        log.debug(f"[Telegram] Error eliminando mensaje {msg_id}: {e}")
+        return False
 
-        # Machine Learning: aprende de cada señal resuelta (WIN/LOSS) y exige
-        # ML_MIN_CONFIDENCE (60%) para confirmar señales nuevas.
-        self.ml               = MLPredictor()
-        self.cat_wins         : dict[str, int] = {cat: 0 for cat in SEQUENCES}
-        self.cat_losses       : dict[str, int] = {cat: 0 for cat in SEQUENCES}
+def build_entry_message(last_number, bet_colors, bet_amount=None) -> str:
+    numero = last_number if last_number is not None else "-"
+    numero_emoji = COLOR_EMOJI.get(color_of(last_number), "🟢") if last_number is not None else ""
+    color = bet_colors[0] if bet_colors else "-"
+    emoji = COLOR_EMOJI.get(color, "")
+    apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP" if bet_amount else ""
+    link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
+    return (f"🚨🚨 ENTRADA PARA COLOR 🚨🚨\n\n👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
+            f"🧨 COLOR: {color} ({emoji})\n"
+            f"{apuesta_line}\n\n"
+            f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
-        self.last_spin_ts     : float = 0.0
+def build_entry_message_zone(last_number, bet_zones, bet_amount=None) -> str:
+    numero = last_number if last_number is not None else "-"
+    numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "🟢") if last_number is not None else ""
+    zone = bet_zones[0] if bet_zones else "-"
+    emoji = ZONE_EMOJI.get(zone, "")
+    if zone == "BAJA":
+        zone_line = f"🧨 ZONA BAJA: 1-18 ({emoji})"
+    elif zone == "ALTA":
+        zone_line = f"🧨 ZONA ALTA: 19-36 ({emoji})"
+    else:
+        zone_line = f"🧨 ZONA: -"
+    apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP" if bet_amount else ""
+    link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
+    return (f"🚨🚨 ENTRADA PARA ZONA 🚨🚨\n\n👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
+            f"{zone_line}\n"
+            f"{apuesta_line}\n\n"
+            f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
-        # Historial por lotes de 100 giros
-        _msg_id, _bc          = load_history_state()
-        self.current_batch    : list[int]  = []    # lote en curso (< 100)
-        self.batch_count      : int        = _bc   # lotes completos ya enviados
-        self.batch_msg_id     : int | None = _msg_id  # msg del lote activo
+def build_entry_message_paridad(last_number, bet_paridad, bet_amount=None) -> str:
+    numero = last_number if last_number is not None else "-"
+    numero_emoji = PARIDAD_EMOJI.get(paridad_of(last_number), "🟢") if last_number is not None else ""
+    paridad = bet_paridad[0] if bet_paridad else "-"
+    if paridad == "PAR":
+        paridad_line = f"🧨 NUMEROS PARES ({PARIDAD_EMOJI['PAR']})"
+    elif paridad == "IMPAR":
+        paridad_line = f"🧨 NUMEROS IMPARES ({PARIDAD_EMOJI['IMPAR']})"
+    else:
+        paridad_line = f"🧨 NUMEROS: -"
+    apuesta_line = f"\n🇨🇴 APUESTA: ${bet_amount:,} COP" if bet_amount else ""
+    link_line = f'🎮 <a href="{TABLE_LINK}">Azure Roulette 1</a>' if TABLE_LINK else "🎮 Azure Roulette 1"
+    return (f"🚨🚨 ENTRADA PARIDAD 🚨🚨\n\n👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
+            f"{paridad_line}\n"
+            f"{apuesta_line}\n\n"
+            f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
+
+def attempt_win_label(attempt: int) -> str:
+    return "✅ WIN 1 EXP" if attempt == 1 else f"✅ WIN {attempt}"
+ATTEMPT_LOSS_LABEL = "🚫 LOSS"
+
+def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) -> str:
+    body = " | ".join(str(v) for v in attempt_results)
+    header = "✅✅✅ 👍🏻" if win else "🚫🚫🚫👎🏻"
+    apuesta_line = f" | Apuesta: ${bet_amount:,}" if bet_amount else ""
+    return f"{header} ({body}){apuesta_line}"
+
+def build_status_message(server_state) -> str:
+    agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+    zone_agent_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent5", "zone_agent6"]
+    paridad_agent_keys = ["paridad_agent1", "paridad_agent2", "paridad_agent3", "paridad_agent4", "paridad_agent5", "paridad_agent6"]
+    lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
+    for key, table in server_state.tables.items():
+        lines.append(f"🎲 Mesa {key}")
+        lab_state = table.labouchere.get_state()
+        seq_str = ','.join(str(x) for x in lab_state['sequence'])
+        lines.append(f"💹 GESTIÓN LABOUCHERE GLOBAL\nSecuencia: [{seq_str}]\nPróxima apuesta: ${lab_state['bet_amount']:,} COP")
+        for akey in agent_keys + zone_agent_keys + paridad_agent_keys:
+            agente = getattr(table, akey, None)
+            if agente is None:
+                continue
+            s = agente.stats
+            total = s.get("total", 0)
+            won = s.get("won", 0)
+            lost = s.get("lost", 0)
+            rate = round((won / total) * 100, 1) if total else 0.0
+            estado = "🟢 activa" if agente.state["active"] else ("🌘 sombra" if agente.train_state["active"] else "⚪ inactiva")
+            live = "📡 EN VIVO" if agente.live_enabled else "🧪 segundo plano (no envía)"
+            rec_attempt, rec_pct = agente.overall_recommended_attempt()
+            rec_line = (f"🧠 Intento recomendado: {rec_attempt} ({rec_pct}% de aciertos)"
+                        if rec_attempt else "🧠 Intento recomendado: aún sin datos suficientes")
+            if agente.trained:
+                modelo_line = "🤖 Modelo: entrenado"
+            elif agente.is_fasttrack_ready():
+                modelo_line = f"🤖 Modelo: fast-track ⚡ ({rate}% efectividad, {total} señales) — aún acumulando hacia {ML_MIN_SIGNALS_TO_TRAIN}"
+            else:
+                modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
+            lines.append(f"{agente.label}  {live}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}")
+    return "\n\n".join(lines)
+
+if bot is not None:
+    @bot.message_handler(commands=["status"])
+    async def handle_status_command(message):
+        if _server_state is None:
+            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
+            return
+        try:
+            await bot.reply_to(message, build_status_message(_server_state))
+        except Exception as e:
+            log.warning(f"[Telegram] Error respondiendo /status: {e}")
+
+def build_daily_marker_message(stats: dict) -> str:
+    total = stats.get("total", 0)
+    won = stats.get("won", 0)
+    lost = stats.get("lost", 0)
+    rate = round((won / total) * 100, 1) if total else 0.0
+    return f"📆 MARCADOR DIARIO 💎\n✅ Ganadas: {won}\n❌ Perdidas: {lost}\n🎯 Total señales: {total}\n📈 Efectividad: {rate}%"
+
+class DailyMarker:
+    def __init__(self, thread_signals=None):
+        self.stats = {"total": 0, "won": 0, "lost": 0}
+        self.msg_id = None
+        self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
+
+    async def record(self, win: bool):
+        self.stats["total"] += 1
+        self.stats["won" if win else "lost"] += 1
+        text = build_daily_marker_message(self.stats)
+        if self.msg_id is not None:
+            await delete_msg(self.msg_id)
+            self.msg_id = None
+        self.msg_id = await send_msg(text, self.thread_signals)
+
+
+# ══════════════════════════════════════════════
+#  AGENTE DE PATRÓN CON ML Y LABOUCHERE
+# ══════════════════════════════════════════════
+class ColorPatternAgent:
+    def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
+                 values=None, num_map=None, zero_label="VERDE", entry_builder=None,
+                 thread_signals=None, thread_stats=None, dynamic_bet: bool = True,
+                 fixed_target: str = None):
+        self.pattern_len = pattern_len
+        self.name = name
+        self.label = label
+        self.mode = mode
+        self.daily_marker = daily_marker
+        self.values = values if values is not None else COLOR_VALUES
+        self.num_map = num_map if num_map is not None else COLOR_NUM
+        self.zero_label = zero_label
+        self.entry_builder = entry_builder if entry_builder is not None else build_entry_message
+        self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
+        self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS
+        self.dynamic_bet = dynamic_bet
+        self.fixed_target = fixed_target
+        self.table = None
+
+        self.state = {
+            "active": False, "pattern": None, "bet_colors": None,
+            "attempts_left": 0, "total_attempts": COLOR_MAX_ATTEMPTS,
+            "context": None, "bet_amount": 0,
+        }
+        self.train_state = {
+            "active": False, "pattern": None, "bet_colors": None,
+            "attempts_left": 0, "total_attempts": COLOR_MAX_ATTEMPTS,
+            "context": None, "bet_amount": 0,
+        }
+        self.train_attempt_results = []
+        self.live_enabled = True
+        self.direction_stats = {"repeat": {"wins": 0, "losses": 0}, "change": {"wins": 0, "losses": 0}}
+        self.history_log = []
+        self.history_counter = 0
+        self.stats = {"total": 0, "won": 0, "lost": 0}
+        self.pattern_context = {}
+        self.backtest = {"triggers": 0, "hits": 0, "accuracy": None}
+        self.consecutive_losses = 0
+        self.cooldown_remaining = 0
+        self.msg_id = None
+        self.entry_text = None
+        self.attempt_results = []
+        self._last_raw_number = None
+        self.total_processed = 0
+        self.trained = False
+        self.last_train_ts = 0.0
+        self.trained_snapshot = {}
+
+    def _match(self, window):
+        if len(window) != self.pattern_len:
+            return None
+        if self.mode == "aaaba":
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[4] == a)
+        elif self.mode == "aaabbaa":
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[4] == b and window[5] == a and window[6] == a)
+        elif self.mode == "aabbaa":
+            a, b = window[0], window[2]
+            ok = (window[1] == a and window[3] == b and window[4] == a and window[5] == a)
+        elif self.mode == "ababa":
+            a, b = window[0], window[1]
+            ok = (window[2] == a and window[3] == b and window[4] == a)
+        elif self.mode == "aaabbb":
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[4] == b and window[5] == b)
+        elif self.mode == "aaaaba":
+            a, b = window[0], window[4]
+            ok = (window[1] == a and window[2] == a and window[3] == a and window[5] == a)
+        else:
+            return None
+        if not (ok and a in self.values and b in self.values and a != b):
+            return None
+        return (a, b)
 
     @staticmethod
-    def _ar_date() -> date:
-        return datetime.now(AR_TZ).date()
+    def _bet_colors(pattern):
+        return (pattern[1],)
 
-    def reset_daily_stats(self) -> None:
-        log.info("🌅 Reseteando estadísticas del día")
-        self.stats_date       = self._ar_date()
-        self.won_signals      = 0
-        self.lost_signals     = 0
-        self.consecutive_wins = 0
-        self.c1_wins = self.c2_wins = self.c3_wins = 0
-        self.daily_capital    = 0.0
+    @staticmethod
+    def _key(pattern):
+        return ">".join(pattern)
 
-    def check_daily_reset(self) -> None:
-        if self._ar_date() != self.stats_date:
-            log.info("🌅 [fallback] Día nuevo — reseteando estadísticas")
-            self.reset_daily_stats()
+    def _record_context(self, pattern, hit_attempt: int):
+        key = self._key(pattern)
+        arr = self.pattern_context.setdefault(key, [])
+        arr.append(hit_attempt)
+        if len(arr) > COLOR_CONTEXT_WINDOW:
+            del arr[0]
 
-    @property
-    def total_signals(self) -> int:
-        return self.won_signals + self.lost_signals
+    def _maybe_train(self, timestamp: float):
+        if self.total_processed < ML_MIN_SIGNALS_TO_TRAIN:
+            return
+        if not self.trained or (timestamp - self.last_train_ts) >= ML_RETRAIN_INTERVAL_SECONDS:
+            self._train(timestamp)
 
-    @property
-    def win_rate(self) -> float:
-        if self.total_signals == 0:
-            return 0.0
-        return self.won_signals / self.total_signals * 100
+    def _train(self, timestamp: float):
+        self.trained_snapshot = {k: list(v) for k, v in self.pattern_context.items()}
+        self.trained = True
+        self.last_train_ts = timestamp
 
+    def _win_rate(self, pattern):
+        if not self.trained:
+            return None
+        arr = self.trained_snapshot.get(self._key(pattern), [])
+        if len(arr) < COLOR_MIN_SAMPLES_GATE:
+            return None
+        return sum(1 for v in arr if v > 0) / len(arr)
 
-# ══════════════════════════════════════════════════════════════
-#  TELEGRAM CLIENT
-# ══════════════════════════════════════════════════════════════
+    def _gated(self, pattern, required_win_rate):
+        rate = self._win_rate(pattern)
+        if rate is None:
+            return False
+        return rate < required_win_rate
 
-# Instancia global del bot (compartida para callbacks y envíos)
-_bot = tba.AsyncTeleBot(BOT_TOKEN)
+    def _recommended_attempt(self, pattern):
+        if not self.trained:
+            return None
+        arr = self.trained_snapshot.get(self._key(pattern), [])
+        if len(arr) < COLOR_MIN_SAMPLES_GATE:
+            return None
+        c1 = sum(1 for v in arr if v == 1)
+        c2 = sum(1 for v in arr if v == 2)
+        if c1 == 0 and c2 == 0:
+            return None
+        return 1 if c1 >= c2 else 2
 
+    def is_fasttrack_ready(self):
+        total = self.stats.get("total", 0)
+        if total < LIVE_FASTTRACK_MIN_SAMPLES:
+            return False
+        won = self.stats.get("won", 0)
+        return (won / total) >= LIVE_FASTTRACK_MIN_WIN_RATE
 
-_TG_MAX_RETRIES = 12   # intentos máximos por llamada
+    def overall_recommended_attempt(self):
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            c1 += sum(1 for v in arr if v == 1)
+            c2 += sum(1 for v in arr if v == 2)
+        total = c1 + c2
+        if total < COLOR_MIN_SAMPLES_GATE:
+            return None, 0.0
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
 
+    def _preferred_direction(self, min_samples: int = 10):
+        rep = self.direction_stats["repeat"]
+        chg = self.direction_stats["change"]
+        rep_total = rep["wins"] + rep["losses"]
+        chg_total = chg["wins"] + chg["losses"]
+        if rep_total < min_samples and chg_total < min_samples:
+            return None
+        rep_rate = (rep["wins"] / rep_total) if rep_total >= min_samples else -1
+        chg_rate = (chg["wins"] / chg_total) if chg_total >= min_samples else -1
+        if rep_rate < 0 and chg_rate < 0:
+            return None
+        return "repeat" if rep_rate >= chg_rate else "change"
 
-def _parse_retry_after(err: str, default: int = 30) -> int:
-    """Extrae el número de segundos del mensaje 'retry after N' de Telegram."""
-    m = re.search(r"retry after\s+(\d+)", err)
-    if m:
-        return int(m.group(1)) + 1
-    # fallback: buscar solo dígitos cortos (≤4 cifras) para evitar chat_ids
-    m = re.search(r"\b(\d{1,4})\b", err)
-    if m:
-        return int(m.group(1)) + 1
-    return default
+    def _resolve_dynamic_target(self, pattern, trend_colors):
+        a, b = pattern
+        if trend_colors is None:
+            return None, None
+        change_ok = self.num_map.get(b) in trend_colors
+        repeat_ok = self.num_map.get(a) in trend_colors
+        if change_ok and repeat_ok:
+            pref = self._preferred_direction()
+            if pref == "repeat":
+                return (b, a), "repeat"
+            elif pref == "change":
+                return (a, b), "change"
+            else:
+                return (a, b), "change"
+        if change_ok:
+            return (a, b), "change"
+        if repeat_ok:
+            return (b, a), "repeat"
+        return None, None
 
+    def _ml_should_signal(self, pattern, trend_colors, amx_strength_val):
+        if self.cooldown_remaining > 0:
+            return False
+        if self.dynamic_bet and trend_colors is not None:
+            expected_num = self.num_map.get(pattern[-1])
+            if expected_num not in trend_colors:
+                return False
+        base_rate = COLOR_MIN_WIN_RATE
+        if amx_strength_val >= AMX_STRENGTH_THRESHOLDS["strong"]:
+            required_rate = base_rate * AMX_ADJUST_FACTOR_STRONG
+        elif amx_strength_val < AMX_STRENGTH_THRESHOLDS["weak"]:
+            required_rate = base_rate * AMX_ADJUST_FACTOR_WEAK
+        else:
+            required_rate = base_rate
+        required_rate = max(0.20, min(0.60, required_rate))
+        if self._gated(pattern, required_rate):
+            return False
+        return True
 
-async def _tg_call_async(fn, *args, **kwargs):
-    """
-    Wrapper async con retry idéntico al de ppc.py:
-    - Lee el tiempo exacto del header 'retry after' de Telegram (HTTP 429)
-    - Reintento con backoff exponencial para HTTP 500 y otros errores
-    - Máx 12 intentos antes de rendir
-    """
-    delay = 2.0
-    for attempt in range(1, _TG_MAX_RETRIES + 1):
-        try:
-            return await fn(*args, **kwargs)
-        except Exception as e:
-            err = str(e).lower()
-
-            # ── 429 Rate-limit: Telegram dice cuánto esperar ──────────────
-            if "retry after" in err or "429" in err:
-                wait = _parse_retry_after(err)
-                log.warning(f"⏳ Rate limited (429). Esperando {wait}s...")
-                await asyncio.sleep(wait)
+    def run_backtest(self, color_history):
+        window = color_history[-COLOR_BACKTEST_WINDOW:]
+        triggers, hits = 0, 0
+        for i in range(self.pattern_len, len(window) + 1):
+            seg = window[i - self.pattern_len:i]
+            pattern = self._match(seg)
+            if not pattern:
                 continue
+            bet_colors = self._bet_colors(pattern)
+            future = window[i:i + COLOR_MAX_ATTEMPTS]
+            triggers += 1
+            if any(d in future for d in bet_colors):
+                hits += 1
+        self.backtest = {
+            "triggers": triggers, "hits": hits,
+            "accuracy": round(hits / triggers, 4) if triggers else None
+        }
 
-            # ── 500 / errores transitorios: backoff exponencial ───────────
-            if attempt == _TG_MAX_RETRIES:
-                log.error(f"❌ TG falló tras {_TG_MAX_RETRIES} intentos: {e}")
-                return None
-            log.warning(f"⚠️ TG error (intento {attempt}): {e} — reintentando en {delay:.0f}s")
+    def update(self, color_history, timestamp, blocked: bool = False,
+               trend_colors=None, amx_strength_val=0.0, last_number=None,
+               live_enabled: bool = True, bet_amount: int = 0):
+        self._last_raw_number = last_number
+        self.live_enabled = live_enabled
+        if not color_history:
+            return
+        last = color_history[-1]
+        was_active = self.state["active"]
+
+        # ── Resolución de señal REAL activa ──
+        if self.state["active"]:
+            attempt = self.state["total_attempts"] - self.state["attempts_left"] + 1
+            is_win = (last in self.state["bet_colors"])
+            self.attempt_results.append(last_number)
+
+            # Actualizar Labouchere con el resultado de este intento
+            if self.table is not None:
+                asyncio.create_task(self.table._resolve_signal(is_win))
+
+            if is_win:
+                # Enviar mensaje de win del intento
+                asyncio.create_task(send_msg(attempt_win_label(attempt), self.thread_stats))
+                # Cerrar señal (ganó)
+                self._close(True, last, attempt, timestamp, self.state, dispatch=True)
+            else:
+                self.state["attempts_left"] -= 1
+                if self.state["attempts_left"] > 0:
+                    # Recalcular la nueva apuesta después de la pérdida
+                    if self.table is not None:
+                        new_bet = self.table.labouchere.get_bet()
+                        self.state["bet_amount"] = new_bet
+                    msg = f"🧠 SEGUIR CON LA GESTION\n🇨🇴 APUESTA: {self.state['bet_amount']} COP"
+                    asyncio.create_task(send_msg(msg, self.thread_signals))
+                else:
+                    # Último intento perdido
+                    asyncio.create_task(send_msg(ATTEMPT_LOSS_LABEL, self.thread_stats))
+                    self._close(False, last, attempt, timestamp, self.state, dispatch=True)
+
+        # ── Resolución de señal de SOMBRA ──
+        if self.train_state["active"]:
+            attempt = self.train_state["total_attempts"] - self.train_state["attempts_left"] + 1
+            is_win = (last in self.train_state["bet_colors"])
+            self.train_attempt_results.append(last_number)
+            if is_win:
+                self._close(True, last, attempt, timestamp, self.train_state, dispatch=False)
+            else:
+                self.train_state["attempts_left"] -= 1
+                if self.train_state["attempts_left"] <= 0:
+                    self._close(False, last, attempt, timestamp, self.train_state, dispatch=False)
+
+        self.run_backtest(color_history)
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+
+        self._maybe_train(timestamp)
+
+        # ── Detectar nuevo patrón ──
+        if (not self.state["active"] and not self.train_state["active"]
+                and len(color_history) >= self.pattern_len
+                and len(color_history) >= COLOR_MIN_SPIN_TO_SIGNAL):
+            pattern = self._match(color_history[-self.pattern_len:])
+            direction = None
+            if pattern and self.dynamic_bet:
+                pattern, direction = self._resolve_dynamic_target(pattern, trend_colors)
+            elif pattern and not self.dynamic_bet and self.fixed_target == "repeat":
+                a, b = pattern
+                pattern, direction = (b, a), "repeat"
+            elif pattern:
+                direction = "change"
+
+            if pattern and self._ml_should_signal(pattern, trend_colors, amx_strength_val):
+                bet_colors = self._bet_colors(pattern)
+                context = list(color_history[-COLOR_CONTEXT_WINDOW:])
+                new_state = {
+                    "active": True, "pattern": list(pattern), "bet_colors": list(bet_colors),
+                    "attempts_left": COLOR_MAX_ATTEMPTS, "total_attempts": COLOR_MAX_ATTEMPTS,
+                    "context": context, "direction": direction, "bet_amount": bet_amount,
+                }
+                if not blocked and self.live_enabled:
+                    self.state = new_state
+                    self.attempt_results = []
+                    entry_text = self.entry_builder(self._last_raw_number, self.state["bet_colors"], bet_amount=bet_amount)
+                    self.entry_text = entry_text
+                    log.info(f"🔔 {self.name} NUEVA SEÑAL: {pattern} -> {bet_colors} (apuesta ${bet_amount})")
+                    asyncio.create_task(self._dispatch_entry(entry_text))
+                else:
+                    self.train_state = new_state
+                    self.train_attempt_results = []
+
+    async def _dispatch_entry(self, entry_text: str):
+        self.msg_id = await send_msg(entry_text, self.thread_signals)
+
+    async def _dispatch_resolution(self, win: bool, attempt_results: list, bet_amount: int):
+        resolution_text = build_resolution_message(win, attempt_results, bet_amount)
+        await send_msg(resolution_text, self.thread_signals)
+        if self.daily_marker is not None:
+            await self.daily_marker.record(win)
+        # Ya no se actualiza Labouchere aquí, se hizo en cada intento
+
+    def _close(self, win: bool, result_color, attempt, timestamp, state: dict, dispatch: bool):
+        pattern = tuple(state["pattern"])
+        bet_colors = tuple(state["bet_colors"])
+        direction = state.get("direction")
+        bet_amount = state.get("bet_amount", 0)
+        hit_attempt = attempt if win else 0
+        self.history_counter += 1
+        self.history_log.append({
+            "n": self.history_counter, "pattern": ">".join(pattern),
+            "bet_colors": list(bet_colors), "result": result_color,
+            "attempt": attempt, "win": win, "hit_attempt": hit_attempt,
+            "context": state.get("context"), "time": timestamp, "shadow": not dispatch,
+            "bet_amount": bet_amount,
+        })
+        self.history_log = self.history_log[-200:]
+        self.stats["total"] += 1
+        self.stats["won" if win else "lost"] += 1
+        self._record_context(pattern, hit_attempt)
+        self.total_processed += 1
+        self._maybe_train(timestamp)
+
+        if direction in ("repeat", "change"):
+            self.direction_stats[direction]["wins" if win else "losses"] += 1
+
+        reset_state = {
+            "active": False, "pattern": None, "bet_colors": None,
+            "attempts_left": 0, "total_attempts": COLOR_MAX_ATTEMPTS,
+            "context": None, "direction": None, "bet_amount": 0,
+        }
+
+        if dispatch:
+            if win:
+                self.consecutive_losses = 0
+            else:
+                self.consecutive_losses += 1
+                if self.consecutive_losses >= COLOR_COOLDOWN_AFTER_LOSSES:
+                    self.cooldown_remaining = COLOR_COOLDOWN_ROUNDS
+
+            self.state = reset_state
+            attempt_results = list(self.attempt_results)
+            asyncio.create_task(self._dispatch_resolution(win, attempt_results, bet_amount))
+            self.msg_id = None
+            self.entry_text = None
+            self.attempt_results = []
+        else:
+            self.train_state = reset_state
+            self.train_attempt_results = []
+
+    def get_state(self):
+        rec_attempt, rec_pct = self.overall_recommended_attempt()
+        pattern_recommendations = {
+            key: self._recommended_attempt(tuple(key.split(">")))
+            for key in self.pattern_context
+        }
+        pattern_recommendations = {k: v for k, v in pattern_recommendations.items() if v is not None}
+        return {
+            "name": self.name,
+            "pattern_len": self.pattern_len,
+            "signal_state": self.state,
+            "stats": self.stats,
+            "history": self.history_log[-30:],
+            "backtest_60": self.backtest,
+            "pattern_context": self.pattern_context,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "recommended_attempt": rec_attempt,
+            "recommended_attempt_pct": rec_pct,
+            "pattern_recommendations": pattern_recommendations,
+            "ml_model": {
+                "trained": self.trained,
+                "total_processed": self.total_processed,
+                "min_signals_to_train": ML_MIN_SIGNALS_TO_TRAIN,
+                "last_train_ts": self.last_train_ts,
+                "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
+            },
+        }
+
+    def to_persist(self):
+        return {
+            "pattern_context": self.pattern_context,
+            "stats": self.stats,
+            "history_counter": self.history_counter,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "total_processed": self.total_processed,
+            "trained": self.trained,
+            "last_train_ts": self.last_train_ts,
+            "trained_snapshot": self.trained_snapshot,
+            "direction_stats": self.direction_stats,
+        }
+
+    def load_persist(self, data):
+        if not data: return
+        self.pattern_context = data.get("pattern_context", {})
+        self.stats = data.get("stats", self.stats)
+        self.history_counter = data.get("history_counter", 0)
+        self.consecutive_losses = data.get("consecutive_losses", 0)
+        self.cooldown_remaining = data.get("cooldown_remaining", 0)
+        self.total_processed = data.get("total_processed", 0)
+        self.trained = data.get("trained", False)
+        self.last_train_ts = data.get("last_train_ts", 0.0)
+        self.trained_snapshot = data.get("trained_snapshot", {})
+        self.direction_stats = data.get("direction_stats", self.direction_stats)
+
+
+# ══════════════════════════════════════════════
+#  RULETTE TABLE
+# ══════════════════════════════════════════════
+class RouletteTable:
+    def __init__(self, key: int):
+        self.key = key
+        self.spin_history = []
+        self.prev_number = None
+        self.last_update_time = time.time()
+
+        self.color_history = []
+        self.total_spins_seen = 0
+        self.daily_marker = DailyMarker()
+        self.labouchere = LabouchereManager(base_amount=500)
+
+        self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba", daily_marker=self.daily_marker, dynamic_bet=False, fixed_target="repeat")
+        self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_2", label="PATRON V2 💎", mode="aaaba", daily_marker=self.daily_marker, dynamic_bet=False, fixed_target="repeat")
+        self.agent3 = ColorPatternAgent(pattern_len=6, name="AGENTE_3", label="PATRON V3 💎", mode="aabbaa", daily_marker=self.daily_marker)
+        self.agent4 = ColorPatternAgent(pattern_len=7, name="AGENTE_4", label="PATRON V4 💎", mode="aaabbaa", daily_marker=self.daily_marker)
+        self.agent5 = ColorPatternAgent(pattern_len=5, name="AGENTE_5", label="PATRON V5 💎", mode="ababa", daily_marker=self.daily_marker)
+        self.agent6 = ColorPatternAgent(pattern_len=6, name="AGENTE_6", label="PATRON V6 💎", mode="aaabbb", daily_marker=self.daily_marker)
+
+        self.zone_history = []
+        zone_kwargs = dict(values=ZONE_VALUES, num_map=ZONE_NUM, zero_label="VERDE",
+                            entry_builder=build_entry_message_zone,
+                            thread_signals=THREAD_SIGNALS_ZONE, thread_stats=THREAD_STATS_ZONE)
+        self.zone_agent1 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_1", label="PATRON ZONA V1 💎", mode="aaaaba", daily_marker=self.daily_marker, **zone_kwargs)
+        self.zone_agent2 = ColorPatternAgent(pattern_len=5, name="ZONA_AGENTE_2", label="PATRON ZONA V2 💎", mode="aaaba", daily_marker=self.daily_marker, **zone_kwargs)
+        self.zone_agent3 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_3", label="PATRON ZONA V3 💎", mode="aabbaa", daily_marker=self.daily_marker, **zone_kwargs)
+        self.zone_agent4 = ColorPatternAgent(pattern_len=7, name="ZONA_AGENTE_4", label="PATRON ZONA V4 💎", mode="aaabbaa", daily_marker=self.daily_marker, **zone_kwargs)
+        self.zone_agent5 = ColorPatternAgent(pattern_len=5, name="ZONA_AGENTE_5", label="PATRON ZONA V5 💎", mode="ababa", daily_marker=self.daily_marker, **zone_kwargs)
+        self.zone_agent6 = ColorPatternAgent(pattern_len=6, name="ZONA_AGENTE_6", label="PATRON ZONA V6 💎", mode="aaabbb", daily_marker=self.daily_marker, **zone_kwargs)
+
+        self.paridad_history = []
+        paridad_kwargs = dict(values=PARIDAD_VALUES, num_map=PARIDAD_NUM, zero_label="VERDE",
+                               entry_builder=build_entry_message_paridad,
+                               thread_signals=THREAD_SIGNALS_PARIDAD, thread_stats=THREAD_STATS_PARIDAD)
+        self.paridad_agent1 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_1", label="PATRON PARIDAD V1 💎", mode="aaaaba", daily_marker=self.daily_marker, **paridad_kwargs)
+        self.paridad_agent2 = ColorPatternAgent(pattern_len=5, name="PARIDAD_AGENTE_2", label="PATRON PARIDAD V2 💎", mode="aaaba", daily_marker=self.daily_marker, **paridad_kwargs)
+        self.paridad_agent3 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_3", label="PATRON PARIDAD V3 💎", mode="aabbaa", daily_marker=self.daily_marker, **paridad_kwargs)
+        self.paridad_agent4 = ColorPatternAgent(pattern_len=7, name="PARIDAD_AGENTE_4", label="PATRON PARIDAD V4 💎", mode="aaabbaa", daily_marker=self.daily_marker, **paridad_kwargs)
+        self.paridad_agent5 = ColorPatternAgent(pattern_len=5, name="PARIDAD_AGENTE_5", label="PATRON PARIDAD V5 💎", mode="ababa", daily_marker=self.daily_marker, **paridad_kwargs)
+        self.paridad_agent6 = ColorPatternAgent(pattern_len=6, name="PARIDAD_AGENTE_6", label="PATRON PARIDAD V6 💎", mode="aaabbb", daily_marker=self.daily_marker, **paridad_kwargs)
+
+        for attr in dir(self):
+            obj = getattr(self, attr)
+            if isinstance(obj, ColorPatternAgent):
+                obj.table = self
+
+        self.zone_level_history = []
+        self.zone_level_current = 0
+        self.last_zone_num = None
+
+        self.paridad_level_history = []
+        self.paridad_level_current = 0
+        self.last_paridad_num = None
+
+        self.level_history = []
+        self.level_current = 0
+        self.last_color_num = None
+        self.trend = "neutral"
+
+    async def _resolve_signal(self, win: bool):
+        self.labouchere.update(win)
+        lab_state = self.labouchere.get_state()
+        seq_str = ','.join(str(x) for x in lab_state['sequence'])
+        log.info(f"💹 Labouchere: {'✅' if win else '❌'} → [{seq_str}] ${lab_state['bet_amount']:,}")
+
+    def _level_change(self, real_color_num: int) -> int:
+        if real_color_num == 1: return 1
+        if real_color_num == 2: return -1
+        if self.last_color_num == 1: return 1
+        if self.last_color_num == 2: return -1
+        return 0
+
+    def _zone_level_change(self, zone_num: int) -> int:
+        if zone_num == 1: return 1
+        if zone_num == 2: return -1
+        if self.last_zone_num == 1: return 1
+        if self.last_zone_num == 2: return -1
+        return 0
+
+    def _paridad_level_change(self, paridad_num: int) -> int:
+        if paridad_num == 1: return 1
+        if paridad_num == 2: return -1
+        if self.last_paridad_num == 1: return 1
+        if self.last_paridad_num == 2: return -1
+        return 0
+
+    def update(self, number: int, real_color: str, timestamp: float = None, signal_mode: str = "tendencia",
+               training: bool = False):
+        if timestamp is None: timestamp = time.time()
+        self.spin_history.append({"number": number, "color": real_color, "timestamp": timestamp})
+        if len(self.spin_history) > 200: self.spin_history.pop(0)
+        self.prev_number = number
+        self.total_spins_seen += 1
+
+        dz = real_color
+        self.color_history.append(dz)
+        if len(self.color_history) > 300: self.color_history = self.color_history[-300:]
+
+        zdz = zone_of(number)
+        self.zone_history.append(zdz)
+        if len(self.zone_history) > 300: self.zone_history = self.zone_history[-300:]
+
+        pdz = paridad_of(number)
+        self.paridad_history.append(pdz)
+        if len(self.paridad_history) > 300: self.paridad_history = self.paridad_history[-300:]
+
+        real_color_num = COLOR_NUM[dz]
+        change = self._level_change(real_color_num)
+        self.level_current += change
+        self.level_history.append(self.level_current)
+        if len(self.level_history) > 100: self.level_history.pop(0)
+        if real_color_num != 0:
+            self.last_color_num = real_color_num
+
+        zone_num = ZONE_NUM[zdz]
+        zone_change = self._zone_level_change(zone_num)
+        self.zone_level_current += zone_change
+        self.zone_level_history.append(self.zone_level_current)
+        if len(self.zone_level_history) > 100: self.zone_level_history.pop(0)
+        if zone_num != 0:
+            self.last_zone_num = zone_num
+
+        paridad_num = PARIDAD_NUM[pdz]
+        paridad_change = self._paridad_level_change(paridad_num)
+        self.paridad_level_current += paridad_change
+        self.paridad_level_history.append(self.paridad_level_current)
+        if len(self.paridad_level_history) > 100: self.paridad_level_history.pop(0)
+        if paridad_num != 0:
+            self.last_paridad_num = paridad_num
+
+        # ── Actualizar agentes ──
+        agent_list = [self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6]
+        agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+        zone_agent_list = [self.zone_agent1, self.zone_agent2, self.zone_agent3,
+                            self.zone_agent4, self.zone_agent5, self.zone_agent6]
+        zone_agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+        paridad_agent_list = [self.paridad_agent1, self.paridad_agent2, self.paridad_agent3,
+                               self.paridad_agent4, self.paridad_agent5, self.paridad_agent6]
+        paridad_agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
+        all_agents = agent_list + zone_agent_list + paridad_agent_list
+
+        table_ready = self.total_spins_seen >= TABLE_MIN_SPINS_LIVE
+        color_processed = sum(a.total_processed for a in agent_list)
+        zone_processed = sum(a.total_processed for a in zone_agent_list)
+        paridad_processed = sum(a.total_processed for a in paridad_agent_list)
+        color_category_ready = table_ready and color_processed >= CATEGORY_MIN_PROCESSED_LIVE
+        zone_category_ready = table_ready and zone_processed >= CATEGORY_MIN_PROCESSED_LIVE
+        paridad_category_ready = table_ready and paridad_processed >= CATEGORY_MIN_PROCESSED_LIVE
+
+        bet_amount = self.labouchere.get_bet() if not any(a.state["active"] for a in all_agents) else 0
+
+        # ── 1) ZONA ──
+        for agente, key in zip(zone_agent_list, zone_agent_keys):
+            config = AGENT_TREND_CONFIG.get(key, {})
+            if config.get("method") == "ema":
+                trend = ema_trend(self.zone_level_history,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  min_diff=config.get("min_diff", 0.0))
+                amx_strength_val = 0.0
+            else:
+                periods = config.get("amx_periods", [5,10,20])
+                trend = amx_trend(self.zone_level_history, periods,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  threshold=config.get("threshold", 0.5))
+                amx_strength_val = amx_strength(self.zone_level_history, periods)
+            favored = trend_favored_zones(trend)
+
+            blocked = any(a.state["active"] for a in all_agents if a is not agente)
+
+            agente.update(self.zone_history, timestamp, blocked=blocked,
+                          trend_colors=favored, amx_strength_val=amx_strength_val,
+                          last_number=number,
+                          live_enabled=(not training) and zone_category_ready and (agente.trained or agente.is_fasttrack_ready()),
+                          bet_amount=bet_amount if not blocked else 0)
+
+        # ── 2) PARIDAD ──
+        for agente, key in zip(paridad_agent_list, paridad_agent_keys):
+            config = AGENT_TREND_CONFIG.get(key, {})
+            if config.get("method") == "ema":
+                trend = ema_trend(self.paridad_level_history,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  min_diff=config.get("min_diff", 0.0))
+                amx_strength_val = 0.0
+            else:
+                periods = config.get("amx_periods", [5,10,20])
+                trend = amx_trend(self.paridad_level_history, periods,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  threshold=config.get("threshold", 0.5))
+                amx_strength_val = amx_strength(self.paridad_level_history, periods)
+            favored = trend_favored_paridad(trend)
+
+            blocked = any(a.state["active"] for a in all_agents if a is not agente)
+
+            agente.update(self.paridad_history, timestamp, blocked=blocked,
+                          trend_colors=favored, amx_strength_val=amx_strength_val,
+                          last_number=number,
+                          live_enabled=(not training) and paridad_category_ready and (agente.trained or agente.is_fasttrack_ready()),
+                          bet_amount=bet_amount if not blocked else 0)
+
+        # ── 3) COLOR ──
+        for agente, key in zip(agent_list, agent_keys):
+            config = AGENT_TREND_CONFIG.get(key, {})
+            if config.get("method") == "ema":
+                trend = ema_trend(self.level_history,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  min_diff=config.get("min_diff", 0.0))
+                amx_strength_val = 0.0
+            else:
+                periods = config.get("amx_periods", [5,10,20])
+                trend = amx_trend(self.level_history, periods,
+                                  strictness=config.get("strictness", "relaxed"),
+                                  threshold=config.get("threshold", 0.5))
+                amx_strength_val = amx_strength(self.level_history, periods)
+            favored = trend_favored_colors(trend)
+
+            blocked = any(a.state["active"] for a in all_agents if a is not agente)
+
+            agente.update(self.color_history, timestamp, blocked=blocked,
+                          trend_colors=favored, amx_strength_val=amx_strength_val,
+                          last_number=number,
+                          live_enabled=(not training) and color_category_ready and (agente.trained or agente.is_fasttrack_ready()),
+                          bet_amount=bet_amount if not blocked else 0)
+
+        # ── Logging ──
+        if training:
+            return
+        lab_state = self.labouchere.get_state()
+        lab_seq = ','.join(str(x) for x in lab_state['sequence'])
+        lab_bet = lab_state['bet_amount']
+        last10 = ",".join(self.color_history[-10:])
+        activos = [f"{a.name}({'+'.join(a.state['bet_colors'])}, {a.state['total_attempts'] - a.state['attempts_left']}/{a.state['total_attempts']})"
+                   for a in agent_list if a.state["active"]]
+        activos += [f"{a.name}({'+'.join(a.state['bet_colors'])}, {a.state['total_attempts'] - a.state['attempts_left']}/{a.state['total_attempts']})"
+                   for a in zone_agent_list if a.state["active"]]
+        activos += [f"{a.name}({'+'.join(a.state['bet_colors'])}, {a.state['total_attempts'] - a.state['attempts_left']}/{a.state['total_attempts']})"
+                   for a in paridad_agent_list if a.state["active"]]
+        activos_txt = " | ".join(activos) if activos else "ninguna"
+        log.info(
+            f"🎰 Mesa {self.key} | Giro #{len(self.color_history)}: {number} ({real_color}) → {dz}/{zdz}/{pdz} "
+            f"(color {real_color_num}, zona {zone_num}, paridad {paridad_num}) | "
+            f"Nivel tendencia color: {self.level_current} | zona: {self.zone_level_current} | paridad: {self.paridad_level_current} | "
+            f"Live: color={color_category_ready} zona={zone_category_ready} paridad={paridad_category_ready} "
+            f"(giros={self.total_spins_seen}/{TABLE_MIN_SPINS_LIVE}, "
+            f"procesadas color={color_processed} zona={zone_processed} paridad={paridad_processed} de {CATEGORY_MIN_PROCESSED_LIVE}) | "
+            f"Lab: [{lab_seq}] ${lab_bet:,} | Últimos 10 colores: [{last10}] | Señales activas: {activos_txt}"
+        )
+
+    def get_state(self, limit: int = 40):
+        hist = self.spin_history[-limit:] if self.spin_history else []
+        return {
+            "key": self.key,
+            "spin_history": hist,
+            "color_history": self.color_history[-limit:],
+            "agent1": self.agent1.get_state(),
+            "agent2": self.agent2.get_state(),
+            "agent3": self.agent3.get_state(),
+            "agent4": self.agent4.get_state(),
+            "agent5": self.agent5.get_state(),
+            "agent6": self.agent6.get_state(),
+            "zone_history": self.zone_history[-limit:],
+            "zone_agent1": self.zone_agent1.get_state(),
+            "zone_agent2": self.zone_agent2.get_state(),
+            "zone_agent3": self.zone_agent3.get_state(),
+            "zone_agent4": self.zone_agent4.get_state(),
+            "zone_agent5": self.zone_agent5.get_state(),
+            "zone_agent6": self.zone_agent6.get_state(),
+            "paridad_history": self.paridad_history[-limit:],
+            "paridad_agent1": self.paridad_agent1.get_state(),
+            "paridad_agent2": self.paridad_agent2.get_state(),
+            "paridad_agent3": self.paridad_agent3.get_state(),
+            "paridad_agent4": self.paridad_agent4.get_state(),
+            "paridad_agent5": self.paridad_agent5.get_state(),
+            "paridad_agent6": self.paridad_agent6.get_state(),
+            "trend": self.trend,
+            "trend_favored_colors": sorted(NUM_COLOR[d] for d in trend_favored_colors(self.trend)),
+            "level_current": self.level_current,
+            "labouchere": self.labouchere.get_state(),
+        }
+
+
+# ══════════════════════════════════════════════
+#  ENTRENAMIENTO CON HISTORIAL (arranque)
+# ══════════════════════════════════════════════
+def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_SEED_TABLE) -> list:
+    """Lee un dump SQL (formato sqlite, como el exportado por la app) y
+    devuelve los spin_number de `table_name` en orden cronológico (por id).
+    Si el archivo no existe o falla el parseo, devuelve [] y el servidor
+    arranca igual, simplemente sin pre-entrenamiento."""
+    if not path or not os.path.exists(path):
+        log.warning(f"[Historial] No se encontró '{path}'; se arranca sin pre-entrenamiento.")
+        return []
+    try:
+        conn = sqlite3.connect(":memory:")
+        with open(path, "r", encoding="utf-8") as f:
+            conn.executescript(f.read())
+        cur = conn.execute(f'SELECT spin_number FROM "{table_name}" ORDER BY id ASC')
+        spins = [int(row[0]) for row in cur.fetchall()]
+        conn.close()
+        log.info(f"[Historial] {len(spins)} giros cargados desde '{path}' (tabla '{table_name}').")
+        return spins
+    except Exception as e:
+        log.warning(f"[Historial] Error leyendo '{path}': {e}")
+        return []
+
+
+async def train_table_from_history(table: "RouletteTable", spins: list) -> None:
+    """Recorre el historial en modo entrenamiento: alimenta a los 18 agentes
+    (color/zona/paridad) para que acumulen estadística y contexto de patrón,
+    pero SIEMPRE en modo sombra (nunca envía señales reales a Telegram ni
+    mueve la gestión Labouchere). Al terminar, total_spins_seen y las señales
+    procesadas por categoría ya están "calentadas", así que en cuanto lleguen
+    giros reales el servidor puede activar señales en vivo de inmediato si
+    los umbrales ya se cumplieron."""
+    if not spins:
+        return
+    log.info(f"[Entrenamiento] Mesa {table.key}: procesando {len(spins)} giros históricos…")
+    now = time.time()
+    for i, number in enumerate(spins):
+        if not (0 <= number <= 36):
+            continue
+        table.update(number, color_of(number), timestamp=now, training=True)
+        if i % 1000 == 0:
+            await asyncio.sleep(0)   # cede el loop, no bloquea el resto del servidor
+    log.info(
+        f"[Entrenamiento] Mesa {table.key}: listo. giros_vistos={table.total_spins_seen} "
+        f"nivel_color={table.level_current} nivel_zona={table.zone_level_current} "
+        f"nivel_paridad={table.paridad_level_current}"
+    )
+
+
+# ══════════════════════════════════════════════
+#  SERVER STATE
+# ══════════════════════════════════════════════
+class ServerState:
+    def __init__(self):
+        self.tables = {k: RouletteTable(k) for k in ROULETTE_KEYS.values()}
+        self.ws_server = None
+        self.signal_mode = "tendencia"
+        self.history_seed_trained = {k: False for k in ROULETTE_KEYS.values()}
+
+    def set_ws_server(self, ws_server):
+        self.ws_server = ws_server
+
+    def set_signal_mode(self, mode: str):
+        if mode in ("tendencia", "moderado"):
+            self.signal_mode = mode
+
+    async def update_mesa(self, key: int, number: int, broadcast: bool = True):
+        if key not in self.tables:
+            return
+        table = self.tables[key]
+        real_color = color_of(number)
+        table.update(number, real_color, signal_mode=self.signal_mode)
+        if broadcast and self.ws_server:
+            state = table.get_state(limit=40)
+            state["signal_mode"] = self.signal_mode
+            await self.ws_server.broadcast_to_mesa(str(key), "update", state)
+
+    def get_state_for_mesa(self, key: int):
+        if key not in self.tables:
+            return None
+        state = self.tables[key].get_state(limit=40)
+        state["signal_mode"] = self.signal_mode
+        return state
+
+    def load_all_models(self):
+        for key in self.tables:
+            self._load_model(key)
+
+    def _load_model(self, key: int):
+        filename = f"model_{key}.json"
+        if not os.path.exists(filename):
+            return
+        try:
+            with open(filename, "r") as f:
+                data = json.load(f)
+                table = self.tables[key]
+                table.agent1.load_persist(data.get("agent1"))
+                table.agent2.load_persist(data.get("agent2"))
+                table.agent3.load_persist(data.get("agent3"))
+                table.agent4.load_persist(data.get("agent4"))
+                table.agent5.load_persist(data.get("agent5"))
+                table.agent6.load_persist(data.get("agent6"))
+                table.zone_agent1.load_persist(data.get("zone_agent1"))
+                table.zone_agent2.load_persist(data.get("zone_agent2"))
+                table.zone_agent3.load_persist(data.get("zone_agent3"))
+                table.zone_agent4.load_persist(data.get("zone_agent4"))
+                table.zone_agent5.load_persist(data.get("zone_agent5"))
+                table.zone_agent6.load_persist(data.get("zone_agent6"))
+                table.paridad_agent1.load_persist(data.get("paridad_agent1"))
+                table.paridad_agent2.load_persist(data.get("paridad_agent2"))
+                table.paridad_agent3.load_persist(data.get("paridad_agent3"))
+                table.paridad_agent4.load_persist(data.get("paridad_agent4"))
+                table.paridad_agent5.load_persist(data.get("paridad_agent5"))
+                table.paridad_agent6.load_persist(data.get("paridad_agent6"))
+                table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
+                self.history_seed_trained[key] = data.get("history_seed_trained", False)
+                log.info(f"Modelo cargado para mesa {key}")
+        except Exception as e:
+            log.warning(f"Error cargando modelo mesa {key}: {e}")
+
+    def save_all_models(self):
+        for key, table in self.tables.items():
+            self._save_model(key)
+
+    def _save_model(self, key: int):
+        table = self.tables[key]
+        data = {
+            "agent1": table.agent1.to_persist(),
+            "agent2": table.agent2.to_persist(),
+            "agent3": table.agent3.to_persist(),
+            "agent4": table.agent4.to_persist(),
+            "agent5": table.agent5.to_persist(),
+            "agent6": table.agent6.to_persist(),
+            "zone_agent1": table.zone_agent1.to_persist(),
+            "zone_agent2": table.zone_agent2.to_persist(),
+            "zone_agent3": table.zone_agent3.to_persist(),
+            "zone_agent4": table.zone_agent4.to_persist(),
+            "zone_agent5": table.zone_agent5.to_persist(),
+            "zone_agent6": table.zone_agent6.to_persist(),
+            "paridad_agent1": table.paridad_agent1.to_persist(),
+            "paridad_agent2": table.paridad_agent2.to_persist(),
+            "paridad_agent3": table.paridad_agent3.to_persist(),
+            "paridad_agent4": table.paridad_agent4.to_persist(),
+            "paridad_agent5": table.paridad_agent5.to_persist(),
+            "paridad_agent6": table.paridad_agent6.to_persist(),
+            "table_total_spins_seen": table.total_spins_seen,
+            "history_seed_trained": self.history_seed_trained.get(key, False),
+        }
+        filename = f"model_{key}.json"
+        try:
+            with open(filename, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.warning(f"Error guardando modelo mesa {key}: {e}")
+
+    async def train_from_history(self):
+        """Se llama una única vez al arrancar (antes de conectar el WS en
+        vivo). Para cada mesa que todavía no fue entrenada con el historial,
+        carga el dump SQL y alimenta a los agentes en modo sombra. Queda
+        marcado por mesa para no repetirlo en reinicios posteriores."""
+        spins_cache = None
+        for key, table in self.tables.items():
+            if self.history_seed_trained.get(key):
+                log.info(f"[Entrenamiento] Mesa {key}: ya estaba entrenada con el historial, se omite.")
+                continue
+            if spins_cache is None:
+                spins_cache = load_history_seed()
+            if not spins_cache:
+                continue
+            await train_table_from_history(table, spins_cache)
+            self.history_seed_trained[key] = True
+            self._save_model(key)
+
+
+# ══════════════════════════════════════════════
+#  WEBSOCKET SERVER
+# ══════════════════════════════════════════════
+class WebSocketServer:
+    def __init__(self, server_state: ServerState):
+        self.server_state = server_state
+        self.rooms = {}
+        self.current_mesa = {}
+
+    async def handle(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        try:
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    data = json.loads(msg.data)
+                except Exception:
+                    continue
+                if data.get("type") == "subscribe":
+                    mesa_raw = data.get("mesa")
+                    try:
+                        int_mesa = int(mesa_raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if int_mesa not in ROULETTE_KEYS.values():
+                        continue
+                    mesa = str(int_mesa)
+                    prev_mesa = self.current_mesa.get(ws)
+                    if prev_mesa is not None and prev_mesa != mesa:
+                        prev_room = self.rooms.get(prev_mesa)
+                        if prev_room:
+                            prev_room.discard(ws)
+                    self.current_mesa[ws] = mesa
+                    self.rooms.setdefault(mesa, set()).add(ws)
+                    state = self.server_state.get_state_for_mesa(int_mesa)
+                    if state:
+                        await ws.send_str(json.dumps({"type": "initial", "data": state}))
+                elif data.get("type") == "set_mode":
+                    mode = data.get("mode")
+                    self.server_state.set_signal_mode(mode)
+                    await self.broadcast_mode(self.server_state.signal_mode)
+        finally:
+            for room in self.rooms.values():
+                room.discard(ws)
+            self.current_mesa.pop(ws, None)
+        return ws
+
+    async def broadcast_mode(self, mode: str):
+        msg = json.dumps({"type": "mode", "data": {"signal_mode": mode}})
+        for room in self.rooms.values():
+            dead = []
+            for ws in room.copy():
+                try:
+                    await ws.send_str(msg)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                room.discard(ws)
+
+    async def broadcast_to_mesa(self, mesa: str, event: str, data: dict):
+        room = self.rooms.get(mesa)
+        if not room:
+            return
+        msg = json.dumps({"type": event, "data": data})
+        dead = []
+        for ws in room.copy():
+            try:
+                await ws.send_str(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            room.discard(ws)
+
+
+# ══════════════════════════════════════════════
+#  WEBSOCKET HANDLER (conexión a Pragmatic Play)
+# ══════════════════════════════════════════════
+class PragmaticWebSocketHandler:
+    def __init__(self, key: int, on_spin_callback: Callable[[int, bool], Awaitable[None]]):
+        self.key = key
+        self.on_spin_callback = on_spin_callback
+        self.seen = set()
+
+    async def run(self):
+        sub = {"type": "subscribe", "casinoId": CASINO_ID, "currency": CURRENCY_ID, "key": [self.key]}
+        delay = 5
+        while True:
+            try:
+                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info(f"✅ WS Pragmatic conectado (key={self.key})")
+                    delay = 5
+                    batch_done = False
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                        results = data.get("last20Results")
+                        if isinstance(results, list):
+                            for r in reversed(results):
+                                await self._feed(r.get("gameId"), r.get("result"), emit=batch_done)
+                            batch_done = True
+                        if data.get("gameId") is not None and data.get("result") is not None:
+                            await self._feed(data.get("gameId"), data.get("result"), emit=True)
+            except Exception as e:
+                log.warning(f"🔌 WS key={self.key}: {e}. Reconectando en {delay}s…")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
-    return None
-
-
-class TelegramClient:
-    def __init__(self, chat_id: int):
-        self._chat_id = chat_id
-
-    async def send(
-        self,
-        text    : str,
-        keyboard: types.InlineKeyboardMarkup | None = None,
-    ) -> int | None:
-        msg = await _tg_call_async(
-            _bot.send_message,
-            self._chat_id, text,
-            parse_mode   = "HTML",
-            reply_markup = keyboard,
-        )
-        if msg:
-            log.info(
-                f"📤 [{self._chat_id}] Enviado (id={msg.message_id}): "
-                f"{text[:60].replace(chr(10), ' ')}"
-            )
-            return msg.message_id
-        log.error(f"❌ [{self._chat_id}] No se pudo enviar tras reintentos")
-        return None
-
-    async def edit(
-        self,
-        message_id: int,
-        text      : str,
-        keyboard  : types.InlineKeyboardMarkup | None = None,
-    ) -> bool:
-        try:
-            # "not modified" no es error real — no merece reintentos
-            await _bot.edit_message_text(
-                text,
-                chat_id      = self._chat_id,
-                message_id   = message_id,
-                parse_mode   = "HTML",
-                reply_markup = keyboard,
-            )
-            log.info(f"✏️  [{self._chat_id}] Editado (id={message_id})")
-            return True
-        except Exception as e:
-            err = str(e).lower()
-            if "not modified" in err:
-                return True
-            if "retry after" in err or "429" in err:
-                wait = _parse_retry_after(err)
-                log.warning(f"⏳ Rate limited al editar. Esperando {wait}s...")
-                await asyncio.sleep(wait)
-                # un solo reintento tras el rate-limit
-                try:
-                    await _bot.edit_message_text(
-                        text,
-                        chat_id      = self._chat_id,
-                        message_id   = message_id,
-                        parse_mode   = "HTML",
-                        reply_markup = keyboard,
-                    )
-                    log.info(f"✏️  [{self._chat_id}] Editado (reintento, id={message_id})")
-                    return True
-                except Exception as e2:
-                    log.warning(f"⚠️ Edición fallida tras espera: {e2}")
-            else:
-                log.debug(f"No se pudo editar {message_id}: {e}")
-            return False
-
-    async def delete(self, message_id: int | None) -> None:
-        if message_id is None:
+    async def _feed(self, gid, result, emit: bool):
+        if gid is None or result is None:
             return
         try:
-            await _bot.delete_message(self._chat_id, message_id)
-            log.info(f"🗑️  [{self._chat_id}] Eliminado (id={message_id})")
-        except Exception as e:
-            log.debug(f"No se pudo eliminar {message_id}: {e}")
-
-
-# ══════════════════════════════════════════════════════════════
-#  MESSAGE BUILDER
-# ══════════════════════════════════════════════════════════════
-
-class MessageBuilder:
-
-    @staticmethod
-    def _bold_lines(text: str) -> str:
-        """Envuelve cada línea no vacía en <b>...</b> (las líneas vacías se
-        dejan como separador, sin tag, para no romper el render en Telegram)."""
-        return "\n".join(f"<b>{line}</b>" if line else "" for line in text.split("\n"))
-
-    @staticmethod
-    def _ce(color: str) -> str:
-        return COLOR_EMOJI.get(color, "⚪")
-
-    def signal(
-        self,
-        last_num    : int,
-        last_color  : str,
-        category    : str,
-        signal_value: str,
-        attempt_str : str,
-        bet_fichas  : int = 0,
-    ) -> str:
-        usd      = bet_fichas * CHIP_VALUE
-        jugar_en = SIGNAL_DISPLAY.get((category, signal_value), signal_value)
-        return self._bold_lines(
-            f"🎯SEÑAL DETECTADA🎯\n\n"
-            f"♦️ ÚLTIMO GIRO: {last_num} {last_color} {self._ce(last_color)}\n"
-            f"🧨 JUGAR EN: {jugar_en}\n"
-            f"🇺🇲 APUESTA USD: ${usd:.2f}\n"
-            f"♻️ INTENTO: {attempt_str}"
-        )
-
-    def pre_signal(self) -> str:
-        return self._bold_lines("🚨POSIBLE SEÑAL A CONFIRMAR🚨\nJugador prepárese para entrar...")
-
-    def win(self, number: int, color: str) -> str:
-        return self._bold_lines(f"✅ GANADA {number} {self._ce(color)} {color} ✅")
-
-    def loss(self, number: int, color: str) -> str:
-        return self._bold_lines(f"❌ PERDIMOS {number} {self._ce(color)} {color} ❌")
-
-    def consecutive(self, count: int) -> str:
-        if count == 0:
-            return self._bold_lines("⛔ SE CORTO LA RACHA POSITIVA ⛔")
-        return self._bold_lines(f"🤑 {count} SEÑALES GANADAS CONSECUTIVAS 🤑")
-
-    def stats(self, state: BotState) -> str:
-        st = state.total_signals
-
-        def pct(wins: int) -> str:
-            if st == 0:
-                return "0.00%"
-            return f"{wins / st * 100:.2f}%"
-
-        sign = "+" if state.daily_capital >= 0 else ""
-        return self._bold_lines(
-            f"📆 MARCADOR DIARIO\n"
-            f"✅ GANADAS: {state.won_signals}\n"
-            f"❌ PERDIDAS: {state.lost_signals}\n"
-            f"🇺🇲 USD: {sign}${state.daily_capital:.2f}\n\n"
-            f"📈 ACIERTO: {state.win_rate:.2f}%"
-        )
-
-    def daily_report(self, state: BotState) -> str:
-        st = state.total_signals
-
-        def pct(wins: int) -> str:
-            if st == 0:
-                return "0.00%"
-            return f"{wins / st * 100:.2f}%"
-
-        sign = "+" if state.daily_capital >= 0 else ""
-        return self._bold_lines(
-            f"📆 MARCADOR DIARIO 00:00 (ARG) — {ROULETTE_NAME}\n"
-            f"✅ GANADAS: {state.won_signals}\n"
-            f"❌ PERDIDAS: {state.lost_signals}\n"
-            f"🇺🇲 USD: {sign}${state.daily_capital:.2f}\n\n"
-            f"📈 ACIERTO: {state.win_rate:.2f}%"
-        )
-
-    def history_text(self, batch: list, batch_num: int, complete: bool = False) -> str:
-        """
-        Texto del historial — canal secundario.
-        Cada mensaje contiene exactamente 100 giros (o los que lleva el lote actual).
-        <pre> genera bloque de código con botón nativo de copiar en Telegram.
-        El encabezado va en negrita; los números dentro de <pre> se dejan tal
-        cual (ya se muestran en bloque monoespaciado con botón de copiar, y
-        Telegram no combina negrita con <pre> de forma útil ahí).
-        """
-        count    = len(batch)
-        nums_str = "\n".join(str(n) for n in batch)
-        status   = "✅ COMPLETO" if complete else f"{count}/100"
-        header   = self._bold_lines(f"🆔 PARTE {batch_num} — {ROULETTE_NAME} [{status}]")
-        return f"{header}\n<pre>{nums_str}</pre>"
-
-
-# ══════════════════════════════════════════════════════════════
-#  SPIN PROCESSOR
-# ══════════════════════════════════════════════════════════════
-
-class SpinProcessor:
-    def __init__(
-        self,
-        state  : BotState,
-        tg_main: TelegramClient,
-        tg_sec : TelegramClient,
-        builder: MessageBuilder,
-    ):
-        self.state   = state
-        self.tg      = tg_main
-        self.tg_sec  = tg_sec
-        self.builder = builder
-
-    # ── Historial (canal secundario) ─────────────────────────
-
-    async def _update_history(self) -> None:
-        """
-        Canal secundario — lotes de 100 giros.
-        · Mientras el lote < 100: edita el mismo mensaje mostrando N/100.
-        · Al llegar al giro 100: edita por última vez marcándolo COMPLETO,
-          luego limpia el lote → el próximo giro creará un mensaje nuevo (Parte N+1).
-        """
-        s   = self.state
-        bat = s.current_batch
-        cnt = len(bat)
-
-        if cnt == 0:
-            return  # nada que mostrar aún
-
-        batch_num = s.batch_count + 1   # número de parte actual (1-based)
-
-        if cnt < 100:
-            # ── Lote en curso: editar o crear mensaje ───────────────────────
-            text = self.builder.history_text(bat, batch_num, complete=False)
-            mid  = s.batch_msg_id
-            if mid:
-                ok = await self.tg_sec.edit(mid, text)
-                if not ok:
-                    log.warning("⚠️ Historial: mensaje no editable → nuevo")
-                    new_id = await self.tg_sec.send(text)
-                    s.batch_msg_id = new_id
-                    save_history_state(new_id, s.batch_count)
-            else:
-                new_id = await self.tg_sec.send(text)
-                s.batch_msg_id = new_id
-                save_history_state(new_id, s.batch_count)
-
-        else:
-            # ── Lote completo (100 giros): cerrar y preparar el siguiente ───
-            text = self.builder.history_text(bat, batch_num, complete=True)
-            mid  = s.batch_msg_id
-            if mid:
-                await self.tg_sec.edit(mid, text)
-            else:
-                await self.tg_sec.send(text)
-            log.info(f"📦 Parte {batch_num} completada (100 giros) — iniciando nueva parte")
-            # Avanzar al siguiente lote
-            s.batch_count  += 1
-            s.current_batch = []
-            s.batch_msg_id  = None
-            save_history_state(None, s.batch_count)
-
-
-    # ── Procesamiento principal ───────────────────────────────
-
-    async def process(self, number: int) -> None:
-        s  = self.state
-        sm = s.signal_manager
-
-        s.check_daily_reset()
-
-        # Avance de las 3 secuencias (color/paridad/zona) — siempre, en CADA giro
-        sm.advance_sequences()
-
-        real_color        = REAL_COLORS.get(number, "VERDE")
-        s.last_spin_num   = number
-        s.last_spin_color = real_color
-        s.last_spin_ts    = time.time()
-
-        # Añadir al historial
-        s.current_batch.append(number)
-
-        # ── WARMUP: contar giros hasta habilitar señales ──────────────────────
-        if not sm.warmup_done:
-            sm.spins_count += 1
-            remaining_wu = WARMUP_SPINS - sm.spins_count
-            log.info(
-                f"🎰 {number} | {real_color} | warmup {sm.spins_count}/{WARMUP_SPINS}"
-                + (f" ({remaining_wu} restantes)" if remaining_wu > 0 else " → ¡LISTO!")
-            )
-            # Enviar mensaje de inicio UNA SOLA VEZ al primer giro
-            if not sm.warmup_msg_sent:
-                sm.warmup_msg_sent = True
-                await self.tg.send(
-                    f"<b>⏳ Analizando mesa...</b>\n"
-                    f"<b>🎰 {ROULETTE_NAME}</b>\n"
-                    f"<b>📊 Procesando {WARMUP_SPINS} giros antes de activar señales.</b>"
-                )
-            if sm.spins_count >= WARMUP_SPINS:
-                sm.warmup_done = True
-                log.info("✅ Warmup completado — señales habilitadas")
-            await self._update_history()
+            num = int(result)
+        except (TypeError, ValueError):
             return
-
-        # ── SINCRONÍA CON LAS 3 SECUENCIAS ─────────────────────────────────────
-        # Se actualiza en CADA giro real (haya o no señal activa) para saber
-        # si la mesa está respetando el patrón de cada categoría en vivo.
-        sm.update_sync(number)
-
-        sync_str = " ".join(f"{cat}={sm.sync_streak[cat]}" for cat in CATEGORY_PRIORITY)
-        log.info(
-            f"🎰 {number} | {real_color} | {sync_str} (min={SYNC_MIN_STREAK}) | "
-            f"espera={sm.waiting_spins} | señal={'SI' if sm.active_signal else 'NO'}"
-        )
-
-        # ── SIN ESPERA POST-SEÑAL ───────────────────────────────────────────────
-        # WAIT_SPINS = 0 → apenas se resuelve una señal (WIN/LOSS), el bot
-        # vuelve a evaluar la sincronía normalmente desde el giro siguiente,
-        # sin ningún período de espera. (waiting_spins queda siempre en 0;
-        # se conserva el mecanismo por si se quisiera reactivar una espera
-        # más adelante.)
-        if sm.waiting_spins > 0:
-            sm.tick_wait()
-
-        # ── SEÑAL ACTIVA → VERIFICAR RESULTADO ───────────────────────────────
-        if sm.active_signal:
-            sig             = sm.active_signal
-            category        = sig.category
-            check_value     = sig.check_value
-            next_gale_value = sm.get_sequence_value(category)
-            real_value      = CATEGORY_VALUE_FN[category](number)
-            bet_fichas_snap = sig.bet_fichas   # capturar ANTES de process_result (que puede nullificar active_signal)
-
-            lost_fichas_snap = sig.lost_fichas   # fichas perdidas en intentos anteriores de esta señal
-            ml_features_snap = sig.ml_features   # features usadas al confirmar (para entrenar al resolver)
-            result = sm.process_result(number, real_value, check_value, next_gale_value)
-
-            if result["type"] == "win":
-                s.won_signals      += 1
-                # ganancia neta = fichas ganadas - fichas perdidas en intentos anteriores
-                net_fichas = bet_fichas_snap - lost_fichas_snap
-                s.daily_capital    += net_fichas * CHIP_VALUE
-                s.martingala.on_win()
-                s.consecutive_wins += 1
-                attempt = result["attempt"]
-                if attempt <= 1:
-                    s.c1_wins += 1
-                elif attempt <= 3:
-                    s.c2_wins += 1
-                else:
-                    s.c3_wins += 1
-                s.signal_msg_id = None
-                if ml_features_snap is not None:
-                    s.ml.fit_one(ml_features_snap, 1.0)
-                s.cat_wins[category]  += 1
-                s.consecutive_losses   = 0
-                await self.tg.send(self.builder.win(number, real_color))
-                await asyncio.sleep(0.4)
-                await self.tg.delete(s.consecutive_msg_id)
-                s.consecutive_msg_id = await self.tg.send(
-                    self.builder.consecutive(s.consecutive_wins)
-                )
-                await asyncio.sleep(0.4)
-                await self.tg.delete(s.stats_msg_id)
-                s.stats_msg_id = await self.tg.send(self.builder.stats(s))
-                log.info(f"✅ GANADA [{category}] intento {result['attempt']+1} | racha={s.consecutive_wins}")
-
-            elif result["type"] == "loss":
-                s.lost_signals    += 1
-                s.consecutive_wins = 0
-                # pérdida total = último intento + todos los intentos anteriores ya acumulados
-                total_lost = bet_fichas_snap + lost_fichas_snap
-                s.daily_capital    -= total_lost * CHIP_VALUE
-                s.martingala.on_loss()
-                s.signal_msg_id   = None
-                if ml_features_snap is not None:
-                    s.ml.fit_one(ml_features_snap, 0.0)
-                s.cat_losses[category] += 1
-                s.consecutive_losses   += 1
-                await self.tg.send(self.builder.loss(number, real_color))
-                await asyncio.sleep(0.4)
-                await self.tg.delete(s.consecutive_msg_id)
-                s.consecutive_msg_id = await self.tg.send(self.builder.consecutive(0))
-                await asyncio.sleep(0.4)
-                await self.tg.delete(s.stats_msg_id)
-                s.stats_msg_id = await self.tg.send(self.builder.stats(s))
-                log.info(f"❌ PERDIDA [{category}] en intento {result['attempt']}")
-
-            else:   # gale
-                new_value   = result["signal_value"]
-                new_attempt = result["attempt"]
-                attempt_str = f"{new_attempt + 1}/{sm.active_signal.max_attempts}"
-                sm.active_signal.lost_fichas += bet_fichas_snap   # acumular fichas perdidas en este intento
-                # Avanzar Martingala: duplicar la apuesta tras la derrota parcial
-                s.martingala.on_loss()
-                new_bet = s.martingala.bet
-                sm.active_signal.bet_fichas = new_bet
-                await self.tg.delete(s.signal_msg_id)
-                s.signal_msg_id = await self.tg.send(
-                    self.builder.signal(number, real_color, category, new_value, attempt_str, bet_fichas=new_bet)
-                )
-                log.info(f"🔁 Gale {new_attempt} [{category}] | apostar {new_value} | bet={new_bet} fichas (Martingala)")
-
-        # ── SIN SEÑAL ACTIVA → CONFIRMAR NUEVA O EVALUAR AVISO PREVIO ─────────
-        else:
-            ready_cat = sm.ready_category()
-
-            if ready_cat and sm.waiting_spins == 0:
-                # ── Machine Learning: pedir confianza antes de confirmar ────────
-                features   = build_ml_features(s, ready_cat)
-                confidence = s.ml.predict_proba(features)
-                ml_ready   = s.ml.is_warmed_up()
-
-                if ml_ready and confidence < ML_MIN_CONFIDENCE:
-                    log.info(
-                        f"🧠 Señal [{ready_cat}] descartada por baja confianza IA: "
-                        f"{confidence*100:.1f}% (mínimo {ML_MIN_CONFIDENCE*100:.0f}%)"
-                    )
-                    if s.pre_signal_msg_id:
-                        await self.tg.delete(s.pre_signal_msg_id)
-                        s.pre_signal_msg_id = None
-                else:
-                    # Se confirma la señal en este giro (sin espera): si había
-                    # aviso previo, se borra.
-                    if s.pre_signal_msg_id:
-                        await self.tg.delete(s.pre_signal_msg_id)
-                        s.pre_signal_msg_id = None
-
-                    bet          = s.martingala.bet
-                    signal_value = sm.get_sequence_value(ready_cat)
-                    sm.start_signal(
-                        number, ready_cat, signal_value, bet_fichas=bet,
-                        ml_features=features, ml_confidence=confidence,
-                    )
-                    max_att = sm.active_signal.max_attempts
-                    s.signal_msg_id  = await self.tg.send(
-                        self.builder.signal(number, real_color, ready_cat, signal_value, f"1/{max_att}", bet_fichas=bet)
-                    )
-                    tag = f"{confidence*100:.1f}%" if ml_ready else f"{confidence*100:.1f}% (aprendiendo, {s.ml.samples_seen}/{ML_MIN_TRAIN_SAMPLES})"
-                    log.info(
-                        f"🟡 Nueva señal [{ready_cat}]: {number} → apostar {signal_value} | Martingala bet={bet} | "
-                        f"🧠 Confianza IA={tag} | máx. intentos={max_att}"
-                    )
-
-            elif sm.about_to_confirm() or (ready_cat and sm.waiting_spins > 0):
-                # Falta un giro para que alguna categoría alcance la racha mínima:
-                # se muestra/mantiene el aviso de posible señal a confirmar.
-                if not s.pre_signal_msg_id:
-                    s.pre_signal_msg_id = await self.tg.send(self.builder.pre_signal())
-                    log.info("🚨 Aviso previo enviado — posible señal a confirmar en el próximo giro")
-
-            elif s.pre_signal_msg_id:
-                # Ya no está "a un giro" de confirmar (se rompió la sincronía) → borrar aviso.
-                await self.tg.delete(s.pre_signal_msg_id)
-                s.pre_signal_msg_id = None
-
-        # Actualizar historial (siempre al final del giro)
-        await self._update_history()
+        if not (0 <= num <= 36) or gid in self.seen:
+            return
+        self.seen.add(gid)
+        if len(self.seen) > 3000:
+            self.seen.clear()
+        if self.on_spin_callback:
+            await self.on_spin_callback(num, emit)
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════
+#  HTTP
+# ══════════════════════════════════════════════
+_server_state: Optional[ServerState] = None
 
+async def http_home(request: web.Request):
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        return await ws_entry(request)
+    return web.json_response({"status": "ok", "service": "Adaptive Roulette Server",
+                               "mesas": list(ROULETTE_KEYS.values())})
 
-# ══════════════════════════════════════════════════════════════
+async def http_ping(request: web.Request):
+    return web.json_response({"status": "pong", "ts": time.time()})
 
-# ══════════════════════════════════════════════════════════════
-#  FLASK — SERVIDOR HTTP (mantiene vivo Render)
-# ══════════════════════════════════════════════════════════════
-
-flask_app = Flask(__name__)
-_state: BotState | None = None
-
-
-@flask_app.route("/")
-def home():
-    return jsonify({
-        "status"  : "ok",
-        "bot"     : "Immersive Roulette — Bot de Señales Telegram",
-        "roulette": ROULETTE_NAME,
+async def http_health(request: web.Request):
+    if _server_state is None:
+        return web.json_response({"status": "not_ready"}, status=503)
+    return web.json_response({
+        "status": "ok",
+        "mesas": list(_server_state.tables.keys()),
+        "total_spins": sum(len(t.spin_history) for t in _server_state.tables.values())
     })
 
+async def http_api_state(request: web.Request):
+    if _server_state is None:
+        return web.json_response({"error": "server not ready"}, status=503)
+    try:
+        mesa = int(request.match_info["mesa"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "mesa inválida"}, status=400)
+    if mesa not in ROULETTE_KEYS.values():
+        return web.json_response({"error": "mesa no soportada"}, status=404)
+    state = _server_state.get_state_for_mesa(mesa)
+    if state is None:
+        return web.json_response({"error": "mesa no encontrada"}, status=404)
+    return web.json_response(state)
 
-@flask_app.route("/ping")
-def ping():
-    return jsonify({"status": "pong", "ts": time.time()})
+async def http_api_all(request: web.Request):
+    if _server_state is None:
+        return web.json_response({"error": "server not ready"}, status=503)
+    result = {str(key): _server_state.get_state_for_mesa(key) for key in ROULETTE_KEYS.values()}
+    return web.json_response(result)
 
-
-@flask_app.route("/health")
-def health():
-    if _state is None:
-        return jsonify({"status": "not_ready"}), 503
-
-    sm     = _state.signal_manager
-    ar_now = datetime.now(AR_TZ).strftime("%Y-%m-%d %H:%M ART")
-    ago    = round(time.time() - _state.last_spin_ts, 1) if _state.last_spin_ts else None
-
-    return jsonify({
-        "status"          : "ok",
-        "ar_time"         : ar_now,
-        "roulette"        : ROULETTE_NAME,
-        "last_spin_num"   : _state.last_spin_num,
-        "last_spin_color" : _state.last_spin_color,
-        "last_spin_ago_s" : ago,
-        "active_signal"   : sm.active_signal is not None,
-        "sync_streak"     : sm.sync_streak,
-        "sync_min_streak" : SYNC_MIN_STREAK,
-        "waiting_spins"   : sm.waiting_spins,
-        "won_signals"     : _state.won_signals,
-        "lost_signals"    : _state.lost_signals,
-        "win_rate_pct"    : round(_state.win_rate, 2),
-        "consecutive_wins": _state.consecutive_wins,
-        "history_count"   : len(_state.current_batch),
-        "batch_count"     : _state.batch_count,
-        "batch_msg_id"    : _state.batch_msg_id,
-        "ml_samples_seen" : _state.ml.samples_seen,
-        "ml_warmed_up"    : _state.ml.is_warmed_up(),
-        "ml_min_confidence": ML_MIN_CONFIDENCE,
-        "cat_wins"        : _state.cat_wins,
-        "cat_losses"      : _state.cat_losses,
-    })
+async def ws_entry(request: web.Request):
+    return await _server_state.ws_server.handle(request)
 
 
-def run_flask() -> None:
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-
-# ══════════════════════════════════════════════════════════════
-#  SELF-PING — ANTI-SLEEP RENDER
-# ══════════════════════════════════════════════════════════════
-
-async def self_ping_loop() -> None:
+# ══════════════════════════════════════════════
+#  SELF-PING
+# ══════════════════════════════════════════════
+async def self_ping_loop():
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not render_url or "localhost" in render_url:
-        log.info("⚙️  RENDER_EXTERNAL_URL no configurada — self-ping desactivado")
+        log.info("Self-ping desactivado (no URL)")
         return
-
     await asyncio.sleep(30)
-    log.info(f"🏓 Self-ping activo → {render_url}/ping cada {PING_INTERVAL}s")
-
-    while True:
-        try:
-            import urllib.request as _ur
-            _ur.urlopen(f"{render_url}/ping", timeout=15)
-            log.debug("🏓 Self-ping OK")
-        except Exception as e:
-            log.debug(f"🏓 Self-ping falló (no crítico): {e}")
-        await asyncio.sleep(PING_INTERVAL)
-
-
-# ══════════════════════════════════════════════════════════════
-#  REPORTE MEDIANOCHE — 00:00 AR
-# ══════════════════════════════════════════════════════════════
-
-async def midnight_report_loop(
-    state  : BotState,
-    tg_main: TelegramClient,
-    builder: MessageBuilder,
-) -> None:
-    while True:
-        now = datetime.now(AR_TZ)
-        next_midnight = (
-            datetime(now.year, now.month, now.day, tzinfo=AR_TZ)
-            + timedelta(days=1)
-        )
-        seconds_until = (next_midnight - now).total_seconds()
-        log.info(
-            f"🕛 Reporte nocturno en {seconds_until:.0f}s "
-            f"({next_midnight.strftime('%d/%m %H:%M')} AR)"
-        )
-        await asyncio.sleep(seconds_until)
-
-        try:
-            await tg_main.send(builder.daily_report(state))
-            log.info("📆 Reporte diario enviado a las 00:00 AR")
-        except Exception as e:
-            log.error(f"❌ Error enviando reporte nocturno: {e}")
-
-        state.reset_daily_stats()
-
-
-# ══════════════════════════════════════════════════════════════
-#  POLLER — EVOLUTION API
-# ══════════════════════════════════════════════════════════════
-
-def _parse_settled_at(s: str) -> float:
-    if not s:
-        return 0.0
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0.0
-
-
-async def poll_evolution(processor: SpinProcessor, state: BotState) -> None:
-    """
-    Consume crashstake-ulmx.onrender.com/latest/IMMERSIVE (igual que ppc.py).
-    Nunca toca la API de Evolution directamente → sin 429.
-    """
-    recon           = 5
-    last_id         = state.last_game_id
-    first_poll_done = False
-
-    log.info(f"🎰 Poller IMMERSIVE iniciado → {STATS_LATEST}")
-
-    # Connector con keep-alive: reutiliza la conexión TCP entre polls
-    connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers={"Connection": "keep-alive"},
-    ) as session:
+    log.info(f"Self-ping activo → {render_url}/ping cada {PING_INTERVAL}s")
+    timeout = ClientTimeout(total=15)
+    async with ClientSession(timeout=timeout) as session:
         while True:
-            t_start = asyncio.get_event_loop().time()
             try:
-                async with session.get(
-                    STATS_LATEST,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-
-                    if resp.status != 200:
-                        log.warning(f"⚠️ Servidor HTTP {resp.status} — reintento en {recon}s")
-                        await asyncio.sleep(recon)
-                        recon = min(recon * 2, 60)
-                        continue
-
-                    payload = await resp.json(content_type=None)
-                    recon   = 5
-                    last_20 = payload.get("last_20", [])
-
-                    if not isinstance(last_20, list) or not last_20:
-                        await asyncio.sleep(POLL_SECS)
-                        continue
-
-                    # ── Primera poll: marcar giros ya conocidos, no procesar ──
-                    if not first_poll_done:
-                        for spin in last_20:
-                            gid = spin.get("game_id")
-                            if gid:
-                                last_id = gid
-                        state.last_game_id = last_id
-                        save_last_game_id(last_id)
-                        state.signal_manager.set_sequence_from_last_black(last_20)
-                        first_poll_done = True
-                        log.info(
-                            f"[Poller] 🔒 Primera poll: {len(last_20)} giros marcados "
-                            f"| último game_id={last_id[:12] if last_id else '—'}"
-                        )
-                        initial_numbers = [
-                            int(spin["number"])
-                            for spin in reversed(last_20)
-                            if spin.get("number") is not None and 0 <= int(spin["number"]) <= 36
-                        ]
-                        if initial_numbers:
-                            state.current_batch = initial_numbers
-                            text = processor.builder.history_text(
-                                state.current_batch, state.batch_count + 1, complete=False
-                            )
-                            mid = await processor.tg_sec.send(text)
-                            state.batch_msg_id = mid
-                            save_history_state(mid, state.batch_count)
-                            log.info(
-                                f"[Poller] 📋 Historial inicial enviado con "
-                                f"{len(initial_numbers)} giros | msg_id={mid}"
-                            )
-                        # no sleep aquí — volver a pollear inmediatamente
-                        continue
-
-                    # ── Polls siguientes: detectar giros nuevos (orden desc→asc) ──
-                    nuevos = []
-                    for spin in last_20:
-                        gid = spin.get("game_id", "")
-                        if gid and gid != last_id:
-                            nuevos.append(spin)
-                        else:
-                            break
-
-                    if not nuevos:
-                        await asyncio.sleep(POLL_SECS)
-                        continue
-
-                    # Procesar en orden cronológico (el más viejo primero)
-                    for spin in reversed(nuevos):
-                        number = spin.get("number")
-                        gid    = spin.get("game_id", "")
-                        if number is None or not gid:
-                            continue
-                        number = int(number)
-                        if not (0 <= number <= 36):
-                            continue
-
-                        log.info(f"[Poller] 🆕 number={number} game_id={gid[:12]}...")
-                        last_id            = gid
-                        state.last_game_id = gid
-                        save_last_game_id(gid)
-                        await processor.process(number)
-
-                    # Compensar el tiempo ya consumido para mantener intervalo estable
-                    elapsed = asyncio.get_event_loop().time() - t_start
-                    sleep   = max(0.0, POLL_SECS - elapsed)
-                    if sleep > 0:
-                        await asyncio.sleep(sleep)
-
-            except aiohttp.ClientError as e:
-                log.warning(f"⚠️ Error de red: {e} — reintento en {recon}s")
-                await asyncio.sleep(recon)
-                recon = min(recon * 2, 60)
-            except Exception as e:
-                log.error(f"❌ Error inesperado en poller: {e}")
-                await asyncio.sleep(recon)
+                async with session.get(f"{render_url}/ping") as resp:
+                    await resp.read()
+            except Exception:
+                pass
+            await asyncio.sleep(PING_INTERVAL)
 
 
+# ══════════════════════════════════════════════
+#  TELEGRAM POLLING
+# ══════════════════════════════════════════════
+async def bot_polling_loop():
+    if bot is None:
+        return
+    delay = 5
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning(f"[Telegram] No se pudo eliminar webhook: {e}")
 
-# ══════════════════════════════════════════════════════════════
-#  PUNTO DE ENTRADA
-# ══════════════════════════════════════════════════════════════
+        started = time.time()
+        try:
+            await bot.infinity_polling(skip_pending=True, timeout=20, request_timeout=30)
+        except Exception as e:
+            log.warning(f"[Telegram] Polling interrumpido: {e}")
 
-async def main() -> None:
-    global _state
+        ran_for = time.time() - started
+        delay = 5 if ran_for > 60 else min(delay * 2, 60)
+        log.warning(f"[Telegram] Reintentando polling en {delay}s…")
+        await asyncio.sleep(delay)
 
+
+# ══════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════
+def build_http_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", http_home)
+    app.router.add_get("/ping", http_ping)
+    app.router.add_get("/health", http_health)
+    app.router.add_get("/api/state/{mesa}", http_api_state)
+    app.router.add_get("/api/all", http_api_all)
+    app.router.add_get("/ws", ws_entry)
+    return app
+
+async def main():
+    global _server_state
     log.info("═" * 60)
-    log.info(f"  {ROULETTE_NAME} — BOT DE SEÑALES TELEGRAM (Render-ready)")
-    log.info(f"  Canal principal  : {MAIN_CHAT_ID}")
-    log.info(f"  Canal secundario : {SECONDARY_CHAT_ID}")
-    log.info(f"  Intentos         : dinámicos según confianza IA (máx. {MAX_ATTEMPTS}) — ver CONFIDENCE_ATTEMPT_TIERS")
-    log.info(f"  Espera           : sin espera tras resolver señal (WAIT_SPINS={WAIT_SPINS})")
-    log.info(f"  Machine Learning : confianza mínima {ML_MIN_CONFIDENCE*100:.0f}% (aprende tras {ML_MIN_TRAIN_SAMPLES} señales)")
-    log.info(
-        "  Tramos intentos  : "
-        + " | ".join(f"≥{th*100:.0f}%→{att} int." for th, att in CONFIDENCE_ATTEMPT_TIERS)
-    )
-    log.info(f"  Ping             : cada {PING_INTERVAL}s (anti-sleep Render)")
-    log.info(f"  Zona AR          : UTC-3 | Hoy: {datetime.now(AR_TZ).date()}")
+    log.info("SERVIDOR ADAPTATIVO POR NÚMERO Y MESA (aiohttp + WS)")
+    log.info(f"Mesas: {', '.join(str(k) for k in ROULETTE_KEYS.values())}")
     log.info("═" * 60)
 
-    if BOT_TOKEN == "TU_TOKEN_AQUI":
-        log.error("❌  DEBES configurar BOT_TOKEN antes de ejecutar el bot.")
-        sys.exit(1)
+    server_state = ServerState()
+    server_state.load_all_models()
+    _server_state = server_state
 
-    state   = BotState()
-    _state  = state
-    tg_main = TelegramClient(MAIN_CHAT_ID)
-    tg_sec  = TelegramClient(SECONDARY_CHAT_ID)
-    builder = MessageBuilder()
-    proc    = SpinProcessor(state, tg_main, tg_sec, builder)
+    await server_state.train_from_history()
 
-    log.info(
-        f"💾 Parte actual: {state.batch_count + 1} | msg_id={state.batch_msg_id or 'nuevo'}"
-    )
-    log.info(
-        f"🎲 Último game_id restaurado: {state.last_game_id or '(ninguno — primer arranque)'}"
-    )
+    ws_server = WebSocketServer(server_state)
+    server_state.set_ws_server(ws_server)
 
-    ar_now = datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M:%S")
-    await tg_main.send(
-        f"<b>🤖 Bot de Señales iniciado</b>\n"
-        f"<b>🎰 Mesa: {ROULETTE_NAME}</b>\n"
-        f"<b>🕐 {ar_now} (AR)</b>"
-    )
+    async def save_loop():
+        while True:
+            await asyncio.sleep(SAVE_INTERVAL)
+            server_state.save_all_models()
 
-    await asyncio.gather(
-        poll_evolution(proc, state),
-        midnight_report_loop(state, tg_main, builder),
-        self_ping_loop(),
-    )
+    async def on_spin(key: int, num: int, emit: bool):
+        await server_state.update_mesa(key, num, broadcast=emit)
 
+    tasks = []
+    for key in ROULETTE_KEYS.values():
+        handler = PragmaticWebSocketHandler(key, lambda num, emit, k=key: on_spin(k, num, emit))
+        tasks.append(asyncio.create_task(handler.run()))
+
+    tasks.append(asyncio.create_task(save_loop()))
+    tasks.append(asyncio.create_task(self_ping_loop()))
+    if bot is not None:
+        tasks.append(asyncio.create_task(bot_polling_loop()))
+
+    port = int(os.environ.get("PORT", 10000))
+    app = build_http_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Servidor HTTP/WebSocket escuchando en puerto {port}")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await runner.cleanup()
 
 if __name__ == "__main__":
-    # Flask arranca primero para que Render detecte el puerto a tiempo
-    _flask_thread = threading.Thread(target=run_flask, daemon=True)
-    _flask_thread.start()
-    time.sleep(1)
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("⏹️  Bot detenido por el usuario")
+        log.info("Servidor detenido")
