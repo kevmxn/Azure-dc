@@ -17,6 +17,7 @@
 ║   - Entrenamiento inicial con historial SQLite              ║
 ║   - Señales solo después de 21 giros EN VIVO                ║
 ║   - Espera un giro tras resolución para nueva señal         ║
+║   - Mensajes: señal -> intento 2 -> resolución -> marcador diario -> ciclo║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -514,6 +515,13 @@ def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) 
         apuesta_line = ""
     return f"{header} ({body}){apuesta_line}"
 
+def build_daily_marker_message(stats: dict) -> str:
+    total = stats.get("total", 0)
+    won = stats.get("won", 0)
+    lost = stats.get("lost", 0)
+    rate = round((won / total) * 100, 1) if total else 0.0
+    return f"📆 MARCADOR DIARIO 💎\n✅ Ganadas: {won}\n❌ Perdidas: {lost}\n🎯 Total señales: {total}\n📈 Efectividad: {rate}%"
+
 def build_status_message(server_state) -> str:
     agent_keys = ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6"]
     zone_agent_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent5", "zone_agent6"]
@@ -566,27 +574,18 @@ if bot is not None:
         except Exception as e:
             log.warning(f"[Telegram] Error respondiendo /status: {e}")
 
-def build_daily_marker_message(stats: dict) -> str:
-    total = stats.get("total", 0)
-    won = stats.get("won", 0)
-    lost = stats.get("lost", 0)
-    rate = round((won / total) * 100, 1) if total else 0.0
-    return f"📆 MARCADOR DIARIO 💎\n✅ Ganadas: {won}\n❌ Perdidas: {lost}\n🎯 Total señales: {total}\n📈 Efectividad: {rate}%"
-
+# ──────────────────────────────────────────────
+# DAILY MARKER (solo estadísticas, sin envío automático)
+# ──────────────────────────────────────────────
 class DailyMarker:
     def __init__(self, thread_signals=None):
         self.stats = {"total": 0, "won": 0, "lost": 0}
-        self.msg_id = None
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
 
     async def record(self, win: bool):
+        """Solo actualiza estadísticas; el mensaje se envía desde el servidor cuando no hay señales."""
         self.stats["total"] += 1
         self.stats["won" if win else "lost"] += 1
-        text = build_daily_marker_message(self.stats)
-        if self.msg_id is not None:
-            await delete_msg(self.msg_id)
-            self.msg_id = None
-        self.msg_id = await send_msg(text, self.thread_signals)
 
 # ══════════════════════════════════════════════
 # AGENTE DE PATRÓN CON ML Y LABOUCHERE
@@ -933,12 +932,13 @@ class ColorPatternAgent:
                 is_win = (last in self.state["bet_colors"])
                 self.attempt_results.append(last_number)
                 
-                # Actualizar Labouchere SÍNCRONAMENTE
+                # Actualizar Labouchère SÍNCRONAMENTE
                 if self.table is not None:
+                    prev_cycles = self.table.labouchere.cycles_completed
                     self.table.labouchere.update(is_win)
-                    # Si se completó un ciclo, notificar (asíncrono)
-                    if self.table.labouchere.cycles_completed > 0:
-                        asyncio.create_task(self.table._notify_cycle_completed())
+                    # Si se completó un ciclo, marcar pendiente
+                    if self.table.labouchere.cycles_completed > prev_cycles:
+                        self.table._mark_cycle_pending(self.table.labouchere.cycles_completed)
                 
                 if is_win:
                     asyncio.create_task(send_msg(attempt_win_label(attempt), self.thread_stats))
@@ -1049,8 +1049,12 @@ class ColorPatternAgent:
     async def _dispatch_resolution(self, win: bool, attempt_results: list, bet_amount: int):
         resolution_text = build_resolution_message(win, attempt_results, bet_amount)
         await send_msg(resolution_text, self.thread_signals)
+        # Registrar en el marcador diario (solo estadísticas)
         if self.daily_marker is not None:
             await self.daily_marker.record(win)
+        # Intentar enviar marcador y ciclo si no hay señales activas
+        if self.table is not None:
+            await self.table.maybe_send_daily_marker_and_cycle()
 
     def _close(self, win: bool, result_color, attempt, timestamp, state: dict, dispatch: bool):
         pattern = tuple(state["pattern"])
@@ -1177,7 +1181,9 @@ class RouletteTable:
         self.live_spins_seen = 0
         self.daily_marker = DailyMarker()
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
-        
+        self.cycle_pending = False
+        self.cycle_number = 0
+
         self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba", daily_marker=self.daily_marker, dynamic_bet=False, fixed_target="repeat")
         self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_2", label="PATRON V2 💎", mode="aaaba", daily_marker=self.daily_marker, dynamic_bet=False, fixed_target="repeat")
         self.agent3 = ColorPatternAgent(pattern_len=6, name="AGENTE_3", label="PATRON V3 💎", mode="aabbaa", daily_marker=self.daily_marker)
@@ -1223,14 +1229,44 @@ class RouletteTable:
         self.last_color_num = None
         self.trend = "neutral"
 
-    async def _notify_cycle_completed(self):
-        """Envía mensaje de ciclo completado de forma asíncrona."""
+    def _mark_cycle_pending(self, num: int):
+        """Marca que un ciclo de Labouchère se ha completado y debe notificarse."""
+        self.cycle_pending = True
+        self.cycle_number = num
+
+    async def _send_cycle_message(self):
+        """Envía el mensaje de ciclo completado con el formato solicitado."""
+        if not self.cycle_pending:
+            return
         lab_state = self.labouchere.get_state()
-        msg = (f"♾️ CICLO #{self.labouchere.cycles_completed} COMPLETA\n"
-               f"📈 Acumulado: {'+' if lab_state['balance'] >= 0 else '-'}"
-               f"{format_cop(abs(lab_state['balance']))}\n"
+        sign = '+' if lab_state['balance'] >= 0 else '-'
+        msg = (f"🎉🎉 CICLO #{self.cycle_number} COMPLETO 🎉🎉\n"
+               f"📈 Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\n"
                f"🇨🇴 Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
         await send_msg(msg, THREAD_SIGNALS)
+        self.cycle_pending = False
+        self.cycle_number = 0
+
+    async def maybe_send_daily_marker_and_cycle(self):
+        """Envía el marcador diario y el ciclo pendiente si no hay señales activas."""
+        # Verificar señales activas en todos los agentes
+        active = any(
+            a.state["active"] for a in [
+                self.agent1, self.agent2, self.agent3, self.agent4, self.agent5, self.agent6,
+                self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4,
+                self.zone_agent5, self.zone_agent6,
+                self.paridad_agent1, self.paridad_agent2, self.paridad_agent3, self.paridad_agent4,
+                self.paridad_agent5, self.paridad_agent6
+            ]
+        )
+        if not active:
+            # Enviar marcador diario si hay estadísticas
+            if self.daily_marker.stats["total"] > 0:
+                text = build_daily_marker_message(self.daily_marker.stats)
+                await send_msg(text, self.daily_marker.thread_signals)
+            # Enviar ciclo pendiente
+            if self.cycle_pending:
+                await self._send_cycle_message()
 
     def _level_change(self, real_color_num: int) -> int:
         if real_color_num == 1: return 1
