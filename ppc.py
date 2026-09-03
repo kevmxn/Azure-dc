@@ -122,7 +122,7 @@ THREAD_STATS_PARIDAD   = int(os.environ.get("THREAD_STATS_PARIDAD", str(THREAD_S
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:roulette1")
 
 # ── Entrenamiento inicial con historial (dump SQLite) ──
-HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure_db.sql")
+HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
 
 # ──────────────────────────────────────────────
