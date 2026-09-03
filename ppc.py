@@ -12,6 +12,7 @@
 ║   - Todas las señales a 3 intentos                          ║
 ║   - Selección de la mejor señal en CADA intento             ║
 ║   - Mensajes: señal1 -> (si falla) señal2 -> (si falla) señal3 -> resultado -> marcador -> ciclo║
+║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
 ║   - Comando /status acortado                                ║
 ╚══════════════════════════════════════════════════════════════
 """
@@ -1066,17 +1067,24 @@ class RouletteTable:
         return best_agent, best_candidate
 
     async def _send_entry(self, agent, candidate, bet_amount, attempt_number):
-        """Envía mensaje de entrada para un intento."""
+        """Envía mensaje de entrada con el formato personalizado para el intento."""
+        # Generar el mensaje original usando el builder del agente
         seq_txt = self.labouchere.seq_str()
-        entry_text = agent.entry_builder(
+        original = agent.entry_builder(
             agent._last_raw_number,
             candidate["bet_colors"],
             bet_amount=bet_amount,
             start_attempt=1,
             sequence_str=seq_txt
         )
-        # Personalizar el mensaje para indicar el número de intento
-        entry_text = entry_text.replace("🚨🚨", f"🚨🚨 INTENTO {attempt_number} ")
+        # Reemplazar el encabezado original por el nuevo formato
+        parts = original.split("\n\n", 1)
+        if len(parts) == 2:
+            body = parts[1]
+        else:
+            body = original
+        new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
+        entry_text = f"{new_header}\n\n{body}"
         await send_msg(entry_text, agent.thread_signals)
 
     async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int):
