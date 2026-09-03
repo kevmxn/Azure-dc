@@ -7,9 +7,10 @@
 ║   - Persistencia y aprendizaje continuo                    ║
 ║   - Parámetros ajustados para efectividad ~85%             ║
 ║   - Filtros más estrictos: win_rate 0.55, muestras 10      ║
-║   - Agente 5 (ababa) se desactiva tras 3 victorias         ║
+║   - Agente V5 (ababa): 3 señales consecutivas → desactivación temporal ║
 ║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
-║   - Comando /status acortado para evitar límite de Telegram║
+║   - Todas las señales a 3 intentos                          ║
+║   - Comando /status acortado                                ║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -44,7 +45,7 @@ LABOUCHERE_INITIAL_SEQUENCE = [1, 1, 1, 1, 1]
 LABOUCHERE_INFINITE_MODE   = True
 LABOUCHERE_INITIAL_CAPITAL = 0
 
-COLOR_MAX_ATTEMPTS = 2
+COLOR_MAX_ATTEMPTS = 3                     # AHORA 3 INTENTOS
 COLOR_BACKTEST_WINDOW = 80
 COLOR_CONTEXT_WINDOW = 20
 COLOR_MIN_SAMPLES_GATE = 10
@@ -568,8 +569,11 @@ class ColorPatternAgent:
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
         self.wait_spins_after_resolution = 0
-        self.consecutive_wins = 0
+        # Para V5: conteo de señales consecutivas
+        self.consecutive_signals = 0
         self.signal_enabled = True
+        # Para victorias consecutivas (ya no se usa para V5, pero lo dejamos por si acaso)
+        self.consecutive_wins = 0
 
     def _match(self, window):
         if len(window) != self.pattern_len:
@@ -886,6 +890,21 @@ class ColorPatternAgent:
                 if self.table is not None:
                     bet_amount = self.table.labouchere.get_bet()
                 if not blocked and self.live_enabled:
+                    # === Manejo especial para agente V5 (ababa) ===
+                    if self.mode == "ababa":
+                        # Si está desactivado por haber alcanzado 3 señales consecutivas,
+                        # se reactiva y se reinicia el contador (nuevas condiciones)
+                        if not self.signal_enabled:
+                            self.signal_enabled = True
+                            self.consecutive_signals = 0
+                            log.info(f"🔄 {self.name} reactivado (nuevas condiciones)")
+                        # Incrementar contador de señales consecutivas
+                        self.consecutive_signals += 1
+                        if self.consecutive_signals >= 3:
+                            # Desactivar después de emitir la tercera señal
+                            self.signal_enabled = False
+                            log.info(f"🔇 {self.name} desactivado tras 3 señales consecutivas")
+                    # === Fin manejo V5 ===
                     self.state = new_state
                     self.state["bet_amount"] = bet_amount
                     self.attempt_results = []
@@ -939,15 +958,12 @@ class ColorPatternAgent:
         if direction in ("repeat", "change"):
             self.direction_stats[direction]["wins" if win else "losses"] += 1
 
+        # Ya no usamos consecutive_wins para V5, pero lo mantenemos por compatibilidad
         if self.mode == "ababa":
             if win:
                 self.consecutive_wins += 1
-                if self.consecutive_wins >= 3:
-                    self.signal_enabled = False
-                    log.info(f"🔇 {self.name} desactivado por 3 victorias consecutivas")
             else:
                 self.consecutive_wins = 0
-                self.signal_enabled = True
 
         reset_state = {
             "active": False, "pattern": None, "bet_colors": None,
@@ -996,6 +1012,7 @@ class ColorPatternAgent:
             "recommended_start_attempt_pct": rec_pct,
             "pattern_recommendations": pattern_recommendations,
             "signal_enabled": self.signal_enabled,
+            "consecutive_signals": self.consecutive_signals,
             "consecutive_wins": self.consecutive_wins,
             "ml_model": {
                 "trained": self.trained,
@@ -1018,7 +1035,7 @@ class ColorPatternAgent:
             "last_train_ts": self.last_train_ts,
             "trained_snapshot": self.trained_snapshot,
             "direction_stats": self.direction_stats,
-            "consecutive_wins": self.consecutive_wins,
+            "consecutive_signals": self.consecutive_signals,
             "signal_enabled": self.signal_enabled,
         }
 
@@ -1034,7 +1051,7 @@ class ColorPatternAgent:
         self.last_train_ts = data.get("last_train_ts", 0.0)
         self.trained_snapshot = data.get("trained_snapshot", {})
         self.direction_stats = data.get("direction_stats", self.direction_stats)
-        self.consecutive_wins = data.get("consecutive_wins", 0)
+        self.consecutive_signals = data.get("consecutive_signals", 0)
         self.signal_enabled = data.get("signal_enabled", True)
 
 # ══════════════════════════════════════════════
