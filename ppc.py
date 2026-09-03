@@ -11,9 +11,10 @@
 ║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
 ║   - Todas las señales a 3 intentos                          ║
 ║   - Selección de la mejor señal en CADA intento             ║
-║   - Mensajes: señal1 -> (se elimina) señal2 -> (se elimina) señal3 -> resolución -> marcador -> ciclo║
+║   - Mensajes: señal1 -> (falla) espera -> señal2 -> (falla) espera -> señal3 -> resolución -> marcador -> ciclo║
 ║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
 ║   - Marcador diario con desglose por intento                ║
+║   - Mensaje de espera "⏳ Calculando siguiente intento..."  ║
 ║   - Comando /status acortado                                ║
 ╚══════════════════════════════════════════════════════════════
 """
@@ -984,6 +985,7 @@ class RouletteTable:
         self.signal_status = None
         self.attempt_numbers = []
         self.entry_msg_ids = []
+        self.waiting_msg_id = None
 
         # Agentes de COLOR (8)
         self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba",
@@ -1093,6 +1095,11 @@ class RouletteTable:
                 await delete_msg(prev_id)
         return msg_id
 
+    async def _send_waiting_message(self):
+        msg = "⏳ Calculando siguiente intento..."
+        self.waiting_msg_id = await send_msg(msg, THREAD_SIGNALS)
+        return self.waiting_msg_id
+
     async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int, winning_attempt: int = None):
         res_text = build_resolution_message(win, attempt_numbers, bet_amount)
         await send_msg(res_text, THREAD_SIGNALS)
@@ -1125,6 +1132,9 @@ class RouletteTable:
         self.signal_status = None
         self.attempt_numbers = []
         self.entry_msg_ids = []
+        if self.waiting_msg_id:
+            asyncio.create_task(delete_msg(self.waiting_msg_id))
+            self.waiting_msg_id = None
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
         candidates = []
@@ -1181,6 +1191,8 @@ class RouletteTable:
                 if self.current_attempt_index < 2:
                     self.current_attempt_index += 1
 
+                    asyncio.create_task(self._send_waiting_message())
+
                     if not candidates:
                         self.signal_status = "lost"
                         asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
@@ -1199,7 +1211,12 @@ class RouletteTable:
                     best_agent.mark_selected()
                     self.signal_sequence.append({"agent": best_agent, "candidate": best_candidate})
                     new_bet = self.labouchere.get_bet()
+
                     asyncio.create_task(self._send_entry(best_agent, best_candidate, new_bet, self.current_attempt_index+1))
+                    if self.waiting_msg_id:
+                        asyncio.create_task(delete_msg(self.waiting_msg_id))
+                        self.waiting_msg_id = None
+
                     log.info(f"🔄 NUEVO INTENTO {self.current_attempt_index+1}: {best_agent.name} -> {best_candidate['bet_colors']} (apuesta {format_cop(new_bet)})")
                     return True
                 else:
