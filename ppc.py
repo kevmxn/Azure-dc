@@ -1092,21 +1092,21 @@ class RouletteTable:
         self.pending_candidate = None
 
         # Agentes de COLOR (8)
-        self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_1", label="PATRON V1 💎", mode="aaaaba",
+        self.agent1 = ColorPatternAgent(pattern_len=6, name="AGENTE_COLOR_1", label="PATRON COLOR V1 💎", mode="aaaaba",
                                         daily_marker=self.daily_marker, target_symbol='a')
-        self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_2", label="PATRON V2 💎", mode="aaaba",
+        self.agent2 = ColorPatternAgent(pattern_len=5, name="AGENTE_COLOR_2", label="PATRON COLOR V2 💎", mode="aaaba",
                                         daily_marker=self.daily_marker, target_symbol='a')
-        self.agent3 = ColorPatternAgent(pattern_len=6, name="AGENTE_3", label="PATRON V3 💎", mode="aabbaa",
+        self.agent3 = ColorPatternAgent(pattern_len=6, name="AGENTE_COLOR_3", label="PATRON COLOR V3 💎", mode="aabbaa",
                                         daily_marker=self.daily_marker, target_symbol='b')
-        self.agent4 = ColorPatternAgent(pattern_len=7, name="AGENTE_4", label="PATRON V4 💎", mode="aaabbaa",
+        self.agent4 = ColorPatternAgent(pattern_len=7, name="AGENTE_COLOR_4", label="PATRON COLOR V4 💎", mode="aaabbaa",
                                         daily_marker=self.daily_marker, target_symbol='a')
-        self.agent5 = ColorPatternAgent(pattern_len=5, name="AGENTE_5", label="PATRON V5 💎", mode="ababa",
+        self.agent5 = ColorPatternAgent(pattern_len=5, name="AGENTE_COLOR_5", label="PATRON COLOR V5 💎", mode="ababa",
                                         daily_marker=self.daily_marker, target_symbol='b')
-        self.agent6 = ColorPatternAgent(pattern_len=6, name="AGENTE_6", label="PATRON V6 💎", mode="aaabbb",
+        self.agent6 = ColorPatternAgent(pattern_len=6, name="AGENTE_COLOR_6", label="PATRON COLOR V6 💎", mode="aaabbb",
                                         daily_marker=self.daily_marker, target_symbol='a')
-        self.agent7 = ColorPatternAgent(pattern_len=7, name="AGENTE_7", label="PATRON V7 💎", mode="aaabaaa",
+        self.agent7 = ColorPatternAgent(pattern_len=7, name="AGENTE_COLOR_7", label="PATRON COLOR V7 💎", mode="aaabaaa",
                                         daily_marker=self.daily_marker, target_symbol='a')
-        self.agent8 = ColorPatternAgent(pattern_len=6, name="AGENTE_8", label="PATRON V8 💎", mode="aaabaa",
+        self.agent8 = ColorPatternAgent(pattern_len=6, name="AGENTE_COLOR_8", label="PATRON COLOR V8 💎", mode="aaabaa",
                                         daily_marker=self.daily_marker, target_symbol='a')
 
         # Agentes de ZONA (8)
@@ -1310,26 +1310,47 @@ class RouletteTable:
             agent = current_entry["agent"]
 
             # Elegir el candidato según el intento
+            agent5_double_opposite = current_entry.get("agent5_double_opposite", False)
             if self.current_attempt_index == 0:
                 candidate = current_entry["original"]
                 label = "original"
             elif self.current_attempt_index == 1:
                 candidate = current_entry["opposite"]
-                label = "opuesta"
+                label = "original" if current_entry.get("always_original") else "opuesta"
             else:
-                candidate = current_entry["original"]
-                label = "original"
+                if agent5_double_opposite:
+                    candidate = current_entry["opposite"]
+                    label = "opuesta"
+                else:
+                    candidate = current_entry["original"]
+                    label = "original"
 
             bet_colors = candidate["bet_colors"]
-            # Verificar si el número es 0 (pérdida inmediata)
+            # Verificar si el número es 0
             if last_number == 0:
-                # CERO -> pérdida inmediata
-                log.info(f"🚫 CERO en intento {self.current_attempt_index+1} - pérdida inmediata")
+                # El cero SIEMPRE aumenta la secuencia de labouchere (se cuenta como pérdida de apuesta)
                 self.attempt_numbers.append(0)
-                self.signal_status = "lost"
-                asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
-                self._finalize_sequence(False, None)
-                return True
+                cycle_completed = self.labouchere.update(False)
+                if cycle_completed:
+                    self.cycle_pending = self.labouchere.cycles_completed
+                if self.current_attempt_index == 0:
+                    # CERO en INTENTO 1 -> no se da por perdida la señal todavía:
+                    # se aumenta la secuencia y se espera que se confirme un nuevo
+                    # patrón para completar el INTENTO 2 (y eventualmente el 3).
+                    log.info("🟢 CERO en intento 1 - secuencia labouchere aumentada, esperando nuevo patrón para intento 2")
+                    self.signal_status = "waiting_pattern"
+                    self.signal_sequence = []
+                    asyncio.create_task(send_msg(
+                        "🟢 CERO en INTENTO 1 · Se ajusta la gestión Labouchère · Esperando nueva confirmación para INTENTO 2",
+                        THREAD_SIGNALS))
+                    return True
+                else:
+                    # CERO en INTENTO 2 o 3 -> se considera señal perdida
+                    log.info(f"🚫 CERO en intento {self.current_attempt_index+1} - señal perdida")
+                    self.signal_status = "lost"
+                    asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
+                    self._finalize_sequence(False, None)
+                    return True
 
             is_win = (last_number is not None and any(
                 self._color_match(last_number, color) for color in bet_colors
@@ -1355,10 +1376,14 @@ class RouletteTable:
                     new_bet = self.labouchere.get_bet()
                     if self.current_attempt_index == 1:
                         next_candidate = current_entry["opposite"]
-                        label = "opuesta"
+                        label = "original" if current_entry.get("always_original") else "opuesta"
                     else:
-                        next_candidate = current_entry["original"]
-                        label = "original"
+                        if agent5_double_opposite:
+                            next_candidate = current_entry["opposite"]
+                            label = "opuesta"
+                        else:
+                            next_candidate = current_entry["original"]
+                            label = "original"
                     asyncio.create_task(self._send_entry(agent, next_candidate, new_bet, self.current_attempt_index+1))
                     log.info(f"🔄 INTENTO {self.current_attempt_index+1}: apuesta {label} {next_candidate['bet_colors']}")
                     return True
@@ -1378,15 +1403,38 @@ class RouletteTable:
         if candidates:
             best_agent, best_candidate = self._select_best_candidate(candidates)
             if best_agent is not None:
-                opposite = self._get_opposite_bet(best_agent, best_candidate["bet_colors"])
-                opposite_candidate = best_candidate.copy() if opposite else None
-                if opposite:
-                    opposite_candidate["bet_colors"] = opposite
-                self.signal_sequence = [{
+                # Agentes 6, 7 y 8 (color/zona/paridad): siempre apuesta original,
+                # en los 3 intentos, sin alternar a la opuesta.
+                use_original_only = best_agent.name.split("_")[-1] in ("6", "7", "8")
+                # Agente 5 (color/zona/paridad): intento 1 original, intentos 2 y 3 opuesta.
+                is_agent5 = best_agent.name.split("_")[-1] == "5"
+                if use_original_only:
+                    opposite_candidate = None
+                else:
+                    opposite = self._get_opposite_bet(best_agent, best_candidate["bet_colors"])
+                    opposite_candidate = best_candidate.copy() if opposite else None
+                    if opposite:
+                        opposite_candidate["bet_colors"] = opposite
+                new_entry = {
                     "agent": best_agent,
                     "original": best_candidate,
-                    "opposite": opposite_candidate if opposite else best_candidate
-                }]
+                    "opposite": best_candidate if use_original_only else (opposite_candidate if opposite_candidate else best_candidate),
+                    "always_original": use_original_only,
+                    "agent5_double_opposite": is_agent5 and not use_original_only
+                }
+
+                if self.signal_status == "waiting_pattern":
+                    # Veníamos de un CERO en el intento 1: esta nueva señal
+                    # confirmada completa el intento 2 (se conserva el 0 ya
+                    # registrado y el avance de la secuencia de labouchere).
+                    self.signal_sequence = [new_entry]
+                    self.current_attempt_index = 1
+                    self.signal_status = "active"
+                    asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 2))
+                    log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {best_agent.name} -> {best_candidate['bet_colors']}")
+                    return True
+
+                self.signal_sequence = [new_entry]
                 self.current_attempt_index = 0
                 self.signal_status = "active"
                 self.attempt_numbers = []
@@ -2029,93 +2077,4 @@ async def self_ping_loop():
         while True:
             try:
                 async with session.get(f"{render_url}/ping") as resp:
-                    await resp.read()
-            except Exception:
-                pass
-            await asyncio.sleep(PING_INTERVAL)
-
-# ══════════════════════════════════════════════
-# TELEGRAM POLLING
-# ══════════════════════════════════════════════
-async def bot_polling_loop():
-    if bot is None:
-        return
-    delay = 5
-    while True:
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:
-            log.warning(f"[Telegram] No se pudo eliminar webhook: {e}")
-        started = time.time()
-        try:
-            await bot.infinity_polling(skip_pending=True, timeout=20, request_timeout=30)
-        except Exception as e:
-            log.warning(f"[Telegram] Polling interrumpido: {e}")
-        ran_for = time.time() - started
-        delay = 5 if ran_for > 60 else min(delay * 2, 60)
-        log.warning(f"[Telegram] Reintentando polling en {delay}s…")
-        await asyncio.sleep(delay)
-
-# ══════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════
-def build_http_app() -> web.Application:
-    app = web.Application()
-    app.router.add_get("/", http_home)
-    app.router.add_get("/ping", http_ping)
-    app.router.add_get("/health", http_health)
-    app.router.add_get("/api/state/{mesa}", http_api_state)
-    app.router.add_get("/api/all", http_api_all)
-    app.router.add_get("/ws", ws_entry)
-    return app
-
-async def main():
-    global _server_state
-    log.info("═" * 60)
-    log.info("SERVIDOR ADAPTATIVO POR NÚMERO Y MESA (aiohttp + WS)")
-    log.info(f"Mesas: {', '.join(str(k) for k in ROULETTE_KEYS.values())}")
-    log.info("═" * 60)
-    server_state = ServerState()
-    server_state.load_all_models()
-    _server_state = server_state
-    await server_state.train_from_history()
-    ws_server = WebSocketServer(server_state)
-    server_state.set_ws_server(ws_server)
-
-    async def save_loop():
-        while True:
-            await asyncio.sleep(SAVE_INTERVAL)
-            server_state.save_all_models()
-
-    async def on_spin(key: int, num: int, emit: bool, training: bool = False):
-        await server_state.update_mesa(key, num, broadcast=emit, training=training)
-
-    tasks = []
-    for key in ROULETTE_KEYS.values():
-        handler = PragmaticWebSocketHandler(key, lambda num, emit, training=False, k=key: on_spin(k, num, emit, training))
-        tasks.append(asyncio.create_task(handler.run()))
-    tasks.append(asyncio.create_task(save_loop()))
-    tasks.append(asyncio.create_task(self_ping_loop()))
-    if bot is not None:
-        tasks.append(asyncio.create_task(bot_polling_loop()))
-
-    port = int(os.environ.get("PORT", 10000))
-    app = build_http_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"Servidor HTTP/WebSocket escuchando en puerto {port}")
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        for t in tasks:
-            t.cancel()
-        await runner.cleanup()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Servidor detenido")
+                    
