@@ -2077,4 +2077,93 @@ async def self_ping_loop():
         while True:
             try:
                 async with session.get(f"{render_url}/ping") as resp:
-                    
+                    await resp.read()
+            except Exception:
+                pass
+            await asyncio.sleep(PING_INTERVAL)
+
+# ══════════════════════════════════════════════
+# TELEGRAM POLLING
+# ══════════════════════════════════════════════
+async def bot_polling_loop():
+    if bot is None:
+        return
+    delay = 5
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning(f"[Telegram] No se pudo eliminar webhook: {e}")
+        started = time.time()
+        try:
+            await bot.infinity_polling(skip_pending=True, timeout=20, request_timeout=30)
+        except Exception as e:
+            log.warning(f"[Telegram] Polling interrumpido: {e}")
+        ran_for = time.time() - started
+        delay = 5 if ran_for > 60 else min(delay * 2, 60)
+        log.warning(f"[Telegram] Reintentando polling en {delay}s…")
+        await asyncio.sleep(delay)
+
+# ══════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════
+def build_http_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", http_home)
+    app.router.add_get("/ping", http_ping)
+    app.router.add_get("/health", http_health)
+    app.router.add_get("/api/state/{mesa}", http_api_state)
+    app.router.add_get("/api/all", http_api_all)
+    app.router.add_get("/ws", ws_entry)
+    return app
+
+async def main():
+    global _server_state
+    log.info("═" * 60)
+    log.info("SERVIDOR ADAPTATIVO POR NÚMERO Y MESA (aiohttp + WS)")
+    log.info(f"Mesas: {', '.join(str(k) for k in ROULETTE_KEYS.values())}")
+    log.info("═" * 60)
+    server_state = ServerState()
+    server_state.load_all_models()
+    _server_state = server_state
+    await server_state.train_from_history()
+    ws_server = WebSocketServer(server_state)
+    server_state.set_ws_server(ws_server)
+
+    async def save_loop():
+        while True:
+            await asyncio.sleep(SAVE_INTERVAL)
+            server_state.save_all_models()
+
+    async def on_spin(key: int, num: int, emit: bool, training: bool = False):
+        await server_state.update_mesa(key, num, broadcast=emit, training=training)
+
+    tasks = []
+    for key in ROULETTE_KEYS.values():
+        handler = PragmaticWebSocketHandler(key, lambda num, emit, training=False, k=key: on_spin(k, num, emit, training))
+        tasks.append(asyncio.create_task(handler.run()))
+    tasks.append(asyncio.create_task(save_loop()))
+    tasks.append(asyncio.create_task(self_ping_loop()))
+    if bot is not None:
+        tasks.append(asyncio.create_task(bot_polling_loop()))
+
+    port = int(os.environ.get("PORT", 10000))
+    app = build_http_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Servidor HTTP/WebSocket escuchando en puerto {port}")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Servidor detenido")
