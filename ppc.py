@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   SERVIDOR ADAPTATIVO — AZURE ROULETTE (key 227)              ║
@@ -20,6 +21,7 @@
 ║   - Loss también por cero en cualquier intento             ║
 ║   - Entrenamiento inicial por bloques de 500 giros         ║
 ║   - Comando /status acortado                                ║
+║   - FIX: liberación correcta del estado de confirmación    ║
 ╚══════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -1276,7 +1278,15 @@ class RouletteTable:
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
         # Recolectar candidatos de todos los agentes
         candidates = []
+        confirmation_resolved = False
+
         for agente in all_agents:
+            # ── FIX: detectar si el agente pendiente de confirmación ya la resolvió ──
+            # (su propio 'confirming' pasó a False este giro, ya sea que haya
+            # confirmado el patrón o que la confirmación haya fallado)
+            if self.confirming and agente is self.pending_agent and not agente.confirming:
+                confirmation_resolved = True
+
             if agente.candidate_signal is not None:
                 # Verificar si es un candidato de confirmación o una señal real
                 if agente.candidate_signal.get("confirming", False):
@@ -1300,9 +1310,21 @@ class RouletteTable:
                     score = win_rate * (1 + amx_str)
                     candidates.append((agente, score, agente.candidate_signal))
 
-        # ── Si estamos en confirmación, ya se envió el mensaje, esperar al siguiente giro ──
+        # ── FIX: liberar el estado de confirmación de la tabla si ya se resolvió ──
+        # Antes, self.confirming solo se reseteaba en _finalize_sequence(), lo que
+        # dejaba la tabla trabada en modo "confirmando" para siempre después de la
+        # primera confirmación (exitosa o fallida), impidiendo que se armara y
+        # enviara cualquier señal real de ahí en adelante.
+        if self.confirming and confirmation_resolved:
+            self.confirming = False
+            if self.confirmation_msg_id:
+                asyncio.create_task(delete_msg(self.confirmation_msg_id))
+                self.confirmation_msg_id = None
+            self.pending_agent = None
+            self.pending_candidate = None
+
+        # ── Si seguimos en confirmación (todavía no llegó el giro de resolución) ──
         if self.confirming:
-            # En el siguiente giro, la confirmación se resuelve sola
             return True
 
         # ── Si no hay secuencia activa, buscar candidato real ──
@@ -2085,34 +2107,4 @@ async def main():
             server_state.save_all_models()
 
     async def on_spin(key: int, num: int, emit: bool, training: bool = False):
-        await server_state.update_mesa(key, num, broadcast=emit, training=training)
-
-    tasks = []
-    for key in ROULETTE_KEYS.values():
-        handler = PragmaticWebSocketHandler(key, lambda num, emit, training=False, k=key: on_spin(k, num, emit, training))
-        tasks.append(asyncio.create_task(handler.run()))
-    tasks.append(asyncio.create_task(save_loop()))
-    tasks.append(asyncio.create_task(self_ping_loop()))
-    if bot is not None:
-        tasks.append(asyncio.create_task(bot_polling_loop()))
-
-    port = int(os.environ.get("PORT", 10000))
-    app = build_http_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"Servidor HTTP/WebSocket escuchando en puerto {port}")
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        for t in tasks:
-            t.cancel()
-        await runner.cleanup()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Servidor detenido")
+        await server_state.update_mesa(key, num, broadcast=emit, trainin
