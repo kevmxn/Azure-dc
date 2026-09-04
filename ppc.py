@@ -1653,7 +1653,7 @@ class RouletteTable:
 # ══════════════════════════════════════════════
 # ENTRENAMIENTO CON HISTORIAL (por bloques de 500)
 # ══════════════════════════════════════════════
-BATCH_SIZE = 500
+BATCH_SIZE = 250
 
 def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_SEED_TABLE) -> list:
     if not path or not os.path.exists(path):
