@@ -941,7 +941,7 @@ class ColorPatternAgent:
             current_value = last  # last es el color/zona/paridad actual
             # Verificar si coincide con expected_last
             if current_value == expected_last:
-                # Confirmación correcta → generar señal completa
+                # Confirmación correcta → generar señal completa y resetear estado de confirmación
                 pattern = (a, b)
                 bet_colors = self._bet_colors(pattern) if self.target_symbol == 'a' else self._bet_colors(pattern)
                 context = list(color_history[-COLOR_CONTEXT_WINDOW:])
@@ -961,12 +961,15 @@ class ColorPatternAgent:
                     "confirming": False,
                 }
                 log.info(f"✅ {self.name} confirmación correcta, enviando señal {pattern}")
+                # Resetear estado de confirmación para permitir procesar la señal
+                self.confirming = False
+                self.pending_pattern = None
             else:
-                # Confirmación fallida → descartar
+                # Confirmación fallida → descartar y resetear
                 log.info(f"❌ {self.name} confirmación fallida: esperaba {expected_last}, obtuve {current_value}")
                 self.candidate_signal = None
-            self.confirming = False
-            self.pending_pattern = None
+                self.confirming = False
+                self.pending_pattern = None
 
     def _close_shadow(self, win: bool, result_color, attempt, timestamp, state: dict):
         pattern = tuple(state["pattern"])
