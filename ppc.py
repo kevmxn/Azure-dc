@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   SERVIDOR ADAPTATIVO — AZURE ROULETTE (key 227)              ║
@@ -12,10 +11,10 @@
 ║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
 ║   - Todas las señales a 2 intentos                          ║
 ║   - Selección de la mejor señal solo para intento 1         ║
-║   - Intento 2 repite la misma señal sin espera de confirmación║
-║   - En caso de fallo en confirmación, se invierte la apuesta (opuesto)║
+║   - Confirmación fallida → apuesta opuesta en intento 1     ║
+║   - Si falla intento 1, intento 2 vuelve a la apuesta original ║
 ║   - Mensaje de espera: "☢️ POSIBLE CONFIRMACION ☢️"        ║
-║   - Mensajes: espera fallo -> señal1 (opuesta) -> (falla) señal2 -> resolución -> marcador -> ciclo║
+║   - Mensajes: espera fallo -> señal1 (opuesta) -> (falla) señal2 (original) -> resolución -> marcador -> ciclo║
 ║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
 ║   - Marcador diario con desglose por intento (Win1, Win2, Loss)║
 ║   - Loss solo se contabiliza al fallar el intento 2        ║
@@ -970,7 +969,7 @@ class ColorPatternAgent:
         self.signal_enabled = data.get("signal_enabled", True)
 
 # ══════════════════════════════════════════════
-# ROULETTE TABLE (con 2 intentos, inversión en confirmación fallida)
+# ROULETTE TABLE (con 2 intentos, inversión en confirmación fallida y vuelta a original en intento 2)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -988,7 +987,7 @@ class RouletteTable:
         self.cycle_pending = 0
 
         # Estados de secuencia
-        self.signal_sequence = []          # solo un elemento: {agent, candidate} (se reutiliza para el intento 2)
+        self.signal_sequence = []          # contendrá: {"agent": agente, "original": candidato_original, "opposite": candidato_opuesto}
         self.current_attempt_index = 0     # 0 para intento 1, 1 para intento 2
         self.signal_status = None          # None, 'pending_confirmation', 'active', 'won', 'lost'
         self.attempt_numbers = []
@@ -1088,7 +1087,7 @@ class RouletteTable:
                 return (values[0],)
         return None
 
-    # ── Gestión de señales con 2 intentos e inversión en confirmación fallida ──
+    # ── Gestión de señales con 2 intentos, inversión y vuelta a original ──
 
     def _select_best_candidate(self, candidates):
         if not candidates:
@@ -1174,7 +1173,7 @@ class RouletteTable:
                 score = win_rate * (1 + amx_str)
                 candidates.append((agente, score, agente.candidate_signal))
 
-        # ── Estado: pendiente de confirmación (solo para intento 1) ──
+        # ── Estado: pendiente de confirmación ──
         if self.signal_status == "pending_confirmation":
             if self.pending_candidate is not None and self.pending_agent is not None:
                 bet_colors = self.pending_candidate["bet_colors"]
@@ -1182,7 +1181,7 @@ class RouletteTable:
                     self._color_match(last_number, color) for color in bet_colors
                 ))
                 if is_win:
-                    # La predicción fue correcta → descartar la señal
+                    # Confirmación correcta → descartar señal
                     log.info(f"✅ Confirmación: predicción correcta, señal descartada")
                     self.pending_agent = None
                     self.pending_candidate = None
@@ -1192,20 +1191,25 @@ class RouletteTable:
                         self.waiting_msg_id = None
                     return True
                 else:
-                    # Falló la predicción → calcular apuesta opuesta y enviar INTENTO 1
-                    opposite_colors = self._get_opposite_bet(self.pending_agent, self.pending_candidate["bet_colors"])
+                    # Confirmación fallida → guardar original y opuesto
+                    original_candidate = self.pending_candidate
+                    opposite_colors = self._get_opposite_bet(self.pending_agent, original_candidate["bet_colors"])
                     if opposite_colors:
-                        # Crear un candidato modificado con la apuesta opuesta
-                        modified_candidate = self.pending_candidate.copy()
-                        modified_candidate["bet_colors"] = opposite_colors
+                        opposite_candidate = original_candidate.copy()
+                        opposite_candidate["bet_colors"] = opposite_colors
                         log.info(f"❌ Confirmación: predicción fallida, enviando INTENTO 1 con apuesta opuesta {opposite_colors}")
-                        asyncio.create_task(self._send_entry(self.pending_agent, modified_candidate, bet_amount, 1))
-                        # Guardar en secuencia
-                        self.signal_sequence = [{"agent": self.pending_agent, "candidate": modified_candidate}]
+                        # Guardar secuencia con original y opuesto
+                        self.signal_sequence = [{
+                            "agent": self.pending_agent,
+                            "original": original_candidate,
+                            "opposite": opposite_candidate
+                        }]
                         self.current_attempt_index = 0
                         self.signal_status = "active"
                         self.attempt_numbers = []
                         self.entry_msg_ids = []
+                        # Enviar intento 1 con opuesto
+                        asyncio.create_task(self._send_entry(self.pending_agent, opposite_candidate, bet_amount, 1))
                         if self.waiting_msg_id:
                             asyncio.create_task(delete_msg(self.waiting_msg_id))
                             self.waiting_msg_id = None
@@ -1213,14 +1217,18 @@ class RouletteTable:
                         self.pending_candidate = None
                         return True
                     else:
-                        # Fallback: enviar señal original si no se pudo obtener el opuesto
+                        # No se puede calcular opuesto, usar original en intento 1
                         log.info(f"❌ Confirmación: predicción fallida, enviando INTENTO 1 (original)")
-                        asyncio.create_task(self._send_entry(self.pending_agent, self.pending_candidate, bet_amount, 1))
-                        self.signal_sequence = [{"agent": self.pending_agent, "candidate": self.pending_candidate}]
+                        self.signal_sequence = [{
+                            "agent": self.pending_agent,
+                            "original": original_candidate,
+                            "opposite": original_candidate  # si no hay opuesto, igual
+                        }]
                         self.current_attempt_index = 0
                         self.signal_status = "active"
                         self.attempt_numbers = []
                         self.entry_msg_ids = []
+                        asyncio.create_task(self._send_entry(self.pending_agent, original_candidate, bet_amount, 1))
                         if self.waiting_msg_id:
                             asyncio.create_task(delete_msg(self.waiting_msg_id))
                             self.waiting_msg_id = None
@@ -1231,7 +1239,7 @@ class RouletteTable:
                 self.signal_status = None
                 return True
 
-        # ── Si no hay secuencia activa, buscar señal y poner en confirmación ──
+        # ── Si no hay secuencia activa, buscar señal ──
         if self.signal_status is None:
             if not candidates:
                 return False
@@ -1254,9 +1262,15 @@ class RouletteTable:
 
             current_entry = self.signal_sequence[0]
             agent = current_entry["agent"]
-            candidate = current_entry["candidate"]
-            bet_colors = candidate["bet_colors"]
+            # Elegir el candidato según el intento
+            if self.current_attempt_index == 0:
+                candidate = current_entry["opposite"]  # intento 1: opuesto
+                label = "opuesta"
+            else:
+                candidate = current_entry["original"]  # intento 2: original
+                label = "original"
 
+            bet_colors = candidate["bet_colors"]
             is_win = (last_number is not None and any(
                 self._color_match(last_number, color) for color in bet_colors
             ))
@@ -1271,16 +1285,17 @@ class RouletteTable:
                 self.signal_status = "won"
                 winning_attempt = self.current_attempt_index + 1
                 asyncio.create_task(self._send_resolution(True, self.attempt_numbers, bet_amount, winning_attempt))
-                log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt}")
+                log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (apuesta {label})")
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
                 if self.current_attempt_index == 0:
-                    # Falló intento 1 → pasar a intento 2, repitiendo la misma señal (la opuesta)
+                    # Falló intento 1 → pasar a intento 2 con apuesta original
                     self.current_attempt_index = 1
                     new_bet = self.labouchere.get_bet()
-                    asyncio.create_task(self._send_entry(agent, candidate, new_bet, 2))
-                    log.info(f"🔄 REPITIENDO SEÑAL PARA INTENTO 2: {agent.name} -> {candidate['bet_colors']} (apuesta {format_cop(new_bet)})")
+                    # Enviar intento 2 con original
+                    asyncio.create_task(self._send_entry(agent, current_entry["original"], new_bet, 2))
+                    log.info(f"🔄 INTENTO 2: VOLVIENDO A APUESTA ORIGINAL {current_entry['original']['bet_colors']}")
                     return True
                 else:
                     # Falló intento 2 → pérdida definitiva
