@@ -9,15 +9,15 @@
 ║   - Filtros más estrictos: win_rate 0.55, muestras 10      ║
 ║   - Agente V5 (ababa): 3 selecciones consecutivas → desactivación temporal ║
 ║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
-║   - Todas las señales a 2 intentos                          ║
-║   - Selección de la mejor señal solo para intento 1         ║
-║   - Confirmación fallida → apuesta opuesta en intento 1     ║
-║   - Si falla intento 1, intento 2 vuelve a la apuesta original ║
-║   - Mensaje de espera: "☢️ POSIBLE CONFIRMACION ☢️"        ║
-║   - Mensajes: espera fallo -> señal1 (opuesta) -> (falla) señal2 (original) -> resolución -> marcador -> ciclo║
+║   - Todas las señales a 3 intentos                          ║
+║   - Confirmación de patrón con -1 valor                    ║
+║   - Mensaje: ☢️ POSIBLE CONFIRMACION ☢️                    ║
+║   - CERO (0) como pérdida inmediata en cualquier intento   ║
+║   - Intento 1: original, Intento 2: opuesto, Intento 3: original ║
+║   - Mensajes: confirmación -> (confirmación correcta) señal1 -> (falla o 0) señal2 -> (falla o 0) señal3 -> resolución -> marcador -> ciclo║
 ║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
-║   - Marcador diario con desglose por intento (Win1, Win2, Loss)║
-║   - Loss solo se contabiliza al fallar el intento 2        ║
+║   - Marcador diario con desglose por intento (Win1, Win2, Win3, Loss)║
+║   - Loss también por cero en cualquier intento             ║
 ║   - Entrenamiento inicial por bloques de 500 giros         ║
 ║   - Comando /status acortado                                ║
 ╚══════════════════════════════════════════════════════════════
@@ -54,7 +54,7 @@ LABOUCHERE_INITIAL_SEQUENCE = [1, 1, 1, 1, 1]
 LABOUCHERE_INFINITE_MODE   = True
 LABOUCHERE_INITIAL_CAPITAL = 0
 
-COLOR_MAX_ATTEMPTS = 2  # AHORA 2 INTENTOS
+COLOR_MAX_ATTEMPTS = 3  # AHORA 3 INTENTOS
 COLOR_BACKTEST_WINDOW = 80
 COLOR_CONTEXT_WINDOW = 20
 COLOR_MIN_SAMPLES_GATE = 10
@@ -466,17 +466,20 @@ def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) 
 def build_daily_marker_message(stats: dict) -> str:
     win1 = stats.get("win1", 0)
     win2 = stats.get("win2", 0)
+    win3 = stats.get("win3", 0)
     loss = stats.get("loss", 0)
-    total = win1 + win2 + loss
+    total = win1 + win2 + win3 + loss
     if total == 0:
         return "📆 MARCADOR DIARIO\nSin señales aún."
     win1_pct = (win1 / total) * 100
     win2_pct = (win2 / total) * 100
+    win3_pct = (win3 / total) * 100
     loss_pct = (loss / total) * 100
-    global_pct = ((win1 + win2) / total) * 100
+    global_pct = ((win1 + win2 + win3) / total) * 100
     return (f"📆 MARCADOR DIARIO\n"
             f"✅ Win 1: {win1} | Acierto: {win1_pct:.2f}%\n"
             f"✅ Win 2: {win2} | Acierto: {win2_pct:.2f}%\n"
+            f"✅ Win 3: {win3} | Acierto: {win3_pct:.2f}%\n"
             f"❌ Loss: {loss} | Fallos: {loss_pct:.2f}%\n"
             f"🎯 Total señales: {total}\n"
             f"📈 Efectividad Global: {global_pct:.2f}%")
@@ -519,11 +522,11 @@ if bot is not None:
             log.warning(f"[Telegram] Error respondiendo /status: {e}")
 
 # ──────────────────────────────────────────────
-# DAILY MARKER (ahora con win1, win2, loss)
+# DAILY MARKER (con win1, win2, win3, loss)
 # ──────────────────────────────────────────────
 class DailyMarker:
     def __init__(self, thread_signals=None):
-        self.stats = {"win1": 0, "win2": 0, "loss": 0}
+        self.stats = {"win1": 0, "win2": 0, "win3": 0, "loss": 0}
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
 
     async def record(self, win: bool, attempt: int = None):
@@ -531,6 +534,8 @@ class DailyMarker:
             self.stats["win1"] = self.stats.get("win1", 0) + 1
         elif win and attempt == 2:
             self.stats["win2"] = self.stats.get("win2", 0) + 1
+        elif win and attempt == 3:
+            self.stats["win3"] = self.stats.get("win3", 0) + 1
         elif not win:
             self.stats["loss"] = self.stats.get("loss", 0) + 1
 
@@ -580,7 +585,10 @@ class ColorPatternAgent:
         self.trained_snapshot = {}
         self.consecutive_signals = 0
         self.signal_enabled = True
-        self.candidate_signal = None
+        # Nuevos atributos para confirmación de patrón (-1 valor)
+        self.confirming = False
+        self.pending_pattern = None
+        self.pending_agent = None
 
     def _match(self, window):
         if len(window) != self.pattern_len:
@@ -614,6 +622,70 @@ class ColorPatternAgent:
         if not (ok and a in self.values and b in self.values and a != b):
             return None
         return (a, b)
+
+    def _match_partial(self, window):
+        """Verifica si el prefijo de longitud pattern_len - 1 coincide con el patrón."""
+        if len(window) != self.pattern_len - 1:
+            return None
+        # Construir el patrón esperado según el modo
+        # Simulamos la última posición con None
+        if self.mode == "aaaba":
+            if len(window) < 4: return None
+            a, b = window[0], window[3]  # el último valor esperado sería a
+            ok = (window[1] == a and window[2] == a and window[3] == b)
+            expected_last = a if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aaaba")
+        elif self.mode == "aaabbaa":
+            if len(window) < 6: return None
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[3] == b and window[4] == a and window[5] == a)
+            expected_last = b if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aaabbaa")
+        elif self.mode == "aabbaa":
+            if len(window) < 5: return None
+            a, b = window[0], window[2]
+            ok = (window[1] == a and window[2] == b and window[3] == a and window[4] == a)
+            expected_last = b if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aabbaa")
+        elif self.mode == "ababa":
+            if len(window) < 4: return None
+            a, b = window[0], window[1]
+            ok = (window[2] == a and window[3] == b)
+            expected_last = a if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "ababa")
+        elif self.mode == "aaabbb":
+            if len(window) < 5: return None
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[3] == b and window[4] == b)
+            expected_last = b if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aaabbb")
+        elif self.mode == "aaaaba":
+            if len(window) < 5: return None
+            a, b = window[0], window[4]
+            ok = (window[1] == a and window[2] == a and window[3] == a and window[4] == b)
+            expected_last = a if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aaaaba")
+        elif self.mode == "aaabaaa":
+            if len(window) < 6: return None
+            a, b = window[0], window[3]
+            ok = (window[1] == a and window[2] == a and window[3] == b and window[4] == a and window[5] == a)
+            expected_last = b if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aaabaaa")
+        elif self.mode == "aaabaa":
+            if len(window) < 5: return None
+            a, b = window[0], window[2]
+            ok = (window[1] == a and window[2] == b and window[3] == a and window[4] == a)
+            expected_last = b if ok else None
+            if ok and a in self.values and b in self.values and a != b:
+                return (a, b, expected_last, "aaabaa")
+        return None
 
     def _bet_colors(self, pattern):
         if self.target_symbol == 'a':
@@ -677,7 +749,6 @@ class ColorPatternAgent:
         self.last_train_ts = timestamp
 
     def force_train(self, timestamp: float):
-        """Fuerza el entrenamiento del agente con los datos actuales (sin condiciones)."""
         self._train(timestamp)
 
     def _win_rate(self, pattern):
@@ -829,39 +900,73 @@ class ColorPatternAgent:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        if (not self.train_state["active"]
-                and len(color_history) >= self.pattern_len
-                and len(color_history) >= COLOR_MIN_SPIN_TO_SIGNAL):
-            pattern = self._match(color_history[-self.pattern_len:])
-            direction = "change"
-            if pattern and self._ml_should_signal(pattern, trend_colors, amx_strength_val):
-                bet_colors = self._bet_colors(pattern)
+        # ── Si no estamos en confirmación, buscar patrón parcial ──
+        if (not self.train_state["active"] and not self.confirming
+                and len(color_history) >= self.pattern_len - 1):
+            # Buscar coincidencia parcial (penúltimo valor)
+            partial = self._match_partial(color_history[-self.pattern_len + 1:])
+            if partial:
+                a, b, expected_last, mode = partial
+                # Verificar si el patrón completo sería válido
+                if self._ml_should_signal((a, b), trend_colors, amx_strength_val):
+                    # Guardar estado de confirmación
+                    self.confirming = True
+                    self.pending_pattern = (a, b, expected_last, mode)
+                    # Generar candidato para confirmación (se usará en tabla)
+                    bet_colors = self._bet_colors((a, b)) if self.target_symbol == 'a' else self._bet_colors((a, b))
+                    context = list(color_history[-COLOR_CONTEXT_WINDOW:])
+                    context_signature = self._get_context_signature(color_history, trend, amx_strength_val, "change")
+                    self.candidate_signal = {
+                        "pattern": (a, b),
+                        "bet_colors": bet_colors,
+                        "context": context,
+                        "direction": "change",
+                        "start_attempt": 1,
+                        "spins_until_start": 0,
+                        "waiting_for_start": False,
+                        "context_signature": context_signature,
+                        "filters": {},
+                        "amx_strength": amx_strength_val,
+                        "score": self._win_rate((a, b)) or 0.0,
+                        "confirming": True,
+                        "expected_last": expected_last,
+                    }
+                    log.info(f"🔍 {self.name} confirmación pendiente: patrón parcial {a},{b}, esperado {expected_last}")
+                    return
+
+        # ── Si estamos en confirmación, evaluar el último valor ──
+        if self.confirming and self.pending_pattern:
+            a, b, expected_last, mode = self.pending_pattern
+            # Obtener el valor actual del número
+            current_value = last  # last es el color/zona/paridad actual
+            # Verificar si coincide con expected_last
+            if current_value == expected_last:
+                # Confirmación correcta → generar señal completa
+                pattern = (a, b)
+                bet_colors = self._bet_colors(pattern) if self.target_symbol == 'a' else self._bet_colors(pattern)
                 context = list(color_history[-COLOR_CONTEXT_WINDOW:])
-                context_signature = self._get_context_signature(color_history, trend, amx_strength_val, direction)
-                current_filters = {
-                    "trend": trend,
-                    "amx_strength": amx_strength_val,
-                    "direction": direction,
-                    "trend_colors": list(trend_colors) if trend_colors else []
-                }
-                start_attempt, start_pct = self._recommended_start_attempt(pattern, context_signature, current_filters)
+                context_signature = self._get_context_signature(color_history, trend, amx_strength_val, "change")
                 self.candidate_signal = {
                     "pattern": pattern,
                     "bet_colors": bet_colors,
                     "context": context,
-                    "direction": direction,
-                    "start_attempt": start_attempt,
-                    "spins_until_start": start_attempt - 1,
-                    "waiting_for_start": start_attempt > 1,
+                    "direction": "change",
+                    "start_attempt": 1,
+                    "spins_until_start": 0,
+                    "waiting_for_start": False,
                     "context_signature": context_signature,
-                    "filters": current_filters,
+                    "filters": {},
                     "amx_strength": amx_strength_val,
                     "score": self._win_rate(pattern) or 0.0,
+                    "confirming": False,
                 }
-                if self.mode == "ababa" and not self.signal_enabled:
-                    self.signal_enabled = True
-                    self.consecutive_signals = 0
-                    log.info(f"🔄 {self.name} reactivado (nuevas condiciones)")
+                log.info(f"✅ {self.name} confirmación correcta, enviando señal {pattern}")
+            else:
+                # Confirmación fallida → descartar
+                log.info(f"❌ {self.name} confirmación fallida: esperaba {expected_last}, obtuve {current_value}")
+                self.candidate_signal = None
+            self.confirming = False
+            self.pending_pattern = None
 
     def _close_shadow(self, win: bool, result_color, attempt, timestamp, state: dict):
         pattern = tuple(state["pattern"])
@@ -928,6 +1033,7 @@ class ColorPatternAgent:
             "pattern_recommendations": pattern_recommendations,
             "signal_enabled": self.signal_enabled,
             "consecutive_signals": self.consecutive_signals,
+            "confirming": self.confirming,
             "ml_model": {
                 "trained": self.trained,
                 "total_processed": self.total_processed,
@@ -969,7 +1075,7 @@ class ColorPatternAgent:
         self.signal_enabled = data.get("signal_enabled", True)
 
 # ══════════════════════════════════════════════
-# ROULETTE TABLE (con 2 intentos, inversión en confirmación fallida y vuelta a original en intento 2)
+# ROULETTE TABLE (con confirmación de patrón -1 valor y cero como pérdida)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -987,12 +1093,13 @@ class RouletteTable:
         self.cycle_pending = 0
 
         # Estados de secuencia
-        self.signal_sequence = []          # contendrá: {"agent": agente, "original": candidato_original, "opposite": candidato_opuesto}
-        self.current_attempt_index = 0     # 0 para intento 1, 1 para intento 2
-        self.signal_status = None          # None, 'pending_confirmation', 'active', 'won', 'lost'
+        self.signal_sequence = []
+        self.current_attempt_index = 0
+        self.signal_status = None
         self.attempt_numbers = []
         self.entry_msg_ids = []
-        self.waiting_msg_id = None
+        self.confirmation_msg_id = None
+        self.confirming = False  # si estamos esperando confirmación de patrón
 
         self.pending_agent = None
         self.pending_candidate = None
@@ -1075,7 +1182,6 @@ class RouletteTable:
 
     # ── Auxiliar para obtener la apuesta opuesta ──
     def _get_opposite_bet(self, agent, bet_colors):
-        """Devuelve la apuesta contraria (tupla) para la categoría del agente."""
         if not bet_colors:
             return None
         current = bet_colors[0]
@@ -1087,13 +1193,18 @@ class RouletteTable:
                 return (values[0],)
         return None
 
-    # ── Gestión de señales con 2 intentos, inversión y vuelta a original ──
+    # ── Gestión de señales con confirmación -1 valor y cero como pérdida ──
 
     def _select_best_candidate(self, candidates):
         if not candidates:
             return None, None
         best_agent, best_score, best_candidate = max(candidates, key=lambda x: x[1])
         return best_agent, best_candidate
+
+    async def _send_confirmation(self):
+        msg = "☢️ POSIBLE CONFIRMACION ☢️"
+        self.confirmation_msg_id = await send_msg(msg, THREAD_SIGNALS)
+        return self.confirmation_msg_id
 
     async def _send_entry(self, agent, candidate, bet_amount, attempt_number):
         seq_txt = self.labouchere.seq_str()
@@ -1119,12 +1230,6 @@ class RouletteTable:
                 await delete_msg(prev_id)
         return msg_id
 
-    async def _send_waiting_message(self, text: str = "☢️ POSIBLE CONFIRMACION ☢️"):
-        if self.waiting_msg_id:
-            await delete_msg(self.waiting_msg_id)
-        self.waiting_msg_id = await send_msg(text, THREAD_SIGNALS)
-        return self.waiting_msg_id
-
     async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int, winning_attempt: int = None):
         res_text = build_resolution_message(win, attempt_numbers, bet_amount)
         await send_msg(res_text, THREAD_SIGNALS)
@@ -1137,7 +1242,8 @@ class RouletteTable:
         await send_msg(simple, THREAD_STATS)
 
     async def _send_daily_marker_and_cycle(self):
-        if self.daily_marker.stats.get("win1", 0) + self.daily_marker.stats.get("win2", 0) + self.daily_marker.stats.get("loss", 0) > 0:
+        total = self.daily_marker.stats.get("win1", 0) + self.daily_marker.stats.get("win2", 0) + self.daily_marker.stats.get("win3", 0) + self.daily_marker.stats.get("loss", 0)
+        if total > 0:
             text = build_daily_marker_message(self.daily_marker.stats)
             await send_msg(text, self.daily_marker.thread_signals)
         if self.cycle_pending > 0:
@@ -1159,87 +1265,44 @@ class RouletteTable:
         self.entry_msg_ids = []
         self.pending_agent = None
         self.pending_candidate = None
-        if self.waiting_msg_id:
-            asyncio.create_task(delete_msg(self.waiting_msg_id))
-            self.waiting_msg_id = None
+        self.confirming = False
+        if self.confirmation_msg_id:
+            asyncio.create_task(delete_msg(self.confirmation_msg_id))
+            self.confirmation_msg_id = None
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
+        # Recolectar candidatos de todos los agentes
         candidates = []
         for agente in all_agents:
             if agente.candidate_signal is not None:
-                pattern = agente.candidate_signal["pattern"]
-                win_rate = agente._win_rate(pattern) or 0.0
-                amx_str = agente.candidate_signal.get("amx_strength", 0.0)
-                score = win_rate * (1 + amx_str)
-                candidates.append((agente, score, agente.candidate_signal))
-
-        # ── Estado: pendiente de confirmación ──
-        if self.signal_status == "pending_confirmation":
-            if self.pending_candidate is not None and self.pending_agent is not None:
-                bet_colors = self.pending_candidate["bet_colors"]
-                is_win = (last_number is not None and any(
-                    self._color_match(last_number, color) for color in bet_colors
-                ))
-                if is_win:
-                    # Confirmación correcta → descartar señal
-                    log.info(f"✅ Confirmación: predicción correcta, señal descartada")
-                    self.pending_agent = None
-                    self.pending_candidate = None
-                    self.signal_status = None
-                    if self.waiting_msg_id:
-                        asyncio.create_task(delete_msg(self.waiting_msg_id))
-                        self.waiting_msg_id = None
-                    return True
-                else:
-                    # Confirmación fallida → guardar original y opuesto
-                    original_candidate = self.pending_candidate
-                    opposite_colors = self._get_opposite_bet(self.pending_agent, original_candidate["bet_colors"])
-                    if opposite_colors:
-                        opposite_candidate = original_candidate.copy()
-                        opposite_candidate["bet_colors"] = opposite_colors
-                        log.info(f"❌ Confirmación: predicción fallida, enviando INTENTO 1 con apuesta opuesta {opposite_colors}")
-                        # Guardar secuencia con original y opuesto
-                        self.signal_sequence = [{
-                            "agent": self.pending_agent,
-                            "original": original_candidate,
-                            "opposite": opposite_candidate
-                        }]
-                        self.current_attempt_index = 0
-                        self.signal_status = "active"
-                        self.attempt_numbers = []
-                        self.entry_msg_ids = []
-                        # Enviar intento 1 con opuesto
-                        asyncio.create_task(self._send_entry(self.pending_agent, opposite_candidate, bet_amount, 1))
-                        if self.waiting_msg_id:
-                            asyncio.create_task(delete_msg(self.waiting_msg_id))
-                            self.waiting_msg_id = None
-                        self.pending_agent = None
-                        self.pending_candidate = None
+                # Verificar si es un candidato de confirmación o una señal real
+                if agente.candidate_signal.get("confirming", False):
+                    # Candidato de confirmación: enviamos mensaje de confirmación y marcamos estado
+                    if not self.confirming and self.signal_status is None:
+                        self.pending_agent = agente
+                        self.pending_candidate = agente.candidate_signal
+                        self.confirming = True
+                        asyncio.create_task(self._send_confirmation())
+                        log.info(f"🔍 Confirmación de patrón pendiente para {agente.name}")
+                        agente.candidate_signal = None  # evitar reuso
                         return True
                     else:
-                        # No se puede calcular opuesto, usar original en intento 1
-                        log.info(f"❌ Confirmación: predicción fallida, enviando INTENTO 1 (original)")
-                        self.signal_sequence = [{
-                            "agent": self.pending_agent,
-                            "original": original_candidate,
-                            "opposite": original_candidate  # si no hay opuesto, igual
-                        }]
-                        self.current_attempt_index = 0
-                        self.signal_status = "active"
-                        self.attempt_numbers = []
-                        self.entry_msg_ids = []
-                        asyncio.create_task(self._send_entry(self.pending_agent, original_candidate, bet_amount, 1))
-                        if self.waiting_msg_id:
-                            asyncio.create_task(delete_msg(self.waiting_msg_id))
-                            self.waiting_msg_id = None
-                        self.pending_agent = None
-                        self.pending_candidate = None
+                        # Si ya hay confirmación pendiente, ignorar otros
                         return True
-            else:
-                self.signal_status = None
-                return True
+                else:
+                    # Es una señal real
+                    pattern = agente.candidate_signal["pattern"]
+                    win_rate = agente._win_rate(pattern) or 0.0
+                    amx_str = agente.candidate_signal.get("amx_strength", 0.0)
+                    score = win_rate * (1 + amx_str)
+                    candidates.append((agente, score, agente.candidate_signal))
 
-        # ── Si no hay secuencia activa, buscar señal ──
+        # ── Si estamos en confirmación, ya se envió el mensaje, esperar al siguiente giro ──
+        if self.confirming:
+            # En el siguiente giro, la confirmación se resuelve sola
+            return True
+
+        # ── Si no hay secuencia activa, buscar candidato real ──
         if self.signal_status is None:
             if not candidates:
                 return False
@@ -1247,11 +1310,23 @@ class RouletteTable:
             if best_agent is None:
                 return False
 
-            self.pending_agent = best_agent
-            self.pending_candidate = best_candidate
-            self.signal_status = "pending_confirmation"
-            asyncio.create_task(self._send_waiting_message("☢️ POSIBLE CONFIRMACION ☢️"))
-            log.info(f"⏳ Esperando confirmación de fallo para: {best_agent.name} -> {best_candidate['bet_colors']}")
+            # Guardar secuencia con original y opuesto
+            opposite = self._get_opposite_bet(best_agent, best_candidate["bet_colors"])
+            opposite_candidate = best_candidate.copy() if opposite else None
+            if opposite:
+                opposite_candidate["bet_colors"] = opposite
+            self.signal_sequence = [{
+                "agent": best_agent,
+                "original": best_candidate,
+                "opposite": opposite_candidate if opposite else best_candidate
+            }]
+            self.current_attempt_index = 0
+            self.signal_status = "active"
+            self.attempt_numbers = []
+            self.entry_msg_ids = []
+            # Enviar intento 1 con original
+            asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 1))
+            log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> {best_candidate['bet_colors']}")
             return True
 
         # ── Si hay secuencia activa, procesar el intento actual ──
@@ -1262,15 +1337,29 @@ class RouletteTable:
 
             current_entry = self.signal_sequence[0]
             agent = current_entry["agent"]
+
             # Elegir el candidato según el intento
             if self.current_attempt_index == 0:
-                candidate = current_entry["opposite"]  # intento 1: opuesto
+                candidate = current_entry["original"]
+                label = "original"
+            elif self.current_attempt_index == 1:
+                candidate = current_entry["opposite"]
                 label = "opuesta"
             else:
-                candidate = current_entry["original"]  # intento 2: original
+                candidate = current_entry["original"]
                 label = "original"
 
             bet_colors = candidate["bet_colors"]
+            # Verificar si el número es 0 (pérdida inmediata)
+            if last_number == 0:
+                # CERO -> pérdida inmediata
+                log.info(f"🚫 CERO en intento {self.current_attempt_index+1} - pérdida inmediata")
+                self.attempt_numbers.append(0)
+                self.signal_status = "lost"
+                asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
+                self._finalize_sequence(False, None)
+                return True
+
             is_win = (last_number is not None and any(
                 self._color_match(last_number, color) for color in bet_colors
             ))
@@ -1289,25 +1378,32 @@ class RouletteTable:
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
-                if self.current_attempt_index == 0:
-                    # Falló intento 1 → pasar a intento 2 con apuesta original
-                    self.current_attempt_index = 1
+                if self.current_attempt_index < 2:
+                    # Falló el intento actual, pasar al siguiente
+                    self.current_attempt_index += 1
                     new_bet = self.labouchere.get_bet()
-                    # Enviar intento 2 con original
-                    asyncio.create_task(self._send_entry(agent, current_entry["original"], new_bet, 2))
-                    log.info(f"🔄 INTENTO 2: VOLVIENDO A APUESTA ORIGINAL {current_entry['original']['bet_colors']}")
+                    if self.current_attempt_index == 1:
+                        next_candidate = current_entry["opposite"]
+                        label = "opuesta"
+                    else:
+                        next_candidate = current_entry["original"]
+                        label = "original"
+                    asyncio.create_task(self._send_entry(agent, next_candidate, new_bet, self.current_attempt_index+1))
+                    log.info(f"🔄 INTENTO {self.current_attempt_index+1}: apuesta {label} {next_candidate['bet_colors']}")
                     return True
                 else:
-                    # Falló intento 2 → pérdida definitiva
+                    # Falló intento 3 → pérdida definitiva
                     self.signal_status = "lost"
                     asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
-                    log.info(f"❌ SECUENCIA PERDIDA (2 intentos fallidos)")
+                    log.info(f"❌ SECUENCIA PERDIDA (3 intentos fallidos)")
                     self._finalize_sequence(False, None)
                     return True
 
         return False
 
     def _color_match(self, number, color_label):
+        if number == 0:
+            return False  # cero nunca coincide
         if color_label in ("ROJO", "NEGRO"):
             return color_of(number) == color_label
         elif color_label in ("BAJA", "ALTA"):
@@ -1404,7 +1500,7 @@ class RouletteTable:
         paridad_category_ready = table_ready and (paridad_processed >= CATEGORY_MIN_PROCESSED_LIVE or training)
         bet_amount = self.labouchere.get_bet()
 
-        # ── Actualizar agentes (modo entrenamiento o vivo) ──
+        # ── Actualizar agentes ──
         for agente, key in zip(zone_agent_list, zone_agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
             method = config.get("method", "amx")
@@ -1552,7 +1648,7 @@ class RouletteTable:
             "live_spins_seen": self.live_spins_seen,
             "signal_status": self.signal_status,
             "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
-            "total_attempts": 2 if self.signal_status == "active" else 0,
+            "total_attempts": 3 if self.signal_status == "active" else 0,
         }
 
 # ══════════════════════════════════════════════
