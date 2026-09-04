@@ -2106,4 +2106,4 @@ async def main():
             server_state.save_all_models()
 
     async def on_spin(key: int, num: int, emit: bool, training: bool = False):
-        await server_state.update_mesa(key, num, broadcast=emit, trainin
+        await server_state.update_mesa(key, num, broadcast=emit, trainin)
