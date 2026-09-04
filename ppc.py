@@ -1258,45 +1258,40 @@ class RouletteTable:
             self.confirmation_msg_id = None
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
-        # Recolectar candidatos de todos los agentes
+        # Recolectar candidatos de todos los agentes SIN cortar el loop:
+        # antes, el primer agente con una confirmación pendiente hacía
+        # `return True` de inmediato, y eso podía descartar una señal real
+        # ya confirmada este mismo giro por otro agente (nunca llegaba a
+        # convertirse en ENTRADA INTENTO 1). Ahora solo recolectamos.
         candidates = []
         confirmation_resolved = False
+        new_confirming_agent = None
 
         for agente in all_agents:
-            # ── FIX: detectar si el agente pendiente de confirmación ya la resolvió ──
-            # (su propio 'confirming' pasó a False este giro, ya sea que haya
-            # confirmado el patrón o que la confirmación haya fallado)
+            # ── Detectar si el agente pendiente de confirmación ya la resolvió ──
             if self.confirming and agente is self.pending_agent and not agente.confirming:
                 confirmation_resolved = True
 
-            if agente.candidate_signal is not None:
-                # Verificar si es un candidato de confirmación o una señal real
-                if agente.candidate_signal.get("confirming", False):
-                    # Candidato de confirmación: enviamos mensaje de confirmación y marcamos estado
-                    if not self.confirming and self.signal_status is None:
-                        self.pending_agent = agente
-                        self.pending_candidate = agente.candidate_signal
-                        self.confirming = True
-                        asyncio.create_task(self._send_confirmation())
-                        log.info(f"🔍 Confirmación de patrón pendiente para {agente.name}")
-                        agente.candidate_signal = None  # evitar reuso
-                        return True
-                    else:
-                        # Si ya hay confirmación pendiente, ignorar otros
-                        return True
-                else:
-                    # Es una señal real
-                    pattern = agente.candidate_signal["pattern"]
-                    win_rate = agente._win_rate(pattern) or 0.0
-                    amx_str = agente.candidate_signal.get("amx_strength", 0.0)
-                    score = win_rate * (1 + amx_str)
-                    candidates.append((agente, score, agente.candidate_signal))
+            if agente.candidate_signal is None:
+                continue
 
-        # ── FIX: liberar el estado de confirmación de la tabla si ya se resolvió ──
-        # Antes, self.confirming solo se reseteaba en _finalize_sequence(), lo que
-        # dejaba la tabla trabada en modo "confirmando" para siempre después de la
-        # primera confirmación (exitosa o fallida), impidiendo que se armara y
-        # enviara cualquier señal real de ahí en adelante.
+            if agente.candidate_signal.get("confirming", False):
+                # Solo tomamos una confirmación NUEVA si no hay secuencia
+                # activa, no hay ya una confirmación en curso, y todavía no
+                # elegimos otra este mismo giro. Si no aplica ahora, se
+                # descarta (el propio agente la re-evaluará si corresponde).
+                if (self.signal_status is None and not self.confirming
+                        and new_confirming_agent is None):
+                    new_confirming_agent = agente
+            else:
+                # Es una señal real
+                pattern = agente.candidate_signal["pattern"]
+                win_rate = agente._win_rate(pattern) or 0.0
+                amx_str = agente.candidate_signal.get("amx_strength", 0.0)
+                score = win_rate * (1 + amx_str)
+                candidates.append((agente, score, agente.candidate_signal))
+
+        # ── Liberar el estado de confirmación de la tabla si ya se resolvió ──
         if self.confirming and confirmation_resolved:
             self.confirming = False
             if self.confirmation_msg_id:
@@ -1305,38 +1300,7 @@ class RouletteTable:
             self.pending_agent = None
             self.pending_candidate = None
 
-        # ── Si seguimos en confirmación (todavía no llegó el giro de resolución) ──
-        if self.confirming:
-            return True
-
-        # ── Si no hay secuencia activa, buscar candidato real ──
-        if self.signal_status is None:
-            if not candidates:
-                return False
-            best_agent, best_candidate = self._select_best_candidate(candidates)
-            if best_agent is None:
-                return False
-
-            # Guardar secuencia con original y opuesto
-            opposite = self._get_opposite_bet(best_agent, best_candidate["bet_colors"])
-            opposite_candidate = best_candidate.copy() if opposite else None
-            if opposite:
-                opposite_candidate["bet_colors"] = opposite
-            self.signal_sequence = [{
-                "agent": best_agent,
-                "original": best_candidate,
-                "opposite": opposite_candidate if opposite else best_candidate
-            }]
-            self.current_attempt_index = 0
-            self.signal_status = "active"
-            self.attempt_numbers = []
-            self.entry_msg_ids = []
-            # Enviar intento 1 con original
-            asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 1))
-            log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> {best_candidate['bet_colors']}")
-            return True
-
-        # ── Si hay secuencia activa, procesar el intento actual ──
+        # ── Prioridad 1: hay una secuencia activa → resolver el intento en curso ──
         if self.signal_status == "active":
             if not self.signal_sequence:
                 self.signal_status = None
@@ -1405,6 +1369,41 @@ class RouletteTable:
                     log.info(f"❌ SECUENCIA PERDIDA (3 intentos fallidos)")
                     self._finalize_sequence(False, None)
                     return True
+
+        # ── Prioridad 2: seguimos esperando el giro de confirmación ──
+        if self.confirming:
+            return True
+
+        # ── Prioridad 3: hay señal(es) real(es) confirmada(s) este giro → entrar ──
+        if candidates:
+            best_agent, best_candidate = self._select_best_candidate(candidates)
+            if best_agent is not None:
+                opposite = self._get_opposite_bet(best_agent, best_candidate["bet_colors"])
+                opposite_candidate = best_candidate.copy() if opposite else None
+                if opposite:
+                    opposite_candidate["bet_colors"] = opposite
+                self.signal_sequence = [{
+                    "agent": best_agent,
+                    "original": best_candidate,
+                    "opposite": opposite_candidate if opposite else best_candidate
+                }]
+                self.current_attempt_index = 0
+                self.signal_status = "active"
+                self.attempt_numbers = []
+                self.entry_msg_ids = []
+                asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 1))
+                log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> {best_candidate['bet_colors']}")
+                return True
+
+        # ── Prioridad 4: nada activo/pendiente → abrir una confirmación nueva ──
+        if new_confirming_agent is not None:
+            self.pending_agent = new_confirming_agent
+            self.pending_candidate = new_confirming_agent.candidate_signal
+            self.confirming = True
+            asyncio.create_task(self._send_confirmation())
+            log.info(f"🔍 Confirmación de patrón pendiente para {new_confirming_agent.name}")
+            new_confirming_agent.candidate_signal = None
+            return True
 
         return False
 
