@@ -1,28 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║   SERVIDOR ADAPTATIVO — AZURE ROULETTE (key 227)              ║
-║   - 8 agentes de COLOR, 8 de ZONA, 8 de PARIDAD              ║
-║   - ML adaptativo con tendencia AMX y EMA (50,70,200)       ║
-║   - Gestión Labouchere GLOBAL (base 500 COP)                ║
-║   - Persistencia y aprendizaje continuo                    ║
-║   - Parámetros ajustados para efectividad ~85%             ║
-║   - Filtros más estrictos: win_rate 0.55, muestras 10      ║
-║   - Agente V5 (ababa): 3 selecciones consecutivas → desactivación temporal ║
-║   - Nuevos patrones V7 (aaabaaa) y V8 (aaabaa)             ║
-║   - Todas las señales a 3 intentos                          ║
-║   - Confirmación de patrón con -1 valor                    ║
-║   - Mensaje: ☢️ POSIBLE CONFIRMACION ☢️                    ║
-║   - CERO (0) como pérdida inmediata en cualquier intento   ║
-║   - Intento 1: original, Intento 2: opuesto, Intento 3: original ║
-║   - Mensajes: confirmación -> (confirmación correcta) señal1 -> (falla o 0) señal2 -> (falla o 0) señal3 -> resolución -> marcador -> ciclo║
-║   - Formato de señal: "🚨🚨 ENTRADA INTENTO X 🚨🚨"        ║
-║   - Marcador diario con desglose por intento (Win1, Win2, Win3, Loss)║
-║   - Loss también por cero en cualquier intento             ║
-║   - Entrenamiento inicial por bloques de 500 giros         ║
-║   - Comando /status acortado                                ║
-║   - FIX: liberación correcta del estado de confirmación    ║
-╚══════════════════════════════════════════════════════════════
-"""
 import asyncio
 import json
 import logging
@@ -2106,4 +2081,34 @@ async def main():
             server_state.save_all_models()
 
     async def on_spin(key: int, num: int, emit: bool, training: bool = False):
-        await server_state.update_mesa(key, num, broadcast=emit, trainin)
+        await server_state.update_mesa(key, num, broadcast=emit, training=training)
+
+    tasks = []
+    for key in ROULETTE_KEYS.values():
+        handler = PragmaticWebSocketHandler(key, lambda num, emit, training=False, k=key: on_spin(k, num, emit, training))
+        tasks.append(asyncio.create_task(handler.run()))
+    tasks.append(asyncio.create_task(save_loop()))
+    tasks.append(asyncio.create_task(self_ping_loop()))
+    if bot is not None:
+        tasks.append(asyncio.create_task(bot_polling_loop()))
+
+    port = int(os.environ.get("PORT", 10000))
+    app = build_http_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Servidor HTTP/WebSocket escuchando en puerto {port}")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Servidor detenido")
