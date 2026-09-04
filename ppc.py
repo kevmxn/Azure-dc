@@ -33,23 +33,23 @@ LABOUCHERE_INITIAL_CAPITAL = 0
 COLOR_MAX_ATTEMPTS = 3  # AHORA 3 INTENTOS
 COLOR_BACKTEST_WINDOW = 80
 COLOR_CONTEXT_WINDOW = 20
-COLOR_MIN_SAMPLES_GATE = 10
-COLOR_MIN_WIN_RATE = 0.55
-COLOR_MIN_SPIN_TO_SIGNAL = 21
+COLOR_MIN_SAMPLES_GATE = 30       # antes 10 -> exige mucha más muestra histórica antes de confiar en un patrón
+COLOR_MIN_WIN_RATE = 0.75         # antes 0.55 -> solo patrones con win-rate alto en backtest
+COLOR_MIN_SPIN_TO_SIGNAL = 40     # antes 21 -> más giros acumulados antes de empezar a señalar
 COLOR_ANALYSIS_WINDOW = 3
-CONTEXT_SIMILARITY_THRESHOLD = 0.85
+CONTEXT_SIMILARITY_THRESHOLD = 0.95   # antes 0.85 -> exige contexto casi idéntico
 
-LIVE_MIN_SPINS_TO_SIGNAL = 21
-ML_MIN_SIGNALS_TO_TRAIN = 50
+LIVE_MIN_SPINS_TO_SIGNAL = 40     # antes 21
+ML_MIN_SIGNALS_TO_TRAIN = 100     # antes 50 -> más señales de entrenamiento antes de confiar en el modelo
 ML_RETRAIN_INTERVAL_SECONDS = 30 * 60
 TABLE_MIN_SPINS_LIVE = 500
-CATEGORY_MIN_PROCESSED_LIVE = 120
-LIVE_FASTTRACK_MIN_SAMPLES = 10
-LIVE_FASTTRACK_MIN_WIN_RATE = 0.90
+CATEGORY_MIN_PROCESSED_LIVE = 200  # antes 120
+LIVE_FASTTRACK_MIN_SAMPLES = 25    # antes 10
+LIVE_FASTTRACK_MIN_WIN_RATE = 0.97 # antes 0.90
 
-AMX_STRENGTH_THRESHOLDS = {"strong": 1.0, "weak": 0.5}
-AMX_ADJUST_FACTOR_STRONG = 0.7
-AMX_ADJUST_FACTOR_WEAK = 0.9
+AMX_STRENGTH_THRESHOLDS = {"strong": 1.3, "weak": 0.8}   # antes 1.0 / 0.5 -> tendencia "fuerte" más exigente
+AMX_ADJUST_FACTOR_STRONG = 0.9    # antes 0.7 -> casi no relaja el umbral aunque la tendencia sea fuerte
+AMX_ADJUST_FACTOR_WEAK = 1.05     # antes 0.9 -> con tendencia débil exige AÚN más que la base
 
 COLOR_COOLDOWN_AFTER_LOSSES = 3
 COLOR_COOLDOWN_ROUNDS = 5
@@ -820,7 +820,7 @@ class ColorPatternAgent:
             required_rate = base_rate * AMX_ADJUST_FACTOR_WEAK
         else:
             required_rate = base_rate
-        required_rate = max(0.45, min(0.75, required_rate))
+        required_rate = max(0.70, min(0.92, required_rate))
         if self._gated(pattern, required_rate):
             return False
         return True
