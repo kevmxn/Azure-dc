@@ -937,6 +937,14 @@ class ColorPatternAgent:
                     "confirming": False,
                 }
                 log.info(f"✅ {self.name} confirmación correcta, enviando señal {pattern}")
+                # Activar seguimiento shadow para que se registre el resultado en stats
+                self.train_state = {
+                    "active": True, "pattern": pattern, "bet_colors": bet_colors,
+                    "attempts_left": COLOR_MAX_ATTEMPTS, "total_attempts": COLOR_MAX_ATTEMPTS,
+                    "context": context, "bet_amount": 0, "current_attempt": 0,
+                    "waiting_for_start": False, "spins_until_start": 0, "start_attempt": 1,
+                    "direction": "change", "context_signature": context_signature, "filters": {},
+                }
                 # Resetear estado de confirmación para permitir procesar la señal
                 self.confirming = False
                 self.pending_pattern = None
