@@ -738,7 +738,8 @@ class ColorPatternAgent:
     def _gated(self, pattern, required_win_rate):
         rate = self._win_rate(pattern)
         if rate is None:
-            return False
+            # Sin confirmación ML suficiente (no entrenado o pocas muestras) → BLOQUEAR
+            return True
         return rate < required_win_rate
 
     def _recommended_start_attempt(self, pattern, current_context_signature: str, current_filters: dict):
@@ -1189,9 +1190,10 @@ class RouletteTable:
         return best_agent, best_candidate
 
     async def _send_confirmation(self):
-        msg = "☢️ POSIBLE CONFIRMACION ☢️"
-        self.confirmation_msg_id = await send_msg(msg, THREAD_SIGNALS)
-        return self.confirmation_msg_id
+        # Mensaje de confirmación deshabilitado: ya no se publica en Telegram,
+        # pero el estado interno de "esperando confirmación" se mantiene igual.
+        self.confirmation_msg_id = None
+        return None
 
     async def _send_entry(self, agent, candidate, bet_amount, attempt_number):
         seq_txt = self.labouchere.seq_str()
@@ -1273,6 +1275,14 @@ class RouletteTable:
                 confirmation_resolved = True
 
             if agente.candidate_signal is None:
+                continue
+
+            # Requisito: el agente debe estar habilitado en vivo (≥ 40 giros
+            # en vivo, categoría lista, y entrenado/fasttrack confirmado por ML)
+            # antes de que su candidato — de confirmación o de señal real —
+            # sea considerado por la mesa. El seguimiento interno (shadow
+            # training) del agente sigue corriendo igual para poder entrenarse.
+            if not agente.live_enabled:
                 continue
 
             if agente.candidate_signal.get("confirming", False):
