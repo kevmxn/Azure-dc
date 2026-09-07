@@ -1174,17 +1174,19 @@ class RouletteTable:
                     # Zona predicha: según el último elemento del patrón
                     pred_zone = "BAJA" if pattern[-1] == "D1" else "ALTA"
                     opposite_zone = "ALTA" if pred_zone == "BAJA" else "BAJA"
-                    zone_sequence = [pred_zone, opposite_zone, pred_zone]
+                    # Secuencia: opuesto -> predicho -> opuesto (como en el original)
+                    zone_sequence = [opposite_zone, pred_zone, opposite_zone]
                     log.info(f"🔀 Señal D1+D3 con tendencia fuerte → secuencia: {zone_sequence}")
                 else:
-                    # Normal: usar la zona que devuelve dozen_bet_to_zone
-                    zone = best_candidate.get("bet_zone")
-                    if zone is None:
-                        # Si la zona es None, descartar
+                    # Normal: obtener la zona de la tupla
+                    zone_tuple = best_candidate.get("bet_zone")
+                    if zone_tuple is None:
                         log.info(f"❌ Señal descartada (zona None): {best_agent.name}")
                         best_agent.candidate_signal = None
                         return False
-                    zone_sequence = [zone, zone, zone]  # misma zona para los 3 intentos
+                    # Extraer el string de la tupla
+                    zone = zone_tuple[0]
+                    zone_sequence = [zone, zone, zone]
 
                 new_entry = {
                     "agent": best_agent,
@@ -1468,7 +1470,7 @@ class PragmaticWebSocketHandler:
                         if not isinstance(data, dict):
                             continue
 
-                        # Siempre procesamos el array last20Results si existe
+                        # Procesamos el array last20Results en cada mensaje
                         results = data.get("last20Results")
                         if isinstance(results, list):
                             log.debug(f"📦 Recibido last20Results con {len(results)} elementos")
