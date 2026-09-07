@@ -6,7 +6,7 @@
 ║   - Conversión: docenas bajas (D1+D2) -> ZONA BAJA 1-18      ║
 ║                 docenas altas (D2+D3) -> ZONA ALTA 19-36     ║
 ║   - Confirmación de patrón "-1 valor" (lógica Roulette 1)    ║
-║   - 3 intentos a la MISMA zona (bajos o altos)               ║
+║   - 2 intentos para ZONA (apuestas), 3 intentos para ML      ║
 ║   - Gestión de capital Labouchère + marcador diario          ║
 ║     (lógica Roulette 1, cero = pérdida)                      ║
 ║   - Telegram / HTTP API / self-ping / persistencia           ║
@@ -44,7 +44,8 @@ SAVE_INTERVAL = 30
 ROULETTE_KEYS = {205: 205}   # Speed Roulette 2
 
 # ── Lógica de docenas (detección) ──
-DOZEN_MAX_ATTEMPTS = 3
+DOZEN_MAX_ATTEMPTS = 3          # para entrenamiento del modelo
+ZONE_MAX_ATTEMPTS = 2           # para apuestas reales (señales de zona)
 DOZEN_BACKTEST_WINDOW = 60
 DOZEN_CONTEXT_WINDOW = 20
 DOZEN_MIN_SAMPLES_GATE = 6
@@ -171,7 +172,8 @@ def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
     return None
 
 def format_cop(amount: int) -> str:
-    return f"${amount:,} COP"
+    sign = '+' if amount >= 0 else '-'
+    return f"{sign}${abs(amount):,} COP"
 
 def calc_ema(data, period):
     if not data or len(data) < period: return []
@@ -418,14 +420,19 @@ def build_entry_message_zone(last_number, bet_zone, bet_amount=None, start_attem
             f"{apuesta_line}\n\n"
             f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
-def build_resolution_message(win: bool, attempt_results: list, bet_amount=None) -> str:
-    body = " | ".join(str(v) for v in attempt_results)
-    header = "✅✅✅ 👍🏻" if win else "🚫🚫🚫👎🏻"
-    if bet_amount is not None:
-        apuesta_line = f" | Apuesta: {format_cop(bet_amount)}"
+def build_resolution_message(win: bool, numbers: list, balance: int) -> str:
+    """
+    Construye el mensaje de resolución con el formato solicitado:
+    - Ganada en intento 1: "✅✅ 👍🏻 (3) | Apuesta: +$1,000 COP"
+    - Ganada en intento 2: "✅✅ 👍🏻 (3 | 34) | Apuesta: +$1,000 COP"
+    - Perdida: "❌❌ 👎🏻 (3 | 4) | Apuesta: -$1,500 COP"
+    """
+    numbers_str = " | ".join(str(n) for n in numbers)
+    if win:
+        header = "✅✅ 👍🏻"
     else:
-        apuesta_line = ""
-    return f"{header} ({body}){apuesta_line}"
+        header = "❌❌ 👎🏻"
+    return f"{header} ({numbers_str}) | Apuesta: {format_cop(balance)}"
 
 def build_daily_marker_message(stats: dict) -> str:
     win1 = stats.get("win1", 0)
@@ -944,6 +951,7 @@ class RouletteTable:
         self.signal_status = None       # None | "active" | "waiting_pattern" | "won" | "lost"
         self.attempt_numbers = []
         self.attempt_zones = []         # zonas usadas en cada intento
+        self.attempt_bets = []          # apuestas de cada intento
         self.entry_msg_ids = []
         self.confirming = False
         self.pending_agent = None
@@ -991,6 +999,13 @@ class RouletteTable:
         new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
         entry_text = f"{new_header}\n\n{body}"
         msg_id = await send_msg(entry_text, agent.thread_signals)
+
+        # Guardar la apuesta de este intento
+        if len(self.attempt_bets) >= attempt_number:
+            self.attempt_bets[attempt_number - 1] = bet_amount
+        else:
+            self.attempt_bets.append(bet_amount)
+
         if len(self.entry_msg_ids) >= attempt_number:
             self.entry_msg_ids[attempt_number - 1] = msg_id
         else:
@@ -1001,17 +1016,12 @@ class RouletteTable:
                 await delete_msg(prev_id)
         return msg_id
 
-    async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int, winning_attempt: int = None):
-        # Construir el resumen incluyendo las zonas usadas
-        resumen = []
-        for i, (num, zone) in enumerate(zip(attempt_numbers, self.attempt_zones), start=1):
-            emoji = ZONE_EMOJI.get(zone, "")
-            resumen.append(f"Intento {i}: {num} ({zone} {emoji})")
-        res_text = build_resolution_message(win, resumen, bet_amount)
+    async def _send_resolution(self, win: bool, numbers: list, balance: int):
+        """Envía el mensaje de resolución con el formato compacto."""
+        res_text = build_resolution_message(win, numbers, balance)
         await send_msg(res_text, THREAD_SIGNALS)
-        if win and winning_attempt is not None:
-            simple = f"✅ WIN INTENTO {winning_attempt}"
-        elif win:
+        # También enviamos un resumen simple al hilo de estadísticas
+        if win:
             simple = "✅ WIN"
         else:
             simple = "🚫 LOSS"
@@ -1035,11 +1045,27 @@ class RouletteTable:
     def _finalize_sequence(self, win: bool, winning_attempt: int = None):
         asyncio.create_task(self.daily_marker.record(win, winning_attempt))
         asyncio.create_task(self._send_daily_marker_and_cycle())
+
+        # Calcular balance neto de la señal
+        if win and winning_attempt == 1:
+            balance = self.attempt_bets[0]  # ganancia del primer intento
+        elif win and winning_attempt == 2:
+            # ganancia del segundo - pérdida del primero
+            balance = self.attempt_bets[1] - self.attempt_bets[0]
+        else:
+            # pérdida total
+            balance = -(self.attempt_bets[0] + self.attempt_bets[1])
+
+        # Enviar resolución
+        asyncio.create_task(self._send_resolution(win, self.attempt_numbers, balance))
+
+        # Limpiar estado
         self.signal_sequence = []
         self.current_attempt_index = 0
         self.signal_status = None
         self.attempt_numbers = []
         self.attempt_zones = []
+        self.attempt_bets = []
         self.entry_msg_ids = []
         self.pending_agent = None
         self.pending_candidate = None
@@ -1122,7 +1148,6 @@ class RouletteTable:
                 else:
                     log.info(f"🚫 CERO en intento {self.current_attempt_index+1} - señal perdida")
                     self.signal_status = "lost"
-                    asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
                     self._finalize_sequence(False, None)
                     return True
 
@@ -1137,12 +1162,11 @@ class RouletteTable:
             if is_win:
                 self.signal_status = "won"
                 winning_attempt = self.current_attempt_index + 1
-                asyncio.create_task(self._send_resolution(True, self.attempt_numbers, bet_amount, winning_attempt))
                 log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (zona {bet_zone})")
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
-                if self.current_attempt_index < 2:
+                if self.current_attempt_index < ZONE_MAX_ATTEMPTS - 1:  # 0 -> 1 (dos intentos)
                     self.current_attempt_index += 1
                     new_bet = self.labouchere.get_bet()
                     next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
@@ -1151,8 +1175,7 @@ class RouletteTable:
                     return True
                 else:
                     self.signal_status = "lost"
-                    asyncio.create_task(self._send_resolution(False, self.attempt_numbers, bet_amount))
-                    log.info("❌ SECUENCIA PERDIDA (3 intentos fallidos)")
+                    log.info("❌ SECUENCIA PERDIDA (2 intentos fallidos)")
                     self._finalize_sequence(False, None)
                     return True
 
@@ -1164,7 +1187,7 @@ class RouletteTable:
         if candidates:
             best_agent, best_candidate = self._select_best_candidate(candidates)
             if best_agent is not None:
-                # Determinar la secuencia de zonas
+                # Determinar la secuencia de zonas (solo 2 intentos)
                 bet_dozens = best_candidate["bet_dozens"]
                 pattern = best_candidate["pattern"]
                 amx_str = best_candidate.get("amx_strength", 0.0)
@@ -1174,8 +1197,8 @@ class RouletteTable:
                     # Zona predicha: según el último elemento del patrón
                     pred_zone = "BAJA" if pattern[-1] == "D1" else "ALTA"
                     opposite_zone = "ALTA" if pred_zone == "BAJA" else "BAJA"
-                    # Secuencia: opuesto -> predicho -> opuesto (como en el original)
-                    zone_sequence = [opposite_zone, pred_zone, opposite_zone]
+                    # Secuencia: opuesto -> predicho (2 intentos)
+                    zone_sequence = [opposite_zone, pred_zone]
                     log.info(f"🔀 Señal D1+D3 con tendencia fuerte → secuencia: {zone_sequence}")
                 else:
                     # Normal: obtener la zona de la tupla
@@ -1184,9 +1207,8 @@ class RouletteTable:
                         log.info(f"❌ Señal descartada (zona None): {best_agent.name}")
                         best_agent.candidate_signal = None
                         return False
-                    # Extraer el string de la tupla
-                    zone = zone_tuple[0]
-                    zone_sequence = [zone, zone, zone]
+                    zone = zone_tuple[0]  # extraer string de la tupla
+                    zone_sequence = [zone, zone]  # 2 intentos a la misma zona
 
                 new_entry = {
                     "agent": best_agent,
@@ -1209,6 +1231,7 @@ class RouletteTable:
                 self.signal_status = "active"
                 self.attempt_numbers = []
                 self.attempt_zones = []
+                self.attempt_bets = []
                 self.entry_msg_ids = []
                 asyncio.create_task(self._send_entry(best_agent, zone_sequence[0], bet_amount, 1))
                 log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> ZONA {zone_sequence[0]}")
@@ -1310,7 +1333,7 @@ class RouletteTable:
             "total_spins_seen": self.total_spins_seen,
             "signal_status": self.signal_status,
             "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
-            "total_attempts": DOZEN_MAX_ATTEMPTS if self.signal_status == "active" else 0,
+            "total_attempts": ZONE_MAX_ATTEMPTS if self.signal_status == "active" else 0,
         }
 
 
