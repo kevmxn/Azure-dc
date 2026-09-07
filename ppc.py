@@ -9,7 +9,7 @@
 ║   - 3 intentos a la MISMA zona (bajos o altos)               ║
 ║   - Gestión de capital Labouchère + marcador diario          ║
 ║     (lógica Roulette 1, cero = pérdida)                      ║
-║   - Telegram / WebSocket / HTTP / self-ping / persistencia   ║
+║   - Telegram / HTTP API / self-ping / persistencia           ║
 ╚══════════════════════════════════════════════════════════════
 """
 
@@ -23,7 +23,7 @@ import time
 from typing import Optional, Callable, Awaitable, List
 
 import websockets
-from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
+from aiohttp import web, ClientSession, ClientTimeout
 
 try:
     from telebot.async_telebot import AsyncTeleBot
@@ -152,13 +152,17 @@ def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
     """Convierte la apuesta de docenas del patrón en la zona a apostar:
        - D1+D2 (docenas bajas)          -> BAJA (1-18)
        - D2+D3 (docenas altas)          -> ALTA (19-36)
-       - D1+D3 (mixto, solo aabbc/abbcc)-> se decide por la docena pronosticada
-         (último elemento del patrón): D1 -> BAJA, D3 -> ALTA."""
+       - D1+D3 (mixto)                  -> None (descartado) excepto en tendencia fuerte (manejo externo)
+       - Otros casos                    -> se decide por el último elemento del patrón
+    """
     s = set(bet_dozens)
     if s == {"D1", "D2"}:
         return "BAJA"
     if s == {"D2", "D3"}:
         return "ALTA"
+    if s == {"D1", "D3"}:
+        return None  # Se descarta normalmente
+    # Fallback: usar el último elemento del patrón
     pred = pattern[-1]
     if pred == "D1":
         return "BAJA"
@@ -392,10 +396,10 @@ async def delete_msg(msg_id: int) -> bool:
         return False
 
 # ── Formatos de mensaje (estilo Roulette 1, para ZONAS) ──
-def build_entry_message_zone(last_number, bet_zones, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
+def build_entry_message_zone(last_number, bet_zone, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
     numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "🟢") if last_number is not None else ""
-    zone = bet_zones[0] if bet_zones else "-"
+    zone = bet_zone
     emoji = ZONE_EMOJI.get(zone, "")
     if zone == "BAJA":
         zone_line = f"🧨 ZONA BAJA: 1-18 ({emoji})"
@@ -788,16 +792,13 @@ class DozenPatternAgent:
                 pattern = self._full_pattern(a, b, expected)
                 bet_dozens = self._bet_dozens(pattern)
                 zone = dozen_bet_to_zone(bet_dozens, pattern)
-                if zone is None:
-                    log.info(f"❌ {self.name} patrón {pattern} sin zona clara, se descarta")
-                    self.confirming = False
-                    self.pending_pattern = None
-                    return
+                # Si la zona es None (D1+D3), almacenamos la señal igual y lo manejamos después
+                # en el servidor (tendencia fuerte) o descartamos.
                 context = list(dozen_history[-DOZEN_CONTEXT_WINDOW:])
                 self.candidate_signal = {
                     "pattern": pattern,
                     "bet_dozens": bet_dozens,
-                    "bet_zone": (zone,),
+                    "bet_zone": (zone,) if zone is not None else None,
                     "context": context,
                     "start_attempt": 1,
                     "amx_strength": amx_strength_val,
@@ -942,6 +943,7 @@ class RouletteTable:
         self.current_attempt_index = 0
         self.signal_status = None       # None | "active" | "waiting_pattern" | "won" | "lost"
         self.attempt_numbers = []
+        self.attempt_zones = []         # zonas usadas en cada intento
         self.entry_msg_ids = []
         self.confirming = False
         self.pending_agent = None
@@ -976,11 +978,11 @@ class RouletteTable:
         self.confirmation_msg_id = None
         return None
 
-    async def _send_entry(self, agent, candidate, bet_amount, attempt_number):
+    async def _send_entry(self, agent, zone, bet_amount, attempt_number):
         seq_txt = self.labouchere.seq_str()
         original = build_entry_message_zone(
             agent._last_raw_number,
-            candidate["bet_zone"],
+            zone,
             bet_amount=bet_amount,
             sequence_str=seq_txt
         )
@@ -1000,7 +1002,12 @@ class RouletteTable:
         return msg_id
 
     async def _send_resolution(self, win: bool, attempt_numbers: list, bet_amount: int, winning_attempt: int = None):
-        res_text = build_resolution_message(win, attempt_numbers, bet_amount)
+        # Construir el resumen incluyendo las zonas usadas
+        resumen = []
+        for i, (num, zone) in enumerate(zip(attempt_numbers, self.attempt_zones), start=1):
+            emoji = ZONE_EMOJI.get(zone, "")
+            resumen.append(f"Intento {i}: {num} ({zone} {emoji})")
+        res_text = build_resolution_message(win, resumen, bet_amount)
         await send_msg(res_text, THREAD_SIGNALS)
         if win and winning_attempt is not None:
             simple = f"✅ WIN INTENTO {winning_attempt}"
@@ -1032,6 +1039,7 @@ class RouletteTable:
         self.current_attempt_index = 0
         self.signal_status = None
         self.attempt_numbers = []
+        self.attempt_zones = []
         self.entry_msg_ids = []
         self.pending_agent = None
         self.pending_candidate = None
@@ -1085,15 +1093,19 @@ class RouletteTable:
             current_entry = self.signal_sequence[0]
             agent = current_entry["agent"]
 
-            # Los 3 intentos van a la MISMA zona detectada por el patrón de docenas
-            candidate = current_entry["original"]
-            label = "original"
-
-            bet_zone = candidate["bet_zone"][0]
+            # La zona para este intento depende del índice
+            attempt_idx = self.current_attempt_index
+            zone_sequence = current_entry["zone_sequence"]
+            if attempt_idx < len(zone_sequence):
+                bet_zone = zone_sequence[attempt_idx]
+            else:
+                # Fallback: usar la primera zona
+                bet_zone = zone_sequence[0]
 
             # El CERO siempre aumenta la secuencia de Labouchère (pérdida de apuesta)
             if last_number == 0:
                 self.attempt_numbers.append(0)
+                self.attempt_zones.append(bet_zone)
                 cycle_completed = self.labouchere.update(False)
                 if cycle_completed:
                     self.cycle_pending = self.labouchere.cycles_completed
@@ -1116,6 +1128,7 @@ class RouletteTable:
 
             is_win = zone_win(bet_zone, last_number)
             self.attempt_numbers.append(last_number if last_number is not None else 0)
+            self.attempt_zones.append(bet_zone)
 
             cycle_completed = self.labouchere.update(is_win)
             if cycle_completed:
@@ -1125,16 +1138,16 @@ class RouletteTable:
                 self.signal_status = "won"
                 winning_attempt = self.current_attempt_index + 1
                 asyncio.create_task(self._send_resolution(True, self.attempt_numbers, bet_amount, winning_attempt))
-                log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (zona {label} {bet_zone})")
+                log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (zona {bet_zone})")
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
                 if self.current_attempt_index < 2:
                     self.current_attempt_index += 1
                     new_bet = self.labouchere.get_bet()
-                    next_candidate = current_entry["original"]
-                    asyncio.create_task(self._send_entry(agent, next_candidate, new_bet, self.current_attempt_index + 1))
-                    log.info(f"🔄 INTENTO {self.current_attempt_index+1}: misma zona {next_candidate['bet_zone']}")
+                    next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
+                    asyncio.create_task(self._send_entry(agent, next_zone, new_bet, self.current_attempt_index + 1))
+                    log.info(f"🔄 INTENTO {self.current_attempt_index+1}: zona {next_zone}")
                     return True
                 else:
                     self.signal_status = "lost"
@@ -1151,10 +1164,32 @@ class RouletteTable:
         if candidates:
             best_agent, best_candidate = self._select_best_candidate(candidates)
             if best_agent is not None:
-                # Los 3 intentos usan la misma zona: solo existe el candidato original
+                # Determinar la secuencia de zonas
+                bet_dozens = best_candidate["bet_dozens"]
+                pattern = best_candidate["pattern"]
+                amx_str = best_candidate.get("amx_strength", 0.0)
+
+                # Caso especial: D1+D3 y tendencia fuerte
+                if set(bet_dozens) == {"D1", "D3"} and amx_str >= AMX_STRENGTH_THRESHOLDS["strong"]:
+                    # Zona predicha: según el último elemento del patrón
+                    pred_zone = "BAJA" if pattern[-1] == "D1" else "ALTA"
+                    opposite_zone = "ALTA" if pred_zone == "BAJA" else "BAJA"
+                    zone_sequence = [pred_zone, opposite_zone, pred_zone]
+                    log.info(f"🔀 Señal D1+D3 con tendencia fuerte → secuencia: {zone_sequence}")
+                else:
+                    # Normal: usar la zona que devuelve dozen_bet_to_zone
+                    zone = best_candidate.get("bet_zone")
+                    if zone is None:
+                        # Si la zona es None, descartar
+                        log.info(f"❌ Señal descartada (zona None): {best_agent.name}")
+                        best_agent.candidate_signal = None
+                        return False
+                    zone_sequence = [zone, zone, zone]  # misma zona para los 3 intentos
+
                 new_entry = {
                     "agent": best_agent,
                     "original": best_candidate,
+                    "zone_sequence": zone_sequence,
                 }
 
                 if self.signal_status == "waiting_pattern":
@@ -1163,17 +1198,18 @@ class RouletteTable:
                     self.signal_sequence = [new_entry]
                     self.current_attempt_index = 1
                     self.signal_status = "active"
-                    asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 2))
-                    log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {best_agent.name} -> ZONA {best_candidate['bet_zone']}")
+                    asyncio.create_task(self._send_entry(best_agent, zone_sequence[1], bet_amount, 2))
+                    log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {best_agent.name} -> ZONA {zone_sequence[1]}")
                     return True
 
                 self.signal_sequence = [new_entry]
                 self.current_attempt_index = 0
                 self.signal_status = "active"
                 self.attempt_numbers = []
+                self.attempt_zones = []
                 self.entry_msg_ids = []
-                asyncio.create_task(self._send_entry(best_agent, best_candidate, bet_amount, 1))
-                log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> ZONA {best_candidate['bet_zone']}")
+                asyncio.create_task(self._send_entry(best_agent, zone_sequence[0], bet_amount, 1))
+                log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> ZONA {zone_sequence[0]}")
                 return True
 
         # ── Prioridad 4: abrir una confirmación nueva ──
@@ -1333,11 +1369,7 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
 class ServerState:
     def __init__(self):
         self.tables = {k: RouletteTable(k) for k in ROULETTE_KEYS.values()}
-        self.ws_server = None
         self.history_seed_trained = {k: False for k in ROULETTE_KEYS.values()}
-
-    def set_ws_server(self, ws_server):
-        self.ws_server = ws_server
 
     async def update_mesa(self, key: int, number: int, broadcast: bool = True, training: bool = False):
         if key not in self.tables:
@@ -1345,9 +1377,6 @@ class ServerState:
         table = self.tables[key]
         real_color = color_of(number)
         table.update(number, real_color, training=training)
-        if broadcast and self.ws_server and not training:
-            state = table.get_state(limit=40)
-            await self.ws_server.broadcast_to_mesa(str(key), "update", state)
 
     def get_state_for_mesa(self, key: int):
         if key not in self.tables:
@@ -1414,66 +1443,6 @@ class ServerState:
 
 
 # ══════════════════════════════════════════════
-#  WEBSOCKET SERVER (clientes HTML)
-# ══════════════════════════════════════════════
-class WebSocketServer:
-    def __init__(self, server_state: ServerState):
-        self.server_state = server_state
-        self.rooms = {}
-        self.current_mesa = {}
-
-    async def handle(self, request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=30)
-        await ws.prepare(request)
-        try:
-            async for msg in ws:
-                if msg.type != WSMsgType.TEXT:
-                    continue
-                try:
-                    data = json.loads(msg.data)
-                except Exception:
-                    continue
-                if data.get("type") == "subscribe":
-                    mesa_raw = data.get("mesa")
-                    try:
-                        int_mesa = int(mesa_raw)
-                    except (TypeError, ValueError):
-                        continue
-                    if int_mesa not in ROULETTE_KEYS.values():
-                        continue
-                    mesa = str(int_mesa)
-                    prev_mesa = self.current_mesa.get(ws)
-                    if prev_mesa is not None and prev_mesa != mesa:
-                        prev_room = self.rooms.get(prev_mesa)
-                        if prev_room:
-                            prev_room.discard(ws)
-                    self.current_mesa[ws] = mesa
-                    self.rooms.setdefault(mesa, set()).add(ws)
-                    state = self.server_state.get_state_for_mesa(int_mesa)
-                    if state:
-                        await ws.send_str(json.dumps({"type": "initial", "data": state}))
-        finally:
-            for room in self.rooms.values():
-                room.discard(ws)
-            self.current_mesa.pop(ws, None)
-        return ws
-
-    async def broadcast_to_mesa(self, mesa: str, event: str, data: dict):
-        room = self.rooms.get(mesa)
-        if not room:
-            return
-        msg = json.dumps({"type": event, "data": data})
-        dead = []
-        for ws in room.copy():
-            try:
-                await ws.send_str(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            room.discard(ws)
-
-
-# ══════════════════════════════════════════════
 #  WEBSOCKET HANDLER (conexión a Pragmatic Play)
 # ══════════════════════════════════════════════
 class PragmaticWebSocketHandler:
@@ -1481,6 +1450,7 @@ class PragmaticWebSocketHandler:
         self.key = key
         self.on_spin_callback = on_spin_callback
         self.seen = set()
+        self.initial_batch_processed = False
 
     async def run(self):
         sub = {"type": "subscribe", "casinoId": CASINO_ID, "currency": CURRENCY_ID, "key": [self.key]}
@@ -1491,7 +1461,6 @@ class PragmaticWebSocketHandler:
                     await ws.send(json.dumps(sub))
                     log.info(f"✅ WS Pragmatic conectado (key={self.key})")
                     delay = 5
-                    batch_done = False
                     async for raw in ws:
                         try:
                             data = json.loads(raw)
@@ -1500,10 +1469,11 @@ class PragmaticWebSocketHandler:
                         if not isinstance(data, dict):
                             continue
                         results = data.get("last20Results")
-                        if isinstance(results, list):
+                        if isinstance(results, list) and not self.initial_batch_processed:
+                            log.info(f"📥 Cargando últimos {len(results)} resultados de la mesa {self.key}")
                             for r in reversed(results):
-                                await self._feed(r.get("gameId"), r.get("result"), emit=batch_done)
-                            batch_done = True
+                                await self._feed(r.get("gameId"), r.get("result"), emit=True)
+                            self.initial_batch_processed = True
                         if data.get("gameId") is not None and data.get("result") is not None:
                             await self._feed(data.get("gameId"), data.get("result"), emit=True)
             except Exception as e:
@@ -1528,15 +1498,9 @@ class PragmaticWebSocketHandler:
 
 
 # ══════════════════════════════════════════════
-#  HTTP (aiohttp)
+#  HTTP (aiohttp) - Solo API sin HTML
 # ══════════════════════════════════════════════
 _server_state: Optional[ServerState] = None
-
-async def http_home(request: web.Request):
-    if request.headers.get("Upgrade", "").lower() == "websocket":
-        return await ws_entry(request)
-    return web.json_response({"status": "ok", "service": "Adaptive Roulette Server (Dozen->Zone)",
-                              "mesas": list(ROULETTE_KEYS.values())})
 
 async def http_ping(request: web.Request):
     return web.json_response({"status": "pong", "ts": time.time()})
@@ -1569,9 +1533,6 @@ async def http_api_all(request: web.Request):
         return web.json_response({"error": "server not ready"}, status=503)
     result = {str(key): _server_state.get_state_for_mesa(key) for key in ROULETTE_KEYS.values()}
     return web.json_response(result)
-
-async def ws_entry(request: web.Request):
-    return await _server_state.ws_server.handle(request)
 
 
 # ══════════════════════════════════════════════
@@ -1623,18 +1584,16 @@ async def bot_polling_loop():
 # ══════════════════════════════════════════════
 def build_http_app() -> web.Application:
     app = web.Application()
-    app.router.add_get("/", http_home)
     app.router.add_get("/ping", http_ping)
     app.router.add_get("/health", http_health)
     app.router.add_get("/api/state/{mesa}", http_api_state)
     app.router.add_get("/api/all", http_api_all)
-    app.router.add_get("/ws", ws_entry)
     return app
 
 async def main():
     global _server_state
     log.info("═" * 60)
-    log.info("BOT UNIFICADO — DOCENAS → ZONAS | SPEED ROULETTE 2 (aiohttp + WS)")
+    log.info("BOT UNIFICADO — DOCENAS → ZONAS | SPEED ROULETTE 2 (solo backend)")
     log.info(f"Mesas: {', '.join(str(k) for k in ROULETTE_KEYS.values())}")
     log.info("═" * 60)
 
@@ -1643,9 +1602,6 @@ async def main():
     _server_state = server_state
 
     await server_state.train_from_history()
-
-    ws_server = WebSocketServer(server_state)
-    server_state.set_ws_server(ws_server)
 
     async def save_loop():
         while True:
@@ -1671,7 +1627,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    log.info(f"Servidor HTTP/WebSocket escuchando en puerto {port}")
+    log.info(f"Servidor HTTP escuchando en puerto {port} (API: /ping, /health, /api/state/205, /api/all)")
 
     try:
         await asyncio.Event().wait()
