@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT UNIFICADO — SPEED ROULETTE 2 (key 205)                 ║
@@ -8,17 +7,15 @@
 ║     con ML adaptativo, tendencia EMA/AMX y cooldowns         ║
 ║   - Conversión: docenas bajas (D1+D2) -> ZONA BAJA 1-18      ║
 ║                 docenas altas (D2+D3) -> ZONA ALTA 19-36     ║
+║   - D1+D3 -> Se apuesta al opuesto de la última zona        ║
+║     (dos intentos iguales)                                   ║
 ║   - Confirmación de patrón "-1 valor" (lógica Roulette 1)    ║
 ║   - 2 intentos para ZONA (apuestas), 3 intentos para ML      ║
 ║   - Gestión de capital Labouchère + marcador diario          ║
-║     (lógica Roulette 1, cero = pérdida)                      ║
 ║   - Telegram / HTTP API / self-ping / persistencia           ║
-║   - [ACTUALIZACIÓN] Marcador diario solo win1/win2/loss      ║
-║   - [ACTUALIZACIÓN] D1+D3 se convierte a zona usando        ║
-║     contexto (último número, tendencia, AMX) y dos intentos  ║
-║   - [ACTUALIZACIÓN] Tendencia global basada en 20 giros      ║
-║   - [ACTUALIZACIÓN] Patrones a,b,c eliminados; añadidos      ║
-║     aaaba y aaaabaa                                          ║
+║   - Marcador diario solo win1/win2/loss                      ║
+║   - Tendencia global basada en 20 giros                      ║
+║   - Eliminados patrones a,b,c; añadidos aaaba y aaaabaa      ║
 ╚══════════════════════════════════════════════════════════════
 """
 
@@ -164,7 +161,7 @@ def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
     if s == {"D2", "D3"}:
         return "ALTA"
     if s == {"D1", "D3"}:
-        return None  # Se decide con contexto
+        return None  # Se decide con la última zona (opuesto)
     pred = pattern[-1]
     if pred == "D1":
         return "BAJA"
@@ -172,6 +169,7 @@ def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
         return "ALTA"
     return None
 
+# Función ya no usada para D1+D3, se mantiene por si acaso
 def infer_zone_from_context(bet_dozens, last_number, level_history, trend, amx_strength):
     s = set(bet_dozens)
     if s == {"D1", "D2"}:
@@ -179,23 +177,9 @@ def infer_zone_from_context(bet_dozens, last_number, level_history, trend, amx_s
     if s == {"D2", "D3"}:
         return "ALTA"
     if s == {"D1", "D3"}:
-        last_zone = zone_of(last_number) if last_number is not None and last_number != 0 else None
-        if len(level_history) < 20:
-            return "BAJA" if trend in ("bearish", "neutral") else "ALTA"
-        if trend == "bullish":
-            base_zone = "ALTA"
-        elif trend == "bearish":
-            base_zone = "BAJA"
-        else:
-            base_zone = last_zone if last_zone in ("BAJA", "ALTA") else "BAJA"
-        if amx_strength >= AMX_STRENGTH_THRESHOLDS["strong"]:
-            return base_zone
-        if amx_strength < AMX_STRENGTH_THRESHOLDS["weak"] and last_zone:
-            if last_zone == "ALTA" and trend == "bearish":
-                return "BAJA"
-            if last_zone == "BAJA" and trend == "bullish":
-                return "ALTA"
-        return base_zone
+        # Esta función ya no se llama para D1+D3; se deja como respaldo
+        last_zone = zone_of(last_number) if last_number is not None and last_number != 0 else "BAJA"
+        return "ALTA" if last_zone == "BAJA" else "BAJA"
     return "BAJA"
 
 def format_cop(amount: int) -> str:
@@ -595,7 +579,7 @@ class DozenPatternAgent:
             return None
         if not (ok and extra_ok and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b):
             return None
-        return (a, b)  # ya no usamos c
+        return (a, b)
 
     # ── Matching parcial (confirmación "-1 valor") ──
     def _match_partial(self, window):
@@ -622,7 +606,7 @@ class DozenPatternAgent:
 
     @staticmethod
     def _bet_dozens(pattern):
-        return tuple(pattern)  # para (a,b) apostamos a a y b
+        return tuple(pattern)
 
     @staticmethod
     def _key(pattern):
@@ -727,7 +711,6 @@ class DozenPatternAgent:
         }
 
     def _full_pattern(self, a, b, expected):
-        # Ya no tenemos patrones a,b,c, siempre devolvemos (a,b)
         return (a, b)
 
     def update(self, dozen_history, timestamp, blocked: bool = False,
@@ -799,7 +782,7 @@ class DozenPatternAgent:
                     "score": self._win_rate(pattern) or 0.0,
                     "confirming": False,
                 }
-                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir con contexto'}")
+                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'}")
                 self.train_state = {
                     "active": True, "pattern": pattern, "bet_dozens": bet_dozens,
                     "bet_zone": zone,
@@ -914,7 +897,7 @@ class DozenPatternAgent:
 
 
 # ══════════════════════════════════════════════
-#  ROULETTE TABLE (con nuevos agentes)
+#  ROULETTE TABLE (con nuevos agentes y conversión D1+D3 a opuesto)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -942,7 +925,7 @@ class RouletteTable:
         self.pending_candidate = None
         self.confirmation_msg_id = None
 
-        # ── NUEVOS AGENTES (reemplazo de a,b,c) ──
+        # ── NUEVOS AGENTES ──
         self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
         self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
         self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎 (abaa)", mode="abaa", daily_marker=self.daily_marker)
@@ -953,6 +936,8 @@ class RouletteTable:
         self.last_dozen_num = None
         self.last_d2_number = None
         self.trend = "neutral"
+        # Guarda la última zona no nula (para D1+D3)
+        self.last_nonzero_zone = "BAJA"  # valor por defecto
 
     def _level_change(self, number: int, real_dozen_num: int) -> int:
         if real_dozen_num == 1: return 1
@@ -1160,16 +1145,11 @@ class RouletteTable:
                     zone = zone_tuple[0]
                     zone_sequence = [zone, zone]
                 else:
-                    zone = infer_zone_from_context(
-                        bet_dozens,
-                        last_number,
-                        self.level_history,
-                        self.trend,
-                        amx_str
-                    )
-                    opposite = "ALTA" if zone == "BAJA" else "BAJA"
-                    zone_sequence = [zone, opposite]
-                    log.info(f"🔀 Señal D1+D3 → zona inferida: {zone}, secuencia: {zone_sequence}")
+                    # D1+D3: apostar al opuesto de la última zona no nula
+                    last_zone = self.last_nonzero_zone
+                    opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
+                    zone_sequence = [opposite, opposite]
+                    log.info(f"🔀 Señal D1+D3 → opuesto de última zona ({last_zone}) → {opposite} en ambos intentos")
 
                 new_entry = {
                     "agent": best_agent,
@@ -1216,6 +1196,10 @@ class RouletteTable:
         self.total_spins_seen += 1
         if not training:
             self.live_spins_seen += 1
+
+        # Actualizar última zona no nula
+        if number != 0:
+            self.last_nonzero_zone = zone_of(number)
 
         dz = dozen_of(number)
         self.dozen_history.append(dz)
@@ -1281,7 +1265,7 @@ class RouletteTable:
             f"🎰 Mesa {self.key} | Giro #{len(self.dozen_history)}: {number} ({real_color}) → {dz} "
             f"(docena {real_dozen_num}) | Zona: {zone_of(number)} | Nivel: {self.level_current} | "
             f"{seq_status} | Lab: [{lab_seq}] {format_cop(lab_bet)} | Últimas 10 docenas: [{last10}] | "
-            f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend}"
+            f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend} | Última zona no nula: {self.last_nonzero_zone}"
         )
 
     def get_state(self, limit: int = 40):
@@ -1304,6 +1288,7 @@ class RouletteTable:
             "signal_status": self.signal_status,
             "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
             "total_attempts": ZONE_MAX_ATTEMPTS if self.signal_status == "active" else 0,
+            "last_nonzero_zone": self.last_nonzero_zone,
         }
 
 
