@@ -102,7 +102,7 @@ AGENT_TREND_CONFIG = {
 # ── Telegram (credenciales y hilos de Roulette 1) ──
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHAT_ID_BASE   = int(os.environ.get("CHAT_ID_BASE", "-1003986868798"))
-THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "4296"))
+THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "4396"))
 THREAD_STATS   = int(os.environ.get("THREAD_STATS", "4398"))
 THREAD_SIGNALS_ZONE = int(os.environ.get("THREAD_SIGNALS_ZONE", str(THREAD_SIGNALS)))
 THREAD_STATS_ZONE   = int(os.environ.get("THREAD_STATS_ZONE", str(THREAD_STATS)))
