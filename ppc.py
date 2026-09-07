@@ -4,16 +4,15 @@
 ║   - Detección: 4 agentes de PATRONES DE DOCENAS              ║
 ║       V2: aaba (4)  |  V3: aaaba (5)                        ║
 ║       V4: abaa (4)  |  V6: aaaabaa (7)                     ║
-║     con ML adaptativo, tendencia EMA/AMX y cooldowns         ║
-║   - Conversión: docenas bajas (D1+D2) -> ZONA BAJA 1-18      ║
-║                 docenas altas (D2+D3) -> ZONA ALTA 19-36     ║
-║   - D1+D3 -> Se apuesta al opuesto de la última zona        ║
-║     (dos intentos iguales)                                   ║
-║   - Confirmación de patrón "-1 valor" (lógica Roulette 1)    ║
+║   - Señales D1+D2/D2+D3: todos los agentes, sin modelo      ║
+║   - Señales D1+D3: solo agentes de 4 valores y             ║
+║     requieren modelo entrenado                              ║
+║   - Conversión: D1+D2 -> BAJA, D2+D3 -> ALTA,              ║
+║     D1+D3 -> opuesto de última zona                        ║
+║   - Confirmación de patrón "-1 valor"                       ║
 ║   - 2 intentos para ZONA (apuestas), 3 intentos para ML      ║
-║   - Gestión de capital Labouchère + marcador diario          ║
+║   - Gestión Labouchère + marcador diario (win1/win2/loss)   ║
 ║   - Telegram / HTTP API / self-ping / persistencia           ║
-║   - Marcador diario solo win1/win2/loss                      ║
 ║   - Tendencia global basada en 20 giros                      ║
 ║   - Eliminados patrones a,b,c; añadidos aaaba y aaaabaa      ║
 ╚══════════════════════════════════════════════════════════════
@@ -168,19 +167,6 @@ def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
     if pred == "D3":
         return "ALTA"
     return None
-
-# Función ya no usada para D1+D3, se mantiene por si acaso
-def infer_zone_from_context(bet_dozens, last_number, level_history, trend, amx_strength):
-    s = set(bet_dozens)
-    if s == {"D1", "D2"}:
-        return "BAJA"
-    if s == {"D2", "D3"}:
-        return "ALTA"
-    if s == {"D1", "D3"}:
-        # Esta función ya no se llama para D1+D3; se deja como respaldo
-        last_zone = zone_of(last_number) if last_number is not None and last_number != 0 else "BAJA"
-        return "ALTA" if last_zone == "BAJA" else "BAJA"
-    return "BAJA"
 
 def format_cop(amount: int) -> str:
     sign = '+' if amount >= 0 else '-'
@@ -515,7 +501,7 @@ class DailyMarker:
 
 
 # ══════════════════════════════════════════════
-#  AGENTE DE PATRÓN DE DOCENAS (actualizado)
+#  AGENTE DE PATRÓN DE DOCENAS
 # ══════════════════════════════════════════════
 class DozenPatternAgent:
     def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
@@ -555,7 +541,7 @@ class DozenPatternAgent:
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
 
-    # ── Matching de patrones completos (sin a,b,c) ──
+    # ── Matching de patrones completos ──
     def _match(self, window):
         if len(window) != self.pattern_len:
             return None
@@ -644,7 +630,7 @@ class DozenPatternAgent:
     def _gated(self, pattern, required_win_rate):
         rate = self._win_rate(pattern)
         if rate is None:
-            return False
+            return False   # sin modelo, se permite (aprender)
         return rate < required_win_rate
 
     def _recommended_attempt(self, pattern):
@@ -674,6 +660,7 @@ class DozenPatternAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _ml_should_signal(self, pattern, trend_dozens, amx_strength_val):
+        """Filtro ML: si el modelo está entrenado, exige win rate mínimo; si no, permite."""
         if self.cooldown_remaining > 0:
             return False
         if trend_dozens is not None:
@@ -752,6 +739,7 @@ class DozenPatternAgent:
             if partial:
                 a, b, expected = partial
                 full_pattern = self._full_pattern(a, b, expected)
+                # Aplicar filtro ML (con o sin modelo)
                 if self._ml_should_signal(full_pattern, trend_dozens, amx_strength_val):
                     self.confirming = True
                     self.pending_pattern = (a, b, expected)
@@ -897,7 +885,7 @@ class DozenPatternAgent:
 
 
 # ══════════════════════════════════════════════
-#  ROULETTE TABLE (con nuevos agentes y conversión D1+D3 a opuesto)
+#  ROULETTE TABLE (con lógica de restricción para D1+D3)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -925,7 +913,7 @@ class RouletteTable:
         self.pending_candidate = None
         self.confirmation_msg_id = None
 
-        # ── NUEVOS AGENTES ──
+        # ── AGENTES ──
         self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
         self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
         self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎 (abaa)", mode="abaa", daily_marker=self.daily_marker)
@@ -1039,6 +1027,7 @@ class RouletteTable:
         return best_agent, best_candidate
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
+        # Recolectar candidatos
         candidates = []
         confirmation_resolved = False
         new_confirming_agent = None
@@ -1056,10 +1045,31 @@ class RouletteTable:
                     new_confirming_agent = agente
             else:
                 pattern = agente.candidate_signal["pattern"]
-                win_rate = agente._win_rate(pattern) or 0.0
-                amx_str = agente.candidate_signal.get("amx_strength", 0.0)
-                score = win_rate * (1 + amx_str)
-                candidates.append((agente, score, agente.candidate_signal))
+                bet_zone_tuple = agente.candidate_signal.get("bet_zone")
+                bet_zone = bet_zone_tuple[0] if bet_zone_tuple is not None else None
+
+                # ── DECISIÓN SOBRE ACEPTAR O NO EL CANDIDATO ──
+                if bet_zone is None:
+                    # D1+D3: solo agentes de 4 valores y modelo entrenado
+                    if agente.mode not in ("aaba", "abaa"):
+                        # Solo los de 4 valores pueden lanzar D1+D3
+                        log.debug(f"⛔ {agente.name} D1+D3 descartado (no es agente de 4 valores)")
+                        continue
+                    win_rate = agente._win_rate(pattern)
+                    if win_rate is None:
+                        # Modelo no entrenado aún para este patrón
+                        log.debug(f"⛔ {agente.name} D1+D3 descartado (modelo no entrenado para {pattern})")
+                        continue
+                    # Si pasa, añadir a candidatos
+                    amx_str = agente.candidate_signal.get("amx_strength", 0.0)
+                    score = win_rate * (1 + amx_str)
+                    candidates.append((agente, score, agente.candidate_signal))
+                else:
+                    # D1+D2 o D2+D3: aceptar siempre (ya filtrado por ML en update)
+                    amx_str = agente.candidate_signal.get("amx_strength", 0.0)
+                    win_rate = agente._win_rate(pattern) or 0.0
+                    score = win_rate * (1 + amx_str)
+                    candidates.append((agente, score, agente.candidate_signal))
 
         if self.confirming and confirmation_resolved:
             self.confirming = False
@@ -1145,7 +1155,7 @@ class RouletteTable:
                     zone = zone_tuple[0]
                     zone_sequence = [zone, zone]
                 else:
-                    # D1+D3: apostar al opuesto de la última zona no nula
+                    # D1+D3: opuesto de la última zona no nula
                     last_zone = self.last_nonzero_zone
                     opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
                     zone_sequence = [opposite, opposite]
