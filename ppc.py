@@ -9,12 +9,15 @@
 ║     requieren modelo entrenado                              ║
 ║   - Conversión: D1+D2 -> BAJA, D2+D3 -> ALTA,              ║
 ║     D1+D3 -> opuesto de última zona                        ║
+║   - Para D1+D2 y D2+D3, el segundo intento puede ser       ║
+║     opuesto si el modelo indica baja efectividad del        ║
+║     segundo intento al mismo lado (tendencia agotamiento)  ║
 ║   - Confirmación de patrón "-1 valor"                       ║
 ║   - 2 intentos para ZONA (apuestas), 3 intentos para ML      ║
 ║   - Gestión Labouchère + marcador diario (win1/win2/loss)   ║
+║   - Mensajes combinados: resolución + nueva señal          ║
 ║   - Telegram / HTTP API / self-ping / persistencia           ║
 ║   - Tendencia global basada en 20 giros                      ║
-║   - Eliminados patrones a,b,c; añadidos aaaba y aaaabaa      ║
 ╚══════════════════════════════════════════════════════════════
 """
 
@@ -67,6 +70,9 @@ AMX_ADJUST_FACTOR_WEAK = 1.2
 
 DOZEN_COOLDOWN_AFTER_LOSSES = 3
 DOZEN_COOLDOWN_ROUNDS = 5
+
+# ── Umbral para decidir opuesto en segundo intento ──
+SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35  # si la tasa de acierto del segundo intento es menor, se usa opuesto
 
 # ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
@@ -160,7 +166,7 @@ def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
     if s == {"D2", "D3"}:
         return "ALTA"
     if s == {"D1", "D3"}:
-        return None  # Se decide con la última zona (opuesto)
+        return None
     pred = pattern[-1]
     if pred == "D1":
         return "BAJA"
@@ -410,8 +416,7 @@ def build_entry_message_zone(last_number, bet_zone, bet_amount=None, start_attem
     else:
         apuesta_line = ""
     link_line = f'🎮 <a href="{TABLE_LINK}">{TABLE_NAME}</a>' if TABLE_LINK else f"🎮 {TABLE_NAME}"
-    return (f"🚨🚨 ENTRADA PARA ZONA 🚨🚨\n\n"
-            f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
+    return (f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"{zone_line}\n"
             f"{apuesta_line}\n\n"
             f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
@@ -660,7 +665,6 @@ class DozenPatternAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _ml_should_signal(self, pattern, trend_dozens, amx_strength_val):
-        """Filtro ML: si el modelo está entrenado, exige win rate mínimo; si no, permite."""
         if self.cooldown_remaining > 0:
             return False
         if trend_dozens is not None:
@@ -678,6 +682,23 @@ class DozenPatternAgent:
         if self._gated(pattern, required_rate):
             return False
         return True
+
+    # ── NUEVO: calcula la tasa de acierto del segundo intento dado que el primero falló ──
+    def _second_attempt_win_rate(self, pattern):
+        """Devuelve la proporción de veces que el segundo intento fue ganador (hit_attempt==2)
+        entre los casos donde el primer intento falló (hit_attempt != 1)."""
+        if not self.trained:
+            return None
+        arr = self.trained_snapshot.get(self._key(pattern), [])
+        if len(arr) < DOZEN_MIN_SAMPLES_GATE:
+            return None
+        # Filtrar casos donde el primer intento falló (hit_attempt != 1)
+        # hit_attempt puede ser 0 (perdida) o 2 (ganado en segundo)
+        filtered = [v for v in arr if v != 1]  # v=0 o v=2
+        if not filtered:
+            return None
+        wins = sum(1 for v in filtered if v == 2)
+        return wins / len(filtered)
 
     def run_backtest(self, dozen_history):
         window = dozen_history[-DOZEN_BACKTEST_WINDOW:]
@@ -739,7 +760,6 @@ class DozenPatternAgent:
             if partial:
                 a, b, expected = partial
                 full_pattern = self._full_pattern(a, b, expected)
-                # Aplicar filtro ML (con o sin modelo)
                 if self._ml_should_signal(full_pattern, trend_dozens, amx_strength_val):
                     self.confirming = True
                     self.pending_pattern = (a, b, expected)
@@ -885,7 +905,7 @@ class DozenPatternAgent:
 
 
 # ══════════════════════════════════════════════
-#  ROULETTE TABLE (con lógica de restricción para D1+D3)
+#  ROULETTE TABLE (con lógica de segundo intento opuesto)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -913,6 +933,9 @@ class RouletteTable:
         self.pending_candidate = None
         self.confirmation_msg_id = None
 
+        self._pending_new_signal = None
+        self._signal_included = False
+
         # ── AGENTES ──
         self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
         self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
@@ -924,8 +947,7 @@ class RouletteTable:
         self.last_dozen_num = None
         self.last_d2_number = None
         self.trend = "neutral"
-        # Guarda la última zona no nula (para D1+D3)
-        self.last_nonzero_zone = "BAJA"  # valor por defecto
+        self.last_nonzero_zone = "BAJA"
 
     def _level_change(self, number: int, real_dozen_num: int) -> int:
         if real_dozen_num == 1: return 1
@@ -969,9 +991,13 @@ class RouletteTable:
                 await delete_msg(prev_id)
         return msg_id
 
-    async def _send_resolution(self, win: bool, numbers: list, balance: int):
+    async def _send_resolution(self, win: bool, numbers: list, balance: int, extra_text: str = ""):
         res_text = build_resolution_message(win, numbers, balance)
-        await send_msg(res_text, THREAD_SIGNALS)
+        if extra_text:
+            full_text = f"{res_text}\n————————————————————\n{extra_text}"
+        else:
+            full_text = res_text
+        await send_msg(full_text, THREAD_SIGNALS)
         if win:
             simple = "✅ WIN"
         else:
@@ -994,9 +1020,6 @@ class RouletteTable:
             self.cycle_pending = 0
 
     def _finalize_sequence(self, win: bool, winning_attempt: int = None):
-        asyncio.create_task(self.daily_marker.record(win, winning_attempt))
-        asyncio.create_task(self._send_daily_marker_and_cycle())
-
         if win and winning_attempt == 1:
             balance = self.attempt_bets[0]
         elif win and winning_attempt == 2:
@@ -1004,7 +1027,26 @@ class RouletteTable:
         else:
             balance = -(self.attempt_bets[0] + self.attempt_bets[1])
 
-        asyncio.create_task(self._send_resolution(win, self.attempt_numbers, balance))
+        extra_text = ""
+        if self._pending_new_signal is not None:
+            new_signal = self._pending_new_signal
+            agent = new_signal["agent"]
+            zone_sequence = new_signal["zone_sequence"]
+            if self.current_attempt_index == 0:
+                header = "🔥🔥 NUEVA SEÑAL CONFIRMADA 🔥🔥"
+            else:
+                header = "🔥🔥 REPETIR SEÑAL CONFIRMADA 🔥🔥"
+            last_num = agent._last_raw_number
+            zone = zone_sequence[0]
+            bet_amount = self.labouchere.get_bet()
+            entry_body = build_entry_message_zone(last_num, zone, bet_amount=bet_amount)
+            extra_text = f"{header}\n\n{entry_body}"
+            self._pending_new_signal = None
+            self._signal_included = True
+
+        asyncio.create_task(self._send_resolution(win, self.attempt_numbers, balance, extra_text))
+        asyncio.create_task(self.daily_marker.record(win, winning_attempt))
+        asyncio.create_task(self._send_daily_marker_and_cycle())
 
         self.signal_sequence = []
         self.current_attempt_index = 0
@@ -1026,8 +1068,99 @@ class RouletteTable:
         best_agent, best_score, best_candidate = max(candidates, key=lambda x: x[1])
         return best_agent, best_candidate
 
+    def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
+        """
+        Decide la secuencia de zonas para los dos intentos basado en el tipo de señal y el aprendizaje.
+        Retorna una lista de dos zonas.
+        """
+        if bet_zone_tuple is not None:
+            zone = bet_zone_tuple[0]
+            # Verificar si es D1+D2 o D2+D3 (zone no None) o D1+D3 (zone None)
+            # Para D1+D3 siempre opuesto en ambos intentos (ya manejado fuera)
+            # Aquí solo se llama cuando bet_zone_tuple no es None, es decir, D1+D2 o D2+D3.
+            # Decidir si el segundo intento será opuesto.
+            pattern = candidate["pattern"]
+            second_rate = agent._second_attempt_win_rate(pattern)
+            use_opposite = False
+            if second_rate is not None:
+                # Si la tasa de acierto del segundo intento es baja, usar opuesto
+                if second_rate < SECOND_ATTEMPT_OPPOSITE_THRESHOLD:
+                    use_opposite = True
+                    log.info(f"🔄 {agent.name} patrón {pattern}: segundo intento al mismo lado tiene tasa {second_rate:.2f} < umbral, se usará opuesto")
+            else:
+                # Si no hay datos, usar AMX como respaldo: si AMX débil, opuesto
+                if amx_strength < AMX_STRENGTH_THRESHOLDS["weak"]:
+                    use_opposite = True
+                    log.info(f"🔄 {agent.name} patrón {pattern}: sin datos de segundo intento, AMX débil ({amx_strength:.2f}), se usará opuesto")
+
+            if use_opposite:
+                opposite = "ALTA" if zone == "BAJA" else "BAJA"
+                return [zone, opposite]
+            else:
+                return [zone, zone]
+        else:
+            # D1+D3: siempre opuesto en ambos intentos (ya manejado en la llamada)
+            # Esta función no debería ser llamada para D1+D3
+            return None
+
+    def _prepare_new_signal(self, agent, candidate, last_number):
+        """Prepara la nueva señal para ser incluida en el mensaje de resolución."""
+        bet_zone_tuple = candidate.get("bet_zone")
+        amx_strength = candidate.get("amx_strength", 0.0)
+        if bet_zone_tuple is not None:
+            zone_sequence = self._determine_zone_sequence(agent, candidate, bet_zone_tuple, amx_strength)
+        else:
+            # D1+D3: opuesto
+            last_zone = self.last_nonzero_zone
+            opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
+            zone_sequence = [opposite, opposite]
+            log.info(f"🔀 Señal D1+D3 → opuesto de última zona ({last_zone}) → {opposite} en ambos intentos")
+
+        self._pending_new_signal = {
+            "agent": agent,
+            "zone_sequence": zone_sequence,
+        }
+        agent.candidate_signal = None
+
+    def _activate_new_signal(self, agent, candidate, bet_amount):
+        """Activa una nueva señal (envía entrada) cuando no hay señal activa."""
+        bet_zone_tuple = candidate.get("bet_zone")
+        amx_strength = candidate.get("amx_strength", 0.0)
+        if bet_zone_tuple is not None:
+            zone_sequence = self._determine_zone_sequence(agent, candidate, bet_zone_tuple, amx_strength)
+        else:
+            # D1+D3: opuesto
+            last_zone = self.last_nonzero_zone
+            opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
+            zone_sequence = [opposite, opposite]
+            log.info(f"🔀 Señal D1+D3 → opuesto de última zona ({last_zone}) → {opposite} en ambos intentos")
+
+        new_entry = {
+            "agent": agent,
+            "original": candidate,
+            "zone_sequence": zone_sequence,
+        }
+
+        if self.signal_status == "waiting_pattern":
+            self.signal_sequence = [new_entry]
+            self.current_attempt_index = 1
+            self.signal_status = "active"
+            asyncio.create_task(self._send_entry(agent, zone_sequence[1], bet_amount, 2))
+            log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {agent.name} -> ZONA {zone_sequence[1]}")
+            return
+
+        self.signal_sequence = [new_entry]
+        self.current_attempt_index = 0
+        self.signal_status = "active"
+        self.attempt_numbers = []
+        self.attempt_zones = []
+        self.attempt_bets = []
+        self.entry_msg_ids = []
+        asyncio.create_task(self._send_entry(agent, zone_sequence[0], bet_amount, 1))
+        log.info(f"🔔 SEÑAL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
+        agent.candidate_signal = None
+
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
-        # Recolectar candidatos
         candidates = []
         confirmation_resolved = False
         new_confirming_agent = None
@@ -1048,24 +1181,17 @@ class RouletteTable:
                 bet_zone_tuple = agente.candidate_signal.get("bet_zone")
                 bet_zone = bet_zone_tuple[0] if bet_zone_tuple is not None else None
 
-                # ── DECISIÓN SOBRE ACEPTAR O NO EL CANDIDATO ──
                 if bet_zone is None:
                     # D1+D3: solo agentes de 4 valores y modelo entrenado
                     if agente.mode not in ("aaba", "abaa"):
-                        # Solo los de 4 valores pueden lanzar D1+D3
-                        log.debug(f"⛔ {agente.name} D1+D3 descartado (no es agente de 4 valores)")
                         continue
                     win_rate = agente._win_rate(pattern)
                     if win_rate is None:
-                        # Modelo no entrenado aún para este patrón
-                        log.debug(f"⛔ {agente.name} D1+D3 descartado (modelo no entrenado para {pattern})")
                         continue
-                    # Si pasa, añadir a candidatos
                     amx_str = agente.candidate_signal.get("amx_strength", 0.0)
                     score = win_rate * (1 + amx_str)
                     candidates.append((agente, score, agente.candidate_signal))
                 else:
-                    # D1+D2 o D2+D3: aceptar siempre (ya filtrado por ML en update)
                     amx_str = agente.candidate_signal.get("amx_strength", 0.0)
                     win_rate = agente._win_rate(pattern) or 0.0
                     score = win_rate * (1 + amx_str)
@@ -1108,6 +1234,10 @@ class RouletteTable:
                 else:
                     log.info(f"🚫 CERO en intento {self.current_attempt_index+1} - señal perdida")
                     self.signal_status = "lost"
+                    if candidates:
+                        best_agent, best_candidate = self._select_best_candidate(candidates)
+                        if best_agent is not None:
+                            self._prepare_new_signal(best_agent, best_candidate, last_number)
                     self._finalize_sequence(False, None)
                     return True
 
@@ -1123,6 +1253,10 @@ class RouletteTable:
                 self.signal_status = "won"
                 winning_attempt = self.current_attempt_index + 1
                 log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (zona {bet_zone})")
+                if candidates:
+                    best_agent, best_candidate = self._select_best_candidate(candidates)
+                    if best_agent is not None:
+                        self._prepare_new_signal(best_agent, best_candidate, last_number)
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
@@ -1136,57 +1270,22 @@ class RouletteTable:
                 else:
                     self.signal_status = "lost"
                     log.info("❌ SECUENCIA PERDIDA (2 intentos fallidos)")
+                    if candidates:
+                        best_agent, best_candidate = self._select_best_candidate(candidates)
+                        if best_agent is not None:
+                            self._prepare_new_signal(best_agent, best_candidate, last_number)
                     self._finalize_sequence(False, None)
                     return True
 
         if self.confirming:
             return True
 
-        # Nueva señal confirmada
-        if candidates:
+        if self.signal_status is None and not self._signal_included and candidates:
             best_agent, best_candidate = self._select_best_candidate(candidates)
             if best_agent is not None:
-                bet_dozens = best_candidate["bet_dozens"]
-                pattern = best_candidate["pattern"]
-                amx_str = best_candidate.get("amx_strength", 0.0)
-
-                zone_tuple = best_candidate.get("bet_zone")
-                if zone_tuple is not None:
-                    zone = zone_tuple[0]
-                    zone_sequence = [zone, zone]
-                else:
-                    # D1+D3: opuesto de la última zona no nula
-                    last_zone = self.last_nonzero_zone
-                    opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
-                    zone_sequence = [opposite, opposite]
-                    log.info(f"🔀 Señal D1+D3 → opuesto de última zona ({last_zone}) → {opposite} en ambos intentos")
-
-                new_entry = {
-                    "agent": best_agent,
-                    "original": best_candidate,
-                    "zone_sequence": zone_sequence,
-                }
-
-                if self.signal_status == "waiting_pattern":
-                    self.signal_sequence = [new_entry]
-                    self.current_attempt_index = 1
-                    self.signal_status = "active"
-                    asyncio.create_task(self._send_entry(best_agent, zone_sequence[1], bet_amount, 2))
-                    log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {best_agent.name} -> ZONA {zone_sequence[1]}")
-                    return True
-
-                self.signal_sequence = [new_entry]
-                self.current_attempt_index = 0
-                self.signal_status = "active"
-                self.attempt_numbers = []
-                self.attempt_zones = []
-                self.attempt_bets = []
-                self.entry_msg_ids = []
-                asyncio.create_task(self._send_entry(best_agent, zone_sequence[0], bet_amount, 1))
-                log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> ZONA {zone_sequence[0]}")
+                self._activate_new_signal(best_agent, best_candidate, bet_amount)
                 return True
 
-        # Nueva confirmación
         if new_confirming_agent is not None:
             self.pending_agent = new_confirming_agent
             self.pending_candidate = new_confirming_agent.candidate_signal
@@ -1207,7 +1306,6 @@ class RouletteTable:
         if not training:
             self.live_spins_seen += 1
 
-        # Actualizar última zona no nula
         if number != 0:
             self.last_nonzero_zone = zone_of(number)
 
@@ -1260,6 +1358,8 @@ class RouletteTable:
             agente.update(self.dozen_history, timestamp, blocked=blocked,
                           trend_dozens=favored, amx_strength_val=amx_strength_val,
                           last_number=number, live_enabled=live_ok)
+
+        self._signal_included = False
 
         if not training:
             self._handle_signal_sequence(agent_list, number, self.labouchere.get_bet())
