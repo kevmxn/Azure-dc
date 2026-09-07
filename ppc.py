@@ -119,7 +119,7 @@ THREAD_STATS   = int(os.environ.get("THREAD_STATS", "4398"))
 THREAD_SIGNALS_ZONE = int(os.environ.get("THREAD_SIGNALS_ZONE", str(THREAD_SIGNALS)))
 THREAD_STATS_ZONE   = int(os.environ.get("THREAD_STATS_ZONE", str(THREAD_STATS)))
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:speedroulette2")
-TABLE_NAME     = "Speed Roulette 2"
+TABLE_NAME     = "Ruleta: Speed Roulette 2"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
@@ -963,6 +963,7 @@ class RouletteTable:
         return None
 
     async def _send_entry(self, agent, zone, bet_amount, attempt_number):
+        """Envía el mensaje de entrada con el formato completo (número, zona, apuesta)."""
         seq_txt = self.labouchere.seq_str()
         original = build_entry_message_zone(
             agent._last_raw_number,
@@ -970,10 +971,9 @@ class RouletteTable:
             bet_amount=bet_amount,
             sequence_str=seq_txt
         )
-        parts = original.split("\n\n", 1)
-        body = parts[1] if len(parts) == 2 else original
+        # CORRECCIÓN: usar el mensaje completo sin dividir
         new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
-        entry_text = f"{new_header}\n\n{body}"
+        entry_text = f"{new_header}\n\n{original}"
         msg_id = await send_msg(entry_text, agent.thread_signals)
 
         if len(self.attempt_bets) >= attempt_number:
