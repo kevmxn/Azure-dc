@@ -1,7 +1,10 @@
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT UNIFICADO — SPEED ROULETTE 2 (key 205)                 ║
-║   - Detección: 4 agentes de PATRONES DE DOCENAS (D1/D2/D3)   ║
+║   - Detección: 4 agentes de PATRONES DE DOCENAS              ║
+║       V2: aaba (4)  |  V3: aaaba (5)                        ║
+║       V4: abaa (4)  |  V6: aaaabaa (7)                     ║
 ║     con ML adaptativo, tendencia EMA/AMX y cooldowns         ║
 ║   - Conversión: docenas bajas (D1+D2) -> ZONA BAJA 1-18      ║
 ║                 docenas altas (D2+D3) -> ZONA ALTA 19-36     ║
@@ -10,6 +13,12 @@
 ║   - Gestión de capital Labouchère + marcador diario          ║
 ║     (lógica Roulette 1, cero = pérdida)                      ║
 ║   - Telegram / HTTP API / self-ping / persistencia           ║
+║   - [ACTUALIZACIÓN] Marcador diario solo win1/win2/loss      ║
+║   - [ACTUALIZACIÓN] D1+D3 se convierte a zona usando        ║
+║     contexto (último número, tendencia, AMX) y dos intentos  ║
+║   - [ACTUALIZACIÓN] Tendencia global basada en 20 giros      ║
+║   - [ACTUALIZACIÓN] Patrones a,b,c eliminados; añadidos      ║
+║     aaaba y aaaabaa                                          ║
 ╚══════════════════════════════════════════════════════════════
 """
 
@@ -100,7 +109,7 @@ AGENT_TREND_CONFIG = {
     "agent6": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
 }
 
-# ── Telegram (credenciales y hilos de Roulette 1) ──
+# ── Telegram ──
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHAT_ID_BASE   = int(os.environ.get("CHAT_ID_BASE", "-1003986868798"))
 THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "4396"))
@@ -140,7 +149,6 @@ def zone_of(n):
     return "BAJA" if 1 <= n <= 18 else "ALTA"
 
 def zone_win(zone: str, number) -> bool:
-    """Una zona gana solo si el número cae en su rango. El cero SIEMPRE pierde."""
     if number is None or number == 0:
         return False
     if zone == "BAJA":
@@ -150,26 +158,45 @@ def zone_win(zone: str, number) -> bool:
     return False
 
 def dozen_bet_to_zone(bet_dozens, pattern) -> Optional[str]:
-    """Convierte la apuesta de docenas del patrón en la zona a apostar:
-       - D1+D2 (docenas bajas)          -> BAJA (1-18)
-       - D2+D3 (docenas altas)          -> ALTA (19-36)
-       - D1+D3 (mixto)                  -> None (descartado) excepto en tendencia fuerte (manejo externo)
-       - Otros casos                    -> se decide por el último elemento del patrón
-    """
     s = set(bet_dozens)
     if s == {"D1", "D2"}:
         return "BAJA"
     if s == {"D2", "D3"}:
         return "ALTA"
     if s == {"D1", "D3"}:
-        return None  # Se descarta normalmente
-    # Fallback: usar el último elemento del patrón
+        return None  # Se decide con contexto
     pred = pattern[-1]
     if pred == "D1":
         return "BAJA"
     if pred == "D3":
         return "ALTA"
     return None
+
+def infer_zone_from_context(bet_dozens, last_number, level_history, trend, amx_strength):
+    s = set(bet_dozens)
+    if s == {"D1", "D2"}:
+        return "BAJA"
+    if s == {"D2", "D3"}:
+        return "ALTA"
+    if s == {"D1", "D3"}:
+        last_zone = zone_of(last_number) if last_number is not None and last_number != 0 else None
+        if len(level_history) < 20:
+            return "BAJA" if trend in ("bearish", "neutral") else "ALTA"
+        if trend == "bullish":
+            base_zone = "ALTA"
+        elif trend == "bearish":
+            base_zone = "BAJA"
+        else:
+            base_zone = last_zone if last_zone in ("BAJA", "ALTA") else "BAJA"
+        if amx_strength >= AMX_STRENGTH_THRESHOLDS["strong"]:
+            return base_zone
+        if amx_strength < AMX_STRENGTH_THRESHOLDS["weak"] and last_zone:
+            if last_zone == "ALTA" and trend == "bearish":
+                return "BAJA"
+            if last_zone == "BAJA" and trend == "bullish":
+                return "ALTA"
+        return base_zone
+    return "BAJA"
 
 def format_cop(amount: int) -> str:
     sign = '+' if amount >= 0 else '-'
@@ -263,7 +290,7 @@ def amx_strength(level_history, periods):
 
 
 # ══════════════════════════════════════════════
-#  LABOUCHÈRE MANAGER (gestión de capital)
+#  LABOUCHÈRE MANAGER
 # ══════════════════════════════════════════════
 class LabouchereManager:
     def __init__(self, base_amount: int = LABOUCHERE_BASE_AMOUNT,
@@ -397,7 +424,6 @@ async def delete_msg(msg_id: int) -> bool:
         log.debug(f"[Telegram] Error eliminando mensaje {msg_id}: {e}")
         return False
 
-# ── Formatos de mensaje (estilo Roulette 1, para ZONAS) ──
 def build_entry_message_zone(last_number, bet_zone, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
     numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "🟢") if last_number is not None else ""
@@ -421,12 +447,6 @@ def build_entry_message_zone(last_number, bet_zone, bet_amount=None, start_attem
             f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
 def build_resolution_message(win: bool, numbers: list, balance: int) -> str:
-    """
-    Construye el mensaje de resolución con el formato solicitado:
-    - Ganada en intento 1: "✅✅ 👍🏻 (3) | Apuesta: +$1,000 COP"
-    - Ganada en intento 2: "✅✅ 👍🏻 (3 | 34) | Apuesta: +$1,000 COP"
-    - Perdida: "❌❌ 👎🏻 (3 | 4) | Apuesta: -$1,500 COP"
-    """
     numbers_str = " | ".join(str(n) for n in numbers)
     if win:
         header = "✅✅ 👍🏻"
@@ -437,20 +457,17 @@ def build_resolution_message(win: bool, numbers: list, balance: int) -> str:
 def build_daily_marker_message(stats: dict) -> str:
     win1 = stats.get("win1", 0)
     win2 = stats.get("win2", 0)
-    win3 = stats.get("win3", 0)
     loss = stats.get("loss", 0)
-    total = win1 + win2 + win3 + loss
+    total = win1 + win2 + loss
     if total == 0:
         return "📆 MARCADOR DIARIO\nSin señales aún."
     win1_pct = (win1 / total) * 100
     win2_pct = (win2 / total) * 100
-    win3_pct = (win3 / total) * 100
     loss_pct = (loss / total) * 100
-    global_pct = ((win1 + win2 + win3) / total) * 100
+    global_pct = ((win1 + win2) / total) * 100
     return (f"📆 MARCADOR DIARIO\n"
             f"✅ Win 1: {win1} | Acierto: {win1_pct:.2f}%\n"
             f"✅ Win 2: {win2} | Acierto: {win2_pct:.2f}%\n"
-            f"✅ Win 3: {win3} | Acierto: {win3_pct:.2f}%\n"
             f"❌ Loss: {loss} | Fallos: {loss_pct:.2f}%\n"
             f"🎯 Total señales: {total}\n"
             f"📈 Efectividad Global: {global_pct:.2f}%")
@@ -497,11 +514,11 @@ if bot is not None:
 
 
 # ──────────────────────────────────────────────
-#  DAILY MARKER (win1, win2, win3, loss)
+#  DAILY MARKER
 # ──────────────────────────────────────────────
 class DailyMarker:
     def __init__(self, thread_signals=None):
-        self.stats = {"win1": 0, "win2": 0, "win3": 0, "loss": 0}
+        self.stats = {"win1": 0, "win2": 0, "loss": 0}
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS
 
     async def record(self, win: bool, attempt: int = None):
@@ -509,15 +526,12 @@ class DailyMarker:
             self.stats["win1"] = self.stats.get("win1", 0) + 1
         elif win and attempt == 2:
             self.stats["win2"] = self.stats.get("win2", 0) + 1
-        elif win and attempt == 3:
-            self.stats["win3"] = self.stats.get("win3", 0) + 1
         elif not win:
             self.stats["loss"] = self.stats.get("loss", 0) + 1
 
 
 # ══════════════════════════════════════════════
-#  AGENTE DE PATRÓN DE DOCENAS
-#  (detección docenas + confirmación "-1 valor" + shadow tracking)
+#  AGENTE DE PATRÓN DE DOCENAS (actualizado)
 # ══════════════════════════════════════════════
 class DozenPatternAgent:
     def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
@@ -530,7 +544,6 @@ class DozenPatternAgent:
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS_ZONE
         self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS_ZONE
 
-        # Shadow tracking (resultado de la señal para ML/estadísticas)
         self.train_state = {
             "active": False, "pattern": None, "bet_dozens": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
@@ -540,7 +553,6 @@ class DozenPatternAgent:
         self.live_enabled = True
         self.candidate_signal = None
 
-        # Confirmación de patrón "-1 valor"
         self.confirming = False
         self.pending_pattern = None
 
@@ -554,17 +566,15 @@ class DozenPatternAgent:
         self.msg_id = None
         self.entry_text = None
         self._last_raw_number = None
-        # Entrenamiento ML
         self.total_processed = 0
         self.trained = False
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
 
-    # ── Matching de patrones completos ──
+    # ── Matching de patrones completos (sin a,b,c) ──
     def _match(self, window):
         if len(window) != self.pattern_len:
             return None
-        c = None
         if self.mode == "aaaba":
             a, b = window[0], window[3]
             ok = (window[1] == a and window[2] == a and window[4] == a)
@@ -573,61 +583,46 @@ class DozenPatternAgent:
             a, b = window[0], window[2]
             ok = (window[1] == a and window[3] == a)
             extra_ok = True
-        elif self.mode == "aabbc":
-            a, b, c = window[0], window[2], window[4]
-            ok = (window[1] == a and window[3] == b)
-            extra_ok = (c in DOZEN_VALUES and len({a, b, c}) == 3)
         elif self.mode == "abaa":
             a, b = window[0], window[1]
             ok = (window[2] == a and window[3] == a)
             extra_ok = True
-        elif self.mode == "abaaa":
-            a, b = window[0], window[1]
-            ok = (window[2] == a and window[3] == a and window[4] == a)
-            extra_ok = True
-        elif self.mode == "abbcc":
-            a, b, c = window[0], window[1], window[3]
-            ok = (window[2] == b and window[4] == c)
-            extra_ok = (c in DOZEN_VALUES and len({a, b, c}) == 3)
+        elif self.mode == "aaaabaa":
+            a, b = window[0], window[4]
+            ok = (window[1] == a and window[2] == a and window[3] == a and window[5] == a and window[6] == a)
+            extra_ok = (b != a)
         else:
             return None
         if not (ok and extra_ok and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b):
             return None
-        return (a, b, c) if c is not None else (a, b)
+        return (a, b)  # ya no usamos c
 
     # ── Matching parcial (confirmación "-1 valor") ──
     def _match_partial(self, window):
-        """Verifica si las primeras pattern_len-1 docenas coinciden con el patrón.
-        Devuelve (a, b, expected_last) donde expected_last es la docena que debe
-        salir en el siguiente giro para confirmar el patrón completo."""
         if len(window) != self.pattern_len - 1:
             return None
-        if self.mode == "aaba":          # completo: a a b a
+        if self.mode == "aaba":          # a a b a -> parcial a a b
             a, b = window[0], window[2]
             if window[1] == a and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b:
                 return (a, b, a)
-        elif self.mode == "abaa":        # completo: a b a a
+        elif self.mode == "abaa":        # a b a a -> parcial a b a
             a, b = window[0], window[1]
             if window[2] == a and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b:
                 return (a, b, a)
-        elif self.mode == "aabbc":       # completo: a a b b c
-            a, b = window[0], window[2]
-            if (window[1] == a and window[3] == b
+        elif self.mode == "aaaba":       # a a a b a -> parcial a a a b
+            a, b = window[0], window[3]
+            if window[1] == a and window[2] == a and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b:
+                return (a, b, a)
+        elif self.mode == "aaaabaa":     # a a a a b a a -> parcial a a a a b a
+            a, b = window[0], window[4]
+            if (window[1] == a and window[2] == a and window[3] == a and window[5] == a
                     and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b):
-                c = (set(DOZEN_VALUES) - {a, b}).pop()
-                return (a, b, c)
-        elif self.mode == "abbcc":       # completo: a b b c c
-            a, b = window[0], window[1]
-            if (window[2] == b
-                    and a in DOZEN_VALUES and b in DOZEN_VALUES and a != b):
-                c = (set(DOZEN_VALUES) - {a, b}).pop()
-                return (a, b, c)
+                return (a, b, a)
         return None
 
     @staticmethod
     def _bet_dozens(pattern):
-        """(a,b) -> apuesta a A y B. (a,b,c) -> apuesta a B y C."""
-        return tuple(pattern[1:]) if len(pattern) == 3 else tuple(pattern)
+        return tuple(pattern)  # para (a,b) apostamos a a y b
 
     @staticmethod
     def _key(pattern):
@@ -665,7 +660,7 @@ class DozenPatternAgent:
     def _gated(self, pattern, required_win_rate):
         rate = self._win_rate(pattern)
         if rate is None:
-            return False   # sin suficientes muestras o modelo no entrenado, se permite (aprender)
+            return False
         return rate < required_win_rate
 
     def _recommended_attempt(self, pattern):
@@ -695,7 +690,6 @@ class DozenPatternAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _ml_should_signal(self, pattern, trend_dozens, amx_strength_val):
-        """Cooldown + filtro de tendencia + win rate dinámico según AMX."""
         if self.cooldown_remaining > 0:
             return False
         if trend_dozens is not None:
@@ -733,9 +727,7 @@ class DozenPatternAgent:
         }
 
     def _full_pattern(self, a, b, expected):
-        """Reconstruye el patrón completo a partir de la confirmación."""
-        if self.mode in ("aabbc", "abbcc"):
-            return (a, b, expected)
+        # Ya no tenemos patrones a,b,c, siempre devolvemos (a,b)
         return (a, b)
 
     def update(self, dozen_history, timestamp, blocked: bool = False,
@@ -748,10 +740,7 @@ class DozenPatternAgent:
             return
         last = dozen_history[-1]
 
-        # 1) Resolver shadow tracking de una señal en curso.
-        #    El MODELO aprende con la semántica de DOCENAS del bot original:
-        #    acierta si aparece alguna de las docenas cubiertas O el cero.
-        #    (La gestión de capital en la mesa resuelve por ZONA: el cero pierde.)
+        # 1) Shadow tracking
         if self.train_state["active"]:
             self.train_state["current_attempt"] += 1
             attempt = self.train_state["start_attempt"] + self.train_state["current_attempt"] - 1
@@ -765,13 +754,13 @@ class DozenPatternAgent:
                 if self.train_state["attempts_left"] <= 0:
                     self._close_shadow(False, last, attempt, timestamp)
 
-        # 2) Backtest + cooldown + entrenamiento ML
+        # 2) Backtest / cooldown / ML
         self.run_backtest(dozen_history)
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        # 3) Buscar patrón parcial para entrar en estado de confirmación
+        # 3) Buscar patrón parcial para confirmación
         if (not self.train_state["active"] and not self.confirming
                 and len(dozen_history) >= self.pattern_len - 1
                 and len(dozen_history) >= DOZEN_MIN_SPIN_TO_SIGNAL
@@ -792,15 +781,13 @@ class DozenPatternAgent:
                     log.info(f"🔍 {self.name} confirmación pendiente: {a},{b} -> esperado {expected}")
                     return
 
-        # 4) Evaluar confirmación pendiente con la docena que acaba de salir
+        # 4) Evaluar confirmación
         if self.confirming and self.pending_pattern:
             a, b, expected = self.pending_pattern
             if last == expected:
                 pattern = self._full_pattern(a, b, expected)
                 bet_dozens = self._bet_dozens(pattern)
                 zone = dozen_bet_to_zone(bet_dozens, pattern)
-                # Si la zona es None (D1+D3), almacenamos la señal igual y lo manejamos después
-                # en el servidor (tendencia fuerte) o descartamos.
                 context = list(dozen_history[-DOZEN_CONTEXT_WINDOW:])
                 self.candidate_signal = {
                     "pattern": pattern,
@@ -812,8 +799,7 @@ class DozenPatternAgent:
                     "score": self._win_rate(pattern) or 0.0,
                     "confirming": False,
                 }
-                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone}")
-                # Activar shadow tracking para registrar el resultado en ML/stats
+                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir con contexto'}")
                 self.train_state = {
                     "active": True, "pattern": pattern, "bet_dozens": bet_dozens,
                     "bet_zone": zone,
@@ -859,7 +845,6 @@ class DozenPatternAgent:
         self.train_attempt_results = []
 
     def reset_transient(self):
-        """Limpia estados volátiles tras el entrenamiento por lotes."""
         self.confirming = False
         self.pending_pattern = None
         self.candidate_signal = None
@@ -929,7 +914,7 @@ class DozenPatternAgent:
 
 
 # ══════════════════════════════════════════════
-#  ROULETTE TABLE (docenas -> zonas, Labouchère, confirmación)
+#  ROULETTE TABLE (con nuevos agentes)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -945,24 +930,23 @@ class RouletteTable:
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
         self.cycle_pending = 0
 
-        # Estado de la secuencia de señal activa (apuesta de zona)
         self.signal_sequence = []
         self.current_attempt_index = 0
-        self.signal_status = None       # None | "active" | "waiting_pattern" | "won" | "lost"
+        self.signal_status = None
         self.attempt_numbers = []
-        self.attempt_zones = []         # zonas usadas en cada intento
-        self.attempt_bets = []          # apuestas de cada intento
+        self.attempt_zones = []
+        self.attempt_bets = []
         self.entry_msg_ids = []
         self.confirming = False
         self.pending_agent = None
         self.pending_candidate = None
         self.confirmation_msg_id = None
 
-        # Agentes de docenas
-        self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎", mode="aaba", daily_marker=self.daily_marker)
-        self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎", mode="aabbc", daily_marker=self.daily_marker)
-        self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎", mode="abaa", daily_marker=self.daily_marker)
-        self.agent6 = DozenPatternAgent(pattern_len=5, name="AGENTE_6", label="PATRON V6 💎", mode="abbcc", daily_marker=self.daily_marker)
+        # ── NUEVOS AGENTES (reemplazo de a,b,c) ──
+        self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
+        self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
+        self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎 (abaa)", mode="abaa", daily_marker=self.daily_marker)
+        self.agent6 = DozenPatternAgent(pattern_len=7, name="AGENTE_6", label="PATRON V6 💎 (aaaabaa)", mode="aaaabaa", daily_marker=self.daily_marker)
 
         self.level_history = []
         self.level_current = 0
@@ -979,10 +963,7 @@ class RouletteTable:
         if self.last_dozen_num == 3: return -1
         return 0
 
-    # ── Mensajería de la secuencia ──
     async def _send_confirmation(self):
-        # Mensaje de confirmación deshabilitado: ya no se publica en Telegram,
-        # pero el estado interno de "esperando confirmación" se mantiene igual.
         self.confirmation_msg_id = None
         return None
 
@@ -1000,7 +981,6 @@ class RouletteTable:
         entry_text = f"{new_header}\n\n{body}"
         msg_id = await send_msg(entry_text, agent.thread_signals)
 
-        # Guardar la apuesta de este intento
         if len(self.attempt_bets) >= attempt_number:
             self.attempt_bets[attempt_number - 1] = bet_amount
         else:
@@ -1017,10 +997,8 @@ class RouletteTable:
         return msg_id
 
     async def _send_resolution(self, win: bool, numbers: list, balance: int):
-        """Envía el mensaje de resolución con el formato compacto."""
         res_text = build_resolution_message(win, numbers, balance)
         await send_msg(res_text, THREAD_SIGNALS)
-        # También enviamos un resumen simple al hilo de estadísticas
         if win:
             simple = "✅ WIN"
         else:
@@ -1029,7 +1007,7 @@ class RouletteTable:
 
     async def _send_daily_marker_and_cycle(self):
         total = (self.daily_marker.stats.get("win1", 0) + self.daily_marker.stats.get("win2", 0)
-                 + self.daily_marker.stats.get("win3", 0) + self.daily_marker.stats.get("loss", 0))
+                 + self.daily_marker.stats.get("loss", 0))
         if total > 0:
             text = build_daily_marker_message(self.daily_marker.stats)
             await send_msg(text, self.daily_marker.thread_signals)
@@ -1046,20 +1024,15 @@ class RouletteTable:
         asyncio.create_task(self.daily_marker.record(win, winning_attempt))
         asyncio.create_task(self._send_daily_marker_and_cycle())
 
-        # Calcular balance neto de la señal
         if win and winning_attempt == 1:
-            balance = self.attempt_bets[0]  # ganancia del primer intento
+            balance = self.attempt_bets[0]
         elif win and winning_attempt == 2:
-            # ganancia del segundo - pérdida del primero
             balance = self.attempt_bets[1] - self.attempt_bets[0]
         else:
-            # pérdida total
             balance = -(self.attempt_bets[0] + self.attempt_bets[1])
 
-        # Enviar resolución
         asyncio.create_task(self._send_resolution(win, self.attempt_numbers, balance))
 
-        # Limpiar estado
         self.signal_sequence = []
         self.current_attempt_index = 0
         self.signal_status = None
@@ -1081,7 +1054,6 @@ class RouletteTable:
         return best_agent, best_candidate
 
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
-        # Recolectar candidatos SIN cortar el loop
         candidates = []
         confirmation_resolved = False
         new_confirming_agent = None
@@ -1104,13 +1076,12 @@ class RouletteTable:
                 score = win_rate * (1 + amx_str)
                 candidates.append((agente, score, agente.candidate_signal))
 
-        # Liberar estado de confirmación si ya se resolvió
         if self.confirming and confirmation_resolved:
             self.confirming = False
             self.pending_agent = None
             self.pending_candidate = None
 
-        # ── Prioridad 1: secuencia activa -> resolver intento en curso ──
+        # Secuencia activa
         if self.signal_status == "active":
             if not self.signal_sequence:
                 self.signal_status = None
@@ -1118,17 +1089,13 @@ class RouletteTable:
 
             current_entry = self.signal_sequence[0]
             agent = current_entry["agent"]
-
-            # La zona para este intento depende del índice
             attempt_idx = self.current_attempt_index
             zone_sequence = current_entry["zone_sequence"]
             if attempt_idx < len(zone_sequence):
                 bet_zone = zone_sequence[attempt_idx]
             else:
-                # Fallback: usar la primera zona
                 bet_zone = zone_sequence[0]
 
-            # El CERO siempre aumenta la secuencia de Labouchère (pérdida de apuesta)
             if last_number == 0:
                 self.attempt_numbers.append(0)
                 self.attempt_zones.append(bet_zone)
@@ -1136,9 +1103,7 @@ class RouletteTable:
                 if cycle_completed:
                     self.cycle_pending = self.labouchere.cycles_completed
                 if self.current_attempt_index == 0:
-                    # CERO en INTENTO 1 -> se ajusta gestión y se espera un nuevo
-                    # patrón confirmado para completar el INTENTO 2.
-                    log.info("🟢 CERO en intento 1 - secuencia labouchere aumentada, esperando nuevo patrón para intento 2")
+                    log.info("🟢 CERO en intento 1 - esperando nuevo patrón para intento 2")
                     self.signal_status = "waiting_pattern"
                     self.signal_sequence = []
                     asyncio.create_task(send_msg(
@@ -1166,7 +1131,7 @@ class RouletteTable:
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
-                if self.current_attempt_index < ZONE_MAX_ATTEMPTS - 1:  # 0 -> 1 (dos intentos)
+                if self.current_attempt_index < ZONE_MAX_ATTEMPTS - 1:
                     self.current_attempt_index += 1
                     new_bet = self.labouchere.get_bet()
                     next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
@@ -1179,36 +1144,32 @@ class RouletteTable:
                     self._finalize_sequence(False, None)
                     return True
 
-        # ── Prioridad 2: esperando el giro de confirmación ──
         if self.confirming:
             return True
 
-        # ── Prioridad 3: señal(es) real(es) confirmada(s) -> entrar ──
+        # Nueva señal confirmada
         if candidates:
             best_agent, best_candidate = self._select_best_candidate(candidates)
             if best_agent is not None:
-                # Determinar la secuencia de zonas (solo 2 intentos)
                 bet_dozens = best_candidate["bet_dozens"]
                 pattern = best_candidate["pattern"]
                 amx_str = best_candidate.get("amx_strength", 0.0)
 
-                # Caso especial: D1+D3 y tendencia fuerte
-                if set(bet_dozens) == {"D1", "D3"} and amx_str >= AMX_STRENGTH_THRESHOLDS["strong"]:
-                    # Zona predicha: según el último elemento del patrón
-                    pred_zone = "BAJA" if pattern[-1] == "D1" else "ALTA"
-                    opposite_zone = "ALTA" if pred_zone == "BAJA" else "BAJA"
-                    # Secuencia: opuesto -> predicho (2 intentos)
-                    zone_sequence = [opposite_zone, pred_zone]
-                    log.info(f"🔀 Señal D1+D3 con tendencia fuerte → secuencia: {zone_sequence}")
+                zone_tuple = best_candidate.get("bet_zone")
+                if zone_tuple is not None:
+                    zone = zone_tuple[0]
+                    zone_sequence = [zone, zone]
                 else:
-                    # Normal: obtener la zona de la tupla
-                    zone_tuple = best_candidate.get("bet_zone")
-                    if zone_tuple is None:
-                        log.info(f"❌ Señal descartada (zona None): {best_agent.name}")
-                        best_agent.candidate_signal = None
-                        return False
-                    zone = zone_tuple[0]  # extraer string de la tupla
-                    zone_sequence = [zone, zone]  # 2 intentos a la misma zona
+                    zone = infer_zone_from_context(
+                        bet_dozens,
+                        last_number,
+                        self.level_history,
+                        self.trend,
+                        amx_str
+                    )
+                    opposite = "ALTA" if zone == "BAJA" else "BAJA"
+                    zone_sequence = [zone, opposite]
+                    log.info(f"🔀 Señal D1+D3 → zona inferida: {zone}, secuencia: {zone_sequence}")
 
                 new_entry = {
                     "agent": best_agent,
@@ -1217,8 +1178,6 @@ class RouletteTable:
                 }
 
                 if self.signal_status == "waiting_pattern":
-                    # Veníamos de un CERO en el intento 1: esta señal confirmada
-                    # completa el INTENTO 2 (conserva el 0 y el avance de la secuencia).
                     self.signal_sequence = [new_entry]
                     self.current_attempt_index = 1
                     self.signal_status = "active"
@@ -1237,7 +1196,7 @@ class RouletteTable:
                 log.info(f"🔔 SEÑAL INTENTO 1: {best_agent.name} -> ZONA {zone_sequence[0]}")
                 return True
 
-        # ── Prioridad 4: abrir una confirmación nueva ──
+        # Nueva confirmación
         if new_confirming_agent is not None:
             self.pending_agent = new_confirming_agent
             self.pending_candidate = new_confirming_agent.candidate_signal
@@ -1249,7 +1208,6 @@ class RouletteTable:
 
         return False
 
-    # ── Actualización principal ──
     def update(self, number: int, real_color: str, timestamp: float = None, training: bool = False):
         if timestamp is None: timestamp = time.time()
         self.spin_history.append({"number": number, "color": real_color, "timestamp": timestamp})
@@ -1271,6 +1229,18 @@ class RouletteTable:
         if real_dozen_num != 0:
             self.last_dozen_num = real_dozen_num
             if real_dozen_num == 2: self.last_d2_number = number
+
+        TREND_LOOKBACK = 20
+        if len(self.level_history) >= TREND_LOOKBACK:
+            diff = self.level_history[-1] - self.level_history[-TREND_LOOKBACK]
+            if diff > 0.8:
+                self.trend = "bullish"
+            elif diff < -0.8:
+                self.trend = "bearish"
+            else:
+                self.trend = "neutral"
+        else:
+            self.trend = "neutral"
 
         agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
         agent_keys = ["agent2", "agent3", "agent4", "agent6"]
@@ -1311,7 +1281,7 @@ class RouletteTable:
             f"🎰 Mesa {self.key} | Giro #{len(self.dozen_history)}: {number} ({real_color}) → {dz} "
             f"(docena {real_dozen_num}) | Zona: {zone_of(number)} | Nivel: {self.level_current} | "
             f"{seq_status} | Lab: [{lab_seq}] {format_cop(lab_bet)} | Últimas 10 docenas: [{last10}] | "
-            f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL}"
+            f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend}"
         )
 
     def get_state(self, limit: int = 40):
@@ -1338,7 +1308,7 @@ class RouletteTable:
 
 
 # ══════════════════════════════════════════════
-#  ENTRENAMIENTO CON HISTORIAL (por bloques)
+#  ENTRENAMIENTO CON HISTORIAL
 # ══════════════════════════════════════════════
 BATCH_SIZE = 250
 
@@ -1381,7 +1351,7 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
 
     for agent in agents:
         agent.force_train(timestamp)
-        agent.reset_transient()   # limpiar confirmaciones/shadows a medias
+        agent.reset_transient()
     log.info(
         f"[Entrenamiento] Mesa {table.key}: listo. giros_vistos={table.total_spins_seen} "
         f"nivel={table.level_current}"
@@ -1468,13 +1438,13 @@ class ServerState:
 
 
 # ══════════════════════════════════════════════
-#  WEBSOCKET HANDLER (conexión a Pragmatic Play)
+#  WEBSOCKET HANDLER
 # ══════════════════════════════════════════════
 class PragmaticWebSocketHandler:
     def __init__(self, key: int, on_spin_callback: Callable[[int, bool, bool], Awaitable[None]]):
         self.key = key
         self.on_spin_callback = on_spin_callback
-        self.seen = set()  # Guarda los IDs de giros ya procesados
+        self.seen = set()
 
     async def run(self):
         sub = {"type": "subscribe", "casinoId": CASINO_ID, "currency": CURRENCY_ID, "key": [self.key]}
@@ -1493,14 +1463,12 @@ class PragmaticWebSocketHandler:
                         if not isinstance(data, dict):
                             continue
 
-                        # Procesamos el array last20Results en cada mensaje
                         results = data.get("last20Results")
                         if isinstance(results, list):
                             log.debug(f"📦 Recibido last20Results con {len(results)} elementos")
                             for r in results:
                                 await self._feed(r.get("gameId"), r.get("result"), emit=True)
 
-                        # También procesamos resultados individuales si vienen (por si acaso)
                         if data.get("gameId") is not None and data.get("result") is not None:
                             await self._feed(data.get("gameId"), data.get("result"), emit=True)
 
@@ -1530,7 +1498,7 @@ class PragmaticWebSocketHandler:
 
 
 # ══════════════════════════════════════════════
-#  HTTP (aiohttp) - Solo API sin HTML
+#  HTTP
 # ══════════════════════════════════════════════
 _server_state: Optional[ServerState] = None
 
@@ -1589,12 +1557,11 @@ async def self_ping_loop():
 
 
 # ══════════════════════════════════════════════
-#  TELEGRAM POLLING (resiliente ante 409/errores)
+#  TELEGRAM POLLING
 # ══════════════════════════════════════════════
 async def bot_polling_loop():
     if bot is None:
         return
-    # Permitir deshabilitar Telegram con variable de entorno
     if os.environ.get("DISABLE_TELEGRAM", "").lower() in ("1", "true", "yes"):
         log.info("Telegram deshabilitado por variable DISABLE_TELEGRAM")
         return
@@ -1610,7 +1577,6 @@ async def bot_polling_loop():
         try:
             await bot.infinity_polling(skip_pending=True, timeout=20, request_timeout=30)
         except Exception as e:
-            # Si el error es 409 (conflicto), esperar más tiempo para no saturar
             if "409" in str(e):
                 log.warning("[Telegram] Conflicto 409 detectado (otra instancia activa). Esperando 60s...")
                 await asyncio.sleep(60)
@@ -1618,9 +1584,8 @@ async def bot_polling_loop():
             log.warning(f"[Telegram] Polling interrumpido: {e}")
 
         ran_for = time.time() - started
-        # Si el polling duró menos de 60s, aumentamos el backoff
         if ran_for < 60:
-            delay = min(delay * 2, 120)  # hasta 2 minutos
+            delay = min(delay * 2, 120)
         else:
             delay = 5
         log.warning(f"[Telegram] Reintentando polling en {delay}s…")
