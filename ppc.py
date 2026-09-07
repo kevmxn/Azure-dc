@@ -1449,8 +1449,7 @@ class PragmaticWebSocketHandler:
     def __init__(self, key: int, on_spin_callback: Callable[[int, bool, bool], Awaitable[None]]):
         self.key = key
         self.on_spin_callback = on_spin_callback
-        self.seen = set()
-        self.initial_batch_processed = False
+        self.seen = set()  # Guarda los IDs de giros ya procesados
 
     async def run(self):
         sub = {"type": "subscribe", "casinoId": CASINO_ID, "currency": CURRENCY_ID, "key": [self.key]}
@@ -1468,14 +1467,18 @@ class PragmaticWebSocketHandler:
                             continue
                         if not isinstance(data, dict):
                             continue
+
+                        # Siempre procesamos el array last20Results si existe
                         results = data.get("last20Results")
-                        if isinstance(results, list) and not self.initial_batch_processed:
-                            log.info(f"📥 Cargando últimos {len(results)} resultados de la mesa {self.key}")
-                            for r in reversed(results):
+                        if isinstance(results, list):
+                            log.debug(f"📦 Recibido last20Results con {len(results)} elementos")
+                            for r in results:
                                 await self._feed(r.get("gameId"), r.get("result"), emit=True)
-                            self.initial_batch_processed = True
+
+                        # También procesamos resultados individuales si vienen (por si acaso)
                         if data.get("gameId") is not None and data.get("result") is not None:
                             await self._feed(data.get("gameId"), data.get("result"), emit=True)
+
             except Exception as e:
                 log.warning(f"🔌 WS key={self.key}: {e}. Reconectando en {delay}s…")
             await asyncio.sleep(delay)
@@ -1488,11 +1491,15 @@ class PragmaticWebSocketHandler:
             num = int(result)
         except (TypeError, ValueError):
             return
-        if not (0 <= num <= 36) or gid in self.seen:
+        if not (0 <= num <= 36):
+            return
+        if gid in self.seen:
+            log.debug(f"⏩ gameId {gid} ya procesado (número {num})")
             return
         self.seen.add(gid)
         if len(self.seen) > 3000:
             self.seen.clear()
+        log.info(f"🔄 Nuevo giro: gameId={gid}, número={num}")
         if self.on_spin_callback:
             await self.on_spin_callback(num, emit, training=not emit)
 
@@ -1562,19 +1569,35 @@ async def self_ping_loop():
 async def bot_polling_loop():
     if bot is None:
         return
+    # Permitir deshabilitar Telegram con variable de entorno
+    if os.environ.get("DISABLE_TELEGRAM", "").lower() in ("1", "true", "yes"):
+        log.info("Telegram deshabilitado por variable DISABLE_TELEGRAM")
+        return
+
     delay = 5
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
-            log.warning(f"[Telegram] No se pudo eliminar webhook antes de iniciar polling: {e}")
+            log.warning(f"[Telegram] No se pudo eliminar webhook: {e}")
+
         started = time.time()
         try:
             await bot.infinity_polling(skip_pending=True, timeout=20, request_timeout=30)
         except Exception as e:
+            # Si el error es 409 (conflicto), esperar más tiempo para no saturar
+            if "409" in str(e):
+                log.warning("[Telegram] Conflicto 409 detectado (otra instancia activa). Esperando 60s...")
+                await asyncio.sleep(60)
+                continue
             log.warning(f"[Telegram] Polling interrumpido: {e}")
+
         ran_for = time.time() - started
-        delay = 5 if ran_for > 60 else min(delay * 2, 60)
+        # Si el polling duró menos de 60s, aumentamos el backoff
+        if ran_for < 60:
+            delay = min(delay * 2, 120)  # hasta 2 minutos
+        else:
+            delay = 5
         log.warning(f"[Telegram] Reintentando polling en {delay}s…")
         await asyncio.sleep(delay)
 
