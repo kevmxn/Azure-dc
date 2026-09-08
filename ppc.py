@@ -4,6 +4,10 @@
 ║   - Detección: 4 agentes de PATRONES DE DOCENAS              ║
 ║       V2: aaba (4)  |  V3: aaaba (5)                        ║
 ║       V4: abaa (4)  |  V6: aaaabaa (7)                     ║
+║   - Agentes de ZONA: baaaabbb (8) y aaaabbbbaa (10)        ║
+║     (patrones solo con a/b, el cero es comodín)             ║
+║   - Si el cero está cerca del final, se invierte la         ║
+║     secuencia de apuestas (opuesto primero)                 ║
 ║   - Señales D1+D2/D2+D3: todos los agentes, sin modelo      ║
 ║   - Señales D1+D3: solo agentes de 4 valores y             ║
 ║     requieren modelo entrenado                              ║
@@ -72,7 +76,7 @@ DOZEN_COOLDOWN_AFTER_LOSSES = 3
 DOZEN_COOLDOWN_ROUNDS = 5
 
 # ── Umbral para decidir opuesto en segundo intento ──
-SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35  # si la tasa de acierto del segundo intento es menor, se usa opuesto
+SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
 
 # ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
@@ -92,10 +96,10 @@ DOZEN_NUM = {"D1": 1, "D2": 2, "D3": 3, "VERDE": 0}
 NUM_DOZEN = {1: "D1", 2: "D2", 3: "D3"}
 
 # ── Zonas (apuesta real, mensajes de Roulette 1) ──
-ZONE_VALUES = ("BAJA", "ALTA")
-ZONE_EMOJI = {"BAJA": "🔵", "ALTA": "🟠"}
+ZONE_VALUES = ("BAJA", "ALTA", "VERDE")
+ZONE_EMOJI = {"BAJA": "🔵", "ALTA": "🟠", "VERDE": "🟢"}
 ZONE_NUM = {"BAJA": 1, "ALTA": 2, "VERDE": 0}
-NUM_ZONE = {1: "BAJA", 2: "ALTA"}
+NUM_ZONE = {1: "BAJA", 2: "ALTA", 0: "VERDE"}
 
 EMA_TREND_MIN_HISTORY = 20
 TREND_FAVORED_DOZENS = {
@@ -119,7 +123,7 @@ THREAD_STATS   = int(os.environ.get("THREAD_STATS", "4398"))
 THREAD_SIGNALS_ZONE = int(os.environ.get("THREAD_SIGNALS_ZONE", str(THREAD_SIGNALS)))
 THREAD_STATS_ZONE   = int(os.environ.get("THREAD_STATS_ZONE", str(THREAD_STATS)))
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:speedroulette2")
-TABLE_NAME     = "Ruleta: Speed Roulette 2"
+TABLE_NAME     = "Speed Roulette 2"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
@@ -449,6 +453,7 @@ def build_daily_marker_message(stats: dict) -> str:
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
+    zone_keys = ["zone_agent1", "zone_agent2"]
     lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -458,6 +463,24 @@ def build_status_message(server_state) -> str:
         lines.append(f"💹 Labouchère | Acum: {sign}{format_cop(abs(lab_state['balance']))} | Sec: [{seq_str}] | Sig: {format_cop(lab_state['bet_amount'])} | Ciclos: {lab_state['cycles_completed']}")
         for akey in agent_keys:
             agente = getattr(table, akey, None)
+            if agente is None:
+                continue
+            s = agente.stats
+            total = s.get("total", 0)
+            won = s.get("won", 0)
+            lost = s.get("lost", 0)
+            rate = round((won / total) * 100, 1) if total else 0.0
+            estado = "🟢 activa" if agente.train_state["active"] else "⚪ inactiva"
+            rec_attempt, rec_pct = agente.overall_recommended_attempt()
+            rec_line = (f"🧠 Intento recomendado: {rec_attempt} ({rec_pct}%)"
+                        if rec_attempt else "🧠 Intento recomendado: aún sin datos suficientes")
+            if agente.trained:
+                modelo_line = "🤖 Modelo: entrenado"
+            else:
+                modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
+            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}")
+        for zkey in zone_keys:
+            agente = getattr(table, zkey, None)
             if agente is None:
                 continue
             s = agente.stats
@@ -506,7 +529,7 @@ class DailyMarker:
 
 
 # ══════════════════════════════════════════════
-#  AGENTE DE PATRÓN DE DOCENAS
+#  AGENTE DE PATRÓN DE DOCENAS (sin cambios)
 # ══════════════════════════════════════════════
 class DozenPatternAgent:
     def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
@@ -635,7 +658,7 @@ class DozenPatternAgent:
     def _gated(self, pattern, required_win_rate):
         rate = self._win_rate(pattern)
         if rate is None:
-            return False   # sin modelo, se permite (aprender)
+            return False
         return rate < required_win_rate
 
     def _recommended_attempt(self, pattern):
@@ -685,16 +708,12 @@ class DozenPatternAgent:
 
     # ── NUEVO: calcula la tasa de acierto del segundo intento dado que el primero falló ──
     def _second_attempt_win_rate(self, pattern):
-        """Devuelve la proporción de veces que el segundo intento fue ganador (hit_attempt==2)
-        entre los casos donde el primer intento falló (hit_attempt != 1)."""
         if not self.trained:
             return None
         arr = self.trained_snapshot.get(self._key(pattern), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        # Filtrar casos donde el primer intento falló (hit_attempt != 1)
-        # hit_attempt puede ser 0 (perdida) o 2 (ganado en segundo)
-        filtered = [v for v in arr if v != 1]  # v=0 o v=2
+        filtered = [v for v in arr if v != 1]
         if not filtered:
             return None
         wins = sum(1 for v in filtered if v == 2)
@@ -905,7 +924,430 @@ class DozenPatternAgent:
 
 
 # ══════════════════════════════════════════════
-#  ROULETTE TABLE (con lógica de segundo intento opuesto)
+#  AGENTE DE PATRÓN DE ZONAS (ACTUALIZADO CON COMODÍN Y CERCANÍA)
+# ══════════════════════════════════════════════
+class ZonePatternAgent:
+    """
+    Agente que detecta patrones sobre la secuencia de zonas (BAJA/ALTA/VERDE).
+    El patrón es una cadena de caracteres donde 'a' = BAJA, 'b' = ALTA.
+    El cero (VERDE) es un comodín que puede aparecer en cualquier posición de la historia.
+    La zona predicha es la correspondiente a la última letra del patrón (debe ser 'a' o 'b').
+    Si el cero está cerca del final (en las últimas 2 posiciones), se invierte la secuencia:
+    primer intento = opuesto, segundo = predicha.
+    """
+    def __init__(self, pattern: str, name: str, label: str, daily_marker=None,
+                 thread_signals=None, thread_stats=None):
+        self.pattern = pattern  # solo 'a' y 'b'
+        self.pattern_len = len(pattern)
+        self.name = name
+        self.label = label
+        self.daily_marker = daily_marker
+        self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS_ZONE
+        self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS_ZONE
+
+        # Mapeo de letras a zonas (sin verde)
+        self.letter_to_zone = {'a': 'BAJA', 'b': 'ALTA'}
+        # Última letra debe ser 'a' o 'b' para que haya apuesta
+        self.predicted_zone = self.letter_to_zone.get(pattern[-1]) if pattern[-1] in ('a','b') else None
+        if self.predicted_zone is None:
+            log.warning(f"El patrón {pattern} termina en '{pattern[-1]}', no se puede predecir zona. Se desactivará.")
+            self.active = False
+        else:
+            self.active = True
+        # Umbral de distancia para considerar cero cerca (posiciones desde el final)
+        self.zero_proximity_threshold = 2  # si el cero está en las últimas 2 posiciones
+
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+        }
+        self.train_attempt_results = []
+        self.live_enabled = True
+        self.candidate_signal = None
+
+        self.confirming = False
+        self.pending_pattern = None
+        self.pending_window = None   # guardar la ventana que confirmó el patrón para evaluar ceros
+
+        self.history_log = []
+        self.history_counter = 0
+        self.stats = {"total": 0, "won": 0, "lost": 0}
+        self.pattern_context = {}
+        self.backtest = {"triggers": 0, "hits": 0, "accuracy": None}
+        self.consecutive_losses = 0
+        self.cooldown_remaining = 0
+        self.msg_id = None
+        self.entry_text = None
+        self._last_raw_number = None
+        self.total_processed = 0
+        self.trained = False
+        self.last_train_ts = 0.0
+        self.trained_snapshot = {}
+
+    # ── Matching de patrones completos con comodín (cero) ──
+    def _match(self, window):
+        """window es lista de zonas (strings) de longitud self.pattern_len.
+           Retorna la tupla de zonas que conforman el patrón si coincide,
+           considerando que 'VERDE' en la historia coincide con cualquier letra del patrón.
+           Retorna None si no coincide."""
+        if len(window) != self.pattern_len:
+            return None
+        # Convertir las letras del patrón a zonas esperadas
+        expected = [self.letter_to_zone.get(ch) for ch in self.pattern]
+        if any(e is None for e in expected):
+            return None
+        # Comparar: si la historia es VERDE, siempre coincide; si no, debe ser igual
+        for w, e in zip(window, expected):
+            if w == "VERDE":
+                continue
+            if w != e:
+                return None
+        # Si llegamos aquí, coincide. Devolvemos la tupla de zonas esperadas (sin comodines)
+        return tuple(expected)
+
+    # ── Matching parcial (confirmación "-1 valor") ──
+    def _match_partial(self, window):
+        """window es lista de zonas de longitud self.pattern_len - 1.
+           Retorna el patrón completo esperado si los primeros N-1 coinciden,
+           considerando el cero como comodín.
+           El último elemento del patrón es el que se espera en el siguiente giro."""
+        if len(window) != self.pattern_len - 1:
+            return None
+        expected_full = [self.letter_to_zone.get(ch) for ch in self.pattern]
+        if any(e is None for e in expected_full):
+            return None
+        # Verificar que los primeros N-1 coincidan (con comodín)
+        for w, e in zip(window, expected_full[:-1]):
+            if w == "VERDE":
+                continue
+            if w != e:
+                return None
+        # Si coincide, devolvemos el patrón completo (sin comodines)
+        return tuple(expected_full)
+
+    @staticmethod
+    def _key(pattern_tuple):
+        return ">".join(pattern_tuple)
+
+    def _record_context(self, pattern_tuple, hit_attempt: int):
+        key = self._key(pattern_tuple)
+        arr = self.pattern_context.setdefault(key, [])
+        arr.append(hit_attempt)
+        if len(arr) > DOZEN_CONTEXT_WINDOW:
+            del arr[0]
+
+    def _maybe_train(self, timestamp: float):
+        if self.total_processed < ML_MIN_SIGNALS_TO_TRAIN:
+            return
+        if not self.trained or (timestamp - self.last_train_ts) >= ML_RETRAIN_INTERVAL_SECONDS:
+            self._train(timestamp)
+
+    def _train(self, timestamp: float):
+        self.trained_snapshot = {k: list(v) for k, v in self.pattern_context.items()}
+        self.trained = True
+        self.last_train_ts = timestamp
+
+    def force_train(self, timestamp: float):
+        self._train(timestamp)
+
+    def _win_rate(self, pattern_tuple):
+        if not self.trained:
+            return None
+        arr = self.trained_snapshot.get(self._key(pattern_tuple), [])
+        if len(arr) < DOZEN_MIN_SAMPLES_GATE:
+            return None
+        return sum(1 for v in arr if v > 0) / len(arr)
+
+    def _gated(self, pattern_tuple, required_win_rate):
+        rate = self._win_rate(pattern_tuple)
+        if rate is None:
+            return False
+        return rate < required_win_rate
+
+    def _recommended_attempt(self, pattern_tuple):
+        if not self.trained:
+            return None
+        arr = self.trained_snapshot.get(self._key(pattern_tuple), [])
+        if len(arr) < DOZEN_MIN_SAMPLES_GATE:
+            return None
+        c1 = sum(1 for v in arr if v == 1)
+        c2 = sum(1 for v in arr if v == 2)
+        if c1 == 0 and c2 == 0:
+            return None
+        return 1 if c1 >= c2 else 2
+
+    def overall_recommended_attempt(self):
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            c1 += sum(1 for v in arr if v == 1)
+            c2 += sum(1 for v in arr if v == 2)
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return None, 0.0
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
+
+    def _ml_should_signal(self, pattern_tuple, amx_strength_val):
+        if self.cooldown_remaining > 0:
+            return False
+        base_rate = DOZEN_MIN_WIN_RATE
+        if amx_strength_val >= AMX_STRENGTH_THRESHOLDS["strong"]:
+            required_rate = base_rate * AMX_ADJUST_FACTOR_STRONG
+        elif amx_strength_val < AMX_STRENGTH_THRESHOLDS["weak"]:
+            required_rate = base_rate * AMX_ADJUST_FACTOR_WEAK
+        else:
+            required_rate = base_rate
+        required_rate = max(0.20, min(0.60, required_rate))
+        if self._gated(pattern_tuple, required_rate):
+            return False
+        return True
+
+    def run_backtest(self, zone_history):
+        window = zone_history[-DOZEN_BACKTEST_WINDOW:]
+        triggers, hits = 0, 0
+        for i in range(self.pattern_len, len(window) + 1):
+            seg = window[i - self.pattern_len:i]
+            pattern_tuple = self._match(seg)
+            if not pattern_tuple:
+                continue
+            predicted_zone = pattern_tuple[-1]
+            if predicted_zone == "VERDE":
+                continue
+            future = window[i:i + DOZEN_MAX_ATTEMPTS]
+            triggers += 1
+            if any(z == predicted_zone for z in future):
+                hits += 1
+        self.backtest = {
+            "triggers": triggers, "hits": hits,
+            "accuracy": round(hits / triggers, 4) if triggers else None
+        }
+
+    def update(self, zone_history, timestamp, blocked: bool = False,
+               amx_strength_val=0.0, last_number=None,
+               live_enabled: bool = True):
+        if not self.active:
+            return
+        self._last_raw_number = last_number
+        self.live_enabled = live_enabled
+        self.candidate_signal = None
+        if not zone_history:
+            return
+        last_zone = zone_history[-1]
+
+        # 1) Shadow tracking
+        if self.train_state["active"]:
+            self.train_state["current_attempt"] += 1
+            attempt = self.train_state["start_attempt"] + self.train_state["current_attempt"] - 1
+            bet_zone = self.train_state["bet_zone"]
+            is_win = zone_win(bet_zone, last_number) if last_number is not None else False
+            self.train_attempt_results.append(last_number)
+            if is_win:
+                self._close_shadow(True, last_zone, attempt, timestamp, last_number)
+            else:
+                self.train_state["attempts_left"] -= 1
+                if self.train_state["attempts_left"] <= 0:
+                    self._close_shadow(False, last_zone, attempt, timestamp, last_number)
+
+        # 2) Backtest / cooldown / ML
+        self.run_backtest(zone_history)
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+        self._maybe_train(timestamp)
+
+        # 3) Buscar patrón parcial para confirmación
+        if (not self.train_state["active"] and not self.confirming
+                and len(zone_history) >= self.pattern_len - 1
+                and len(zone_history) >= DOZEN_MIN_SPIN_TO_SIGNAL
+                and not blocked):
+            partial = self._match_partial(zone_history[-(self.pattern_len - 1):])
+            if partial:
+                pattern_tuple = partial
+                predicted_zone = pattern_tuple[-1]
+                if predicted_zone == "VERDE":
+                    log.info(f"⛔ {self.name}: patrón termina en VERDE, no se genera señal")
+                    return
+                if self._ml_should_signal(pattern_tuple, amx_strength_val):
+                    self.confirming = True
+                    self.pending_pattern = pattern_tuple
+                    # Guardamos la ventana que usamos para la confirmación (últimos pattern_len-1)
+                    self.pending_window = zone_history[-(self.pattern_len - 1):]
+                    self.candidate_signal = {
+                        "pattern": pattern_tuple,
+                        "confirming": True,
+                        "expected_last": predicted_zone,
+                        "amx_strength": amx_strength_val,
+                    }
+                    log.info(f"🔍 {self.name} confirmación pendiente: patrón {pattern_tuple} -> esperado {predicted_zone}")
+                    return
+
+        # 4) Evaluar confirmación
+        if self.confirming and self.pending_pattern:
+            pattern_tuple = self.pending_pattern
+            expected_last = pattern_tuple[-1]
+            if last_zone == expected_last:
+                # Patrón confirmado
+                predicted_zone = pattern_tuple[-1]
+                if predicted_zone == "VERDE":
+                    log.info(f"⛔ {self.name}: patrón confirmado pero termina en VERDE, no se genera señal")
+                    self.confirming = False
+                    self.pending_pattern = None
+                    self.pending_window = None
+                    return
+
+                # Evaluar cercanía del cero en la ventana de confirmación (incluyendo el último giro)
+                # La ventana completa que confirma el patrón son los últimos pattern_len elementos
+                confirm_window = zone_history[-self.pattern_len:]
+                # Buscar posiciones de ceros
+                zero_positions = [i for i, z in enumerate(confirm_window) if z == "VERDE"]
+                near_zero = False
+                if zero_positions:
+                    closest_zero = max(zero_positions)  # índice desde el inicio de la ventana
+                    distance_from_end = self.pattern_len - 1 - closest_zero
+                    if distance_from_end <= self.zero_proximity_threshold:
+                        near_zero = True
+                        log.info(f"🔄 {self.name}: cero cerca (distancia {distance_from_end} desde el final), se invertirá la secuencia")
+
+                context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
+                # Determinar secuencia de zonas (dos intentos)
+                opposite = "ALTA" if predicted_zone == "BAJA" else "BAJA"
+                if near_zero:
+                    # Invertir: primero opuesto, luego predicho
+                    zone_sequence = [opposite, predicted_zone]
+                else:
+                    # Normal: primero predicho, luego opuesto
+                    zone_sequence = [predicted_zone, opposite]
+
+                self.candidate_signal = {
+                    "pattern": pattern_tuple,
+                    "bet_zone": (predicted_zone,),  # la zona predicha (útil para referencia)
+                    "zone_sequence": zone_sequence,  # secuencia ya calculada
+                    "context": context,
+                    "start_attempt": 1,
+                    "amx_strength": amx_strength_val,
+                    "score": self._win_rate(pattern_tuple) or 0.0,
+                    "confirming": False,
+                    "near_zero": near_zero,
+                }
+                log.info(f"✅ {self.name} confirmación correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence}")
+                self.train_state = {
+                    "active": True, "pattern": pattern_tuple, "bet_zone": predicted_zone,
+                    "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
+                    "context": context, "current_attempt": 0, "start_attempt": 1,
+                }
+            else:
+                log.info(f"❌ {self.name} confirmación fallida: esperaba {expected_last}, salió {last_zone}")
+            self.confirming = False
+            self.pending_pattern = None
+            self.pending_window = None
+
+    def _close_shadow(self, win: bool, result_zone, attempt, timestamp, last_number):
+        pattern_tuple = tuple(self.train_state["pattern"])
+        hit_attempt = attempt if win else 0
+        self.history_counter += 1
+        self.history_log.append({
+            "n": self.history_counter, "pattern": ">".join(pattern_tuple),
+            "bet_zone": self.train_state["bet_zone"],
+            "result": result_zone, "attempt": attempt, "win": win,
+            "hit_attempt": hit_attempt, "context": self.train_state.get("context"),
+            "time": timestamp, "shadow": True,
+        })
+        self.history_log = self.history_log[-200:]
+        self.stats["total"] += 1
+        self.stats["won" if win else "lost"] += 1
+        self._record_context(pattern_tuple, hit_attempt)
+        self.total_processed += 1
+        self._maybe_train(timestamp)
+
+        if win:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= DOZEN_COOLDOWN_AFTER_LOSSES:
+                self.cooldown_remaining = DOZEN_COOLDOWN_ROUNDS
+
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+        }
+        self.train_attempt_results = []
+
+    def reset_transient(self):
+        self.confirming = False
+        self.pending_pattern = None
+        self.pending_window = None
+        self.candidate_signal = None
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+        }
+        self.train_attempt_results = []
+
+    def get_state(self):
+        rec_attempt, rec_pct = self.overall_recommended_attempt()
+        pattern_recommendations = {
+            key: self._recommended_attempt(tuple(key.split(">")))
+            for key in self.pattern_context
+        }
+        pattern_recommendations = {k: v for k, v in pattern_recommendations.items() if v is not None}
+        return {
+            "name": self.name,
+            "pattern_len": self.pattern_len,
+            "pattern": self.pattern,
+            "train_state": self.train_state,
+            "stats": self.stats,
+            "history": self.history_log[-30:],
+            "backtest_60": self.backtest,
+            "pattern_context": self.pattern_context,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "recommended_attempt": rec_attempt,
+            "recommended_attempt_pct": rec_pct,
+            "pattern_recommendations": pattern_recommendations,
+            "confirming": self.confirming,
+            "live_enabled": self.live_enabled,
+            "ml_model": {
+                "trained": self.trained,
+                "total_processed": self.total_processed,
+                "min_signals_to_train": ML_MIN_SIGNALS_TO_TRAIN,
+                "last_train_ts": self.last_train_ts,
+                "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
+            },
+        }
+
+    def to_persist(self):
+        return {
+            "pattern_context": self.pattern_context,
+            "stats": self.stats,
+            "history_counter": self.history_counter,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "total_processed": self.total_processed,
+            "trained": self.trained,
+            "last_train_ts": self.last_train_ts,
+            "trained_snapshot": self.trained_snapshot,
+        }
+
+    def load_persist(self, data):
+        if not data: return
+        self.pattern_context = data.get("pattern_context", {})
+        self.stats = data.get("stats", self.stats)
+        self.history_counter = data.get("history_counter", 0)
+        self.consecutive_losses = data.get("consecutive_losses", 0)
+        self.cooldown_remaining = data.get("cooldown_remaining", 0)
+        self.total_processed = data.get("total_processed", 0)
+        self.trained = data.get("trained", False)
+        self.last_train_ts = data.get("last_train_ts", 0.0)
+        self.trained_snapshot = data.get("trained_snapshot", {})
+
+
+# ══════════════════════════════════════════════
+#  ROULETTE TABLE (ajustes para usar secuencia directa de agentes zona)
 # ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
@@ -917,6 +1359,7 @@ class RouletteTable:
         self.live_spins_seen = 0
 
         self.dozen_history = []
+        self.zone_history = []
         self.daily_marker = DailyMarker()
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
         self.cycle_pending = 0
@@ -936,11 +1379,17 @@ class RouletteTable:
         self._pending_new_signal = None
         self._signal_included = False
 
-        # ── AGENTES ──
+        # ── AGENTES DE DOCENAS ──
         self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
         self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
         self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎 (abaa)", mode="abaa", daily_marker=self.daily_marker)
         self.agent6 = DozenPatternAgent(pattern_len=7, name="AGENTE_6", label="PATRON V6 💎 (aaaabaa)", mode="aaaabaa", daily_marker=self.daily_marker)
+
+        # ── AGENTES DE ZONA ──
+        # Patrones solo con a/b; el cero es comodín
+        self.zone_agent1 = ZonePatternAgent(pattern='baaaabbb', name="ZONE_AGENT_1", label="ZONA LARGA 1 (b+4a+3b)", daily_marker=self.daily_marker)
+        self.zone_agent2 = ZonePatternAgent(pattern='aaaabbbbaa', name="ZONE_AGENT_2", label="ZONA LARGA 2 (4a+4b+2a)", daily_marker=self.daily_marker)
+        # Se pueden añadir más con patrones como 'aaabbb', etc.
 
         self.level_history = []
         self.level_current = 0
@@ -963,7 +1412,6 @@ class RouletteTable:
         return None
 
     async def _send_entry(self, agent, zone, bet_amount, attempt_number):
-        """Envía el mensaje de entrada con el formato completo (número, zona, apuesta)."""
         seq_txt = self.labouchere.seq_str()
         original = build_entry_message_zone(
             agent._last_raw_number,
@@ -971,7 +1419,6 @@ class RouletteTable:
             bet_amount=bet_amount,
             sequence_str=seq_txt
         )
-        # CORRECCIÓN: usar el mensaje completo sin dividir
         new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
         entry_text = f"{new_header}\n\n{original}"
         msg_id = await send_msg(entry_text, agent.thread_signals)
@@ -1070,38 +1517,31 @@ class RouletteTable:
 
     def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
         """
-        Decide la secuencia de zonas para los dos intentos basado en el tipo de señal y el aprendizaje.
-        Retorna una lista de dos zonas.
+        Para agentes de zona, la secuencia ya viene calculada en el candidato.
+        Para agentes de docenas, se aplica la lógica de segundo intento adaptativo.
         """
-        if bet_zone_tuple is not None:
+        if isinstance(agent, ZonePatternAgent):
+            # La secuencia ya está en el candidato
+            return candidate.get("zone_sequence")
+        else:
+            # Agente de docenas
             zone = bet_zone_tuple[0]
-            # Verificar si es D1+D2 o D2+D3 (zone no None) o D1+D3 (zone None)
-            # Para D1+D3 siempre opuesto en ambos intentos (ya manejado fuera)
-            # Aquí solo se llama cuando bet_zone_tuple no es None, es decir, D1+D2 o D2+D3.
-            # Decidir si el segundo intento será opuesto.
             pattern = candidate["pattern"]
             second_rate = agent._second_attempt_win_rate(pattern)
             use_opposite = False
             if second_rate is not None:
-                # Si la tasa de acierto del segundo intento es baja, usar opuesto
                 if second_rate < SECOND_ATTEMPT_OPPOSITE_THRESHOLD:
                     use_opposite = True
                     log.info(f"🔄 {agent.name} patrón {pattern}: segundo intento al mismo lado tiene tasa {second_rate:.2f} < umbral, se usará opuesto")
             else:
-                # Si no hay datos, usar AMX como respaldo: si AMX débil, opuesto
                 if amx_strength < AMX_STRENGTH_THRESHOLDS["weak"]:
                     use_opposite = True
                     log.info(f"🔄 {agent.name} patrón {pattern}: sin datos de segundo intento, AMX débil ({amx_strength:.2f}), se usará opuesto")
-
             if use_opposite:
                 opposite = "ALTA" if zone == "BAJA" else "BAJA"
                 return [zone, opposite]
             else:
                 return [zone, zone]
-        else:
-            # D1+D3: siempre opuesto en ambos intentos (ya manejado en la llamada)
-            # Esta función no debería ser llamada para D1+D3
-            return None
 
     def _prepare_new_signal(self, agent, candidate, last_number):
         """Prepara la nueva señal para ser incluida en el mensaje de resolución."""
@@ -1177,25 +1617,34 @@ class RouletteTable:
                         and new_confirming_agent is None):
                     new_confirming_agent = agente
             else:
-                pattern = agente.candidate_signal["pattern"]
+                # Candidato real (confirmado)
                 bet_zone_tuple = agente.candidate_signal.get("bet_zone")
                 bet_zone = bet_zone_tuple[0] if bet_zone_tuple is not None else None
+                pattern = agente.candidate_signal.get("pattern")
+                amx_str = agente.candidate_signal.get("amx_strength", 0.0)
 
-                if bet_zone is None:
-                    # D1+D3: solo agentes de 4 valores y modelo entrenado
-                    if agente.mode not in ("aaba", "abaa"):
+                if isinstance(agente, DozenPatternAgent):
+                    if bet_zone is None:
+                        # D1+D3: solo agentes de 4 valores y modelo entrenado
+                        if agente.mode not in ("aaba", "abaa"):
+                            continue
+                        win_rate = agente._win_rate(pattern)
+                        if win_rate is None:
+                            continue
+                        score = win_rate * (1 + amx_str)
+                        candidates.append((agente, score, agente.candidate_signal))
+                    else:
+                        win_rate = agente._win_rate(pattern) or 0.0
+                        score = win_rate * (1 + amx_str)
+                        candidates.append((agente, score, agente.candidate_signal))
+                elif isinstance(agente, ZonePatternAgent):
+                    if bet_zone is None:
                         continue
-                    win_rate = agente._win_rate(pattern)
-                    if win_rate is None:
-                        continue
-                    amx_str = agente.candidate_signal.get("amx_strength", 0.0)
-                    score = win_rate * (1 + amx_str)
-                    candidates.append((agente, score, agente.candidate_signal))
-                else:
-                    amx_str = agente.candidate_signal.get("amx_strength", 0.0)
                     win_rate = agente._win_rate(pattern) or 0.0
                     score = win_rate * (1 + amx_str)
                     candidates.append((agente, score, agente.candidate_signal))
+                else:
+                    continue
 
         if self.confirming and confirmation_resolved:
             self.confirming = False
@@ -1306,8 +1755,12 @@ class RouletteTable:
         if not training:
             self.live_spins_seen += 1
 
+        z = zone_of(number)
+        self.zone_history.append(z)
+        if len(self.zone_history) > 300: self.zone_history = self.zone_history[-300:]
+
         if number != 0:
-            self.last_nonzero_zone = zone_of(number)
+            self.last_nonzero_zone = z
 
         dz = dozen_of(number)
         self.dozen_history.append(dz)
@@ -1334,6 +1787,7 @@ class RouletteTable:
         else:
             self.trend = "neutral"
 
+        # Actualizar agentes de docenas
         agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
         agent_keys = ["agent2", "agent3", "agent4", "agent6"]
 
@@ -1359,10 +1813,21 @@ class RouletteTable:
                           trend_dozens=favored, amx_strength_val=amx_strength_val,
                           last_number=number, live_enabled=live_ok)
 
+        # Actualizar agentes de zona
+        zone_agents = [self.zone_agent1, self.zone_agent2]
+        for zagente in zone_agents:
+            blocked = (self.signal_status is not None) or self.confirming
+            live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
+            amx_strength_val = 0.0
+            zagente.update(self.zone_history, timestamp, blocked=blocked,
+                           amx_strength_val=amx_strength_val,
+                           last_number=number, live_enabled=live_ok)
+
+        all_agents = agent_list + zone_agents
         self._signal_included = False
 
         if not training:
-            self._handle_signal_sequence(agent_list, number, self.labouchere.get_bet())
+            self._handle_signal_sequence(all_agents, number, self.labouchere.get_bet())
 
         if training:
             return
@@ -1373,7 +1838,7 @@ class RouletteTable:
         seq_status = f"Sec: {self.signal_status}" if self.signal_status else "Sin secuencia"
         log.info(
             f"🎰 Mesa {self.key} | Giro #{len(self.dozen_history)}: {number} ({real_color}) → {dz} "
-            f"(docena {real_dozen_num}) | Zona: {zone_of(number)} | Nivel: {self.level_current} | "
+            f"(docena {real_dozen_num}) | Zona: {z} | Nivel: {self.level_current} | "
             f"{seq_status} | Lab: [{lab_seq}] {format_cop(lab_bet)} | Últimas 10 docenas: [{last10}] | "
             f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend} | Última zona no nula: {self.last_nonzero_zone}"
         )
@@ -1385,10 +1850,13 @@ class RouletteTable:
             "table_name": TABLE_NAME,
             "spin_history": hist,
             "dozen_history": self.dozen_history[-limit:],
+            "zone_history": self.zone_history[-limit:],
             "agent2": self.agent2.get_state(),
             "agent3": self.agent3.get_state(),
             "agent4": self.agent4.get_state(),
             "agent6": self.agent6.get_state(),
+            "zone_agent1": self.zone_agent1.get_state(),
+            "zone_agent2": self.zone_agent2.get_state(),
             "trend": self.trend,
             "trend_favored_dozens": sorted(NUM_DOZEN[d] for d in trend_favored_dozens(self.trend)),
             "level_current": self.level_current,
@@ -1438,7 +1906,8 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
             table.update(number, color_of(number), timestamp=timestamp, training=True)
             if i % 100 == 0:
                 await asyncio.sleep(0)
-        agents = [table.agent2, table.agent3, table.agent4, table.agent6]
+        agents = [table.agent2, table.agent3, table.agent4, table.agent6,
+                  table.zone_agent1, table.zone_agent2]
         for agent in agents:
             agent.force_train(timestamp)
         log.info(f"[Entrenamiento] Mesa {table.key}: entrenamiento forzado tras bloque {start//BATCH_SIZE + 1}")
@@ -1489,6 +1958,8 @@ class ServerState:
                 table.agent3.load_persist(data.get("agent3"))
                 table.agent4.load_persist(data.get("agent4"))
                 table.agent6.load_persist(data.get("agent6"))
+                table.zone_agent1.load_persist(data.get("zone_agent1"))
+                table.zone_agent2.load_persist(data.get("zone_agent2"))
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
                 log.info(f"Modelo cargado para mesa {key}")
@@ -1506,6 +1977,8 @@ class ServerState:
             "agent3": table.agent3.to_persist(),
             "agent4": table.agent4.to_persist(),
             "agent6": table.agent6.to_persist(),
+            "zone_agent1": table.zone_agent1.to_persist(),
+            "zone_agent2": table.zone_agent2.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
             "history_seed_trained": self.history_seed_trained.get(key, False),
         }
