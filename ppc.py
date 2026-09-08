@@ -4,6 +4,10 @@
 ║   - Detección: 4 agentes de PATRONES DE DOCENAS              ║
 ║       V2: aaba (4)  |  V3: aaaba (5)                        ║
 ║       V4: abaa (4)  |  V6: aaaabaa (7)                     ║
+║   - Agentes de ZONA: baaaabbb, aaaabbbbaa,                 ║
+║     aaabaa (a,a,a,b,a,a) y aaabbaa (a,a,a,b,b,a,a)         ║
+║   - Agente de RACHAS: señal permisiva si la misma zona     ║
+║     sale ZONE_STREAK_MIN veces seguidas (sin patrón ni ML) ║
 ║   - Señales D1+D2/D2+D3: todos los agentes, sin modelo      ║
 ║   - Señales D1+D3: solo agentes de 4 valores y             ║
 ║     requieren modelo entrenado                              ║
@@ -18,8 +22,10 @@
 ║   - Mensajes combinados: resolución + nueva señal          ║
 ║   - Telegram / HTTP API / self-ping / persistencia           ║
 ║   - Tendencia global basada en 20 giros                      ║
-║   - Interfaz web (/dashboard) con gráficos de zonas,        ║
-║     soportes/resistencias y gestión Labouchère integrada    ║
+║   - 2º intento considera rebote (ALCISTA→BAJA/BAJISTA→ALTA) ║
+║   - Interfaz web (/dashboard) con DOS gráficos (ALTOS y    ║
+║     BAJOS) + líneas de soporte/resistencia y gestión        ║
+║     Labouchère integrada                                    ║
 ╚══════════════════════════════════════════════════════════════
 """
 
@@ -76,6 +82,9 @@ DOZEN_COOLDOWN_ROUNDS = 5
 
 # ── Umbral para decidir opuesto en segundo intento ──
 SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
+
+# ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
+ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
 
 # ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
@@ -452,7 +461,7 @@ def build_daily_marker_message(stats: dict) -> str:
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2"]
+    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak"]
     lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -1441,6 +1450,250 @@ class ZonePatternAgent:
         self.trained_snapshot = data.get("trained_snapshot", {})
 
 
+def current_zone_streak(zone_history):
+    """Devuelve (zona, largo) de la racha actual de la misma zona (VERDE corta la racha)."""
+    streak = 0
+    zone = None
+    for z in reversed(zone_history):
+        if z == "VERDE":
+            break
+        if zone is None:
+            zone = z
+            streak = 1
+        elif z == zone:
+            streak += 1
+        else:
+            break
+    return zone, streak
+
+
+class StreakZoneAgent:
+    """Señal de RACHA: cuando la misma zona sale N veces seguidas, genera una
+    señal permisiva para SEGUIR la racha aunque ningún patrón de docenas ni de
+    zonas coincida. Sin confirmación (la racha es la confirmación) y sin gates
+    de ML: la recency de la racha es el criterio. Los 2 intentos van a la zona
+    de la racha."""
+    def __init__(self, min_streak: int, name: str, label: str, daily_marker=None,
+                 thread_signals=None, thread_stats=None):
+        self.min_streak = min_streak
+        self.name = name
+        self.label = label
+        self.daily_marker = daily_marker
+        self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS_ZONE
+        self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS_ZONE
+
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
+        }
+        self.train_attempt_results = []
+        self.live_enabled = True
+        self.candidate_signal = None
+        self.confirming = False
+        self.pending_pattern = None
+        self.history_log = []
+        self.history_counter = 0
+        self.stats = {"total": 0, "won": 0, "lost": 0}
+        self.pattern_context = {}
+        self.backtest = {"triggers": 0, "hits": 0, "accuracy": None}
+        self.consecutive_losses = 0
+        self.cooldown_remaining = 0
+        self.msg_id = None
+        self.entry_text = None
+        self._last_raw_number = None
+        self.total_processed = 0
+        self.trained = False
+        self.last_train_ts = 0.0
+        self.trained_snapshot = {}
+        self.last_rebound_direction = "NEUTRAL"
+
+    @staticmethod
+    def _key(zone):
+        return f"RACHA_{zone}"
+
+    def _record_context(self, zone, hit_attempt: int):
+        arr = self.pattern_context.setdefault(self._key(zone), [])
+        arr.append(hit_attempt)
+        if len(arr) > DOZEN_CONTEXT_WINDOW:
+            del arr[0]
+
+    def _win_rate(self, pattern):
+        if not self.trained:
+            return None
+        zone = pattern[1] if isinstance(pattern, (tuple, list)) and len(pattern) > 1 else None
+        if zone is None:
+            return None
+        arr = self.trained_snapshot.get(self._key(zone), [])
+        if len(arr) < DOZEN_MIN_SAMPLES_GATE:
+            return None
+        return sum(1 for v in arr if v > 0) / len(arr)
+
+    def overall_recommended_attempt(self):
+        return None, 0.0
+
+    def _recommended_attempt_for_direction(self, pattern, rebound_direction):
+        return None, 0.0
+
+    def overall_recommended_attempt_for_direction(self, rebound_direction):
+        return None, 0.0
+
+    def force_train(self, timestamp: float):
+        self.trained_snapshot = {k: list(v) for k, v in self.pattern_context.items()}
+        self.trained = True
+        self.last_train_ts = timestamp
+
+    def update(self, zone_history, timestamp, blocked: bool = False,
+               amx_strength_val=0.0, rebound_direction="NEUTRAL",
+               last_number=None, live_enabled: bool = True):
+        self._last_raw_number = last_number
+        self.live_enabled = live_enabled
+        self.last_rebound_direction = rebound_direction
+        self.candidate_signal = None
+        if not zone_history:
+            return
+
+        # 1) Shadow tracking de una señal de racha en curso
+        if self.train_state["active"]:
+            self.train_state["current_attempt"] += 1
+            attempt = self.train_state["start_attempt"] + self.train_state["current_attempt"] - 1
+            is_win = zone_win(self.train_state["bet_zone"], last_number)
+            self.train_attempt_results.append(last_number)
+            if is_win:
+                self._close_shadow(True, zone_history[-1], attempt, timestamp)
+            else:
+                self.train_state["attempts_left"] -= 1
+                if self.train_state["attempts_left"] <= 0:
+                    self._close_shadow(False, zone_history[-1], attempt, timestamp)
+
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+
+        # 2) Racha: señal permisiva (sin patrones ni ML)
+        zone, streak = current_zone_streak(zone_history)
+        if (zone is not None and streak >= self.min_streak
+                and not self.train_state["active"] and not blocked
+                and self.cooldown_remaining <= 0):
+            context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
+            self.candidate_signal = {
+                "pattern": ("RACHA", zone),
+                "bet_zone": (zone,),
+                "zone_sequence": [zone, zone],
+                "context": context,
+                "streak": streak,
+                "amx_strength": 0.0,
+                # Score competitivo que crece con la racha (sin superar patrones entrenados con buena tasa)
+                "score": round(min(0.60 + 0.08 * (streak - self.min_streak), 0.95), 3),
+                "confirming": False,
+                "is_streak": True,
+                "rebound_direction": rebound_direction,
+                "near_zero": False,
+            }
+            self.train_state = {
+                "active": True, "pattern": ("RACHA", zone), "bet_zone": zone,
+                "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
+                "context": context, "current_attempt": 0, "start_attempt": 1,
+                "rebound_direction": rebound_direction,
+            }
+            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal permisiva (sin patrón)")
+
+    def _close_shadow(self, win: bool, result_zone, attempt, timestamp):
+        zone = self.train_state["bet_zone"]
+        hit_attempt = attempt if win else 0
+        self.history_counter += 1
+        self.history_log.append({
+            "n": self.history_counter, "pattern": f"RACHA_{zone}",
+            "bet_zone": zone, "result": result_zone, "attempt": attempt,
+            "win": win, "hit_attempt": hit_attempt,
+            "context": self.train_state.get("context"), "time": timestamp, "shadow": True,
+        })
+        self.history_log = self.history_log[-200:]
+        self.stats["total"] += 1
+        self.stats["won" if win else "lost"] += 1
+        self._record_context(zone, hit_attempt)
+        self.total_processed += 1
+
+        if win:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= DOZEN_COOLDOWN_AFTER_LOSSES:
+                self.cooldown_remaining = DOZEN_COOLDOWN_ROUNDS
+
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
+        }
+        self.train_attempt_results = []
+
+    def reset_transient(self):
+        self.candidate_signal = None
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
+        }
+        self.train_attempt_results = []
+
+    def get_state(self):
+        return {
+            "name": self.name,
+            "pattern_len": self.min_streak,
+            "pattern": f"racha>={self.min_streak}",
+            "train_state": self.train_state,
+            "stats": self.stats,
+            "history": self.history_log[-30:],
+            "backtest_60": self.backtest,
+            "pattern_context": self.pattern_context,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "recommended_attempt": None,
+            "recommended_attempt_pct": 0.0,
+            "rebound_direction": self.last_rebound_direction,
+            "recommended_attempt_by_rebound": None,
+            "recommended_attempt_by_rebound_pct": 0.0,
+            "pattern_recommendations": {},
+            "confirming": False,
+            "live_enabled": self.live_enabled,
+            "ml_model": {
+                "trained": self.trained,
+                "total_processed": self.total_processed,
+                "min_signals_to_train": ML_MIN_SIGNALS_TO_TRAIN,
+                "last_train_ts": self.last_train_ts,
+                "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
+            },
+        }
+
+    def to_persist(self):
+        return {
+            "pattern_context": self.pattern_context,
+            "stats": self.stats,
+            "history_counter": self.history_counter,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "total_processed": self.total_processed,
+            "trained": self.trained,
+            "last_train_ts": self.last_train_ts,
+            "trained_snapshot": self.trained_snapshot,
+        }
+
+    def load_persist(self, data):
+        if not data: return
+        self.pattern_context = data.get("pattern_context", {})
+        self.stats = data.get("stats", self.stats)
+        self.history_counter = data.get("history_counter", 0)
+        self.consecutive_losses = data.get("consecutive_losses", 0)
+        self.cooldown_remaining = data.get("cooldown_remaining", 0)
+        self.total_processed = data.get("total_processed", 0)
+        self.trained = data.get("trained", False)
+        self.last_train_ts = data.get("last_train_ts", 0.0)
+        self.trained_snapshot = data.get("trained_snapshot", {})
+
+
 # ══════════════════════════════════════════════
 #  ROULETTE TABLE
 # ══════════════════════════════════════════════
@@ -1486,6 +1739,9 @@ class RouletteTable:
         # ── AGENTES DE ZONA ──
         self.zone_agent1 = ZonePatternAgent(pattern='baaaabbb', name="ZONE_AGENT_1", label="ZONA LARGA 1 (b+4a+3b)", daily_marker=self.daily_marker)
         self.zone_agent2 = ZonePatternAgent(pattern='aaaabbbbaa', name="ZONE_AGENT_2", label="ZONA LARGA 2 (4a+4b+2a)", daily_marker=self.daily_marker)
+        self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa · repite a)", daily_marker=self.daily_marker)
+        self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa · repite a)", daily_marker=self.daily_marker)
+        self.zone_agent_streak = StreakZoneAgent(min_streak=ZONE_STREAK_MIN, name="ZONE_STREAK", label=f"🔥 RACHA (>={ZONE_STREAK_MIN}x misma zona)", daily_marker=self.daily_marker)
 
         self.level_history = []
         self.level_current = 0
@@ -1494,6 +1750,9 @@ class RouletteTable:
         self.trend = "neutral"
         self.last_nonzero_zone = "BAJA"
         self.last_rebound_direction = "NEUTRAL"
+        # Niveles de zona independientes (gráficos ALTOS/BAJOS + S/R)
+        self.alto_level_history = []
+        self.bajo_level_history = []
 
     def _level_change(self, number: int, real_dozen_num: int) -> int:
         if real_dozen_num == 1: return 1
@@ -1519,11 +1778,6 @@ class RouletteTable:
         new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
         entry_text = f"{new_header}\n\n{original}"
         msg_id = await send_msg(entry_text, agent.thread_signals)
-
-        if len(self.attempt_bets) >= attempt_number:
-            self.attempt_bets[attempt_number - 1] = bet_amount
-        else:
-            self.attempt_bets.append(bet_amount)
 
         if len(self.entry_msg_ids) >= attempt_number:
             self.entry_msg_ids[attempt_number - 1] = msg_id
@@ -1564,12 +1818,14 @@ class RouletteTable:
             self.cycle_pending = 0
 
     def _finalize_sequence(self, win: bool, winning_attempt: int = None):
+        b1 = self.attempt_bets[0] if len(self.attempt_bets) > 0 else 0
+        b2 = self.attempt_bets[1] if len(self.attempt_bets) > 1 else 0
         if win and winning_attempt == 1:
-            balance = self.attempt_bets[0]
+            balance = b1
         elif win and winning_attempt == 2:
-            balance = self.attempt_bets[1] - self.attempt_bets[0]
+            balance = b2 - b1
         else:
-            balance = -(self.attempt_bets[0] + self.attempt_bets[1])
+            balance = -(b1 + b2)
 
         self.last_signal_outcome = "win" if win else "loss"
         self.last_signal_number = self.attempt_numbers[-1] if self.attempt_numbers else None
@@ -1615,11 +1871,32 @@ class RouletteTable:
         best_agent, best_score, best_candidate = max(candidates, key=lambda x: x[1])
         return best_agent, best_candidate
 
+    # El nivel de docenas SUBE con zonas bajas (D1/D2-bajas) y BAJA con altas (D3):
+    # rebote ALCISTA del nivel => momentum de bajas => favorece BAJA; BAJISTA => ALTA.
+    REBOUND_FAVORED_ZONE = {"ALCISTA": "BAJA", "BAJISTA": "ALTA"}
+
     def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
+        rebound_dir = candidate.get("rebound_direction", "NEUTRAL")
+        favored = self.REBOUND_FAVORED_ZONE.get(rebound_dir)
+        if candidate.get("is_streak"):
+            # La racha manda: ambos intentos a la zona de la racha
+            zone = bet_zone_tuple[0]
+            return [zone, zone]
         if isinstance(agent, ZonePatternAgent):
-            return candidate.get("zone_sequence")
+            seq = list(candidate.get("zone_sequence") or [])
+            # El rebote manda en la predicción del segundo intento (salvo inversión por cero)
+            if favored and len(seq) >= 2 and not candidate.get("near_zero"):
+                if seq[1] != favored:
+                    log.info(f"🌊 {agent.name}: rebote {rebound_dir} favorece {favored} → 2º intento a {favored}")
+                seq[1] = favored
+            return seq
         else:
             zone = bet_zone_tuple[0]
+            # 1) Rebote con señal clara: el 2º intento va a la zona favorecida por el rebote
+            if favored:
+                log.info(f"🌊 {agent.name}: rebote {rebound_dir} favorece {favored} → 2º intento a {favored}")
+                return [zone, favored]
+            # 2) Sin rebote claro: lógica previa (tasa de 2º intento del modelo / AMX)
             pattern = candidate["pattern"]
             second_rate = agent._second_attempt_win_rate(pattern)
             use_opposite = False
@@ -1675,6 +1952,7 @@ class RouletteTable:
             self.signal_sequence = [new_entry]
             self.current_attempt_index = 1
             self.signal_status = "active"
+            self.attempt_bets.append(bet_amount)
             asyncio.create_task(self._send_entry(agent, zone_sequence[1], bet_amount, 2))
             log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {agent.name} -> ZONA {zone_sequence[1]}")
             return
@@ -1684,7 +1962,7 @@ class RouletteTable:
         self.signal_status = "active"
         self.attempt_numbers = []
         self.attempt_zones = []
-        self.attempt_bets = []
+        self.attempt_bets = [bet_amount]
         self.entry_msg_ids = []
         asyncio.create_task(self._send_entry(agent, zone_sequence[0], bet_amount, 1))
         log.info(f"🔔 SEÑAL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
@@ -1712,7 +1990,12 @@ class RouletteTable:
                 pattern = agente.candidate_signal.get("pattern")
                 amx_str = agente.candidate_signal.get("amx_strength", 0.0)
 
-                if isinstance(agente, DozenPatternAgent):
+                if agente.candidate_signal.get("is_streak"):
+                    if bet_zone is None:
+                        continue
+                    score = agente.candidate_signal.get("score", 0.6)
+                    candidates.append((agente, score, agente.candidate_signal))
+                elif isinstance(agente, DozenPatternAgent):
                     if bet_zone is None:
                         if agente.mode not in ("aaba", "abaa"):
                             continue
@@ -1800,6 +2083,7 @@ class RouletteTable:
                 if self.current_attempt_index < ZONE_MAX_ATTEMPTS - 1:
                     self.current_attempt_index += 1
                     new_bet = self.labouchere.get_bet()
+                    self.attempt_bets.append(new_bet)
                     next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
                     asyncio.create_task(self._send_entry(agent, next_zone, new_bet, self.current_attempt_index + 1))
                     log.info(f"🔄 INTENTO {self.current_attempt_index+1}: zona {next_zone}")
@@ -1849,6 +2133,26 @@ class RouletteTable:
 
         if number != 0:
             self.last_nonzero_zone = z
+
+        # ── Niveles de zona (ALTOS/BAJOS) para gráficos y S/R ──
+        last_alto = self.alto_level_history[-1] if self.alto_level_history else 0
+        last_bajo = self.bajo_level_history[-1] if self.bajo_level_history else 0
+        if number == 0:
+            # El cero repite la contribución de la última zona no nula
+            if self.last_nonzero_zone == "ALTA":
+                self.alto_level_history.append(last_alto + 1)
+                self.bajo_level_history.append(last_bajo - 1)
+            elif self.last_nonzero_zone == "BAJA":
+                self.alto_level_history.append(last_alto - 1)
+                self.bajo_level_history.append(last_bajo + 1)
+            else:
+                self.alto_level_history.append(last_alto)
+                self.bajo_level_history.append(last_bajo)
+        else:
+            self.alto_level_history.append(last_alto + (1 if z == "ALTA" else -1))
+            self.bajo_level_history.append(last_bajo + (1 if z == "BAJA" else -1))
+        if len(self.alto_level_history) > 300: self.alto_level_history.pop(0)
+        if len(self.bajo_level_history) > 300: self.bajo_level_history.pop(0)
 
         dz = dozen_of(number)
         self.dozen_history.append(dz)
@@ -1903,7 +2207,7 @@ class RouletteTable:
                           last_number=number, live_enabled=live_ok,
                           rebound_direction=self.last_rebound_direction)
 
-        zone_agents = [self.zone_agent1, self.zone_agent2]
+        zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4, self.zone_agent_streak]
         for zagente in zone_agents:
             blocked = (self.signal_status is not None) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
@@ -1962,6 +2266,9 @@ class RouletteTable:
             "agent6": self.agent6.get_state(),
             "zone_agent1": self.zone_agent1.get_state(),
             "zone_agent2": self.zone_agent2.get_state(),
+            "zone_agent3": self.zone_agent3.get_state(),
+            "zone_agent4": self.zone_agent4.get_state(),
+            "zone_agent_streak": self.zone_agent_streak.get_state(),
             "trend": self.trend,
             "trend_favored_dozens": sorted(NUM_DOZEN[d] for d in trend_favored_dozens(self.trend)),
             "rebound_direction": self.last_rebound_direction,
@@ -2075,6 +2382,44 @@ def detect_rebound_direction(level_history, lookback=40, pivot_window=3,
         return "BAJISTA"
     return "NEUTRAL"
 
+def _zone_analysis_payload(level_history, lookback):
+    levels = level_history[-lookback:] if len(level_history) >= lookback else level_history
+    start_idx = len(level_history) - len(levels)
+    peaks, valleys = detect_pivots(level_history, lookback=lookback, pivot_window=3)
+    supports = cluster_levels(valleys, threshold=1.0)
+    resistances = cluster_levels(peaks, threshold=1.0)
+    return {
+        "level_data": [{"index": start_idx + i, "value": v} for i, v in enumerate(levels)],
+        "peaks": [{"index": i, "value": v} for i, v in peaks],
+        "valleys": [{"index": i, "value": v} for i, v in valleys],
+        "support_levels": supports,
+        "resistance_levels": resistances,
+        "current_level": levels[-1] if levels else 0,
+    }
+
+async def http_analysis_zones(request: web.Request):
+    """Soportes/resistencias y niveles para los DOS gráficos de zona (ALTOS y BAJOS)."""
+    if _server_state is None:
+        return web.json_response({"error": "server not ready"}, status=503)
+    try:
+        mesa = int(request.match_info["mesa"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "mesa inválida"}, status=400)
+    if mesa not in ROULETTE_KEYS.values():
+        return web.json_response({"error": "mesa no soportada"}, status=404)
+    table = _server_state.tables.get(mesa)
+    if table is None:
+        return web.json_response({"error": "mesa no encontrada"}, status=404)
+    try:
+        lookback = int(request.query.get("lookback", 60))
+    except ValueError:
+        lookback = 60
+    lookback = max(20, min(300, lookback))
+    return web.json_response({
+        "alto": _zone_analysis_payload(table.alto_level_history, lookback),
+        "bajo": _zone_analysis_payload(table.bajo_level_history, lookback),
+    })
+
 async def http_analysis(request: web.Request):
     global _server_state
     if _server_state is None:
@@ -2128,7 +2473,7 @@ DASHBOARD_HTML = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes">
-    <title>Sistema de Zonas · EMA 4/8/20 · Soporte/Resistencia</title>
+    <title>Sistema de Zonas · ALTOS/BAJOS · Soporte/Resistencia</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
@@ -2246,8 +2591,6 @@ DASHBOARD_HTML = r"""
         .signal-alert.state-win { border-color:rgba(0,220,100,.65); background:radial-gradient(circle at center, rgba(0,60,20,.95), rgba(0,30,10,.98)); }
         .signal-alert.state-loss { border-color:rgba(220,30,50,.65); background:radial-gradient(circle at center, rgba(70,5,10,.95), rgba(35,3,6,.98)); }
 
-        .legend { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; font-size:0.65rem; margin-top:6px; }
-        .legend-item { display:flex; align-items:center; gap:6px; }
         .footer { font-size:0.7rem; color:#4a6080; text-align:center; border-top:1px solid #1a2640; padding-top:14px; }
     </style>
 </head>
@@ -2255,8 +2598,8 @@ DASHBOARD_HTML = r"""
 <div class="container">
 
     <div class="card main-title">
-        <h1>🎯 Sistema de Zonas · Soporte/Resistencia</h1>
-        <div class="sub">Señales del bot de Telegram · Gestión Labouchère independiente · Tiempo real</div>
+        <h1>🎯 Sistema de Zonas · ALTOS / BAJOS</h1>
+        <div class="sub">Señales del bot de Telegram · Soporte/Resistencia en ambos gráficos · 2º intento con rebote</div>
         <div class="info-bar">
             <span class="table-tag"><span class="led" id="connectionLed"></span><span id="connectionText">Conectando...</span></span>
             <span class="table-tag" id="tableTag">Mesa —</span>
@@ -2299,16 +2642,32 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Nivel de Zona · EMA 4/8/20 · Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Gráfico ALTOS (19-36) · EMA 4/8/20 · Soporte/Resistencia</span>
             <div class="ema-legend">
                 <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
                 <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
                 <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 20</span>
                 <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
                 <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
+                <span style="color:#00b894;">▲ Pivotes</span>
             </div>
         </div>
-        <div class="chart-container"><canvas id="chartZona"></canvas></div>
+        <div class="chart-container"><canvas id="chartAltos"></canvas></div>
+    </div>
+
+    <div class="chart-box">
+        <div class="chart-header">
+            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> Gráfico BAJOS (1-18) · EMA 4/8/20 · Soporte/Resistencia</span>
+            <div class="ema-legend">
+                <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
+                <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
+                <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 20</span>
+                <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
+                <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
+                <span style="color:#00b894;">▲ Pivotes</span>
+            </div>
+        </div>
+        <div class="chart-container"><canvas id="chartBajos"></canvas></div>
     </div>
 
     <div class="card signal-panel" id="signalPanel">
@@ -2362,7 +2721,7 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
 
-    <div class="footer">La gestión Labouchère de este panel corre en tu navegador, independiente del Labouchère interno del bot. Soportes/resistencias: picos/valles agrupados, umbral 1.0.</div>
+    <div class="footer">La gestión Labouchère de este panel corre en tu navegador, independiente del Labouchère interno del bot. Soportes/resistencias: picos/valleys agrupados (umbral 1.0) calculados en el servidor para los niveles ALTOS y BAJOS por separado. El 2º intento de las señales considera el rebote actual (ALCISTA→BAJA, BAJISTA→ALTA).</div>
 </div>
 
 <div id="signalAlert" class="signal-alert hidden">
@@ -2379,7 +2738,8 @@ DASHBOARD_HTML = r"""
     const API_BASE = window.location.origin;
     const currentMesa = {mesa_key};
     let visibleLength = 60;
-    let chartZona = null;
+    let chartAltos = null;
+    let chartBajos = null;
     let lastSignalState = null;
     let s4Active = false;
     let s4Bal = 100, s4Cap = 100, s4Base = 1, s4Seq = [], s4Bet = 0, s4InitSeq = [], s4Ent = 0, s4W = 0, s4L = 0;
@@ -2387,7 +2747,7 @@ DASHBOARD_HTML = r"""
     const DEFAULT_SEQ = [1,1,1,1,1,1,1,1,1,1];
     let pollingInterval = null;
 
-    const ZONE_LABEL = { 'ALTA': 'ALTA', 'BAJA': 'BAJA', 'VERDE': 'VERDE (0)' };
+    const ZONE_LABEL = { 'ALTA': 'ALTA (19-36)', 'BAJA': 'BAJA (1-18)', 'VERDE': 'VERDE (0)' };
     const ZONE_CLASS = { 'ALTA': 'alta', 'BAJA': 'baja', 'VERDE': 'verde' };
 
     // ============================================================
@@ -2421,9 +2781,9 @@ DASHBOARD_HTML = r"""
         } catch (e) { return null; }
     }
 
-    async function fetchAnalysis() {
+    async function fetchZoneAnalysis() {
         try {
-            const resp = await fetch(API_BASE + '/api/analysis/' + currentMesa + '?lookback=' + visibleLength);
+            const resp = await fetch(API_BASE + '/api/analysis_zones/' + currentMesa + '?lookback=' + visibleLength);
             if (!resp.ok) return null;
             return await resp.json();
         } catch (e) { return null; }
@@ -2492,7 +2852,9 @@ DASHBOARD_HTML = r"""
     }
 
     // ============================================================
-    //  TENDENCIA / DIRECCIÓN
+    //  TENDENCIA / REBOTE
+    //  El nivel de docenas SUBE con bajas (D1/D2) y BAJA con altas (D3):
+    //  ALCISTA => favorece BAJA · BAJISTA => favorece ALTA
     // ============================================================
     function renderTrend(state) {
         const el = document.getElementById('trendBadge');
@@ -2500,29 +2862,26 @@ DASHBOARD_HTML = r"""
         el.classList.remove('bullish', 'bearish', 'neutral');
         if (trend === 'bullish') {
             el.classList.add('bullish');
-            el.textContent = '▲ TENDENCIA: ALCISTA (ALTA)';
+            el.textContent = '▲ TENDENCIA: ALCISTA (favorece BAJA)';
         } else if (trend === 'bearish') {
             el.classList.add('bearish');
-            el.textContent = '▼ TENDENCIA: BAJISTA (BAJA)';
+            el.textContent = '▼ TENDENCIA: BAJISTA (favorece ALTA)';
         } else {
             el.classList.add('neutral');
             el.textContent = '➡ TENDENCIA: NEUTRAL';
         }
     }
 
-    // ============================================================
-    //  DIRECCIÓN DEL REBOTE (soporte/resistencia)
-    // ============================================================
     function renderRebound(state) {
         const el = document.getElementById('reboundBadge');
         const dir = state.rebound_direction || 'NEUTRAL';
         el.classList.remove('alcista', 'bajista', 'neutral');
         if (dir === 'ALCISTA') {
             el.classList.add('alcista');
-            el.textContent = '🔄 REBOTE: ALCISTA (soporte → ALTA)';
+            el.textContent = '🔄 REBOTE: ALCISTA (soporte → BAJA)';
         } else if (dir === 'BAJISTA') {
             el.classList.add('bajista');
-            el.textContent = '🔄 REBOTE: BAJISTA (resistencia → BAJA)';
+            el.textContent = '🔄 REBOTE: BAJISTA (resistencia → ALTA)';
         } else {
             el.classList.add('neutral');
             el.textContent = '🔄 REBOTE: NEUTRAL';
@@ -2530,24 +2889,20 @@ DASHBOARD_HTML = r"""
     }
 
     // ============================================================
-    //  GRÁFICO DE ZONA (EMA + Soporte/Resistencia + Pivotes)
+    //  GRÁFICOS DE ZONA (EMA + Soporte/Resistencia + Pivotes)
     // ============================================================
-    function renderChart(analysisData) {
-        if (!analysisData) return;
-        const levels = analysisData.level_data || [];
+    function buildZoneDatasets(series, nivelColor) {
+        const levels = series.level_data || [];
         const labels = levels.map(d => d.index);
-        const levelValues = levels.map(d => d.value);
-        const supports = analysisData.support_levels || [];
-        const resistances = analysisData.resistance_levels || [];
-        const peaks = analysisData.peaks || [];
-        const valleys = analysisData.valleys || [];
-
-        const ema4 = calcEMA(levelValues, 4);
-        const ema8 = calcEMA(levelValues, 8);
-        const ema20 = calcEMA(levelValues, 20);
+        const values = levels.map(d => d.value);
+        const ema4 = calcEMA(values, 4);
+        const ema8 = calcEMA(values, 8);
+        const ema20 = calcEMA(values, 20);
+        const supports = series.support_levels || [];
+        const resistances = series.resistance_levels || [];
 
         const datasets = [
-            { label: 'Nivel', data: levelValues, borderColor: '#8fb4ff', backgroundColor: 'rgba(143,180,255,0.05)', borderWidth: 2, pointRadius: 0, tension: 0.15, fill: true },
+            { label: 'Nivel', data: values, borderColor: nivelColor, backgroundColor: 'rgba(143,180,255,0.05)', borderWidth: 2, pointRadius: 0, tension: 0.15, fill: true },
             { label: 'EMA 4', data: ema4, borderColor: '#ffd700', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
             { label: 'EMA 8', data: ema8, borderColor: '#ff8c00', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
             { label: 'EMA 20', data: ema20, borderColor: '#ff4d4d', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
@@ -2555,25 +2910,25 @@ DASHBOARD_HTML = r"""
 
         supports.forEach((s, idx) => {
             datasets.push({
-                label: 'Soporte ' + (idx+1) + ' (' + s.frequency + 'x)',
-                data: levelValues.map(() => s.level),
-                borderColor: `hsl(190, 80%, ${60 + idx * 8}%)`,
-                borderDash: [6,4], borderWidth: 2, pointRadius: 0, fill: false
+                label: 'Soporte ' + (idx + 1) + ' (' + s.frequency + 'x)',
+                data: values.map(() => s.level),
+                borderColor: 'hsl(190, 80%, ' + (60 + idx * 8) + '%)',
+                borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false
             });
         });
         resistances.forEach((r, idx) => {
             datasets.push({
-                label: 'Resistencia ' + (idx+1) + ' (' + r.frequency + 'x)',
-                data: levelValues.map(() => r.level),
-                borderColor: `hsl(0, 80%, ${60 + idx * 8}%)`,
-                borderDash: [6,4], borderWidth: 2, pointRadius: 0, fill: false
+                label: 'Resistencia ' + (idx + 1) + ' (' + r.frequency + 'x)',
+                data: values.map(() => r.level),
+                borderColor: 'hsl(0, 80%, ' + (60 + idx * 8) + '%)',
+                borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false
             });
         });
 
-        const allPivots = [...peaks, ...valleys];
-        if (allPivots.length) {
-            const pivotMap = {};
-            allPivots.forEach(p => { pivotMap[p.index] = p.value; });
+        const pivotMap = {};
+        (series.peaks || []).forEach(p => pivotMap[p.index] = p.value);
+        (series.valleys || []).forEach(p => pivotMap[p.index] = p.value);
+        if (Object.keys(pivotMap).length) {
             datasets.push({
                 label: 'Pivotes',
                 data: labels.map(idx => pivotMap[idx] !== undefined ? pivotMap[idx] : null),
@@ -2581,7 +2936,12 @@ DASHBOARD_HTML = r"""
                 pointRadius: 5, pointStyle: 'triangle', showLine: false
             });
         }
+        return { labels, datasets };
+    }
 
+    function renderZoneChart(chart, canvasId, series, nivelColor) {
+        if (!series) return;
+        const built = buildZoneDatasets(series, nivelColor);
         const opts = {
             responsive: true, maintainAspectRatio: false, animation: false,
             plugins: {
@@ -2598,14 +2958,20 @@ DASHBOARD_HTML = r"""
                 y: { grid: { color: 'rgba(255,255,255,0.06)' }, ticks: { color: '#b0caf0' } }
             }
         };
-
-        if (!chartZona) {
-            chartZona = new Chart(document.getElementById('chartZona'), { type: 'line', data: { labels, datasets }, options: opts });
+        if (!chart) {
+            chart = new Chart(document.getElementById(canvasId), { type: 'line', data: built, options: opts });
         } else {
-            chartZona.data.labels = labels;
-            chartZona.data.datasets = datasets;
-            chartZona.update();
+            chart.data.labels = built.labels;
+            chart.data.datasets = built.datasets;
+            chart.update();
         }
+        return chart;
+    }
+
+    function renderCharts(zoneAnalysis) {
+        if (!zoneAnalysis) return;
+        chartAltos = renderZoneChart(chartAltos, 'chartAltos', zoneAnalysis.alto, '#4fa8ff');
+        chartBajos = renderZoneChart(chartBajos, 'chartBajos', zoneAnalysis.bajo, '#c98a4a');
     }
 
     // ============================================================
@@ -2648,7 +3014,7 @@ DASHBOARD_HTML = r"""
     // ============================================================
     //  ACTUALIZAR UI
     // ============================================================
-    function updateUI(state, analysis) {
+    function updateUI(state, zoneAnalysis) {
         if (!state) return;
         document.getElementById('spinCount').textContent = state.total_spins_seen || 0;
         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('es-ES',{hour12:false});
@@ -2699,7 +3065,7 @@ DASHBOARD_HTML = r"""
         }
         lastSignalState = state;
 
-        if (analysis) renderChart(analysis);
+        if (zoneAnalysis) renderCharts(zoneAnalysis);
         s4UI();
     }
 
@@ -2708,8 +3074,8 @@ DASHBOARD_HTML = r"""
     // ============================================================
     async function poll() {
         const state = await fetchState();
-        const analysis = await fetchAnalysis();
-        if (state) updateUI(state, analysis);
+        const zoneAnalysis = await fetchZoneAnalysis();
+        if (state) updateUI(state, zoneAnalysis);
         else {
             document.getElementById('connectionLed').className = 'led red';
             document.getElementById('connectionText').textContent = 'Desconectado';
@@ -3006,6 +3372,7 @@ def build_http_app() -> web.Application:
     app.router.add_get("/api/state/{mesa}", http_api_state)
     app.router.add_get("/api/all", http_api_all)
     app.router.add_get("/api/analysis/{mesa}", http_analysis)
+    app.router.add_get("/api/analysis_zones/{mesa}", http_analysis_zones)
     app.router.add_get("/dashboard", http_dashboard)
     app.router.add_get("/", http_dashboard)
     return app
@@ -3108,7 +3475,8 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
             if i % 100 == 0:
                 await asyncio.sleep(0)
         agents = [table.agent2, table.agent3, table.agent4, table.agent6,
-                  table.zone_agent1, table.zone_agent2]
+                  table.zone_agent1, table.zone_agent2, table.zone_agent3, table.zone_agent4,
+                  table.zone_agent_streak]
         for agent in agents:
             agent.force_train(timestamp)
         log.info(f"[Entrenamiento] Mesa {table.key}: entrenamiento forzado tras bloque {start//BATCH_SIZE + 1}")
@@ -3161,6 +3529,9 @@ class ServerState:
                 table.agent6.load_persist(data.get("agent6"))
                 table.zone_agent1.load_persist(data.get("zone_agent1"))
                 table.zone_agent2.load_persist(data.get("zone_agent2"))
+                table.zone_agent3.load_persist(data.get("zone_agent3"))
+                table.zone_agent4.load_persist(data.get("zone_agent4"))
+                table.zone_agent_streak.load_persist(data.get("zone_agent_streak"))
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
                 log.info(f"Modelo cargado para mesa {key}")
@@ -3180,6 +3551,9 @@ class ServerState:
             "agent6": table.agent6.to_persist(),
             "zone_agent1": table.zone_agent1.to_persist(),
             "zone_agent2": table.zone_agent2.to_persist(),
+            "zone_agent3": table.zone_agent3.to_persist(),
+            "zone_agent4": table.zone_agent4.to_persist(),
+            "zone_agent_streak": table.zone_agent_streak.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
             "history_seed_trained": self.history_seed_trained.get(key, False),
         }
