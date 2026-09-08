@@ -122,7 +122,7 @@ THREAD_STATS   = int(os.environ.get("THREAD_STATS", "4398"))
 THREAD_SIGNALS_ZONE = int(os.environ.get("THREAD_SIGNALS_ZONE", str(THREAD_SIGNALS)))
 THREAD_STATS_ZONE   = int(os.environ.get("THREAD_STATS_ZONE", str(THREAD_STATS)))
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:speedroulette2")
-TABLE_NAME     = "Ruleta: Speed Roulette 2"
+TABLE_NAME     = "Ruleta: Speed Roulette 2"   # <-- CAMBIO SOLICITADO
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
@@ -923,20 +923,12 @@ class DozenPatternAgent:
 
 
 # ══════════════════════════════════════════════
-#  AGENTE DE PATRÓN DE ZONAS (con comodín y cercanía)
+#  AGENTE DE PATRÓN DE ZONAS
 # ══════════════════════════════════════════════
 class ZonePatternAgent:
-    """
-    Agente que detecta patrones sobre la secuencia de zonas (BAJA/ALTA/VERDE).
-    El patrón es una cadena de caracteres donde 'a' = BAJA, 'b' = ALTA.
-    El cero (VERDE) es un comodín que puede aparecer en cualquier posición de la historia.
-    La zona predicha es la correspondiente a la última letra del patrón (debe ser 'a' o 'b').
-    Si el cero está cerca del final (en las últimas 2 posiciones), se invierte la secuencia:
-    primer intento = opuesto, segundo = predicha.
-    """
     def __init__(self, pattern: str, name: str, label: str, daily_marker=None,
                  thread_signals=None, thread_stats=None):
-        self.pattern = pattern  # solo 'a' y 'b'
+        self.pattern = pattern
         self.pattern_len = len(pattern)
         self.name = name
         self.label = label
@@ -1348,7 +1340,6 @@ class RouletteTable:
         self._pending_new_signal = None
         self._signal_included = False
 
-        # ── RESULTADO DE LA ÚLTIMA SEÑAL (para el dashboard) ──
         self.last_signal_outcome = None   # "win" o "loss"
         self.last_signal_number = None
 
@@ -1445,7 +1436,6 @@ class RouletteTable:
         else:
             balance = -(self.attempt_bets[0] + self.attempt_bets[1])
 
-        # Guardar resultado para el dashboard
         self.last_signal_outcome = "win" if win else "loss"
         self.last_signal_number = self.attempt_numbers[-1] if self.attempt_numbers else None
 
@@ -1750,7 +1740,6 @@ class RouletteTable:
         else:
             self.trend = "neutral"
 
-        # Actualizar agentes de docenas
         agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
         agent_keys = ["agent2", "agent3", "agent4", "agent6"]
 
@@ -1776,7 +1765,6 @@ class RouletteTable:
                           trend_dozens=favored, amx_strength_val=amx_strength_val,
                           last_number=number, live_enabled=live_ok)
 
-        # Actualizar agentes de zona
         zone_agents = [self.zone_agent1, self.zone_agent2]
         for zagente in zone_agents:
             blocked = (self.signal_status is not None) or self.confirming
@@ -1808,7 +1796,6 @@ class RouletteTable:
 
     def get_state(self, limit: int = 40):
         hist = self.spin_history[-limit:] if self.spin_history else []
-        # Obtener la zona del intento actual si hay señal activa
         signal_zone = None
         signal_attempt = 0
         signal_zone_sequence = []
@@ -1946,7 +1933,7 @@ async def http_analysis(request: web.Request):
 
 
 # ══════════════════════════════════════════════
-#  DASHBOARD HTML (interfaz web)
+#  DASHBOARD HTML (raw string para evitar warnings de escape)
 # ══════════════════════════════════════════════
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
@@ -2551,7 +2538,6 @@ DASHBOARD_HTML = r"""
         if (lastSignalState && lastSignalState.signal_active && !state.signal_active) {
             if (state.last_signal_outcome) {
                 const win = state.last_signal_outcome === 'win';
-                // Solo si la gestión está activa
                 if (s4Active) {
                     s4AutoResult(win);
                 }
@@ -2559,10 +2545,7 @@ DASHBOARD_HTML = r"""
         }
         lastSignalState = state;
 
-        // Renderizar análisis
         if (analysis) renderCharts(analysis);
-
-        // Actualizar la gestión (UI)
         s4UI();
     }
 
@@ -2611,7 +2594,6 @@ DASHBOARD_HTML = r"""
         const state = await fetchState();
         const analysis = await fetchAnalysis();
         if (state) updateUI(state, analysis);
-        // Actualizar conexión led si falla
         if (!state) {
             document.getElementById('connectionLed').className = 'led red';
             document.getElementById('connectionText').textContent = 'Desconectado';
@@ -2621,11 +2603,11 @@ DASHBOARD_HTML = r"""
     function startPolling() {
         if (pollingInterval) clearInterval(pollingInterval);
         pollingInterval = setInterval(poll, 2000);
-        poll(); // inmediato
+        poll();
     }
 
     // ============================================================
-    //  GESTIÓN LABOUCHÈRE (copia de la lógica del HTML original)
+    //  GESTIÓN LABOUCHÈRE
     // ============================================================
     function s4Sum(arr){ return _r2(arr.reduce(function(a,b){ return a + b; }, 0)); }
     function s4Fichas(){
@@ -2814,11 +2796,9 @@ DASHBOARD_HTML = r"""
     function sxCfgToggle(id){ var c = document.getElementById(id+'Cfg'); c.style.display = c.style.display === 'block' ? 'none' : 'block'; }
 
     // ============================================================
-    //  RESET CONFIGURACIÓN (limpiar estado de señales)
+    //  RESET CONFIGURACIÓN
     // ============================================================
     function resetConfig() {
-        // Reiniciar contadores de señales del backend (solo para la interfaz)
-        // El backend no tiene un reset, pero podemos resetear la gestión
         if (s4Active) s4Reset();
         lastSignalState = null;
         hideSignalAlert();
@@ -2829,13 +2809,11 @@ DASHBOARD_HTML = r"""
     // ============================================================
     document.getElementById('mesaSelector').addEventListener('change', function(e) {
         currentMesa = parseInt(e.target.value);
-        // Reiniciar gráficos
         if (chartAltos) { chartAltos.destroy(); chartAltos = null; }
         if (chartBajos) { chartBajos.destroy(); chartBajos = null; }
         startPolling();
     });
 
-    // Inicializar
     s4InitSeq = DEFAULT_SEQ.slice();
     s4Seq = s4InitSeq.slice();
     s4Bal = s4Cap;
@@ -2845,7 +2823,6 @@ DASHBOARD_HTML = r"""
 
     startPolling();
 
-    // Exponer funciones para botones manuales
     window.s4Toggle = sxToggle;
     window.sxCfgToggle = sxCfgToggle;
     window.s4Start = s4Start;
@@ -2864,7 +2841,7 @@ DASHBOARD_HTML = r"""
 # ══════════════════════════════════════════════
 #  HTTP APP
 # ══════════════════════════════════════════════
-_server_state: Optional[ServerState] = None
+_server_state: Optional[ServerState] = None   # <-- Ahora ServerState ya está definido
 
 async def http_ping(request: web.Request):
     return web.json_response({"status": "pong", "ts": time.time()})
@@ -2909,12 +2886,207 @@ def build_http_app() -> web.Application:
     app.router.add_get("/api/all", http_api_all)
     app.router.add_get("/api/analysis/{mesa}", http_analysis)
     app.router.add_get("/dashboard", http_dashboard)
-    app.router.add_get("/", http_dashboard)  # redirigir raíz al dashboard
+    app.router.add_get("/", http_dashboard)
     return app
 
 
 # ══════════════════════════════════════════════
-#  MAIN
+#  WEBSOCKET HANDLER
+# ══════════════════════════════════════════════
+class PragmaticWebSocketHandler:
+    def __init__(self, key: int, on_spin_callback: Callable[[int, bool, bool], Awaitable[None]]):
+        self.key = key
+        self.on_spin_callback = on_spin_callback
+        self.seen = set()
+
+    async def run(self):
+        sub = {"type": "subscribe", "casinoId": CASINO_ID, "currency": CURRENCY_ID, "key": [self.key]}
+        delay = 5
+        while True:
+            try:
+                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info(f"✅ WS Pragmatic conectado (key={self.key})")
+                    delay = 5
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+
+                        results = data.get("last20Results")
+                        if isinstance(results, list):
+                            log.debug(f"📦 Recibido last20Results con {len(results)} elementos")
+                            for r in results:
+                                await self._feed(r.get("gameId"), r.get("result"), emit=True)
+
+                        if data.get("gameId") is not None and data.get("result") is not None:
+                            await self._feed(data.get("gameId"), data.get("result"), emit=True)
+
+            except Exception as e:
+                log.warning(f"🔌 WS key={self.key}: {e}. Reconectando en {delay}s…")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    async def _feed(self, gid, result, emit: bool):
+        if gid is None or result is None:
+            return
+        try:
+            num = int(result)
+        except (TypeError, ValueError):
+            return
+        if not (0 <= num <= 36):
+            return
+        if gid in self.seen:
+            log.debug(f"⏩ gameId {gid} ya procesado (número {num})")
+            return
+        self.seen.add(gid)
+        if len(self.seen) > 3000:
+            self.seen.clear()
+        log.info(f"🔄 Nuevo giro: gameId={gid}, número={num}")
+        if self.on_spin_callback:
+            await self.on_spin_callback(num, emit, training=not emit)
+
+
+# ══════════════════════════════════════════════
+#  ENTRENAMIENTO CON HISTORIAL
+# ══════════════════════════════════════════════
+BATCH_SIZE = 250
+
+def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_SEED_TABLE) -> list:
+    if not path or not os.path.exists(path):
+        log.warning(f"[Historial] No se encontró '{path}'; se arranca sin pre-entrenamiento.")
+        return []
+    try:
+        conn = sqlite3.connect(":memory:")
+        with open(path, "r", encoding="utf-8") as f:
+            conn.executescript(f.read())
+        cur = conn.execute(f'SELECT spin_number FROM "{table_name}" ORDER BY id ASC')
+        spins = [int(row[0]) for row in cur.fetchall()]
+        conn.close()
+        log.info(f"[Historial] {len(spins)} giros cargados desde '{path}' (tabla '{table_name}').")
+        return spins
+    except Exception as e:
+        log.warning(f"[Historial] Error leyendo '{path}': {e}")
+        return []
+
+async def train_table_from_history(table: "RouletteTable", spins: list, timestamp: float) -> None:
+    if not spins:
+        return
+    log.info(f"[Entrenamiento] Mesa {table.key}: procesando {len(spins)} giros históricos en bloques de {BATCH_SIZE}...")
+    total = len(spins)
+    for start in range(0, total, BATCH_SIZE):
+        batch = spins[start:start + BATCH_SIZE]
+        log.info(f"[Entrenamiento] Mesa {table.key}: bloque {start//BATCH_SIZE + 1} ({len(batch)} giros)")
+        for i, number in enumerate(batch):
+            if not (0 <= number <= 36):
+                continue
+            table.update(number, color_of(number), timestamp=timestamp, training=True)
+            if i % 100 == 0:
+                await asyncio.sleep(0)
+        agents = [table.agent2, table.agent3, table.agent4, table.agent6,
+                  table.zone_agent1, table.zone_agent2]
+        for agent in agents:
+            agent.force_train(timestamp)
+        log.info(f"[Entrenamiento] Mesa {table.key}: entrenamiento forzado tras bloque {start//BATCH_SIZE + 1}")
+        await asyncio.sleep(0.1)
+
+    for agent in agents:
+        agent.force_train(timestamp)
+        agent.reset_transient()
+    log.info(
+        f"[Entrenamiento] Mesa {table.key}: listo. giros_vistos={table.total_spins_seen} "
+        f"nivel={table.level_current}"
+    )
+
+
+# ══════════════════════════════════════════════
+#  SERVER STATE (DEFINICIÓN FINAL)
+# ══════════════════════════════════════════════
+class ServerState:
+    def __init__(self):
+        self.tables = {k: RouletteTable(k) for k in ROULETTE_KEYS.values()}
+        self.history_seed_trained = {k: False for k in ROULETTE_KEYS.values()}
+
+    async def update_mesa(self, key: int, number: int, broadcast: bool = True, training: bool = False):
+        if key not in self.tables:
+            return
+        table = self.tables[key]
+        real_color = color_of(number)
+        table.update(number, real_color, training=training)
+
+    def get_state_for_mesa(self, key: int):
+        if key not in self.tables:
+            return None
+        return self.tables[key].get_state(limit=40)
+
+    def load_all_models(self):
+        for key in self.tables:
+            self._load_model(key)
+
+    def _load_model(self, key: int):
+        filename = f"model_{key}.json"
+        if not os.path.exists(filename):
+            return
+        try:
+            with open(filename, "r") as f:
+                data = json.load(f)
+                table = self.tables[key]
+                table.agent2.load_persist(data.get("agent2"))
+                table.agent3.load_persist(data.get("agent3"))
+                table.agent4.load_persist(data.get("agent4"))
+                table.agent6.load_persist(data.get("agent6"))
+                table.zone_agent1.load_persist(data.get("zone_agent1"))
+                table.zone_agent2.load_persist(data.get("zone_agent2"))
+                table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
+                self.history_seed_trained[key] = data.get("history_seed_trained", False)
+                log.info(f"Modelo cargado para mesa {key}")
+        except Exception as e:
+            log.warning(f"Error cargando modelo mesa {key}: {e}")
+
+    def save_all_models(self):
+        for key, table in self.tables.items():
+            self._save_model(key)
+
+    def _save_model(self, key: int):
+        table = self.tables[key]
+        data = {
+            "agent2": table.agent2.to_persist(),
+            "agent3": table.agent3.to_persist(),
+            "agent4": table.agent4.to_persist(),
+            "agent6": table.agent6.to_persist(),
+            "zone_agent1": table.zone_agent1.to_persist(),
+            "zone_agent2": table.zone_agent2.to_persist(),
+            "table_total_spins_seen": table.total_spins_seen,
+            "history_seed_trained": self.history_seed_trained.get(key, False),
+        }
+        filename = f"model_{key}.json"
+        try:
+            with open(filename, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.warning(f"Error guardando modelo mesa {key}: {e}")
+
+    async def train_from_history(self):
+        spins_cache = None
+        for key, table in self.tables.items():
+            if self.history_seed_trained.get(key):
+                log.info(f"[Entrenamiento] Mesa {key}: ya estaba entrenada con el historial, se omite.")
+                continue
+            if spins_cache is None:
+                spins_cache = load_history_seed()
+            if not spins_cache:
+                continue
+            now = time.time()
+            await train_table_from_history(table, spins_cache, now)
+            self.history_seed_trained[key] = True
+            self._save_model(key)
+
+
+# ══════════════════════════════════════════════
+#  SELF-PING Y BOT POLLING
 # ══════════════════════════════════════════════
 async def self_ping_loop():
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -2965,6 +3137,10 @@ async def bot_polling_loop():
         log.warning(f"[Telegram] Reintentando polling en {delay}s…")
         await asyncio.sleep(delay)
 
+
+# ══════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════
 async def main():
     global _server_state
     log.info("═" * 60)
