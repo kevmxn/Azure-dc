@@ -122,7 +122,7 @@ THREAD_STATS   = int(os.environ.get("THREAD_STATS", "4398"))
 THREAD_SIGNALS_ZONE = int(os.environ.get("THREAD_SIGNALS_ZONE", str(THREAD_SIGNALS)))
 THREAD_STATS_ZONE   = int(os.environ.get("THREAD_STATS_ZONE", str(THREAD_STATS)))
 TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.lat/casino/play/v_pragmatic:speedroulette2")
-TABLE_NAME     = "Speed Roulette 2"
+TABLE_NAME     = "Ruleta: Speed Roulette 2"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
@@ -1948,7 +1948,7 @@ async def http_analysis(request: web.Request):
 # ══════════════════════════════════════════════
 #  DASHBOARD HTML (interfaz web)
 # ══════════════════════════════════════════════
-DASHBOARD_HTML = """
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="es">
 <head>
