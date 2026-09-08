@@ -84,7 +84,7 @@ DOZEN_COOLDOWN_ROUNDS = 5
 SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
 
 # ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
-ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
+ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "5"))
 
 # ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
@@ -1730,6 +1730,10 @@ class RouletteTable:
         self.last_signal_outcome = None   # "win" o "loss"
         self.last_signal_number = None
 
+        # ── Log de resoluciones POR INTENTO (para que el panel HTML procese también el intento 1) ──
+        self.attempt_log = []       # lista de {"seq": int, "attempt": int, "win": bool, "number": int}
+        self.attempt_log_seq = 0
+
         # ── AGENTES DE DOCENAS ──
         self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
         self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
@@ -1753,6 +1757,7 @@ class RouletteTable:
         # Niveles de zona independientes (gráficos ALTOS/BAJOS + S/R)
         self.alto_level_history = []
         self.bajo_level_history = []
+        self.zone_number_history = []   # números reales alineados índice a índice con alto/bajo_level_history
 
     def _level_change(self, number: int, real_dozen_num: int) -> int:
         if real_dozen_num == 1: return 1
@@ -1817,6 +1822,20 @@ class RouletteTable:
             await send_msg(msg, THREAD_SIGNALS)
             self.cycle_pending = 0
 
+    def _log_attempt_result(self, attempt: int, win: bool, number: int):
+        """Registra la resolución de CADA intento (1 y 2), no solo el resultado final
+        de la señal. El panel HTML usa esto para avanzar su gestión Labouchère también
+        cuando el intento 1 pierde (antes solo se procesaba al cerrar la señal completa)."""
+        self.attempt_log_seq += 1
+        self.attempt_log.append({
+            "seq": self.attempt_log_seq,
+            "attempt": attempt,
+            "win": bool(win),
+            "number": number,
+        })
+        if len(self.attempt_log) > 50:
+            self.attempt_log = self.attempt_log[-50:]
+
     def _finalize_sequence(self, win: bool, winning_attempt: int = None):
         b1 = self.attempt_bets[0] if len(self.attempt_bets) > 0 else 0
         b2 = self.attempt_bets[1] if len(self.attempt_bets) > 1 else 0
@@ -1831,8 +1850,9 @@ class RouletteTable:
         self.last_signal_number = self.attempt_numbers[-1] if self.attempt_numbers else None
 
         extra_text = ""
-        if self._pending_new_signal is not None:
-            new_signal = self._pending_new_signal
+        new_signal = self._pending_new_signal
+        new_bet_amount = None
+        if new_signal is not None:
             agent = new_signal["agent"]
             zone_sequence = new_signal["zone_sequence"]
             if self.current_attempt_index == 0:
@@ -1841,8 +1861,8 @@ class RouletteTable:
                 header = "🔥🔥 REPETIR SEÑAL CONFIRMADA 🔥🔥"
             last_num = agent._last_raw_number
             zone = zone_sequence[0]
-            bet_amount = self.labouchere.get_bet()
-            entry_body = build_entry_message_zone(last_num, zone, bet_amount=bet_amount)
+            new_bet_amount = self.labouchere.get_bet()
+            entry_body = build_entry_message_zone(last_num, zone, bet_amount=new_bet_amount)
             extra_text = f"{header}\n\n{entry_body}"
             self._pending_new_signal = None
             self._signal_included = True
@@ -1851,12 +1871,9 @@ class RouletteTable:
         asyncio.create_task(self.daily_marker.record(win, winning_attempt))
         asyncio.create_task(self._send_daily_marker_and_cycle())
 
-        self.signal_sequence = []
         self.current_attempt_index = 0
-        self.signal_status = None
         self.attempt_numbers = []
         self.attempt_zones = []
-        self.attempt_bets = []
         self.entry_msg_ids = []
         self.pending_agent = None
         self.pending_candidate = None
@@ -1864,6 +1881,23 @@ class RouletteTable:
         if self.confirmation_msg_id:
             asyncio.create_task(delete_msg(self.confirmation_msg_id))
             self.confirmation_msg_id = None
+
+        if new_signal is not None:
+            # La nueva señal ya se anunció (combinada con el mensaje de resolución):
+            # ahora se activa de verdad para que sus intentos/resultados se procesen.
+            new_entry = {
+                "agent": new_signal["agent"],
+                "original": None,
+                "zone_sequence": new_signal["zone_sequence"],
+                "is_streak": bool(new_signal.get("is_streak")),
+            }
+            self.signal_sequence = [new_entry]
+            self.signal_status = "active"
+            self.attempt_bets = [new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
+        else:
+            self.signal_sequence = []
+            self.signal_status = None
+            self.attempt_bets = []
 
     def _select_best_candidate(self, candidates):
         if not candidates:
@@ -1879,9 +1913,11 @@ class RouletteTable:
         rebound_dir = candidate.get("rebound_direction", "NEUTRAL")
         favored = self.REBOUND_FAVORED_ZONE.get(rebound_dir)
         if candidate.get("is_streak"):
-            # La racha manda: ambos intentos a la zona de la racha
+            # RACHA: intento 1 a favor de la racha. Si el intento 1 pierde, el intento 2
+            # cambia de dirección (va a la zona contraria).
             zone = bet_zone_tuple[0]
-            return [zone, zone]
+            opposite = "ALTA" if zone == "BAJA" else "BAJA"
+            return [zone, opposite]
         if isinstance(agent, ZonePatternAgent):
             seq = list(candidate.get("zone_sequence") or [])
             # El rebote manda en la predicción del segundo intento (salvo inversión por cero)
@@ -1928,6 +1964,7 @@ class RouletteTable:
         self._pending_new_signal = {
             "agent": agent,
             "zone_sequence": zone_sequence,
+            "is_streak": bool(candidate.get("is_streak")),
         }
         agent.candidate_signal = None
 
@@ -1946,6 +1983,7 @@ class RouletteTable:
             "agent": agent,
             "original": candidate,
             "zone_sequence": zone_sequence,
+            "is_streak": bool(candidate.get("is_streak")),
         }
 
         if self.signal_status == "waiting_pattern":
@@ -2043,7 +2081,19 @@ class RouletteTable:
                 cycle_completed = self.labouchere.update(False)
                 if cycle_completed:
                     self.cycle_pending = self.labouchere.cycles_completed
+                self._log_attempt_result(self.current_attempt_index + 1, False, 0)
                 if self.current_attempt_index == 0:
+                    if current_entry.get("is_streak"):
+                        # Señal de RACHA: el 0 se trata igual que una pérdida del intento 1.
+                        # Se continúa directo al intento 2 en la zona CONTRARIA (zone_sequence
+                        # ya trae [zona_racha, zona_opuesta]), sin esperar un patrón nuevo.
+                        self.current_attempt_index = 1
+                        new_bet = self.labouchere.get_bet()
+                        self.attempt_bets.append(new_bet)
+                        next_zone = zone_sequence[1] if len(zone_sequence) > 1 else zone_sequence[0]
+                        asyncio.create_task(self._send_entry(agent, next_zone, new_bet, 2))
+                        log.info(f"🟢 CERO en intento 1 de RACHA -> INTENTO 2 cambia de dirección: {next_zone}")
+                        return True
                     log.info("🟢 CERO en intento 1 - esperando nuevo patrón para intento 2")
                     self.signal_status = "waiting_pattern"
                     self.signal_sequence = []
@@ -2068,6 +2118,7 @@ class RouletteTable:
             cycle_completed = self.labouchere.update(is_win)
             if cycle_completed:
                 self.cycle_pending = self.labouchere.cycles_completed
+            self._log_attempt_result(self.current_attempt_index + 1, is_win, last_number if last_number is not None else 0)
 
             if is_win:
                 self.signal_status = "won"
@@ -2153,6 +2204,8 @@ class RouletteTable:
             self.bajo_level_history.append(last_bajo + (1 if z == "BAJA" else -1))
         if len(self.alto_level_history) > 300: self.alto_level_history.pop(0)
         if len(self.bajo_level_history) > 300: self.bajo_level_history.pop(0)
+        self.zone_number_history.append(number)
+        if len(self.zone_number_history) > 300: self.zone_number_history.pop(0)
 
         dz = dozen_of(number)
         self.dozen_history.append(dz)
@@ -2285,6 +2338,8 @@ class RouletteTable:
             "signal_zone_sequence": signal_zone_sequence,
             "last_signal_outcome": self.last_signal_outcome,
             "last_signal_number": self.last_signal_number,
+            "attempt_log": self.attempt_log[-20:],
+            "attempt_log_seq": self.attempt_log_seq,
             "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
             "total_attempts": ZONE_MAX_ATTEMPTS if self.signal_status == "active" else 0,
             "last_nonzero_zone": self.last_nonzero_zone,
@@ -2382,14 +2437,24 @@ def detect_rebound_direction(level_history, lookback=40, pivot_window=3,
         return "BAJISTA"
     return "NEUTRAL"
 
-def _zone_analysis_payload(level_history, lookback):
+def _zone_analysis_payload(level_history, lookback, number_history=None):
     levels = level_history[-lookback:] if len(level_history) >= lookback else level_history
     start_idx = len(level_history) - len(levels)
     peaks, valleys = detect_pivots(level_history, lookback=lookback, pivot_window=3)
     supports = cluster_levels(valleys, threshold=1.0)
     resistances = cluster_levels(peaks, threshold=1.0)
+
+    numbers_slice = []
+    if number_history:
+        # number_history está alineado índice a índice con level_history
+        numbers_slice = number_history[-lookback:] if len(number_history) >= lookback else number_history
+        # aseguramos misma longitud que levels (por si difieren en algún borde)
+        if len(numbers_slice) != len(levels):
+            numbers_slice = numbers_slice[-len(levels):] if len(numbers_slice) > len(levels) else numbers_slice
+
     return {
         "level_data": [{"index": start_idx + i, "value": v} for i, v in enumerate(levels)],
+        "numbers": numbers_slice,
         "peaks": [{"index": i, "value": v} for i, v in peaks],
         "valleys": [{"index": i, "value": v} for i, v in valleys],
         "support_levels": supports,
@@ -2416,8 +2481,8 @@ async def http_analysis_zones(request: web.Request):
         lookback = 60
     lookback = max(20, min(300, lookback))
     return web.json_response({
-        "alto": _zone_analysis_payload(table.alto_level_history, lookback),
-        "bajo": _zone_analysis_payload(table.bajo_level_history, lookback),
+        "alto": _zone_analysis_payload(table.alto_level_history, lookback, table.zone_number_history),
+        "bajo": _zone_analysis_payload(table.bajo_level_history, lookback, table.zone_number_history),
     })
 
 async def http_analysis(request: web.Request):
@@ -2561,11 +2626,9 @@ DASHBOARD_HTML = r"""
         .s4-seq-chip { padding:3px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; background:rgba(48,216,192,.12); border:1px solid rgba(48,216,192,.35); color:#30d8c0; }
         .s4-seq-chip.s4-chip-first { border-color:rgba(255,220,80,.6); color:#f0d040; background:rgba(240,208,64,.12); }
         .s4-seq-chip.s4-chip-last  { border-color:rgba(255,100,100,.6); color:#ff8080; background:rgba(255,100,100,.12); }
-        .sx-btns { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:10px 0 6px; }
+        .sx-btns { display:grid; grid-template-columns:1fr; gap:6px; margin:10px 0 6px; }
         .sx-btn { padding:9px; border:none; border-radius:8px; font-size:0.75rem; font-weight:700; cursor:pointer; letter-spacing:1px; transition:all .2s; }
-        .sx-btn-win  { background:linear-gradient(135deg,rgba(80,200,120,.18),rgba(40,140,60,.22)); color:#7ae99b; border:1px solid rgba(80,200,120,.35); }
-        .sx-btn-loss { background:linear-gradient(135deg,rgba(200,40,70,.15),rgba(140,0,30,.2)); color:#ff7070; border:1px solid rgba(200,40,70,.3); }
-        .sx-btn-reset { background:linear-gradient(135deg,rgba(200,180,60,.1),rgba(160,100,0,.14)); color:#f0c040; border:1px solid rgba(200,180,60,.25); grid-column:span 2; font-size:0.7rem; }
+        .sx-btn-reset { background:linear-gradient(135deg,rgba(200,180,60,.1),rgba(160,100,0,.14)); color:#f0c040; border:1px solid rgba(200,180,60,.25); }
         .sx-btn-start { width:100%; padding:10px; background:linear-gradient(135deg,rgba(80,130,220,.12),rgba(40,80,180,.16)); color:#80b0ff; border:1px solid rgba(80,130,220,.25); border-radius:8px; font-size:0.72rem; font-weight:700; letter-spacing:2px; cursor:pointer; }
         .sx-cfg-toggle { text-align:center; font-size:0.65rem; color:rgba(80,130,220,.35); cursor:pointer; margin-top:8px; padding:5px; border-top:1px solid rgba(80,130,220,.07); letter-spacing:1px; }
         .sx-cfg { background:rgba(80,130,220,.04); border:1px solid rgba(80,130,220,.12); border-radius:8px; padding:10px; margin-top:8px; display:none; }
@@ -2642,7 +2705,7 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Gráfico ALTOS (19-36) · EMA 4/8/20 · Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Gráfico ALTOS (19-36) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 4/8/20 · Soporte/Resistencia</span>
             <div class="ema-legend">
                 <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
                 <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
@@ -2657,7 +2720,7 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> Gráfico BAJOS (1-18) · EMA 4/8/20 · Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> Gráfico BAJOS (1-18) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 4/8/20 · Soporte/Resistencia</span>
             <div class="ema-legend">
                 <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
                 <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
@@ -2697,8 +2760,6 @@ DASHBOARD_HTML = r"""
             <div id="s4Goal" style="text-align:center; font-size:0.68rem; color:rgba(48,216,192,.75); letter-spacing:.5px; margin:4px 0 8px;">🎯 Meta ciclo: --</div>
             <div class="sx-auto-badge" id="s4AutoStatus">🤖 MODO AUTOMÁTICO — Señales del bot de Telegram</div>
             <div class="sx-btns" id="s4Controls" style="display:none">
-                <button class="sx-btn sx-btn-win" onclick="s4ManualResult(true)">✅ WIN</button>
-                <button class="sx-btn sx-btn-loss" onclick="s4ManualResult(false)">❌ LOSS</button>
                 <button class="sx-btn sx-btn-reset" onclick="s4Reset()">🔄 RESET</button>
             </div>
             <button class="sx-btn-start" id="s4BtnStart" onclick="s4Start()">🔢 INICIAR LABOUCHÈRE</button>
@@ -2741,6 +2802,7 @@ DASHBOARD_HTML = r"""
     let chartAltos = null;
     let chartBajos = null;
     let lastSignalState = null;
+    let lastProcessedAttemptSeq = null; // null = aún no inicializado (evita reproducir historial viejo al cargar)
     let s4Active = false;
     let s4Bal = 100, s4Cap = 100, s4Base = 1, s4Seq = [], s4Bet = 0, s4InitSeq = [], s4Ent = 0, s4W = 0, s4L = 0;
     const S4_MAX_SEQ = 25;
@@ -2889,23 +2951,40 @@ DASHBOARD_HTML = r"""
     }
 
     // ============================================================
-    //  GRÁFICOS DE ZONA (EMA + Soporte/Resistencia + Pivotes)
+    //  GRÁFICOS DE ZONA — estilo "Johan" (puntos por número/color)
+    //  + EMA 4/8/20 + Soporte/Resistencia + Pivotes
     // ============================================================
-    function buildZoneDatasets(series, nivelColor) {
+    // Azul para ALTO (19-36), marrón para BAJO (1-18), verde para el 0
+    function zoneNumColor(num) {
+        if (num === null || num === undefined) return '#ffffff';
+        if (num === 0) return '#5fd17c';
+        return (num >= 19 && num <= 36) ? '#4fa8ff' : '#a0703c';
+    }
+
+    function buildZoneDatasets(series, nivelColor, nivelFill) {
         const levels = series.level_data || [];
         const labels = levels.map(d => d.index);
         const values = levels.map(d => d.value);
+        const numbers = series.numbers || [];
         const ema4 = calcEMA(values, 4);
         const ema8 = calcEMA(values, 8);
         const ema20 = calcEMA(values, 20);
         const supports = series.support_levels || [];
         const resistances = series.resistance_levels || [];
 
+        const pointColors = values.map((_, i) => zoneNumColor(numbers[i]));
+
         const datasets = [
-            { label: 'Nivel', data: values, borderColor: nivelColor, backgroundColor: 'rgba(143,180,255,0.05)', borderWidth: 2, pointRadius: 0, tension: 0.15, fill: true },
-            { label: 'EMA 4', data: ema4, borderColor: '#ffd700', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
-            { label: 'EMA 8', data: ema8, borderColor: '#ff8c00', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
-            { label: 'EMA 20', data: ema20, borderColor: '#ff4d4d', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
+            {
+                label: 'Nivel', data: values, borderColor: nivelColor, backgroundColor: (nivelFill || nivelColor),
+                borderWidth: 2, tension: 0.1, fill: false,
+                pointRadius: 4, pointHoverRadius: 6,
+                pointBackgroundColor: pointColors, pointBorderColor: 'rgba(0,0,0,.35)', pointBorderWidth: 1,
+                pointNumbers: numbers
+            },
+            { label: 'EMA 20', data: ema20, borderColor: '#ff4d4d', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.15 },
+            { label: 'EMA 8',  data: ema8,  borderColor: '#ff8c00', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.15, borderDash: [4, 2] },
+            { label: 'EMA 4',  data: ema4,  borderColor: '#ffd700', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.15, borderDash: [2, 2] },
         ];
 
         supports.forEach((s, idx) => {
@@ -2939,9 +3018,9 @@ DASHBOARD_HTML = r"""
         return { labels, datasets };
     }
 
-    function renderZoneChart(chart, canvasId, series, nivelColor) {
-        if (!series) return;
-        const built = buildZoneDatasets(series, nivelColor);
+    function renderZoneChart(chart, canvasId, series, nivelColor, nivelFill) {
+        if (!series) return chart;
+        const built = buildZoneDatasets(series, nivelColor, nivelFill);
         const opts = {
             responsive: true, maintainAspectRatio: false, animation: false,
             plugins: {
@@ -2950,7 +3029,12 @@ DASHBOARD_HTML = r"""
                     let label = ctx.dataset.label || '';
                     let val = ctx.parsed.y;
                     if (val === null || val === undefined) return '';
-                    return label + ': ' + (Number.isInteger(val) ? val : val.toFixed(2));
+                    let txt = label + ': ' + (Number.isInteger(val) ? val : val.toFixed(2));
+                    if (label === 'Nivel' && ctx.dataset.pointNumbers) {
+                        const num = ctx.dataset.pointNumbers[ctx.dataIndex];
+                        if (num !== undefined && num !== null) txt += '  ·  Número: ' + num;
+                    }
+                    return txt;
                 } } }
             },
             scales: {
@@ -2970,8 +3054,8 @@ DASHBOARD_HTML = r"""
 
     function renderCharts(zoneAnalysis) {
         if (!zoneAnalysis) return;
-        chartAltos = renderZoneChart(chartAltos, 'chartAltos', zoneAnalysis.alto, '#4fa8ff');
-        chartBajos = renderZoneChart(chartBajos, 'chartBajos', zoneAnalysis.bajo, '#c98a4a');
+        chartAltos = renderZoneChart(chartAltos, 'chartAltos', zoneAnalysis.alto, '#4fa8ff', 'rgba(79,168,255,.12)');
+        chartBajos = renderZoneChart(chartBajos, 'chartBajos', zoneAnalysis.bajo, '#a0703c', 'rgba(160,112,60,.14)');
     }
 
     // ============================================================
@@ -3058,11 +3142,10 @@ DASHBOARD_HTML = r"""
             hideSignalAlert();
         }
 
-        if (lastSignalState && lastSignalState.signal_active && !state.signal_active) {
-            if (state.last_signal_outcome && s4Active) {
-                s4AutoResult(state.last_signal_outcome === 'win');
-            }
-        }
+        // Procesa CADA intento resuelto (intento 1 y también intento 2), no solo el
+        // resultado final de la señal. Así el LOSS del intento 1 sí se aplica a la
+        // gestión aunque la señal continúe al intento 2.
+        processAttemptLog(state.attempt_log);
         lastSignalState = state;
 
         if (zoneAnalysis) renderCharts(zoneAnalysis);
@@ -3185,10 +3268,30 @@ DASHBOARD_HTML = r"""
         s4Seq = s4InitSeq.slice();
         s4Bet = s4Calc();
         s4Ent = s4W = s4L = 0;
+        lastProcessedAttemptSeq = null; // no aplicar intentos resueltos antes de iniciar
         s4ClearHist();
         _sxShow('s4', true);
         _sxSetAlert('s4', '🤖 AUTO · [' + s4Txt(s4Seq) + '] · $' + _money(s4Bet) + ' · Esperando señal...');
         s4UI();
+    }
+
+    // Procesa el log de intentos resueltos que llega del backend. Cada intento
+    // (1 y 2) tiene su propio "seq" incremental; se procesan en orden y solo los
+    // que no se hayan visto antes, así el LOSS del intento 1 SÍ avanza la gestión
+    // aunque la señal siga viva esperando el intento 2.
+    function processAttemptLog(log){
+        if (!log || !log.length) return;
+        if (lastProcessedAttemptSeq === null) {
+            // Primera carga: no reproducir historial anterior, solo fijar el punto de partida.
+            lastProcessedAttemptSeq = log[log.length - 1].seq;
+            return;
+        }
+        log.forEach(function(entry){
+            if (entry.seq > lastProcessedAttemptSeq) {
+                lastProcessedAttemptSeq = entry.seq;
+                if (s4Active) s4AutoResult(entry.win);
+            }
+        });
     }
 
     function s4AutoResult(win){
@@ -3225,8 +3328,6 @@ DASHBOARD_HTML = r"""
         }
         s4UI();
     }
-
-    function s4ManualResult(win){ if (s4Active) s4AutoResult(win); }
 
     function s4End(){
         s4Active = false;
@@ -3289,6 +3390,7 @@ DASHBOARD_HTML = r"""
     function resetConfig() {
         if (s4Active) s4Reset();
         lastSignalState = null;
+        lastProcessedAttemptSeq = null;
         hideSignalAlert();
     }
 
@@ -3309,7 +3411,6 @@ DASHBOARD_HTML = r"""
     window.s4Start = s4Start;
     window.s4Reset = s4Reset;
     window.s4Apply = s4Apply;
-    window.s4ManualResult = s4ManualResult;
     window.resetConfig = resetConfig;
     window.s4Live = s4Live;
     window.sxToggle = sxToggle;
