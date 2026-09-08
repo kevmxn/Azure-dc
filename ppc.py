@@ -460,6 +460,7 @@ def build_status_message(server_state) -> str:
         seq_str = ','.join(str(x) for x in lab_state['sequence'])
         sign = '+' if lab_state['balance'] >= 0 else '-'
         lines.append(f"💹 Labouchère | Acum: {sign}{format_cop(abs(lab_state['balance']))} | Sec: [{seq_str}] | Sig: {format_cop(lab_state['bet_amount'])} | Ciclos: {lab_state['cycles_completed']}")
+        lines.append(f"🔄 Rebote actual: {table.last_rebound_direction}")
         for akey in agent_keys:
             agente = getattr(table, akey, None)
             if agente is None:
@@ -473,11 +474,15 @@ def build_status_message(server_state) -> str:
             rec_attempt, rec_pct = agente.overall_recommended_attempt()
             rec_line = (f"🧠 Intento recomendado: {rec_attempt} ({rec_pct}%)"
                         if rec_attempt else "🧠 Intento recomendado: aún sin datos suficientes")
+            rec_attempt_dir, rec_pct_dir = agente.overall_recommended_attempt_for_direction(table.last_rebound_direction)
+            rec_dir_line = (f"🌊 Intento según rebote ({table.last_rebound_direction}): {rec_attempt_dir}"
+                             + (f" ({rec_pct_dir}%)" if rec_pct_dir is not None else " (usando general, pocos datos por rebote)")
+                             if rec_attempt_dir else "🌊 Intento según rebote: aún sin datos suficientes")
             if agente.trained:
                 modelo_line = "🤖 Modelo: entrenado"
             else:
                 modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
-            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}")
+            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
         for zkey in zone_keys:
             agente = getattr(table, zkey, None)
             if agente is None:
@@ -491,11 +496,15 @@ def build_status_message(server_state) -> str:
             rec_attempt, rec_pct = agente.overall_recommended_attempt()
             rec_line = (f"🧠 Intento recomendado: {rec_attempt} ({rec_pct}%)"
                         if rec_attempt else "🧠 Intento recomendado: aún sin datos suficientes")
+            rec_attempt_dir, rec_pct_dir = agente.overall_recommended_attempt_for_direction(table.last_rebound_direction)
+            rec_dir_line = (f"🌊 Intento según rebote ({table.last_rebound_direction}): {rec_attempt_dir}"
+                             + (f" ({rec_pct_dir}%)" if rec_pct_dir is not None else " (usando general, pocos datos por rebote)")
+                             if rec_attempt_dir else "🌊 Intento según rebote: aún sin datos suficientes")
             if agente.trained:
                 modelo_line = "🤖 Modelo: entrenado"
             else:
                 modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
-            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}")
+            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
     return "\n\n".join(lines)
 
 if bot is not None:
@@ -545,6 +554,7 @@ class DozenPatternAgent:
             "active": False, "pattern": None, "bet_dozens": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
             "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
         }
         self.train_attempt_results = []
         self.live_enabled = True
@@ -567,6 +577,7 @@ class DozenPatternAgent:
         self.trained = False
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
+        self.last_rebound_direction = "NEUTRAL"
 
     # ── Matching de patrones completos ──
     def _match(self, window):
@@ -625,10 +636,19 @@ class DozenPatternAgent:
     def _key(pattern):
         return ">".join(pattern)
 
-    def _record_context(self, pattern, hit_attempt: int):
+    @staticmethod
+    def _entry_attempt(entry):
+        """Compatibilidad: entradas antiguas son int (hit_attempt); las nuevas son dict {'a':.., 'r':..}."""
+        return entry["a"] if isinstance(entry, dict) else entry
+
+    @staticmethod
+    def _entry_rebound(entry):
+        return entry.get("r", "NEUTRAL") if isinstance(entry, dict) else "NEUTRAL"
+
+    def _record_context(self, pattern, hit_attempt: int, rebound_direction: str = "NEUTRAL"):
         key = self._key(pattern)
         arr = self.pattern_context.setdefault(key, [])
-        arr.append(hit_attempt)
+        arr.append({"a": hit_attempt, "r": rebound_direction})
         if len(arr) > DOZEN_CONTEXT_WINDOW:
             del arr[0]
 
@@ -652,7 +672,7 @@ class DozenPatternAgent:
         arr = self.trained_snapshot.get(self._key(pattern), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        return sum(1 for v in arr if v > 0) / len(arr)
+        return sum(1 for e in arr if self._entry_attempt(e) > 0) / len(arr)
 
     def _gated(self, pattern, required_win_rate):
         rate = self._win_rate(pattern)
@@ -666,8 +686,8 @@ class DozenPatternAgent:
         arr = self.trained_snapshot.get(self._key(pattern), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        c1 = sum(1 for v in arr if v == 1)
-        c2 = sum(1 for v in arr if v == 2)
+        c1 = sum(1 for e in arr if self._entry_attempt(e) == 1)
+        c2 = sum(1 for e in arr if self._entry_attempt(e) == 2)
         if c1 == 0 and c2 == 0:
             return None
         return 1 if c1 >= c2 else 2
@@ -677,11 +697,50 @@ class DozenPatternAgent:
             return None, 0.0
         c1 = c2 = 0
         for arr in self.trained_snapshot.values():
-            c1 += sum(1 for v in arr if v == 1)
-            c2 += sum(1 for v in arr if v == 2)
+            c1 += sum(1 for e in arr if self._entry_attempt(e) == 1)
+            c2 += sum(1 for e in arr if self._entry_attempt(e) == 2)
         total = c1 + c2
         if total < DOZEN_MIN_SAMPLES_GATE:
             return None, 0.0
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
+
+    def _recommended_attempt_for_direction(self, pattern, rebound_direction):
+        """Intento recomendado condicionado a la dirección de rebote actual, con
+        fallback al recomendado general del patrón si no hay muestras suficientes."""
+        if not self.trained:
+            return None, 0.0
+        arr = self.trained_snapshot.get(self._key(pattern), [])
+        filtered = [self._entry_attempt(e) for e in arr if self._entry_rebound(e) == rebound_direction]
+        if len(filtered) < DOZEN_MIN_SAMPLES_GATE:
+            fallback = self._recommended_attempt(pattern)
+            return fallback, None
+        c1 = sum(1 for v in filtered if v == 1)
+        c2 = sum(1 for v in filtered if v == 2)
+        if c1 == 0 and c2 == 0:
+            fallback = self._recommended_attempt(pattern)
+            return fallback, None
+        if c1 >= c2:
+            return 1, round(c1 / len(filtered) * 100, 1)
+        return 2, round(c2 / len(filtered) * 100, 1)
+
+    def overall_recommended_attempt_for_direction(self, rebound_direction):
+        """Igual que overall_recommended_attempt() pero solo con señales que ocurrieron
+        con la misma dirección de rebote; si no hay datos suficientes, cae al general."""
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            for e in arr:
+                if self._entry_rebound(e) != rebound_direction:
+                    continue
+                v = self._entry_attempt(e)
+                if v == 1: c1 += 1
+                elif v == 2: c2 += 1
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return self.overall_recommended_attempt()
         if c1 >= c2:
             return 1, round(c1 / total * 100, 1)
         return 2, round(c2 / total * 100, 1)
@@ -712,7 +771,8 @@ class DozenPatternAgent:
         arr = self.trained_snapshot.get(self._key(pattern), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        filtered = [v for v in arr if v != 1]
+        values = [self._entry_attempt(e) for e in arr]
+        filtered = [v for v in values if v != 1]
         if not filtered:
             return None
         wins = sum(1 for v in filtered if v == 2)
@@ -741,9 +801,10 @@ class DozenPatternAgent:
 
     def update(self, dozen_history, timestamp, blocked: bool = False,
                trend_dozens=None, amx_strength_val=0.0, last_number=None,
-               live_enabled: bool = True):
+               live_enabled: bool = True, rebound_direction: str = "NEUTRAL"):
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
+        self.last_rebound_direction = rebound_direction
         self.candidate_signal = None
         if not dozen_history:
             return
@@ -798,6 +859,7 @@ class DozenPatternAgent:
                 bet_dozens = self._bet_dozens(pattern)
                 zone = dozen_bet_to_zone(bet_dozens, pattern)
                 context = list(dozen_history[-DOZEN_CONTEXT_WINDOW:])
+                rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(pattern, rebound_direction)
                 self.candidate_signal = {
                     "pattern": pattern,
                     "bet_dozens": bet_dozens,
@@ -807,13 +869,17 @@ class DozenPatternAgent:
                     "amx_strength": amx_strength_val,
                     "score": self._win_rate(pattern) or 0.0,
                     "confirming": False,
+                    "rebound_direction": rebound_direction,
+                    "recommended_attempt_by_rebound": rec_attempt_dir,
+                    "recommended_attempt_by_rebound_pct": rec_pct_dir,
                 }
-                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'}")
+                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'} | Rebote: {rebound_direction}")
                 self.train_state = {
                     "active": True, "pattern": pattern, "bet_dozens": bet_dozens,
                     "bet_zone": zone,
                     "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
                     "context": context, "current_attempt": 0, "start_attempt": 1,
+                    "rebound_direction": rebound_direction,
                 }
             else:
                 log.info(f"❌ {self.name} confirmación fallida: esperaba {expected}, salió {last}")
@@ -835,7 +901,7 @@ class DozenPatternAgent:
         self.history_log = self.history_log[-200:]
         self.stats["total"] += 1
         self.stats["won" if win else "lost"] += 1
-        self._record_context(pattern, hit_attempt)
+        self._record_context(pattern, hit_attempt, self.train_state.get("rebound_direction", "NEUTRAL"))
         self.total_processed += 1
         self._maybe_train(timestamp)
 
@@ -850,6 +916,7 @@ class DozenPatternAgent:
             "active": False, "pattern": None, "bet_dozens": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
             "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
         }
         self.train_attempt_results = []
 
@@ -861,11 +928,13 @@ class DozenPatternAgent:
             "active": False, "pattern": None, "bet_dozens": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
             "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
         }
         self.train_attempt_results = []
 
     def get_state(self):
         rec_attempt, rec_pct = self.overall_recommended_attempt()
+        rec_attempt_dir, rec_pct_dir = self.overall_recommended_attempt_for_direction(self.last_rebound_direction)
         pattern_recommendations = {
             key: self._recommended_attempt(tuple(key.split(">")))
             for key in self.pattern_context
@@ -884,6 +953,9 @@ class DozenPatternAgent:
             "cooldown_remaining": self.cooldown_remaining,
             "recommended_attempt": rec_attempt,
             "recommended_attempt_pct": rec_pct,
+            "rebound_direction": self.last_rebound_direction,
+            "recommended_attempt_by_rebound": rec_attempt_dir,
+            "recommended_attempt_by_rebound_pct": rec_pct_dir,
             "pattern_recommendations": pattern_recommendations,
             "confirming": self.confirming,
             "live_enabled": self.live_enabled,
@@ -949,6 +1021,7 @@ class ZonePatternAgent:
             "active": False, "pattern": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
             "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
         }
         self.train_attempt_results = []
         self.live_enabled = True
@@ -972,6 +1045,7 @@ class ZonePatternAgent:
         self.trained = False
         self.last_train_ts = 0.0
         self.trained_snapshot = {}
+        self.last_rebound_direction = "NEUTRAL"
 
     def _match(self, window):
         if len(window) != self.pattern_len:
@@ -1003,10 +1077,19 @@ class ZonePatternAgent:
     def _key(pattern_tuple):
         return ">".join(pattern_tuple)
 
-    def _record_context(self, pattern_tuple, hit_attempt: int):
+    @staticmethod
+    def _entry_attempt(entry):
+        """Compatibilidad: entradas antiguas son int (hit_attempt); las nuevas son dict {'a':.., 'r':..}."""
+        return entry["a"] if isinstance(entry, dict) else entry
+
+    @staticmethod
+    def _entry_rebound(entry):
+        return entry.get("r", "NEUTRAL") if isinstance(entry, dict) else "NEUTRAL"
+
+    def _record_context(self, pattern_tuple, hit_attempt: int, rebound_direction: str = "NEUTRAL"):
         key = self._key(pattern_tuple)
         arr = self.pattern_context.setdefault(key, [])
-        arr.append(hit_attempt)
+        arr.append({"a": hit_attempt, "r": rebound_direction})
         if len(arr) > DOZEN_CONTEXT_WINDOW:
             del arr[0]
 
@@ -1030,7 +1113,7 @@ class ZonePatternAgent:
         arr = self.trained_snapshot.get(self._key(pattern_tuple), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        return sum(1 for v in arr if v > 0) / len(arr)
+        return sum(1 for e in arr if self._entry_attempt(e) > 0) / len(arr)
 
     def _gated(self, pattern_tuple, required_win_rate):
         rate = self._win_rate(pattern_tuple)
@@ -1044,8 +1127,8 @@ class ZonePatternAgent:
         arr = self.trained_snapshot.get(self._key(pattern_tuple), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        c1 = sum(1 for v in arr if v == 1)
-        c2 = sum(1 for v in arr if v == 2)
+        c1 = sum(1 for e in arr if self._entry_attempt(e) == 1)
+        c2 = sum(1 for e in arr if self._entry_attempt(e) == 2)
         if c1 == 0 and c2 == 0:
             return None
         return 1 if c1 >= c2 else 2
@@ -1055,11 +1138,50 @@ class ZonePatternAgent:
             return None, 0.0
         c1 = c2 = 0
         for arr in self.trained_snapshot.values():
-            c1 += sum(1 for v in arr if v == 1)
-            c2 += sum(1 for v in arr if v == 2)
+            c1 += sum(1 for e in arr if self._entry_attempt(e) == 1)
+            c2 += sum(1 for e in arr if self._entry_attempt(e) == 2)
         total = c1 + c2
         if total < DOZEN_MIN_SAMPLES_GATE:
             return None, 0.0
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
+
+    def _recommended_attempt_for_direction(self, pattern_tuple, rebound_direction):
+        """Intento recomendado condicionado a la dirección de rebote actual, con
+        fallback al recomendado general del patrón si no hay muestras suficientes."""
+        if not self.trained:
+            return None, 0.0
+        arr = self.trained_snapshot.get(self._key(pattern_tuple), [])
+        filtered = [self._entry_attempt(e) for e in arr if self._entry_rebound(e) == rebound_direction]
+        if len(filtered) < DOZEN_MIN_SAMPLES_GATE:
+            fallback = self._recommended_attempt(pattern_tuple)
+            return fallback, None
+        c1 = sum(1 for v in filtered if v == 1)
+        c2 = sum(1 for v in filtered if v == 2)
+        if c1 == 0 and c2 == 0:
+            fallback = self._recommended_attempt(pattern_tuple)
+            return fallback, None
+        if c1 >= c2:
+            return 1, round(c1 / len(filtered) * 100, 1)
+        return 2, round(c2 / len(filtered) * 100, 1)
+
+    def overall_recommended_attempt_for_direction(self, rebound_direction):
+        """Igual que overall_recommended_attempt() pero solo con señales que ocurrieron
+        con la misma dirección de rebote; si no hay datos suficientes, cae al general."""
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            for e in arr:
+                if self._entry_rebound(e) != rebound_direction:
+                    continue
+                v = self._entry_attempt(e)
+                if v == 1: c1 += 1
+                elif v == 2: c2 += 1
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return self.overall_recommended_attempt()
         if c1 >= c2:
             return 1, round(c1 / total * 100, 1)
         return 2, round(c2 / total * 100, 1)
@@ -1101,11 +1223,12 @@ class ZonePatternAgent:
 
     def update(self, zone_history, timestamp, blocked: bool = False,
                amx_strength_val=0.0, last_number=None,
-               live_enabled: bool = True):
+               live_enabled: bool = True, rebound_direction: str = "NEUTRAL"):
         if not self.active:
             return
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
+        self.last_rebound_direction = rebound_direction
         self.candidate_signal = None
         if not zone_history:
             return
@@ -1182,6 +1305,7 @@ class ZonePatternAgent:
                 else:
                     zone_sequence = [predicted_zone, opposite]
 
+                rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(pattern_tuple, rebound_direction)
                 self.candidate_signal = {
                     "pattern": pattern_tuple,
                     "bet_zone": (predicted_zone,),
@@ -1192,12 +1316,16 @@ class ZonePatternAgent:
                     "score": self._win_rate(pattern_tuple) or 0.0,
                     "confirming": False,
                     "near_zero": near_zero,
+                    "rebound_direction": rebound_direction,
+                    "recommended_attempt_by_rebound": rec_attempt_dir,
+                    "recommended_attempt_by_rebound_pct": rec_pct_dir,
                 }
-                log.info(f"✅ {self.name} confirmación correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence}")
+                log.info(f"✅ {self.name} confirmación correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence} | Rebote: {rebound_direction}")
                 self.train_state = {
                     "active": True, "pattern": pattern_tuple, "bet_zone": predicted_zone,
                     "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
                     "context": context, "current_attempt": 0, "start_attempt": 1,
+                    "rebound_direction": rebound_direction,
                 }
             else:
                 log.info(f"❌ {self.name} confirmación fallida: esperaba {expected_last}, salió {last_zone}")
@@ -1219,7 +1347,7 @@ class ZonePatternAgent:
         self.history_log = self.history_log[-200:]
         self.stats["total"] += 1
         self.stats["won" if win else "lost"] += 1
-        self._record_context(pattern_tuple, hit_attempt)
+        self._record_context(pattern_tuple, hit_attempt, self.train_state.get("rebound_direction", "NEUTRAL"))
         self.total_processed += 1
         self._maybe_train(timestamp)
 
@@ -1234,6 +1362,7 @@ class ZonePatternAgent:
             "active": False, "pattern": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
             "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
         }
         self.train_attempt_results = []
 
@@ -1246,11 +1375,13 @@ class ZonePatternAgent:
             "active": False, "pattern": None, "bet_zone": None,
             "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
             "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
         }
         self.train_attempt_results = []
 
     def get_state(self):
         rec_attempt, rec_pct = self.overall_recommended_attempt()
+        rec_attempt_dir, rec_pct_dir = self.overall_recommended_attempt_for_direction(self.last_rebound_direction)
         pattern_recommendations = {
             key: self._recommended_attempt(tuple(key.split(">")))
             for key in self.pattern_context
@@ -1269,6 +1400,9 @@ class ZonePatternAgent:
             "cooldown_remaining": self.cooldown_remaining,
             "recommended_attempt": rec_attempt,
             "recommended_attempt_pct": rec_pct,
+            "rebound_direction": self.last_rebound_direction,
+            "recommended_attempt_by_rebound": rec_attempt_dir,
+            "recommended_attempt_by_rebound_pct": rec_pct_dir,
             "pattern_recommendations": pattern_recommendations,
             "confirming": self.confirming,
             "live_enabled": self.live_enabled,
@@ -1359,6 +1493,7 @@ class RouletteTable:
         self.last_d2_number = None
         self.trend = "neutral"
         self.last_nonzero_zone = "BAJA"
+        self.last_rebound_direction = "NEUTRAL"
 
     def _level_change(self, number: int, real_dozen_num: int) -> int:
         if real_dozen_num == 1: return 1
@@ -1740,6 +1875,8 @@ class RouletteTable:
         else:
             self.trend = "neutral"
 
+        self.last_rebound_direction = detect_rebound_direction(self.level_history)
+
         agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
         agent_keys = ["agent2", "agent3", "agent4", "agent6"]
 
@@ -1763,7 +1900,8 @@ class RouletteTable:
 
             agente.update(self.dozen_history, timestamp, blocked=blocked,
                           trend_dozens=favored, amx_strength_val=amx_strength_val,
-                          last_number=number, live_enabled=live_ok)
+                          last_number=number, live_enabled=live_ok,
+                          rebound_direction=self.last_rebound_direction)
 
         zone_agents = [self.zone_agent1, self.zone_agent2]
         for zagente in zone_agents:
@@ -1772,6 +1910,7 @@ class RouletteTable:
             amx_strength_val = 0.0
             zagente.update(self.zone_history, timestamp, blocked=blocked,
                            amx_strength_val=amx_strength_val,
+                           rebound_direction=self.last_rebound_direction,
                            last_number=number, live_enabled=live_ok)
 
         all_agents = agent_list + zone_agents
@@ -1791,7 +1930,8 @@ class RouletteTable:
             f"🎰 Mesa {self.key} | Giro #{len(self.dozen_history)}: {number} ({real_color}) → {dz} "
             f"(docena {real_dozen_num}) | Zona: {z} | Nivel: {self.level_current} | "
             f"{seq_status} | Lab: [{lab_seq}] {format_cop(lab_bet)} | Últimas 10 docenas: [{last10}] | "
-            f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend} | Última zona no nula: {self.last_nonzero_zone}"
+            f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend} | "
+            f"Rebote: {self.last_rebound_direction} | Última zona no nula: {self.last_nonzero_zone}"
         )
 
     def get_state(self, limit: int = 40):
@@ -1824,6 +1964,7 @@ class RouletteTable:
             "zone_agent2": self.zone_agent2.get_state(),
             "trend": self.trend,
             "trend_favored_dozens": sorted(NUM_DOZEN[d] for d in trend_favored_dozens(self.trend)),
+            "rebound_direction": self.last_rebound_direction,
             "level_current": self.level_current,
             "level_history": self.level_history,
             "labouchere": self.labouchere.get_state(),
@@ -1893,6 +2034,47 @@ def cluster_levels(points, threshold=1.0):
         })
     return clusters
 
+def detect_rebound_direction(level_history, lookback=40, pivot_window=3,
+                              cluster_threshold=1.0, near_distance=1.5, confirm_span=3):
+    """
+    Detecta la dirección del rebote del nivel de zona:
+      - "ALCISTA": el nivel acaba de rebotar hacia arriba desde un soporte (favorece ALTA / D2-D3)
+      - "BAJISTA": el nivel acaba de rebotar hacia abajo desde una resistencia (favorece BAJA / D1-D2)
+      - "NEUTRAL": no hay un rebote reciente y claro desde soporte/resistencia
+    Reutiliza detect_pivots/cluster_levels (mismos usados en /api/analysis/<mesa>).
+    """
+    if len(level_history) < (pivot_window * 2 + confirm_span + 2):
+        return "NEUTRAL"
+
+    eff_lookback = min(lookback, len(level_history))
+    peaks, valleys = detect_pivots(level_history, lookback=eff_lookback, pivot_window=pivot_window)
+    if not peaks and not valleys:
+        return "NEUTRAL"
+
+    support_clusters = cluster_levels(valleys, threshold=cluster_threshold)
+    resistance_clusters = cluster_levels(peaks, threshold=cluster_threshold)
+
+    current_level = level_history[-1]
+    recent = level_history[-(confirm_span + 1):]
+    short_dir = recent[-1] - recent[0] if len(recent) >= 2 else 0
+
+    nearest_support = min(support_clusters, key=lambda c: abs(c["level"] - current_level)) if support_clusters else None
+    nearest_resistance = min(resistance_clusters, key=lambda c: abs(c["level"] - current_level)) if resistance_clusters else None
+
+    dist_support = abs(current_level - nearest_support["level"]) if nearest_support else None
+    dist_resistance = abs(current_level - nearest_resistance["level"]) if nearest_resistance else None
+
+    bounced_up = dist_support is not None and dist_support <= near_distance and short_dir > 0
+    bounced_down = dist_resistance is not None and dist_resistance <= near_distance and short_dir < 0
+
+    if bounced_up and bounced_down:
+        return "ALCISTA" if dist_support <= dist_resistance else "BAJISTA"
+    if bounced_up:
+        return "ALCISTA"
+    if bounced_down:
+        return "BAJISTA"
+    return "NEUTRAL"
+
 async def http_analysis(request: web.Request):
     global _server_state
     if _server_state is None:
@@ -1908,8 +2090,13 @@ async def http_analysis(request: web.Request):
     if table is None:
         return web.json_response({"error": "mesa no encontrada"}, status=404)
 
+    try:
+        lookback = int(request.query.get("lookback", 60))
+    except ValueError:
+        lookback = 60
+    lookback = max(20, min(300, lookback))
+
     level_history = table.level_history
-    lookback = 60
     levels = level_history[-lookback:] if len(level_history) >= lookback else level_history
     start_idx = len(level_history) - len(levels)
 
@@ -1940,192 +2127,91 @@ DASHBOARD_HTML = r"""
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard Zonas · Soportes/Resistencias</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes">
+    <title>Sistema de Zonas · EMA 4/8/20 · Soporte/Resistencia</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            background: #0b101f;
-            color: #c8d6e5;
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            padding: 20px;
-            display: flex;
-            justify-content: center;
-        }
-        .container {
-            max-width: 1200px;
-            width: 100%;
-            background: rgba(12, 20, 35, 0.85);
-            backdrop-filter: blur(4px);
-            border-radius: 24px;
-            padding: 20px;
-            border: 1px solid #2a3f60;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.7);
-        }
-        h1 {
-            font-size: 1.8rem;
-            background: linear-gradient(135deg, #8cb4ff, #5a7fd4);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 6px;
-        }
-        .sub {
-            color: #7388aa;
-            font-size: 0.85rem;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #1f314a;
-            padding-bottom: 12px;
-        }
-        .status-bar {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            align-items: center;
-            margin-bottom: 16px;
-            background: #0f1a2a;
-            padding: 10px 14px;
-            border-radius: 16px;
-            border: 1px solid #1f314a;
-        }
-        .status-bar .led {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 6px;
-        }
-        .status-bar .led.green { background: #3fe06d; box-shadow: 0 0 12px #2ecc71; }
-        .status-bar .led.yellow { background: #f0b34b; }
-        .status-bar .led.red { background: #e05a5a; }
-        .mesa-selector {
-            background: #1b273f;
-            border: 1px solid #3a507a;
-            color: #ccdeff;
-            padding: 6px 14px;
-            border-radius: 30px;
-            font-weight: 600;
-            font-size: 0.82rem;
-            cursor: pointer;
-            outline: none;
-            margin-left: auto;
-        }
-        .mesa-selector:focus { border-color: #90c0ff; }
-        .chart-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-            margin-top: 12px;
-        }
-        .chart-box {
-            background: #0a1220;
-            border-radius: 16px;
-            padding: 12px;
-            border: 1px solid #1f314a;
-            position: relative;
-            height: 280px;
-        }
-        .chart-box canvas { width: 100% !important; height: 100% !important; }
-        .chart-title {
-            font-size: 0.75rem;
-            color: #8a9fc0;
-            margin-bottom: 4px;
-            text-align: center;
-            letter-spacing: 1px;
-        }
-        .legend {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            justify-content: center;
-            font-size: 0.65rem;
-            margin-top: 8px;
-        }
-        .legend-item { display: flex; align-items: center; gap: 6px; }
-        .legend-color { width: 18px; height: 3px; border-radius: 3px; }
-        .support-color { background: #00d4ff; }
-        .resistance-color { background: #ff6b6b; }
-        .level-color { background: #ffd93d; }
-        .pivot-color { background: #00b894; }
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; }
+        body { background:#0b101f; color:#d9e2f5; max-width:1000px; margin:0 auto; padding:10px; font-size:13px; min-height:100vh; }
+        .container { display:flex; flex-direction:column; gap:12px; }
+        .card { background:rgba(12,20,35,0.8); backdrop-filter:blur(4px); border-radius:20px; padding:14px 18px; border:1px solid #25395a; box-shadow:0 8px 18px #00000050; }
+        .main-title h1 { font-size:1.5rem; font-weight:600; background:linear-gradient(145deg,#bfdbff,#8fb4ff); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+        .main-title .sub { color:#7388aa; font-size:0.78rem; margin-top:4px; }
+        .info-bar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:6px; }
+        .table-tag { background:#1b273f; border:1px solid #3a507a; color:#ccdeff; padding:6px 14px; border-radius:30px; font-weight:600; font-size:0.78rem; }
+        .led { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
+        .led.green { background:#3fe06d; box-shadow:0 0 12px #2ecc71; }
+        .led.red { background:#e05a5a; }
+        .trend-badge { padding:6px 14px; border-radius:30px; font-weight:700; font-size:0.78rem; border:1px solid; }
+        .trend-badge.bullish { color:#7ae99b; border-color:rgba(80,200,120,.4); background:rgba(80,200,120,.08); }
+        .trend-badge.bearish { color:#ff8888; border-color:rgba(220,60,60,.4); background:rgba(220,60,60,.08); }
+        .trend-badge.neutral { color:#b0caf0; border-color:rgba(120,140,180,.35); background:rgba(120,140,180,.08); }
+        .rebound-badge { padding:6px 14px; border-radius:30px; font-weight:700; font-size:0.78rem; border:1px solid; }
+        .rebound-badge.alcista { color:#7ae9d9; border-color:rgba(80,200,180,.4); background:rgba(80,200,180,.08); }
+        .rebound-badge.bajista { color:#ffb27a; border-color:rgba(220,140,60,.4); background:rgba(220,140,60,.08); }
+        .rebound-badge.neutral { color:#b0caf0; border-color:rgba(120,140,180,.35); background:rgba(120,140,180,.08); }
+        .counters { display:flex; gap:16px; margin-left:auto; font-size:0.78rem; }
+        .btn-reset-conf { background:rgba(80,130,220,.1); border:1px solid rgba(80,130,220,.3); color:#80b0ff; padding:5px 12px; border-radius:20px; font-size:0.72rem; cursor:pointer; }
 
-        .signal-panel {
-            background: #0f1a2a;
-            border: 1px solid #1f314a;
-            border-radius: 16px;
-            padding: 14px;
-            margin-top: 16px;
-        }
-        .signal-panel .signal-status {
-            display: flex;
-            align-items: center;
-            gap: 18px;
-            flex-wrap: wrap;
-        }
-        .signal-badge {
-            font-size: 1.2rem;
-            font-weight: 800;
-            padding: 4px 18px;
-            border-radius: 40px;
-            background: rgba(80,130,220,0.15);
-            border: 1px solid rgba(80,130,220,0.3);
-        }
-        .signal-badge.active {
-            background: rgba(200,180,60,0.15);
-            border-color: #f0c040;
-            color: #f0c040;
-        }
-        .signal-zone {
-            font-size: 1.4rem;
-            font-weight: 900;
-        }
-        .signal-zone.baja { color: #00d4ff; }
-        .signal-zone.alta { color: #ff6b6b; }
+        .vis-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; }
+        .vis-btn { background:#1b273f; border:1px solid #3a507a; color:#ccdeff; padding:5px 14px; border-radius:30px; font-weight:600; font-size:0.78rem; cursor:pointer; }
+        .vis-btn.active { background:#2f6e9e; border-color:#90c0ff; color:white; }
 
-        .sx-wrap { margin-top: 16px; }
-        .sx-header {
-            background: linear-gradient(135deg,rgba(0,25,60,.9),rgba(0,12,35,.95));
-            border: 1px solid rgba(80,130,220,.22);
-            border-radius: 14px;
-            padding: 10px 16px;
-            cursor: pointer;
-            user-select: none;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
+        .balls-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+        .ball { width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:0.85rem; box-shadow:0 3px 8px black; }
+        .ball.alta  { background:#0d3a66; border:2px solid #4fa8ff; color:#dff0ff; }
+        .ball.baja  { background:#4a2e12; border:2px solid #c98a4a; color:#ffe8cf; }
+        .ball.verde { background:#196f3d; border:2px solid #8ceda3; }
+
+        .last-num-card { display:flex; align-items:center; gap:18px; padding:16px 20px; }
+        .ln-ball { flex-shrink:0; width:72px; height:72px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:1.9rem; font-weight:900; box-shadow:0 6px 20px rgba(0,0,0,.55); transition:background .35s,border-color .35s; }
+        .ln-ball.ln-alta  { background:radial-gradient(circle at 35% 35%,#3d8fe8,#0d3a66); border:2px solid #4fa8ff; }
+        .ln-ball.ln-baja  { background:radial-gradient(circle at 35% 35%,#c98a4a,#4a2e12); border:2px solid #c98a4a; }
+        .ln-ball.ln-verde { background:radial-gradient(circle at 35% 35%,#2eb860,#0d5c28); border:2px solid #5fd17c; }
+        .ln-ball.ln-waiting { background:radial-gradient(circle at 35% 35%,#2a3550,#151d30); border:2px solid rgba(80,130,220,.3); color:rgba(120,150,200,.5); font-size:1.1rem; }
+        .ln-info { flex:1; min-width:0; display:flex; flex-direction:column; gap:8px; }
+        .ln-top { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+        .ln-zone-tag { font-size:0.7rem; font-weight:700; letter-spacing:2px; text-transform:uppercase; padding:2px 10px; border-radius:20px; }
+        .ln-zone-tag.alta  { background:rgba(20,80,160,.35); color:#7fc0ff; border:1px solid rgba(79,168,255,.4); }
+        .ln-zone-tag.baja  { background:rgba(140,80,30,.35); color:#e8b57f; border:1px solid rgba(201,138,74,.4); }
+        .ln-zone-tag.verde { background:rgba(20,100,50,.4); color:#7ae99b; border:1px solid rgba(60,180,100,.4); }
+        .ln-signal-badge { font-size:0.75rem; font-weight:800; letter-spacing:1px; padding:3px 12px; border-radius:20px; }
+        .ln-signal-badge.sig-active { background:rgba(200,180,60,.2); color:#f0c040; border:1px solid rgba(200,180,60,.4); }
+        .ln-signal-badge.sig-no { background:rgba(80,80,100,.25); color:rgba(160,165,190,.6); border:1px solid rgba(100,105,140,.25); }
+        .ln-waiting-text { font-size:0.78rem; color:rgba(120,150,200,.5); }
+
+        .chart-box { background:#0f1a2a; border-radius:24px; padding:14px 12px 10px; border:1px solid #30486a; }
+        .chart-container { position:relative; height:230px; width:100%; }
+        .chart-header { display:flex; justify-content:space-between; font-size:0.78rem; margin-bottom:6px; color:#b0caf0; flex-wrap:wrap; gap:4px; }
+        .ema-legend { display:flex; gap:10px; align-items:center; font-size:0.68rem; flex-wrap:wrap; }
+        .ema-dot { width:10px; height:3px; border-radius:2px; display:inline-block; }
+        .legend-dash { width:12px; height:0; border-top:2px dashed; display:inline-block; }
+
+        .signal-panel { background:#0f1a2a; border:1px solid #1f314a; border-radius:16px; padding:12px 16px; }
+        .signal-status { display:flex; align-items:center; gap:14px; flex-wrap:wrap; font-size:0.85rem; }
+        .signal-badge { font-size:0.9rem; font-weight:800; padding:4px 14px; border-radius:40px; background:rgba(80,130,220,0.15); border:1px solid rgba(80,130,220,0.3); }
+        .signal-badge.active { background:rgba(200,180,60,0.15); border-color:#f0c040; color:#f0c040; }
+        .signal-zone { font-size:1.1rem; font-weight:900; }
+        .signal-zone.baja { color:#e8b57f; }
+        .signal-zone.alta { color:#7fc0ff; }
+
+        .sx-wrap { margin-top:4px; }
+        .sx-header { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; background:linear-gradient(135deg,rgba(0,25,60,.9),rgba(0,12,35,.95)); border:1px solid rgba(80,130,220,.22); border-radius:14px; cursor:pointer; user-select:none; }
         .sx-header h3 { font-size:0.85rem; font-weight:700; color:#80b0ff; letter-spacing:1px; margin:0; }
-        .sx-sub { font-size:0.65rem; color:rgba(200,190,100,.6); letter-spacing:1px; }
+        .sx-sub { font-size:0.65rem; color:rgba(200,190,100,.6); letter-spacing:1px; margin-top:2px; }
         .sx-arrow { font-size:10px; color:rgba(80,130,220,.5); transition:transform .3s; }
         .sx-header.sxopen .sx-arrow { transform:rotate(180deg); }
-        .sx-body {
-            background: linear-gradient(135deg,rgba(4,8,18,.97),rgba(6,12,28,.96));
-            border: 1px solid rgba(80,130,220,.12);
-            border-radius:14px;
-            padding:12px;
-            margin-top:6px;
-            display:none;
-        }
+        .sx-body { background:linear-gradient(135deg,rgba(4,8,18,.97),rgba(6,12,28,.96)); border:1px solid rgba(80,130,220,.12); border-radius:14px; padding:12px; margin-top:6px; display:none; }
         .sx-body.sxopen { display:block; }
         .sx-info { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:10px; }
         .sx-box { background:rgba(0,0,0,.4); border:1px solid rgba(80,130,220,.1); border-radius:8px; padding:7px 10px; text-align:center; }
         .sx-box .sx-lbl { font-size:0.6rem; color:rgba(80,130,220,.5); letter-spacing:1px; text-transform:uppercase; }
         .sx-box .sx-val { font-size:1.1rem; font-weight:900; margin-top:2px; }
         .sv-green { color:#7ae99b; } .sv-red { color:#ff7070; } .sv-blue { color:#60c0ff; } .sv-gold { color:#f0c040; }
-        .sx-alert-box {
-            background:rgba(0,0,0,.5);
-            border:1px solid rgba(200,180,80,.25);
-            border-radius:8px;
-            padding:9px 12px;
-            text-align:center;
-            margin:8px 0;
-            font-size:0.75rem;
-            min-height:42px;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            flex-direction:column;
-            gap:3px;
-        }
+        .sx-alert-box { background:rgba(0,0,0,.5); border:1px solid rgba(200,180,80,.25); border-radius:8px; padding:9px 12px; text-align:center; margin:8px 0; font-size:0.75rem; min-height:42px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:3px; transition:border-color .3s; }
+        .sx-alert-box.sx-pulse { border-color:rgba(200,180,80,.6); animation:sxPulse 1.5s infinite; }
+        @keyframes sxPulse { 50%{opacity:.7} }
         .s4-seq-row { display:flex; flex-wrap:wrap; gap:4px; justify-content:center; margin:8px 0; }
         .s4-seq-chip { padding:3px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; background:rgba(48,216,192,.12); border:1px solid rgba(48,216,192,.35); color:#30d8c0; }
         .s4-seq-chip.s4-chip-first { border-color:rgba(255,220,80,.6); color:#f0d040; background:rgba(240,208,64,.12); }
@@ -2141,7 +2227,6 @@ DASHBOARD_HTML = r"""
         .sx-cfg label { display:block; font-size:0.65rem; color:#f0c040; letter-spacing:1px; margin:8px 0 4px; }
         .sx-cfg input { width:100%; padding:7px; background:rgba(0,0,0,.5); border:1px solid rgba(80,130,220,.18); color:#e0e8ff; border-radius:6px; text-align:center; font-size:0.85rem; font-weight:700; outline:none; }
         .sx-apply { width:100%; margin-top:10px; padding:8px; background:linear-gradient(135deg,rgba(80,200,120,.15),rgba(40,140,60,.2)); border:1px solid rgba(80,200,120,.25); border-radius:6px; color:#7ae99b; font-weight:700; cursor:pointer; font-size:0.7rem; letter-spacing:1px; }
-
         .sx-hist { margin-top:10px; font-size:0.68rem; max-height:110px; overflow-y:auto; }
         .sx-hist table { width:100%; border-collapse:collapse; }
         .sx-hist th { background:rgba(80,130,220,.07); color:rgba(80,130,220,.5); font-size:0.6rem; letter-spacing:1px; padding:4px 3px; position:sticky; top:0; text-transform:uppercase; }
@@ -2150,79 +2235,85 @@ DASHBOARD_HTML = r"""
         .sxh-loss { color:#ff7070!important; font-weight:700; }
         .sx-auto-badge { text-align:center; padding:6px 10px; background:rgba(80,200,120,.06); border:1px solid rgba(80,200,120,.2); border-radius:8px; font-size:0.65rem; color:rgba(80,200,120,.7); letter-spacing:1px; margin-bottom:6px; display:none; }
 
-        .signal-alert {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 250px;
-            height: 250px;
-            border-radius: 50%;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-            text-align: center;
-            color: white;
-            border: 2px solid rgba(150,150,200,.4);
-            background: radial-gradient(circle at center, rgba(20,30,60,.95), rgba(10,15,35,.98));
-            box-shadow: 0 0 25px rgba(80,120,220,.2), inset 0 0 18px rgba(80,120,220,.06);
-            pointer-events: none;
-            backdrop-filter: blur(8px);
-            padding: 20px;
-            transition: all .3s;
-        }
-        .signal-alert.hidden { display: none; }
-        .signal-alert.state-baja { background: radial-gradient(circle at center, rgba(0,60,120,.95), rgba(0,30,60,.98), rgba(0,10,20,1)); border-color: rgba(0,180,255,.65); }
-        .signal-alert.state-alta { background: radial-gradient(circle at center, rgba(120,20,20,.95), rgba(60,10,10,.98), rgba(20,0,0,1)); border-color: rgba(255,80,80,.65); }
-        .signal-alert .alert-zone { font-size: 2.2rem; font-weight: 900; letter-spacing: 3px; }
-        .signal-alert .alert-attempt { font-size: 0.8rem; opacity: .7; }
-        .signal-alert .alert-bet { font-size: 0.7rem; color: #f0c040; margin-top: 4px; }
-        .signal-alert .alert-result { font-size: 1.6rem; font-weight: 900; margin-top: 8px; }
-        .signal-alert.state-win { border-color: rgba(0,220,100,.65); background: radial-gradient(circle at center, rgba(0,60,20,.95), rgba(0,30,10,.98)); }
-        .signal-alert.state-loss { border-color: rgba(220,30,50,.65); background: radial-gradient(circle at center, rgba(70,5,10,.95), rgba(35,3,6,.98)); }
-        .footer { margin-top: 16px; font-size:0.7rem; color:#4a6080; text-align:center; border-top:1px solid #1a2640; padding-top:14px; }
-        .btn-reset-conf { background:rgba(80,130,220,.1); border:1px solid rgba(80,130,220,.3); color:#80b0ff; padding:4px 12px; border-radius:20px; font-size:0.72rem; cursor:pointer; }
+        .signal-alert { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:250px; height:250px; border-radius:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:1000; text-align:center; color:white; border:2px solid rgba(150,150,200,.4); background:radial-gradient(circle at center, rgba(20,30,60,.95), rgba(10,15,35,.98)); box-shadow:0 0 25px rgba(80,120,220,.2), inset 0 0 18px rgba(80,120,220,.06); pointer-events:none; backdrop-filter:blur(8px); padding:20px; transition:all .3s; }
+        .signal-alert.hidden { display:none; }
+        .signal-alert.state-baja { background:radial-gradient(circle at center, rgba(120,70,20,.95), rgba(60,35,10,.98), rgba(20,10,0,1)); border-color:rgba(220,150,80,.65); }
+        .signal-alert.state-alta { background:radial-gradient(circle at center, rgba(10,50,120,.95), rgba(5,25,60,.98), rgba(0,10,20,1)); border-color:rgba(80,160,255,.65); }
+        .signal-alert .alert-zone { font-size:2.2rem; font-weight:900; letter-spacing:3px; }
+        .signal-alert .alert-attempt { font-size:0.8rem; opacity:.7; }
+        .signal-alert .alert-bet { font-size:0.7rem; color:#f0c040; margin-top:4px; }
+        .signal-alert .alert-result { font-size:1.6rem; font-weight:900; margin-top:8px; }
+        .signal-alert.state-win { border-color:rgba(0,220,100,.65); background:radial-gradient(circle at center, rgba(0,60,20,.95), rgba(0,30,10,.98)); }
+        .signal-alert.state-loss { border-color:rgba(220,30,50,.65); background:radial-gradient(circle at center, rgba(70,5,10,.95), rgba(35,3,6,.98)); }
+
+        .legend { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; font-size:0.65rem; margin-top:6px; }
+        .legend-item { display:flex; align-items:center; gap:6px; }
+        .footer { font-size:0.7rem; color:#4a6080; text-align:center; border-top:1px solid #1a2640; padding-top:14px; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>📐 Dashboard Zonas · Soportes/Resistencias</h1>
-    <div class="sub">Señales del bot de Telegram · Gestión Labouchère integrada · Gráficos en tiempo real</div>
 
-    <div class="status-bar">
-        <div><span class="led" id="connectionLed"></span><span id="connectionText">Conectando...</span></div>
-        <span>Mesa <select id="mesaSelector" class="mesa-selector">
-            <option value="205">205 Speed Roulette 2</option>
-        </select></span>
-        <span><i class="fas fa-sync-alt"></i> <span id="lastUpdate">--:--:--</span></span>
-        <span>Giros <span id="spinCount">0</span></span>
-        <button class="btn-reset-conf" onclick="resetConfig()">↺ Reset configuración</button>
-    </div>
-
-    <div class="chart-grid">
-        <div class="chart-box">
-            <div class="chart-title">📈 Nivel ALTOS (19-36) · Soporte/Resistencia</div>
-            <canvas id="chartAltos"></canvas>
-        </div>
-        <div class="chart-box">
-            <div class="chart-title">📉 Nivel BAJOS (1-18) · Soporte/Resistencia</div>
-            <canvas id="chartBajos"></canvas>
+    <div class="card main-title">
+        <h1>🎯 Sistema de Zonas · Soporte/Resistencia</h1>
+        <div class="sub">Señales del bot de Telegram · Gestión Labouchère independiente · Tiempo real</div>
+        <div class="info-bar">
+            <span class="table-tag"><span class="led" id="connectionLed"></span><span id="connectionText">Conectando...</span></span>
+            <span class="table-tag" id="tableTag">Mesa —</span>
+            <span class="trend-badge neutral" id="trendBadge">➡ TENDENCIA: —</span>
+            <span class="rebound-badge neutral" id="reboundBadge">🔄 REBOTE: —</span>
+            <div class="counters">
+                <span><i class="fas fa-database"></i> <span id="spinCount">0</span></span>
+                <span><i class="fas fa-clock"></i> <span id="lastUpdate">--:--:--</span></span>
+            </div>
+            <button class="btn-reset-conf" onclick="resetConfig()">↺ Reset</button>
         </div>
     </div>
 
-    <div class="legend">
-        <span class="legend-item"><span class="legend-color level-color"></span> Nivel</span>
-        <span class="legend-item"><span class="legend-color support-color"></span> Soporte</span>
-        <span class="legend-item"><span class="legend-color resistance-color"></span> Resistencia</span>
-        <span class="legend-item"><span class="legend-color pivot-color"></span> Pivotes</span>
+    <div class="card vis-bar">
+        <span><i class="fas fa-ruler"></i> Ver:</span>
+        <button class="vis-btn" data-length="40">40</button>
+        <button class="vis-btn active" data-length="60">60</button>
+        <button class="vis-btn" data-length="80">80</button>
+        <button class="vis-btn" data-length="100">100</button>
+        <button class="vis-btn" data-length="150">150</button>
+        <button class="vis-btn" data-length="200">200</button>
+        <button class="vis-btn" data-length="300">300</button>
     </div>
 
-    <!-- Signal Panel -->
-    <div class="signal-panel" id="signalPanel">
+    <div class="card balls-row">
+        <span><i class="fas fa-history"></i> Últimas zonas:</span>
+        <div id="historyBalls" style="display:flex;gap:5px;flex-wrap:wrap;"></div>
+    </div>
+
+    <div class="card last-num-card">
+        <div class="ln-ball ln-waiting" id="lnBall">--</div>
+        <div class="ln-info">
+            <div class="ln-top">
+                <span class="ln-zone-tag" id="lnZoneTag">SIN DATOS</span>
+                <span class="ln-signal-badge sig-no" id="lnSignalBadge">⏸️ Sin señal</span>
+            </div>
+            <div class="ln-waiting-text" id="lnWaitingText">Esperando primer giro...</div>
+        </div>
+    </div>
+
+    <div class="chart-box">
+        <div class="chart-header">
+            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Nivel de Zona · EMA 4/8/20 · Soporte/Resistencia</span>
+            <div class="ema-legend">
+                <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
+                <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
+                <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 20</span>
+                <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
+                <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
+            </div>
+        </div>
+        <div class="chart-container"><canvas id="chartZona"></canvas></div>
+    </div>
+
+    <div class="card signal-panel" id="signalPanel">
         <div class="signal-status">
-            <span>📡 Señal:</span>
+            <span>📡 Señal Telegram:</span>
             <span class="signal-badge" id="signalBadge">Inactiva</span>
             <span class="signal-zone" id="signalZone">-</span>
             <span id="signalAttempt">-</span>
@@ -2230,10 +2321,9 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
 
-    <!-- Gestión Labouchère -->
     <div class="sx-wrap">
-        <div class="sx-header sxopen" onclick="sxToggle('s4')">
-            <div><h3>🔢 GESTIÓN — LABOUCHÈRE</h3><div class="sx-sub">Secuencia <span id="s4SeqLabel">1,1,1,1,1,1,1,1,1,1</span></div></div>
+        <div class="sx-header sxopen" id="s4Header" onclick="sxToggle('s4')">
+            <div><h3>🔢 GESTIÓN INDEPENDIENTE — LABOUCHÈRE</h3><div class="sx-sub">Secuencia <span id="s4SeqLabel">1,1,1,1,1,1,1,1,1,1</span></div></div>
             <span class="sx-arrow" id="s4Arrow" style="transform:rotate(180deg)">▼</span>
         </div>
         <div class="sx-body sxopen" id="s4Body">
@@ -2246,7 +2336,7 @@ DASHBOARD_HTML = r"""
             <div class="sx-alert-box" id="s4Alerta">⏳ Esperando inicio...</div>
             <div class="s4-seq-row" id="s4SeqRow"></div>
             <div id="s4Goal" style="text-align:center; font-size:0.68rem; color:rgba(48,216,192,.75); letter-spacing:.5px; margin:4px 0 8px;">🎯 Meta ciclo: --</div>
-            <div class="sx-auto-badge" id="s4AutoStatus">🤖 MODO AUTOMÁTICO — Señales del bot</div>
+            <div class="sx-auto-badge" id="s4AutoStatus">🤖 MODO AUTOMÁTICO — Señales del bot de Telegram</div>
             <div class="sx-btns" id="s4Controls" style="display:none">
                 <button class="sx-btn sx-btn-win" onclick="s4ManualResult(true)">✅ WIN</button>
                 <button class="sx-btn sx-btn-loss" onclick="s4ManualResult(false)">❌ LOSS</button>
@@ -2256,6 +2346,7 @@ DASHBOARD_HTML = r"""
             <div class="sx-hist" id="s4Hist" style="display:none">
                 <table><thead><tr><th>#</th><th>Fichas</th><th>$Ap</th><th>Res</th><th>Bal</th></tr></thead>
                 <tbody id="s4HistBody"><tr><td colspan="5" style="color:rgba(255,255,255,.25);padding:6px">Sin datos</td></tr></tbody>
+                </table>
             </div>
             <div class="sx-cfg-toggle" onclick="sxCfgToggle('s4')">⚙️ Configurar capital, apuesta base y secuencia</div>
             <div class="sx-cfg" id="s4Cfg">
@@ -2271,10 +2362,9 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
 
-    <div class="footer">Los soportes/resistencias se calculan agrupando picos/valles de los últimos 60 giros. Umbral: 1.0</div>
+    <div class="footer">La gestión Labouchère de este panel corre en tu navegador, independiente del Labouchère interno del bot. Soportes/resistencias: picos/valles agrupados, umbral 1.0.</div>
 </div>
 
-<!-- Signal Alert Circle -->
 <div id="signalAlert" class="signal-alert hidden">
     <div class="alert-zone" id="alertZone">BAJA</div>
     <div class="alert-attempt" id="alertAttempt">Intento 1/2</div>
@@ -2287,8 +2377,9 @@ DASHBOARD_HTML = r"""
     //  CONFIGURACIÓN
     // ============================================================
     const API_BASE = window.location.origin;
-    let currentMesa = 205;
-    let chartAltos = null, chartBajos = null;
+    const currentMesa = {mesa_key};
+    let visibleLength = 60;
+    let chartZona = null;
     let lastSignalState = null;
     let s4Active = false;
     let s4Bal = 100, s4Cap = 100, s4Base = 1, s4Seq = [], s4Bet = 0, s4InitSeq = [], s4Ent = 0, s4W = 0, s4L = 0;
@@ -2296,21 +2387,35 @@ DASHBOARD_HTML = r"""
     const DEFAULT_SEQ = [1,1,1,1,1,1,1,1,1,1];
     let pollingInterval = null;
 
+    const ZONE_LABEL = { 'ALTA': 'ALTA', 'BAJA': 'BAJA', 'VERDE': 'VERDE (0)' };
+    const ZONE_CLASS = { 'ALTA': 'alta', 'BAJA': 'baja', 'VERDE': 'verde' };
+
     // ============================================================
-    //  FUNCIONES DE UTILIDAD
+    //  UTILIDADES
     // ============================================================
     function _r2(n) { n = Number(n); if (!isFinite(n)) n = 0; return Math.round((n + Number.EPSILON) * 100) / 100; }
     function _money(n) { return _r2(n).toFixed(2); }
-    function _units(n) { n = _r2(n); return (n % 1 === 0) ? String(n) : String(n); }
-    function _sum(arr) { return _r2(arr.reduce(function(a,b){ return a + b; }, 0)); }
+    function _units(n) { n = _r2(n); return String(n); }
     function _sxToggleBody(id) { var b = document.getElementById(id+'Body'); var h = document.getElementById(id+'Header'); var a = document.getElementById(id+'Arrow'); var open = !b.classList.contains('sxopen'); b.style.display = open ? 'block' : ''; b.classList.toggle('sxopen', open); h.classList.toggle('sxopen', open); a.style.transform = open ? 'rotate(180deg)' : ''; }
 
+    function calcEMA(arr, period) {
+        if (!arr.length) return [];
+        var k = 2 / (period + 1);
+        var out = [];
+        var ema = arr[0];
+        for (var i = 0; i < arr.length; i++) {
+            ema = (i === 0) ? arr[0] : (arr[i] * k + ema * (1 - k));
+            out.push(ema);
+        }
+        return out;
+    }
+
     // ============================================================
-    //  OBTENER DATOS DEL BACKEND
+    //  DATOS DEL BACKEND
     // ============================================================
     async function fetchState() {
         try {
-            const resp = await fetch(API_BASE + '/api/state/' + currentMesa);
+            const resp = await fetch(API_BASE + '/api/state/' + currentMesa + '?limit=' + visibleLength);
             if (!resp.ok) return null;
             return await resp.json();
         } catch (e) { return null; }
@@ -2318,16 +2423,116 @@ DASHBOARD_HTML = r"""
 
     async function fetchAnalysis() {
         try {
-            const resp = await fetch(API_BASE + '/api/analysis/' + currentMesa);
+            const resp = await fetch(API_BASE + '/api/analysis/' + currentMesa + '?lookback=' + visibleLength);
             if (!resp.ok) return null;
             return await resp.json();
         } catch (e) { return null; }
     }
 
     // ============================================================
-    //  RENDER GRÁFICOS
+    //  BARRA DE HISTORIAL (colores de ZONA)
     // ============================================================
-    function renderCharts(analysisData) {
+    function renderHistoryBalls(state) {
+        const wrap = document.getElementById('historyBalls');
+        const hist = (state.spin_history || []).slice(-40);
+        const zones = (state.zone_history || []).slice(-40);
+        wrap.innerHTML = '';
+        hist.forEach(function(spin, i) {
+            const zone = zones[i] || 'VERDE';
+            const cls = ZONE_CLASS[zone] || 'verde';
+            const b = document.createElement('div');
+            b.className = 'ball ' + cls;
+            b.textContent = spin.number;
+            b.title = ZONE_LABEL[zone] || zone;
+            wrap.appendChild(b);
+        });
+    }
+
+    // ============================================================
+    //  ÚLTIMO NÚMERO / SEÑAL
+    // ============================================================
+    function renderLastNumber(state) {
+        const hist = state.spin_history || [];
+        const zones = state.zone_history || [];
+        const ball = document.getElementById('lnBall');
+        const zoneTag = document.getElementById('lnZoneTag');
+        const sigBadge = document.getElementById('lnSignalBadge');
+        const waitTxt = document.getElementById('lnWaitingText');
+
+        if (!hist.length) {
+            ball.className = 'ln-ball ln-waiting';
+            ball.textContent = '--';
+            zoneTag.textContent = 'SIN DATOS';
+            zoneTag.className = 'ln-zone-tag';
+            waitTxt.textContent = 'Esperando primer giro...';
+            sigBadge.textContent = '⏸️ Sin señal';
+            sigBadge.className = 'ln-signal-badge sig-no';
+            return;
+        }
+
+        const last = hist[hist.length - 1];
+        const lastZone = zones[zones.length - 1] || 'VERDE';
+        const cls = ZONE_CLASS[lastZone] || 'verde';
+        ball.className = 'ln-ball ln-' + cls + ' ln-pop';
+        ball.textContent = last.number;
+        zoneTag.textContent = ZONE_LABEL[lastZone] || lastZone;
+        zoneTag.className = 'ln-zone-tag ' + cls;
+
+        if (state.signal_active && state.signal_zone) {
+            sigBadge.textContent = '🔔 Señal ' + state.signal_zone + ' · Intento ' + state.signal_attempt + '/' + state.signal_total_attempts;
+            sigBadge.className = 'ln-signal-badge sig-active';
+            waitTxt.textContent = '';
+        } else {
+            sigBadge.textContent = '⏸️ Sin señal activa';
+            sigBadge.className = 'ln-signal-badge sig-no';
+            waitTxt.textContent = state.last_signal_outcome
+                ? 'Último resultado: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')'
+                : 'Esperando patrón...';
+        }
+    }
+
+    // ============================================================
+    //  TENDENCIA / DIRECCIÓN
+    // ============================================================
+    function renderTrend(state) {
+        const el = document.getElementById('trendBadge');
+        const trend = state.trend || 'neutral';
+        el.classList.remove('bullish', 'bearish', 'neutral');
+        if (trend === 'bullish') {
+            el.classList.add('bullish');
+            el.textContent = '▲ TENDENCIA: ALCISTA (ALTA)';
+        } else if (trend === 'bearish') {
+            el.classList.add('bearish');
+            el.textContent = '▼ TENDENCIA: BAJISTA (BAJA)';
+        } else {
+            el.classList.add('neutral');
+            el.textContent = '➡ TENDENCIA: NEUTRAL';
+        }
+    }
+
+    // ============================================================
+    //  DIRECCIÓN DEL REBOTE (soporte/resistencia)
+    // ============================================================
+    function renderRebound(state) {
+        const el = document.getElementById('reboundBadge');
+        const dir = state.rebound_direction || 'NEUTRAL';
+        el.classList.remove('alcista', 'bajista', 'neutral');
+        if (dir === 'ALCISTA') {
+            el.classList.add('alcista');
+            el.textContent = '🔄 REBOTE: ALCISTA (soporte → ALTA)';
+        } else if (dir === 'BAJISTA') {
+            el.classList.add('bajista');
+            el.textContent = '🔄 REBOTE: BAJISTA (resistencia → BAJA)';
+        } else {
+            el.classList.add('neutral');
+            el.textContent = '🔄 REBOTE: NEUTRAL';
+        }
+    }
+
+    // ============================================================
+    //  GRÁFICO DE ZONA (EMA + Soporte/Resistencia + Pivotes)
+    // ============================================================
+    function renderChart(analysisData) {
         if (!analysisData) return;
         const levels = analysisData.level_data || [];
         const labels = levels.map(d => d.index);
@@ -2337,126 +2542,56 @@ DASHBOARD_HTML = r"""
         const peaks = analysisData.peaks || [];
         const valleys = analysisData.valleys || [];
 
-        // Dataset base: nivel
-        const dsAltos = [{
-            label: 'Nivel',
-            data: levelValues,
-            borderColor: '#ffd93d',
-            backgroundColor: 'rgba(255,217,61,0.05)',
-            borderWidth: 2,
-            pointRadius: 0,
-            tension: 0.15,
-            fill: true,
-            yAxisID: 'y'
-        }];
-        const dsBajos = [{
-            label: 'Nivel',
-            data: levelValues,
-            borderColor: '#ffd93d',
-            backgroundColor: 'rgba(255,217,61,0.05)',
-            borderWidth: 2,
-            pointRadius: 0,
-            tension: 0.15,
-            fill: true,
-            yAxisID: 'y'
-        }];
+        const ema4 = calcEMA(levelValues, 4);
+        const ema8 = calcEMA(levelValues, 8);
+        const ema20 = calcEMA(levelValues, 20);
 
-        // Soportes (líneas horizontales)
+        const datasets = [
+            { label: 'Nivel', data: levelValues, borderColor: '#8fb4ff', backgroundColor: 'rgba(143,180,255,0.05)', borderWidth: 2, pointRadius: 0, tension: 0.15, fill: true },
+            { label: 'EMA 4', data: ema4, borderColor: '#ffd700', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
+            { label: 'EMA 8', data: ema8, borderColor: '#ff8c00', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
+            { label: 'EMA 20', data: ema20, borderColor: '#ff4d4d', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false },
+        ];
+
         supports.forEach((s, idx) => {
-            const color = `hsl(190, 80%, ${60 + idx * 8}%)`;
-            const lineData = levelValues.map(() => s.level);
-            dsAltos.push({
-                label: `Soporte ${idx+1} (${s.frequency}x)`,
-                data: lineData,
-                borderColor: color,
-                borderDash: [6,4],
-                borderWidth: 2,
-                pointRadius: 0,
-                fill: false,
-                yAxisID: 'y'
-            });
-            dsBajos.push({
-                label: `Soporte ${idx+1} (${s.frequency}x)`,
-                data: lineData,
-                borderColor: color,
-                borderDash: [6,4],
-                borderWidth: 2,
-                pointRadius: 0,
-                fill: false,
-                yAxisID: 'y'
+            datasets.push({
+                label: 'Soporte ' + (idx+1) + ' (' + s.frequency + 'x)',
+                data: levelValues.map(() => s.level),
+                borderColor: `hsl(190, 80%, ${60 + idx * 8}%)`,
+                borderDash: [6,4], borderWidth: 2, pointRadius: 0, fill: false
             });
         });
-
-        // Resistencias
         resistances.forEach((r, idx) => {
-            const color = `hsl(0, 80%, ${60 + idx * 8}%)`;
-            const lineData = levelValues.map(() => r.level);
-            dsAltos.push({
-                label: `Resistencia ${idx+1} (${r.frequency}x)`,
-                data: lineData,
-                borderColor: color,
-                borderDash: [6,4],
-                borderWidth: 2,
-                pointRadius: 0,
-                fill: false,
-                yAxisID: 'y'
-            });
-            dsBajos.push({
-                label: `Resistencia ${idx+1} (${r.frequency}x)`,
-                data: lineData,
-                borderColor: color,
-                borderDash: [6,4],
-                borderWidth: 2,
-                pointRadius: 0,
-                fill: false,
-                yAxisID: 'y'
+            datasets.push({
+                label: 'Resistencia ' + (idx+1) + ' (' + r.frequency + 'x)',
+                data: levelValues.map(() => r.level),
+                borderColor: `hsl(0, 80%, ${60 + idx * 8}%)`,
+                borderDash: [6,4], borderWidth: 2, pointRadius: 0, fill: false
             });
         });
 
-        // Pivotes (puntos)
         const allPivots = [...peaks, ...valleys];
         if (allPivots.length) {
             const pivotMap = {};
             allPivots.forEach(p => { pivotMap[p.index] = p.value; });
-            const pivotData = labels.map(idx => pivotMap[idx] !== undefined ? pivotMap[idx] : null);
-            dsAltos.push({
+            datasets.push({
                 label: 'Pivotes',
-                data: pivotData,
-                borderColor: '#00b894',
-                backgroundColor: '#00b894',
-                pointRadius: 5,
-                pointStyle: 'triangle',
-                showLine: false,
-                yAxisID: 'y'
-            });
-            dsBajos.push({
-                label: 'Pivotes',
-                data: pivotData,
-                borderColor: '#00b894',
-                backgroundColor: '#00b894',
-                pointRadius: 5,
-                pointStyle: 'triangle',
-                showLine: false,
-                yAxisID: 'y'
+                data: labels.map(idx => pivotMap[idx] !== undefined ? pivotMap[idx] : null),
+                borderColor: '#00b894', backgroundColor: '#00b894',
+                pointRadius: 5, pointStyle: 'triangle', showLine: false
             });
         }
 
         const opts = {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false,
+            responsive: true, maintainAspectRatio: false, animation: false,
             plugins: {
                 legend: { labels: { color: '#b0caf0', font: { size: 9 } } },
-                tooltip: {
-                    callbacks: {
-                        label: function(ctx) {
-                            let label = ctx.dataset.label || '';
-                            let val = ctx.parsed.y;
-                            if (val === null || val === undefined) return '';
-                            return label + ': ' + (Number.isInteger(val) ? val : val.toFixed(2));
-                        }
-                    }
-                }
+                tooltip: { callbacks: { label: function(ctx) {
+                    let label = ctx.dataset.label || '';
+                    let val = ctx.parsed.y;
+                    if (val === null || val === undefined) return '';
+                    return label + ': ' + (Number.isInteger(val) ? val : val.toFixed(2));
+                } } }
             },
             scales: {
                 x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6a80a0', maxTicksLimit: 20 } },
@@ -2464,89 +2599,13 @@ DASHBOARD_HTML = r"""
             }
         };
 
-        if (!chartAltos) {
-            chartAltos = new Chart(document.getElementById('chartAltos'), {
-                type: 'line',
-                data: { labels, datasets: dsAltos },
-                options: opts
-            });
-            chartBajos = new Chart(document.getElementById('chartBajos'), {
-                type: 'line',
-                data: { labels, datasets: dsBajos },
-                options: opts
-            });
+        if (!chartZona) {
+            chartZona = new Chart(document.getElementById('chartZona'), { type: 'line', data: { labels, datasets }, options: opts });
         } else {
-            chartAltos.data.labels = labels;
-            chartAltos.data.datasets = dsAltos;
-            chartAltos.update();
-            chartBajos.data.labels = labels;
-            chartBajos.data.datasets = dsBajos;
-            chartBajos.update();
+            chartZona.data.labels = labels;
+            chartZona.data.datasets = datasets;
+            chartZona.update();
         }
-    }
-
-    // ============================================================
-    //  ACTUALIZAR UI (estado, señal, stats)
-    // ============================================================
-    function updateUI(state, analysis) {
-        if (!state) return;
-        document.getElementById('spinCount').textContent = state.total_spins_seen || 0;
-        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('es-ES',{hour12:false});
-
-        // Conexión
-        const led = document.getElementById('connectionLed');
-        const txt = document.getElementById('connectionText');
-        if (state && state.total_spins_seen !== undefined) {
-            led.className = 'led green';
-            txt.textContent = 'Conectado';
-        } else {
-            led.className = 'led red';
-            txt.textContent = 'Desconectado';
-        }
-
-        // Señal
-        const badge = document.getElementById('signalBadge');
-        const zoneEl = document.getElementById('signalZone');
-        const attemptEl = document.getElementById('signalAttempt');
-        const resultEl = document.getElementById('signalLastResult');
-
-        if (state.signal_active) {
-            badge.textContent = '🔔 ACTIVA';
-            badge.className = 'signal-badge active';
-            const zone = state.signal_zone || '?';
-            zoneEl.textContent = zone;
-            zoneEl.className = 'signal-zone ' + (zone === 'BAJA' ? 'baja' : 'alta');
-            attemptEl.textContent = `Intento ${state.signal_attempt || 1}/${state.signal_total_attempts || 2}`;
-            if (state.last_signal_outcome) {
-                resultEl.textContent = 'Último: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')';
-            } else {
-                resultEl.textContent = '';
-            }
-            // Mostrar alerta circular
-            showSignalAlert(state.signal_zone, state.signal_attempt, state.signal_total_attempts);
-        } else {
-            badge.textContent = '⏸️ Inactiva';
-            badge.className = 'signal-badge';
-            zoneEl.textContent = '-';
-            zoneEl.className = 'signal-zone';
-            attemptEl.textContent = '';
-            resultEl.textContent = state.last_signal_outcome ? 'Último: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
-            hideSignalAlert();
-        }
-
-        // Si la señal cambió de activa a inactiva y tenemos resultado, procesar gestión automática
-        if (lastSignalState && lastSignalState.signal_active && !state.signal_active) {
-            if (state.last_signal_outcome) {
-                const win = state.last_signal_outcome === 'win';
-                if (s4Active) {
-                    s4AutoResult(win);
-                }
-            }
-        }
-        lastSignalState = state;
-
-        if (analysis) renderCharts(analysis);
-        s4UI();
     }
 
     // ============================================================
@@ -2556,8 +2615,11 @@ DASHBOARD_HTML = r"""
         const alert = document.getElementById('signalAlert');
         alert.className = 'signal-alert ' + (zone === 'BAJA' ? 'state-baja' : 'state-alta');
         document.getElementById('alertZone').textContent = zone;
-        document.getElementById('alertAttempt').textContent = `Intento ${attempt}/${total}`;
+        document.getElementById('alertAttempt').textContent = 'Intento ' + attempt + '/' + total;
         document.getElementById('alertBet').textContent = 'Apuesta: $' + _money(s4Bet);
+        document.getElementById('alertZone').style.display = 'block';
+        document.getElementById('alertAttempt').style.display = 'block';
+        document.getElementById('alertBet').style.display = 'block';
         document.getElementById('alertResult').style.display = 'none';
         alert.classList.remove('hidden');
     }
@@ -2579,12 +2641,66 @@ DASHBOARD_HTML = r"""
         setTimeout(() => {
             if (!lastSignalState || !lastSignalState.signal_active) {
                 alert.classList.add('hidden');
-                document.getElementById('alertZone').style.display = 'block';
-                document.getElementById('alertAttempt').style.display = 'block';
-                document.getElementById('alertBet').style.display = 'block';
-                document.getElementById('alertResult').style.display = 'none';
             }
         }, 4000);
+    }
+
+    // ============================================================
+    //  ACTUALIZAR UI
+    // ============================================================
+    function updateUI(state, analysis) {
+        if (!state) return;
+        document.getElementById('spinCount').textContent = state.total_spins_seen || 0;
+        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('es-ES',{hour12:false});
+        document.getElementById('tableTag').textContent = 'Mesa ' + state.key + ' · ' + (state.table_name || '');
+
+        const led = document.getElementById('connectionLed');
+        const txt = document.getElementById('connectionText');
+        if (state.total_spins_seen !== undefined) {
+            led.className = 'led green'; txt.textContent = 'Conectado';
+        } else {
+            led.className = 'led red'; txt.textContent = 'Desconectado';
+        }
+
+        renderTrend(state);
+        renderRebound(state);
+        renderHistoryBalls(state);
+        renderLastNumber(state);
+
+        const badge = document.getElementById('signalBadge');
+        const zoneEl = document.getElementById('signalZone');
+        const attemptEl = document.getElementById('signalAttempt');
+        const resultEl = document.getElementById('signalLastResult');
+
+        if (state.signal_active) {
+            badge.textContent = '🔔 ACTIVA';
+            badge.className = 'signal-badge active';
+            const zone = state.signal_zone || '?';
+            zoneEl.textContent = zone;
+            zoneEl.className = 'signal-zone ' + (zone === 'BAJA' ? 'baja' : 'alta');
+            attemptEl.textContent = 'Intento ' + (state.signal_attempt || 1) + '/' + (state.signal_total_attempts || 2);
+            resultEl.textContent = state.last_signal_outcome
+                ? 'Último: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
+            if (state.signal_zone) showSignalAlert(state.signal_zone, state.signal_attempt, state.signal_total_attempts);
+        } else {
+            badge.textContent = '⏸️ Inactiva';
+            badge.className = 'signal-badge';
+            zoneEl.textContent = '-'; zoneEl.className = 'signal-zone';
+            attemptEl.textContent = '';
+            resultEl.textContent = state.last_signal_outcome
+                ? 'Último: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
+            hideSignalAlert();
+        }
+
+        if (lastSignalState && lastSignalState.signal_active && !state.signal_active) {
+            if (state.last_signal_outcome && s4Active) {
+                s4AutoResult(state.last_signal_outcome === 'win');
+            }
+        }
+        lastSignalState = state;
+
+        if (analysis) renderChart(analysis);
+        s4UI();
     }
 
     // ============================================================
@@ -2594,7 +2710,7 @@ DASHBOARD_HTML = r"""
         const state = await fetchState();
         const analysis = await fetchAnalysis();
         if (state) updateUI(state, analysis);
-        if (!state) {
+        else {
             document.getElementById('connectionLed').className = 'led red';
             document.getElementById('connectionText').textContent = 'Desconectado';
         }
@@ -2607,7 +2723,19 @@ DASHBOARD_HTML = r"""
     }
 
     // ============================================================
-    //  GESTIÓN LABOUCHÈRE
+    //  BOTONES "VER" (largo visible)
+    // ============================================================
+    document.querySelectorAll('.vis-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            document.querySelectorAll('.vis-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            visibleLength = parseInt(btn.getAttribute('data-length'), 10);
+            poll();
+        });
+    });
+
+    // ============================================================
+    //  GESTIÓN LABOUCHÈRE (independiente del bot de Telegram)
     // ============================================================
     function s4Sum(arr){ return _r2(arr.reduce(function(a,b){ return a + b; }, 0)); }
     function s4Fichas(){
@@ -2732,10 +2860,7 @@ DASHBOARD_HTML = r"""
         s4UI();
     }
 
-    function s4ManualResult(win){
-        if (!s4Active) return;
-        s4AutoResult(win);
-    }
+    function s4ManualResult(win){ if (s4Active) s4AutoResult(win); }
 
     function s4End(){
         s4Active = false;
@@ -2795,9 +2920,6 @@ DASHBOARD_HTML = r"""
     function sxToggle(id){ _sxToggleBody(id); }
     function sxCfgToggle(id){ var c = document.getElementById(id+'Cfg'); c.style.display = c.style.display === 'block' ? 'none' : 'block'; }
 
-    // ============================================================
-    //  RESET CONFIGURACIÓN
-    // ============================================================
     function resetConfig() {
         if (s4Active) s4Reset();
         lastSignalState = null;
@@ -2807,13 +2929,6 @@ DASHBOARD_HTML = r"""
     // ============================================================
     //  INICIO
     // ============================================================
-    document.getElementById('mesaSelector').addEventListener('change', function(e) {
-        currentMesa = parseInt(e.target.value);
-        if (chartAltos) { chartAltos.destroy(); chartAltos = null; }
-        if (chartBajos) { chartBajos.destroy(); chartBajos = null; }
-        startPolling();
-    });
-
     s4InitSeq = DEFAULT_SEQ.slice();
     s4Seq = s4InitSeq.slice();
     s4Bal = s4Cap;
@@ -2835,7 +2950,7 @@ DASHBOARD_HTML = r"""
 </script>
 </body>
 </html>
-"""
+""".replace("{mesa_key}", str(list(ROULETTE_KEYS.values())[0]))
 
 
 # ══════════════════════════════════════════════
@@ -2864,9 +2979,15 @@ async def http_api_state(request: web.Request):
         return web.json_response({"error": "mesa inválida"}, status=400)
     if mesa not in ROULETTE_KEYS.values():
         return web.json_response({"error": "mesa no soportada"}, status=404)
-    state = _server_state.get_state_for_mesa(mesa)
-    if state is None:
+    try:
+        limit = int(request.query.get("limit", 40))
+    except ValueError:
+        limit = 40
+    limit = max(20, min(300, limit))
+    table = _server_state.tables.get(mesa)
+    if table is None:
         return web.json_response({"error": "mesa no encontrada"}, status=404)
+    state = table.get_state(limit=limit)
     return web.json_response(state)
 
 async def http_api_all(request: web.Request):
