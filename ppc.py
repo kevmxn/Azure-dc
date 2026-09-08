@@ -2841,7 +2841,7 @@ DASHBOARD_HTML = r"""
 # ══════════════════════════════════════════════
 #  HTTP APP
 # ══════════════════════════════════════════════
-_server_state: Optional[ServerState] = None   # <-- Ahora ServerState ya está definido
+_server_state: Optional["ServerState"] = None   # forward reference: ServerState se define más abajo
 
 async def http_ping(request: web.Request):
     return web.json_response({"status": "pong", "ts": time.time()})
