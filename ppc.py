@@ -163,8 +163,11 @@ def zone_of(n):
     return "BAJA" if 1 <= n <= 18 else "ALTA"
 
 def zone_win(zone: str, number) -> bool:
-    if number is None or number == 0:
+    if number is None:
         return False
+    if number == 0:
+        # El cero se considera acierto (gana) para cualquier señal de zona.
+        return True
     if zone == "BAJA":
         return 1 <= number <= 18
     if zone == "ALTA":
@@ -2010,6 +2013,11 @@ class RouletteTable:
         candidates = []
         confirmation_resolved = False
         new_confirming_agent = None
+        # Estados en los que el bot puede aceptar/activar una señal nueva:
+        # None (sin secuencia) o "waiting_pattern" (esperando confirmación
+        # tras un CERO en el intento 1). Antes solo se permitía "None", por lo
+        # que el bot se quedaba trabado para siempre en "waiting_pattern".
+        open_for_signal = self.signal_status in (None, "waiting_pattern")
 
         for agente in all_agents:
             if self.confirming and agente is self.pending_agent and not agente.confirming:
@@ -2019,7 +2027,7 @@ class RouletteTable:
             if not agente.live_enabled:
                 continue
             if agente.candidate_signal.get("confirming", False):
-                if (self.signal_status is None and not self.confirming
+                if (open_for_signal and not self.confirming
                         and new_confirming_agent is None):
                     new_confirming_agent = agente
             else:
@@ -2075,42 +2083,6 @@ class RouletteTable:
             else:
                 bet_zone = zone_sequence[0]
 
-            if last_number == 0:
-                self.attempt_numbers.append(0)
-                self.attempt_zones.append(bet_zone)
-                cycle_completed = self.labouchere.update(False)
-                if cycle_completed:
-                    self.cycle_pending = self.labouchere.cycles_completed
-                self._log_attempt_result(self.current_attempt_index + 1, False, 0)
-                if self.current_attempt_index == 0:
-                    if current_entry.get("is_streak"):
-                        # Señal de RACHA: el 0 se trata igual que una pérdida del intento 1.
-                        # Se continúa directo al intento 2 en la zona CONTRARIA (zone_sequence
-                        # ya trae [zona_racha, zona_opuesta]), sin esperar un patrón nuevo.
-                        self.current_attempt_index = 1
-                        new_bet = self.labouchere.get_bet()
-                        self.attempt_bets.append(new_bet)
-                        next_zone = zone_sequence[1] if len(zone_sequence) > 1 else zone_sequence[0]
-                        asyncio.create_task(self._send_entry(agent, next_zone, new_bet, 2))
-                        log.info(f"🟢 CERO en intento 1 de RACHA -> INTENTO 2 cambia de dirección: {next_zone}")
-                        return True
-                    log.info("🟢 CERO en intento 1 - esperando nuevo patrón para intento 2")
-                    self.signal_status = "waiting_pattern"
-                    self.signal_sequence = []
-                    asyncio.create_task(send_msg(
-                        "🟢 CERO en INTENTO 1 · Se ajusta la gestión Labouchère · Esperando nueva confirmación para INTENTO 2",
-                        THREAD_SIGNALS))
-                    return True
-                else:
-                    log.info(f"🚫 CERO en intento {self.current_attempt_index+1} - señal perdida")
-                    self.signal_status = "lost"
-                    if candidates:
-                        best_agent, best_candidate = self._select_best_candidate(candidates)
-                        if best_agent is not None:
-                            self._prepare_new_signal(best_agent, best_candidate, last_number)
-                    self._finalize_sequence(False, None)
-                    return True
-
             is_win = zone_win(bet_zone, last_number)
             self.attempt_numbers.append(last_number if last_number is not None else 0)
             self.attempt_zones.append(bet_zone)
@@ -2153,6 +2125,12 @@ class RouletteTable:
             return True
 
         if self.signal_status is None and not self._signal_included and candidates:
+            best_agent, best_candidate = self._select_best_candidate(candidates)
+            if best_agent is not None:
+                self._activate_new_signal(best_agent, best_candidate, bet_amount)
+                return True
+
+        if self.signal_status == "waiting_pattern" and candidates:
             best_agent, best_candidate = self._select_best_candidate(candidates)
             if best_agent is not None:
                 self._activate_new_signal(best_agent, best_candidate, bet_amount)
@@ -2252,7 +2230,7 @@ class RouletteTable:
                 amx_strength_val = amx_strength(self.level_history, periods)
             favored = trend_favored_dozens(trend)
 
-            blocked = (self.signal_status is not None) or self.confirming
+            blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
 
             agente.update(self.dozen_history, timestamp, blocked=blocked,
@@ -2262,7 +2240,7 @@ class RouletteTable:
 
         zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4, self.zone_agent_streak]
         for zagente in zone_agents:
-            blocked = (self.signal_status is not None) or self.confirming
+            blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
             amx_strength_val = 0.0
             zagente.update(self.zone_history, timestamp, blocked=blocked,
