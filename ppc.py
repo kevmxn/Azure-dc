@@ -93,6 +93,32 @@ ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
 #    posibilidad de que la misma zona repita una vez más. ──
 ZONE_STREAK4_MIN = 4
 
+# ── Familia de agentes de RACHA por longitud exacta: 3,4,5,6,7 repeticiones
+#    seguidas de la misma zona (configurable vía ZONE_STREAK_LENGTHS, coma-
+#    separado). Cada longitud tiene su propio agente y su propia estadística
+#    (win-rate, intento recomendado, etc.), de forma que una racha de 5 no
+#    se mezcla con la de 3 o la de 7: cada una analiza "su" situación por
+#    separado. La longitud MÁS LARGA configurada queda abierta (>=) para
+#    seguir cubriendo rachas todavía más largas (8, 9, ...); las demás
+#    disparan solo en el momento EXACTO en que la racha llega a esa
+#    longitud (para no relanzar la misma racha varias veces).
+def _parse_streak_lengths(raw: str, fallback):
+    try:
+        vals = sorted(set(int(x.strip()) for x in raw.split(",") if x.strip()))
+        return vals if vals else list(fallback)
+    except Exception:
+        return list(fallback)
+
+ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS", "3,4,5,6,7"), [3, 4, 5, 6, 7])
+
+# ── Umbral mínimo (%) de aciertos en INTENTO 2 vs INTENTO 1, condicionado al
+#    rebote actual, para que un agente de racha decida ENTRAR DIRECTAMENTE EN
+#    EL INTENTO 2 (saltándose el 1) y avisar así por Telegram. Por debajo de
+#    este umbral (o sin datos suficientes) se sigue entrando en el intento 1,
+#    como siempre. ──
+STREAK_SECOND_ENTRY_MIN_PCT = float(os.environ.get("STREAK_SECOND_ENTRY_MIN_PCT", "60.0"))
+
+
 # ── Predictor de "ronda de repetición de zona" (BAJA/ALTA) — réplica en
 #    RONDAS del predictor de tiempo de Spaceman (calcularPrediccionInteligente
 #    / checkAutoPredictions), pero contando giros en vez de segundos: cada vez
@@ -524,7 +550,7 @@ def build_daily_marker_message(stats: dict) -> str:
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak", "zone_agent_streak4"]
+    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
     lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -614,7 +640,7 @@ def _agent_ml_block(agente) -> str:
 
 def build_mlstatus_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak", "zone_agent_streak4"]
+    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
     lines = ["🧠 ESTADO DEL MODELO (ML)"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -1603,15 +1629,27 @@ class StreakZoneAgent:
     señal permisiva para SEGUIR la racha aunque ningún patrón de docenas ni de
     zonas coincida. Sin confirmación (la racha es la confirmación) y sin gates
     de ML: la recency de la racha es el criterio. Los 2 intentos van a la zona
-    de la racha."""
+    de la racha.
+
+    Además, analiza -por situación de rebote (ALCISTA/BAJISTA/NEUTRAL)- si
+    históricamente esta racha (de esta longitud exacta) rinde mejor en el
+    intento 1 o en el intento 2. Si el intento 2 es claramente mejor
+    (>= STREAK_SECOND_ENTRY_MIN_PCT y con muestra suficiente), la señal que se
+    envía a Telegram arranca DIRECTAMENTE en el intento 2 (se salta el 1)."""
     def __init__(self, min_streak: int, name: str, label: str, daily_marker=None,
-                 thread_signals=None, thread_stats=None):
+                 thread_signals=None, thread_stats=None, exact_length: bool = True):
         self.min_streak = min_streak
         self.name = name
         self.label = label
         self.daily_marker = daily_marker
         self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS_ZONE
         self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS_ZONE
+        # Si exact_length=True, el agente solo dispara cuando la racha llega
+        # EXACTAMENTE a min_streak (evita que la de longitud 3 vuelva a
+        # disparar cuando la misma racha ya llegó a 6). El agente de la
+        # longitud más larga configurada usa exact_length=False (>=) para
+        # seguir cubriendo rachas más largas que las configuradas.
+        self.exact_length = exact_length
 
         self.train_state = {
             "active": False, "pattern": None, "bet_zone": None,
@@ -1644,9 +1682,18 @@ class StreakZoneAgent:
     def _key(zone):
         return f"RACHA_{zone}"
 
-    def _record_context(self, zone, hit_attempt: int):
+    @staticmethod
+    def _entry_attempt(entry):
+        """Compatibilidad: entradas antiguas son int (hit_attempt); las nuevas son dict {'a':.., 'r':..}."""
+        return entry["a"] if isinstance(entry, dict) else entry
+
+    @staticmethod
+    def _entry_rebound(entry):
+        return entry.get("r", "NEUTRAL") if isinstance(entry, dict) else "NEUTRAL"
+
+    def _record_context(self, zone, hit_attempt: int, rebound_direction: str = "NEUTRAL"):
         arr = self.pattern_context.setdefault(self._key(zone), [])
-        arr.append(hit_attempt)
+        arr.append({"a": hit_attempt, "r": rebound_direction})
         if len(arr) > DOZEN_CONTEXT_WINDOW:
             del arr[0]
 
@@ -1659,16 +1706,62 @@ class StreakZoneAgent:
         arr = self.trained_snapshot.get(self._key(zone), [])
         if len(arr) < DOZEN_MIN_SAMPLES_GATE:
             return None
-        return sum(1 for v in arr if v > 0) / len(arr)
+        return sum(1 for e in arr if self._entry_attempt(e) > 0) / len(arr)
 
     def overall_recommended_attempt(self):
-        return None, 0.0
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            c1 += sum(1 for e in arr if self._entry_attempt(e) == 1)
+            c2 += sum(1 for e in arr if self._entry_attempt(e) == 2)
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return None, 0.0
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
 
-    def _recommended_attempt_for_direction(self, pattern, rebound_direction):
-        return None, 0.0
+    def _recommended_attempt_for_direction(self, zone, rebound_direction):
+        """Intento recomendado (1 o 2) condicionado a la dirección de rebote
+        actual, con fallback al recomendado general de esta racha si no hay
+        muestras suficientes para ese rebote en particular."""
+        if not self.trained:
+            return None, 0.0
+        arr = self.trained_snapshot.get(self._key(zone), [])
+        filtered = [self._entry_attempt(e) for e in arr if self._entry_rebound(e) == rebound_direction]
+        if len(filtered) < DOZEN_MIN_SAMPLES_GATE:
+            fallback, _ = self.overall_recommended_attempt()
+            return fallback, None
+        c1 = sum(1 for v in filtered if v == 1)
+        c2 = sum(1 for v in filtered if v == 2)
+        if c1 == 0 and c2 == 0:
+            fallback, _ = self.overall_recommended_attempt()
+            return fallback, None
+        if c1 >= c2:
+            return 1, round(c1 / len(filtered) * 100, 1)
+        return 2, round(c2 / len(filtered) * 100, 1)
 
     def overall_recommended_attempt_for_direction(self, rebound_direction):
-        return None, 0.0
+        """Igual que overall_recommended_attempt() pero solo con señales que
+        ocurrieron con la misma dirección de rebote; si no hay datos
+        suficientes, cae al general."""
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            for e in arr:
+                if self._entry_rebound(e) != rebound_direction:
+                    continue
+                v = self._entry_attempt(e)
+                if v == 1: c1 += 1
+                elif v == 2: c2 += 1
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return self.overall_recommended_attempt()
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
 
     def force_train(self, timestamp: float):
         self.trained_snapshot = {k: list(v) for k, v in self.pattern_context.items()}
@@ -1720,7 +1813,8 @@ class StreakZoneAgent:
         # de los patrones (DOZEN_MIN_WIN_RATE). Sin entrenar todavía, se
         # deja pasar (igual que los demás agentes al arrancar en frío).
         zone, streak = current_zone_streak(zone_history)
-        if (zone is not None and streak >= self.min_streak
+        streak_matches = (streak == self.min_streak) if self.exact_length else (streak >= self.min_streak)
+        if (zone is not None and streak_matches
                 and not self.train_state["active"] and not blocked
                 and self.cooldown_remaining <= 0):
             if trend_zones is not None and zone not in trend_zones:
@@ -1731,6 +1825,17 @@ class StreakZoneAgent:
                 log.info(f"⛔ {self.name}: racha de {streak}x {zone} con tasa histórica {rate:.2f} < mínimo {DOZEN_MIN_WIN_RATE:.2f}, se descarta")
                 return
             context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
+
+            # ── Análisis de rondas: ¿en esta situación (racha de este largo +
+            # este rebote) conviene entrar directo en el INTENTO 2? ──
+            rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(zone, rebound_direction)
+            start_attempt = 1
+            if (rec_attempt_dir == 2 and rec_pct_dir is not None
+                    and rec_pct_dir >= STREAK_SECOND_ENTRY_MIN_PCT):
+                start_attempt = 2
+                log.info(f"🎯 {self.name}: análisis de rondas → ENTRAR DIRECTO EN INTENTO 2 para {zone} "
+                          f"(rebote {rebound_direction}, {rec_pct_dir}% de aciertos en intento 2 vs intento 1)")
+
             self.candidate_signal = {
                 "pattern": ("RACHA", zone),
                 "bet_zone": (zone,),
@@ -1744,14 +1849,22 @@ class StreakZoneAgent:
                 "is_streak": True,
                 "rebound_direction": rebound_direction,
                 "near_zero": False,
+                "start_attempt": start_attempt,
+                "recommended_attempt_by_rebound": rec_attempt_dir,
+                "recommended_attempt_by_rebound_pct": rec_pct_dir,
             }
             self.train_state = {
                 "active": True, "pattern": ("RACHA", zone), "bet_zone": zone,
                 "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
+                # El "shadow" (seguimiento interno para seguir aprendiendo)
+                # SIEMPRE simula desde el intento 1, sin importar en qué
+                # intento arrancó la señal real: así se sigue midiendo si el
+                # intento 1 hubiera ganado o no, para poder recalcular la
+                # recomendación en la próxima racha de este mismo largo.
                 "context": context, "current_attempt": 0, "start_attempt": 1,
                 "rebound_direction": rebound_direction,
             }
-            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'})")
+            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'}, intento inicial: {start_attempt})")
 
     def _close_shadow(self, win: bool, result_zone, attempt, timestamp):
         zone = self.train_state["bet_zone"]
@@ -1766,7 +1879,7 @@ class StreakZoneAgent:
         self.history_log = self.history_log[-200:]
         self.stats["total"] += 1
         self.stats["won" if win else "lost"] += 1
-        self._record_context(zone, hit_attempt)
+        self._record_context(zone, hit_attempt, self.train_state.get("rebound_direction", "NEUTRAL"))
         self.total_processed += 1
 
         if win:
@@ -1795,10 +1908,12 @@ class StreakZoneAgent:
         self.train_attempt_results = []
 
     def get_state(self):
+        rec_attempt, rec_pct = self.overall_recommended_attempt()
+        rec_attempt_dir, rec_pct_dir = self.overall_recommended_attempt_for_direction(self.last_rebound_direction)
         return {
             "name": self.name,
             "pattern_len": self.min_streak,
-            "pattern": f"racha>={self.min_streak}",
+            "pattern": (f"racha=={self.min_streak}" if self.exact_length else f"racha>={self.min_streak}"),
             "train_state": self.train_state,
             "stats": self.stats,
             "history": self.history_log[-30:],
@@ -1806,11 +1921,11 @@ class StreakZoneAgent:
             "pattern_context": self.pattern_context,
             "consecutive_losses": self.consecutive_losses,
             "cooldown_remaining": self.cooldown_remaining,
-            "recommended_attempt": None,
-            "recommended_attempt_pct": 0.0,
+            "recommended_attempt": rec_attempt,
+            "recommended_attempt_pct": rec_pct,
             "rebound_direction": self.last_rebound_direction,
-            "recommended_attempt_by_rebound": None,
-            "recommended_attempt_by_rebound_pct": 0.0,
+            "recommended_attempt_by_rebound": rec_attempt_dir,
+            "recommended_attempt_by_rebound_pct": rec_pct_dir,
             "pattern_recommendations": {},
             "confirming": False,
             "live_enabled": self.live_enabled,
@@ -1890,6 +2005,12 @@ class RouletteTable:
 
         self.signal_sequence = []
         self.current_attempt_index = 0
+        # Índice (0-based) en el que arrancó la señal activa actual: 0 si
+        # empezó en el intento 1 de siempre, 1 si se saltó el intento 1 y
+        # entró directo en el intento 2 (recomendación por rondas/racha).
+        # Sirve para que, aunque se entre directo en intento 2, la señal
+        # siga arriesgando capital real en 2 intentos (2 y 3), no solo 1.
+        self.current_signal_start_index = 0
         self.signal_status = None
         self.attempt_numbers = []
         self.attempt_zones = []
@@ -1921,8 +2042,26 @@ class RouletteTable:
         self.zone_agent2 = ZonePatternAgent(pattern='aaaabbbbaa', name="ZONE_AGENT_2", label="ZONA LARGA 2 (4a+4b+2a)", daily_marker=self.daily_marker)
         self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa · repite a)", daily_marker=self.daily_marker)
         self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa · repite a)", daily_marker=self.daily_marker)
-        self.zone_agent_streak = StreakZoneAgent(min_streak=ZONE_STREAK_MIN, name="ZONE_STREAK", label=f"🔥 RACHA (>={ZONE_STREAK_MIN}x misma zona)", daily_marker=self.daily_marker)
-        self.zone_agent_streak4 = StreakZoneAgent(min_streak=ZONE_STREAK4_MIN, name="ZONE_STREAK4", label=f"🔥 RACHA x{ZONE_STREAK4_MIN} (repetición misma zona)", daily_marker=self.daily_marker)
+        # ── AGENTES DE RACHA por longitud exacta (3,4,5,6,7 por defecto,
+        # configurable con ZONE_STREAK_LENGTHS). Cada longitud tiene su
+        # propio agente/estadística, y cada uno analiza por separado si en
+        # su situación conviene entrar directo en el intento 2 (ver
+        # STREAK_SECOND_ENTRY_MIN_PCT y StreakZoneAgent). ──
+        self.streak_agents = {}
+        _max_streak_len = max(ZONE_STREAK_LENGTHS)
+        for _len in ZONE_STREAK_LENGTHS:
+            _agent = StreakZoneAgent(
+                min_streak=_len, name=f"ZONE_STREAK{_len}",
+                label=f"🔥 RACHA x{_len} (repetición misma zona)",
+                daily_marker=self.daily_marker,
+                exact_length=(_len != _max_streak_len),
+            )
+            self.streak_agents[_len] = _agent
+            setattr(self, f"zone_agent_streak{_len}", _agent)
+        # Alias de compatibilidad con nombres antiguos (persistencia previa,
+        # mensajes de /status ya usaban "zone_agent_streak"/"zone_agent_streak4").
+        self.zone_agent_streak = self.streak_agents.get(ZONE_STREAK_MIN) or next(iter(self.streak_agents.values()))
+        self.zone_agent_streak4 = self.streak_agents.get(4) or self.zone_agent_streak
 
         self.level_history = []
         self.level_current = 0
@@ -2014,8 +2153,13 @@ class RouletteTable:
             self.attempt_log = self.attempt_log[-50:]
 
     def _finalize_sequence(self, win: bool, winning_attempt: int = None):
-        b1 = self.attempt_bets[0] if len(self.attempt_bets) > 0 else 0
-        b2 = self.attempt_bets[1] if len(self.attempt_bets) > 1 else 0
+        # b1/b2 = las DOS apuestas reales de la señal (en orden), sin importar
+        # si arrancaron en el índice absoluto 0/1 (intento normal) o 1/2
+        # (señal que se saltó el intento 1): siempre se cuentan desde
+        # current_signal_start_index, que es donde empezó a arriesgarse capital.
+        start = self.current_signal_start_index
+        b1 = self.attempt_bets[start] if len(self.attempt_bets) > start else 0
+        b2 = self.attempt_bets[start + 1] if len(self.attempt_bets) > start + 1 else 0
         if win and winning_attempt == 1:
             balance = b1
         elif win and winning_attempt == 2:
@@ -2032,12 +2176,13 @@ class RouletteTable:
         if new_signal is not None:
             agent = new_signal["agent"]
             zone_sequence = new_signal["zone_sequence"]
-            if self.current_attempt_index == 0:
+            new_start_attempt = new_signal.get("start_attempt", 1)
+            if self.current_attempt_index == self.current_signal_start_index:
                 header = "🔥🔥 NUEVA SEÑAL CONFIRMADA 🔥🔥"
             else:
                 header = "🔥🔥 REPETIR SEÑAL CONFIRMADA 🔥🔥"
             last_num = agent._last_raw_number
-            zone = zone_sequence[0]
+            zone = zone_sequence[new_start_attempt - 1] if new_start_attempt - 1 < len(zone_sequence) else zone_sequence[0]
             new_bet_amount = self.labouchere.get_bet()
             entry_body = build_entry_message_zone(last_num, zone, bet_amount=new_bet_amount)
             extra_text = f"{header}\n\n{entry_body}"
@@ -2049,6 +2194,7 @@ class RouletteTable:
         asyncio.create_task(self._send_daily_marker_and_cycle())
 
         self.current_attempt_index = 0
+        self.current_signal_start_index = 0
         self.attempt_numbers = []
         self.attempt_zones = []
         self.entry_msg_ids = []
@@ -2067,17 +2213,28 @@ class RouletteTable:
                 "original": None,
                 "zone_sequence": new_signal["zone_sequence"],
                 "is_streak": bool(new_signal.get("is_streak")),
+                "start_attempt": new_start_attempt,
             }
             self.signal_sequence = [new_entry]
             self.signal_status = "active"
-            self.attempt_bets = [new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
-            # El intento 1 de esta señal fue anunciado DENTRO del mensaje de
-            # resolución (extra_text), no vía _send_entry, así que no hay
-            # mensaje real que borrar para el intento 1. Se deja un
-            # placeholder (None) en el índice 0 para que, si el intento 1
-            # se pierde y se pasa a intento 2, _send_entry no borre por
-            # error el mensaje de INTENTO 2 recién enviado (antes usaba
-            # ese índice vacío como si fuera el id del intento 2).
+            if new_start_attempt == 2:
+                # Igual que en _activate_new_signal: no se apostó el intento 1
+                # (b1=0), pero la señal sigue teniendo 2 intentos REALES con
+                # capital (2 y, si hace falta, 3) — ver current_signal_start_index.
+                self.current_attempt_index = 1
+                self.current_signal_start_index = 1
+                self.attempt_bets = [0, new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
+            else:
+                self.current_attempt_index = 0
+                self.current_signal_start_index = 0
+                self.attempt_bets = [new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
+            # El intento anunciado en extra_text fue publicado DENTRO del
+            # mensaje de resolución, no vía _send_entry, así que no hay
+            # mensaje real que borrar para ese intento. Se deja un
+            # placeholder (None) para que, si se pierde y avanza al
+            # siguiente intento, _send_entry no borre por error el mensaje
+            # recién enviado (antes usaba ese índice vacío como si fuera el
+            # id del intento nuevo).
             self.entry_msg_ids = [None]
         else:
             self.signal_sequence = []
@@ -2116,6 +2273,7 @@ class RouletteTable:
             "agent": agent,
             "zone_sequence": zone_sequence,
             "is_streak": bool(candidate.get("is_streak")),
+            "start_attempt": candidate.get("start_attempt", 1),
         }
         agent.candidate_signal = None
 
@@ -2146,15 +2304,32 @@ class RouletteTable:
             log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {agent.name} -> ZONA {zone_sequence[1]}")
             return
 
+        # ── Intento inicial de la señal: normalmente 1, pero si el agente
+        # (típicamente uno de racha) calculó que en esta situación conviene
+        # entrar directo en el intento 2 real (start_attempt=2), se salta el 1:
+        # no se apuesta nada en ese intento. De cara al usuario el mensaje
+        # sigue mostrando el formato normal ("ENTRADA INTENTO 1" / "INTENTO 2"),
+        # igual que cualquier otra señal: el salto de capital es solo interno
+        # (current_signal_start_index), no se refleja en la numeración mostrada. ──
+        start_attempt = candidate.get("start_attempt", 1)
         self.signal_sequence = [new_entry]
-        self.current_attempt_index = 0
         self.signal_status = "active"
         self.attempt_numbers = []
         self.attempt_zones = []
-        self.attempt_bets = [bet_amount]
-        self.entry_msg_ids = []
-        asyncio.create_task(self._send_entry(agent, zone_sequence[0], bet_amount, 1))
-        log.info(f"🔔 SEÑAL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
+        if start_attempt == 2 and len(zone_sequence) > 1:
+            self.current_attempt_index = 1
+            self.current_signal_start_index = 1
+            self.attempt_bets = [0, bet_amount]
+            self.entry_msg_ids = [None]
+            asyncio.create_task(self._send_entry(agent, zone_sequence[1], bet_amount, 1))
+            log.info(f"🔔 SEÑAL DIRECTA INTENTO 2 real (racha analizada, se salta intento 1; se muestra como INTENTO 1): {agent.name} -> ZONA {zone_sequence[1]}")
+        else:
+            self.current_attempt_index = 0
+            self.current_signal_start_index = 0
+            self.attempt_bets = [bet_amount]
+            self.entry_msg_ids = []
+            asyncio.create_task(self._send_entry(agent, zone_sequence[0], bet_amount, 1))
+            log.info(f"🔔 SEÑAL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
         agent.candidate_signal = None
 
     def _record_zone_streak_time_event(self, timestamp):
@@ -2377,11 +2552,16 @@ class RouletteTable:
             cycle_completed = self.labouchere.update(is_win)
             if cycle_completed:
                 self.cycle_pending = self.labouchere.cycles_completed
-            self._log_attempt_result(self.current_attempt_index + 1, is_win, last_number if last_number is not None else 0)
+            # Numeración MOSTRADA (relativa a esta señal): siempre 1 o 2,
+            # sin importar si internamente arrancó en el índice absoluto 0
+            # o 1 (señal que se saltó el intento 1) — así el formato de
+            # mensajes/registro es igual al de cualquier otra señal.
+            display_attempt = self.current_attempt_index - self.current_signal_start_index + 1
+            self._log_attempt_result(display_attempt, is_win, last_number if last_number is not None else 0)
 
             if is_win:
                 self.signal_status = "won"
-                winning_attempt = self.current_attempt_index + 1
+                winning_attempt = display_attempt
                 log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (zona {bet_zone})")
                 if candidates:
                     best_agent, best_candidate = self._select_best_candidate(candidates)
@@ -2390,13 +2570,19 @@ class RouletteTable:
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
-                if self.current_attempt_index < ZONE_MAX_ATTEMPTS - 1:
+                # Tope dinámico: normalmente ZONE_MAX_ATTEMPTS-1 (intentos 1→2),
+                # pero si la señal arrancó directo en intento 2 (se saltó el 1),
+                # el tope se corre una posición para que siga habiendo 2 intentos
+                # REALES con capital en juego (2→3), no solo el intento 2 suelto.
+                max_index = self.current_signal_start_index + ZONE_MAX_ATTEMPTS - 1
+                if self.current_attempt_index < max_index:
                     self.current_attempt_index += 1
                     new_bet = self.labouchere.get_bet()
                     self.attempt_bets.append(new_bet)
                     next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
-                    asyncio.create_task(self._send_entry(agent, next_zone, new_bet, self.current_attempt_index + 1))
-                    log.info(f"🔄 INTENTO {self.current_attempt_index+1}: zona {next_zone}")
+                    next_display_attempt = self.current_attempt_index - self.current_signal_start_index + 1
+                    asyncio.create_task(self._send_entry(agent, next_zone, new_bet, next_display_attempt))
+                    log.info(f"🔄 INTENTO {next_display_attempt} (índice interno {self.current_attempt_index+1}): zona {next_zone}")
                     return True
                 else:
                     self.signal_status = "lost"
@@ -2550,7 +2736,7 @@ class RouletteTable:
                           last_number=number, live_enabled=live_ok,
                           rebound_direction=self.last_rebound_direction)
 
-        zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4, self.zone_agent_streak, self.zone_agent_streak4]
+        zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4] + list(self.streak_agents.values())
         for zagente in zone_agents:
             blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
@@ -2592,13 +2778,16 @@ class RouletteTable:
             signal_zone_sequence = zone_seq
             if self.current_attempt_index < len(zone_seq):
                 signal_zone = zone_seq[self.current_attempt_index]
-            signal_attempt = self.current_attempt_index + 1
+            # Relativo a esta señal (1 o 2), igual que en Telegram: aunque
+            # arrancó saltándose el intento 1 (índice absoluto 1/2), el
+            # dashboard también debe mostrar "Intento 1/2" y "Intento 2/2".
+            signal_attempt = self.current_attempt_index - self.current_signal_start_index + 1
         elif self.signal_status == "waiting_pattern":
             signal_zone = None
             signal_attempt = 0
             signal_zone_sequence = []
 
-        return {
+        base_state = {
             "key": self.key,
             "table_name": TABLE_NAME,
             "spin_history": hist,
@@ -2612,8 +2801,6 @@ class RouletteTable:
             "zone_agent2": self.zone_agent2.get_state(),
             "zone_agent3": self.zone_agent3.get_state(),
             "zone_agent4": self.zone_agent4.get_state(),
-            "zone_agent_streak": self.zone_agent_streak.get_state(),
-            "zone_agent_streak4": self.zone_agent_streak4.get_state(),
             "trend": self.trend,
             "trend_favored_dozens": sorted(NUM_DOZEN[d] for d in trend_favored_dozens(self.trend)),
             "rebound_direction": self.last_rebound_direction,
@@ -2632,12 +2819,18 @@ class RouletteTable:
             "last_signal_number": self.last_signal_number,
             "attempt_log": self.attempt_log[-20:],
             "attempt_log_seq": self.attempt_log_seq,
-            "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
+            "current_attempt": signal_attempt if self.signal_status == "active" else 0,
             "total_attempts": ZONE_MAX_ATTEMPTS if self.signal_status == "active" else 0,
             "last_nonzero_zone": self.last_nonzero_zone,
             "time_due_info": self.time_due_info,
             "round_due_info": self.round_due_info,
         }
+        for _len, _agent in self.streak_agents.items():
+            base_state[f"zone_agent_streak{_len}"] = _agent.get_state()
+        # Alias de compatibilidad con el dashboard/mensajes antiguos.
+        base_state["zone_agent_streak"] = self.zone_agent_streak.get_state()
+        base_state["zone_agent_streak4"] = self.zone_agent_streak4.get_state()
+        return base_state
 
 
 # ══════════════════════════════════════════════
@@ -4018,8 +4211,8 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
             if i % 100 == 0:
                 await asyncio.sleep(0)
         agents = [table.agent2, table.agent3, table.agent4, table.agent6,
-                  table.zone_agent1, table.zone_agent2, table.zone_agent3, table.zone_agent4,
-                  table.zone_agent_streak, table.zone_agent_streak4]
+                  table.zone_agent1, table.zone_agent2, table.zone_agent3, table.zone_agent4]
+        agents += list(table.streak_agents.values())
         for agent in agents:
             agent.force_train(timestamp)
         log.info(f"[Entrenamiento] Mesa {table.key}: entrenamiento forzado tras bloque {start//BATCH_SIZE + 1}")
@@ -4074,8 +4267,15 @@ class ServerState:
                 table.zone_agent2.load_persist(data.get("zone_agent2"))
                 table.zone_agent3.load_persist(data.get("zone_agent3"))
                 table.zone_agent4.load_persist(data.get("zone_agent4"))
-                table.zone_agent_streak.load_persist(data.get("zone_agent_streak"))
-                table.zone_agent_streak4.load_persist(data.get("zone_agent_streak4"))
+                for _len, _agent in table.streak_agents.items():
+                    _persist = data.get(f"zone_agent_streak{_len}")
+                    if _persist is None and _len == ZONE_STREAK_MIN:
+                        # Migración desde el esquema viejo (un solo agente
+                        # "zone_agent_streak" sin longitud en el nombre).
+                        _persist = data.get("zone_agent_streak")
+                    if _persist is None and _len == 4:
+                        _persist = data.get("zone_agent_streak4")
+                    _agent.load_persist(_persist)
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
                 log.info(f"Modelo cargado para mesa {key}")
@@ -4097,11 +4297,11 @@ class ServerState:
             "zone_agent2": table.zone_agent2.to_persist(),
             "zone_agent3": table.zone_agent3.to_persist(),
             "zone_agent4": table.zone_agent4.to_persist(),
-            "zone_agent_streak": table.zone_agent_streak.to_persist(),
-            "zone_agent_streak4": table.zone_agent_streak4.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
             "history_seed_trained": self.history_seed_trained.get(key, False),
         }
+        for _len, _agent in table.streak_agents.items():
+            data[f"zone_agent_streak{_len}"] = _agent.to_persist()
         filename = f"model_{key}.json"
         try:
             with open(filename, "w") as f:
