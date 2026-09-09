@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT UNIFICADO — SPEED ROULETTE 2 (key 205)                 ║
@@ -84,7 +85,7 @@ DOZEN_COOLDOWN_ROUNDS = 5
 SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
 
 # ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
-ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "5"))
+ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
 
 # ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
@@ -278,6 +279,43 @@ def amx_strength(level_history, periods):
     momentum_values = [calc_momentum(level_history, p) for p in periods]
     amx = sum(momentum_values) / len(periods)
     return abs(amx)
+
+EMA_LONG_FAST = 20
+EMA_LONG_SLOW = 50
+
+def ema_long_trend(level_history, fast=EMA_LONG_FAST, slow=EMA_LONG_SLOW):
+    """Filtro de tendencia de largo plazo (EMA20 vs EMA50) sobre un historial
+    de nivel (funciona tanto para el nivel de docenas como para el de zonas,
+    ya que ambos son el mismo tipo de "paseo" numérico +1/-1).
+    'bullish': nivel actual > EMA20 > EMA50 (favorece D2/D3 o ALTA).
+    'bearish': nivel actual < EMA20 < EMA50 (favorece D1/D2 o BAJA).
+    Devuelve None si todavía no hay suficiente historial (no se aplica el
+    filtro en frío, para no bloquear el bot al arrancar)."""
+    if len(level_history) < slow + 1:
+        return None
+    ema_fast = calc_ema(level_history, fast)
+    ema_slow = calc_ema(level_history, slow)
+    if not ema_fast or not ema_slow:
+        return None
+    ef, es = ema_fast[-1], ema_slow[-1]
+    if ef is None or es is None:
+        return None
+    cur = level_history[-1]
+    if cur > ef > es:
+        return "bullish"
+    if cur < ef < es:
+        return "bearish"
+    return "neutral"
+
+def trend_favored_zones(trend):
+    """Análogo a trend_favored_dozens pero para ALTA/BAJA. A diferencia de
+    las docenas (3 categorías), acá 'neutral' o sin datos no restringe
+    ninguna zona, ya que no hay una tercera opción intermedia."""
+    if trend == "bullish":
+        return {"ALTA"}
+    if trend == "bearish":
+        return {"BAJA"}
+    return {"ALTA", "BAJA"}
 
 
 # ══════════════════════════════════════════════
@@ -519,6 +557,59 @@ def build_status_message(server_state) -> str:
             lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
     return "\n\n".join(lines)
 
+def _format_ago(timestamp: float) -> str:
+    if not timestamp:
+        return "nunca"
+    delta = max(0, time.time() - timestamp)
+    if delta < 60:
+        return f"hace {int(delta)}s"
+    if delta < 3600:
+        return f"hace {int(delta // 60)}min"
+    return f"hace {delta / 3600:.1f}h"
+
+def _agent_ml_block(agente) -> str:
+    total = agente.total_processed
+    if not agente.trained:
+        estado = f"⚪ en entrenamiento ({total}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
+    else:
+        estado = f"🟢 entrenado · actualizado {_format_ago(agente.last_train_ts)} · próx. reentrenamiento cada {ML_RETRAIN_INTERVAL_SECONDS // 60}min"
+
+    snapshot = agente.trained_snapshot or {}
+    patrones_con_datos = [(k, v) for k, v in snapshot.items() if len(v) >= DOZEN_MIN_SAMPLES_GATE]
+    patrones_con_datos.sort(key=lambda kv: len(kv[1]), reverse=True)
+    n_patrones = len(patrones_con_datos)
+    n_total_patrones = len(snapshot)
+
+    lines = [f"{agente.label}", estado, f"🧬 Patrones observados: {n_total_patrones} · con muestra suficiente (≥{DOZEN_MIN_SAMPLES_GATE}): {n_patrones}"]
+    if patrones_con_datos:
+        lines.append("🔝 Top patrones por muestra:")
+        for key, arr in patrones_con_datos[:3]:
+            c1 = sum(1 for e in arr if agente._entry_attempt(e) == 1)
+            c2 = sum(1 for e in arr if agente._entry_attempt(e) == 2)
+            win_rate = sum(1 for e in arr if agente._entry_attempt(e) > 0) / len(arr) * 100
+            lines.append(f"   · {key}: {len(arr)} muestras · {win_rate:.1f}% acierto · int1={c1} int2={c2}")
+    return "\n".join(lines)
+
+def build_mlstatus_message(server_state) -> str:
+    agent_keys = ["agent2", "agent3", "agent4", "agent6"]
+    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak"]
+    lines = ["🧠 ESTADO DEL MODELO (ML)"]
+    for key, table in server_state.tables.items():
+        lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
+        lines.append("— Patrones de DOCENAS —")
+        for akey in agent_keys:
+            agente = getattr(table, akey, None)
+            if agente is None:
+                continue
+            lines.append(_agent_ml_block(agente))
+        lines.append("— Patrones de ZONAS —")
+        for zkey in zone_keys:
+            agente = getattr(table, zkey, None)
+            if agente is None:
+                continue
+            lines.append(_agent_ml_block(agente))
+    return "\n\n".join(lines)
+
 if bot is not None:
     @bot.message_handler(commands=["status"])
     async def handle_status_command(message):
@@ -529,6 +620,19 @@ if bot is not None:
             await bot.reply_to(message, build_status_message(_server_state))
         except Exception as e:
             log.warning(f"[Telegram] Error respondiendo /status: {e}")
+
+    @bot.message_handler(commands=["mlstatus"])
+    async def handle_mlstatus_command(message):
+        if _server_state is None:
+            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
+            return
+        try:
+            text = build_mlstatus_message(_server_state)
+            # Telegram limita ~4096 caracteres por mensaje; se divide si hace falta.
+            for i in range(0, len(text), 3800):
+                await bot.reply_to(message, text[i:i + 3800])
+        except Exception as e:
+            log.warning(f"[Telegram] Error respondiendo /mlstatus: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -1198,9 +1302,13 @@ class ZonePatternAgent:
             return 1, round(c1 / total * 100, 1)
         return 2, round(c2 / total * 100, 1)
 
-    def _ml_should_signal(self, pattern_tuple, amx_strength_val):
+    def _ml_should_signal(self, pattern_tuple, amx_strength_val, trend_zones=None):
         if self.cooldown_remaining > 0:
             return False
+        if trend_zones is not None:
+            predicted_zone = pattern_tuple[-1]
+            if predicted_zone not in trend_zones:
+                return False
         base_rate = DOZEN_MIN_WIN_RATE
         if amx_strength_val >= AMX_STRENGTH_THRESHOLDS["strong"]:
             required_rate = base_rate * AMX_ADJUST_FACTOR_STRONG
@@ -1235,7 +1343,8 @@ class ZonePatternAgent:
 
     def update(self, zone_history, timestamp, blocked: bool = False,
                amx_strength_val=0.0, last_number=None,
-               live_enabled: bool = True, rebound_direction: str = "NEUTRAL"):
+               live_enabled: bool = True, rebound_direction: str = "NEUTRAL",
+               trend_zones=None):
         if not self.active:
             return
         self._last_raw_number = last_number
@@ -1275,7 +1384,7 @@ class ZonePatternAgent:
                 if predicted_zone == "VERDE":
                     log.info(f"⛔ {self.name}: patrón termina en VERDE, no se genera señal")
                     return
-                if self._ml_should_signal(pattern_tuple, amx_strength_val):
+                if self._ml_should_signal(pattern_tuple, amx_strength_val, trend_zones):
                     self.confirming = True
                     self.pending_pattern = pattern_tuple
                     self.pending_window = zone_history[-(self.pattern_len - 1):]
@@ -1547,9 +1656,19 @@ class StreakZoneAgent:
         self.trained = True
         self.last_train_ts = timestamp
 
+    def _maybe_train(self, timestamp: float):
+        # Antes la racha nunca se reentrenaba sola en vivo (solo con el
+        # entrenamiento inicial sobre el histórico). Ahora se actualiza
+        # como los demás agentes: cada ML_MIN_SIGNALS_TO_TRAIN señales
+        # cerradas, o cada ML_RETRAIN_INTERVAL_SECONDS si ya está entrenada.
+        if self.total_processed < ML_MIN_SIGNALS_TO_TRAIN:
+            return
+        if not self.trained or (timestamp - self.last_train_ts) >= ML_RETRAIN_INTERVAL_SECONDS:
+            self.force_train(timestamp)
+
     def update(self, zone_history, timestamp, blocked: bool = False,
                amx_strength_val=0.0, rebound_direction="NEUTRAL",
-               last_number=None, live_enabled: bool = True):
+               last_number=None, live_enabled: bool = True, trend_zones=None):
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
         self.last_rebound_direction = rebound_direction
@@ -1572,12 +1691,26 @@ class StreakZoneAgent:
 
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
+        self._maybe_train(timestamp)
 
-        # 2) Racha: señal permisiva (sin patrones ni ML)
+        # 2) Racha: señal "inteligente" -> ya no dispara solo por longitud.
+        # Antes de armar la señal exige: a) que la zona de la racha no vaya
+        # en contra de la tendencia EMA20/50 (si hay datos para calcularla),
+        # y b) si ya hay modelo entrenado para esta racha, que su tasa de
+        # acierto histórica no esté por debajo del mínimo exigido al resto
+        # de los patrones (DOZEN_MIN_WIN_RATE). Sin entrenar todavía, se
+        # deja pasar (igual que los demás agentes al arrancar en frío).
         zone, streak = current_zone_streak(zone_history)
         if (zone is not None and streak >= self.min_streak
                 and not self.train_state["active"] and not blocked
                 and self.cooldown_remaining <= 0):
+            if trend_zones is not None and zone not in trend_zones:
+                log.info(f"⛔ {self.name}: racha de {streak}x {zone} en contra de la tendencia EMA20/50, se descarta")
+                return
+            rate = self._win_rate(("RACHA", zone))
+            if rate is not None and rate < DOZEN_MIN_WIN_RATE:
+                log.info(f"⛔ {self.name}: racha de {streak}x {zone} con tasa histórica {rate:.2f} < mínimo {DOZEN_MIN_WIN_RATE:.2f}, se descarta")
+                return
             context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
             self.candidate_signal = {
                 "pattern": ("RACHA", zone),
@@ -1599,7 +1732,7 @@ class StreakZoneAgent:
                 "context": context, "current_attempt": 0, "start_attempt": 1,
                 "rebound_direction": rebound_direction,
             }
-            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal permisiva (sin patrón)")
+            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'})")
 
     def _close_shadow(self, win: bool, result_zone, attempt, timestamp):
         zone = self.train_state["bet_zone"]
@@ -1714,6 +1847,16 @@ class RouletteTable:
         self.daily_marker = DailyMarker()
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
         self.cycle_pending = 0
+
+        # Frecuencia horaria de rachas: guarda cuándo (timestamp real) se
+        # cumplió por última vez una racha de ZONE_STREAK_MIN en cada zona,
+        # para calcular cada cuántos minutos suele repetirse y usarlo como
+        # confirmación extra cuando "toca" que vuelva a salir.
+        self.zone_streak_event_times = {"ALTA": [], "BAJA": []}
+        self._prev_zone_streak = (None, 0)
+        self.time_due_info = {"ALTA": {"due": False, "avg_minutes": None, "elapsed_minutes": None},
+                               "BAJA": {"due": False, "avg_minutes": None, "elapsed_minutes": None}}
+        self.time_due_zones = set()
 
         self.signal_sequence = []
         self.current_attempt_index = 0
@@ -1897,6 +2040,14 @@ class RouletteTable:
             self.signal_sequence = [new_entry]
             self.signal_status = "active"
             self.attempt_bets = [new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
+            # El intento 1 de esta señal fue anunciado DENTRO del mensaje de
+            # resolución (extra_text), no vía _send_entry, así que no hay
+            # mensaje real que borrar para el intento 1. Se deja un
+            # placeholder (None) en el índice 0 para que, si el intento 1
+            # se pierde y se pasa a intento 2, _send_entry no borre por
+            # error el mensaje de INTENTO 2 recién enviado (antes usaba
+            # ese índice vacío como si fuera el id del intento 2).
+            self.entry_msg_ids = [None]
         else:
             self.signal_sequence = []
             self.signal_status = None
@@ -2009,6 +2160,36 @@ class RouletteTable:
         log.info(f"🔔 SEÑAL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
         agent.candidate_signal = None
 
+    def _record_zone_streak_time_event(self, timestamp):
+        """Registra (una sola vez por racha, en el momento en que cruza el
+        mínimo) el instante real en que una zona alcanza ZONE_STREAK_MIN
+        seguidas. Sirve para calcular después cada cuántos minutos suele
+        repetirse ese fenómeno en cada zona."""
+        zone, streak = current_zone_streak(self.zone_history)
+        prev_zone, prev_streak = self._prev_zone_streak
+        just_crossed = (zone is not None and streak >= ZONE_STREAK_MIN
+                         and not (prev_zone == zone and prev_streak >= ZONE_STREAK_MIN))
+        if just_crossed:
+            log_list = self.zone_streak_event_times.setdefault(zone, [])
+            log_list.append(timestamp)
+            if len(log_list) > 30:
+                del log_list[0]
+        self._prev_zone_streak = (zone, streak)
+
+    def _zone_time_due(self, zone, timestamp):
+        """Con el historial de instantes en que 'zone' hizo una racha de
+        ZONE_STREAK_MIN, calcula el intervalo promedio (en minutos) entre
+        una repetición y la siguiente, y si ya pasó ese tiempo desde la
+        última vez (o sea, estadísticamente "toca" que vuelva a salir)."""
+        events = self.zone_streak_event_times.get(zone, [])
+        if len(events) < 2:
+            return {"due": False, "avg_minutes": None, "elapsed_minutes": None}
+        diffs = [(events[i] - events[i - 1]) / 60.0 for i in range(1, len(events))]
+        avg_minutes = sum(diffs) / len(diffs)
+        elapsed_minutes = (timestamp - events[-1]) / 60.0
+        due = avg_minutes > 0 and elapsed_minutes >= avg_minutes
+        return {"due": due, "avg_minutes": round(avg_minutes, 1), "elapsed_minutes": round(elapsed_minutes, 1)}
+
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
         candidates = []
         confirmation_resolved = False
@@ -2067,6 +2248,34 @@ class RouletteTable:
             self.confirming = False
             self.pending_agent = None
             self.pending_candidate = None
+
+        # Freno real por frecuencia horaria: si para la zona del candidato
+        # ya tenemos un promedio calculado (>=2 rachas de ZONE_STREAK_MIN
+        # anteriores) y todavía NO pasó ese tiempo promedio desde la
+        # última vez ("no está en tiempo"), esa señal se descarta esta
+        # vuelta -> el bot espera, aunque el patrón esté confirmado. Si
+        # todavía no hay datos suficientes para calcular el promedio, no
+        # se bloquea nada (igual que el resto de los filtros del bot).
+        # Si sí está "en tiempo", además se le da prioridad (mayor score)
+        # frente a otros candidatos que compitan en el mismo giro.
+        if candidates:
+            filtered = []
+            for agente, score, cand in candidates:
+                bz = cand.get("bet_zone")
+                zone = bz[0] if bz else None
+                info = self.time_due_info.get(zone) if zone else None
+                if info is not None and info.get("avg_minutes") is not None and not info.get("due"):
+                    log.info(f"⏳ {agente.name}: señal a {zone} esperando frecuencia horaria "
+                             f"({info.get('elapsed_minutes')}min / {info.get('avg_minutes')}min prom.)")
+                    continue
+                if zone in self.time_due_zones:
+                    cand["time_confirmed"] = True
+                    cand["time_due_info"] = info
+                    score = score * 1.25 + 0.05
+                else:
+                    cand["time_confirmed"] = False
+                filtered.append((agente, score, cand))
+            candidates = filtered
 
         # Secuencia activa
         if self.signal_status == "active":
@@ -2212,6 +2421,21 @@ class RouletteTable:
 
         self.last_rebound_direction = detect_rebound_direction(self.level_history)
 
+        # Filtro adicional de tendencia de largo plazo (EMA20 vs EMA50),
+        # aplicado sobre docenas y zonas. Si aún no hay suficiente
+        # historial (< 51 giros) no se aplica y no bloquea nada.
+        long_trend_dozens = ema_long_trend(self.level_history)
+        long_trend_zone = ema_long_trend(self.alto_level_history)
+        zone_trend_favored = trend_favored_zones(long_trend_zone) if long_trend_zone is not None else None
+
+        # Frecuencia horaria de rachas (ver _record_zone_streak_time_event /
+        # _zone_time_due): no se calcula durante el entrenamiento con
+        # histórico porque ahí los timestamps no son reales.
+        if not training:
+            self._record_zone_streak_time_event(timestamp)
+            self.time_due_info = {z: self._zone_time_due(z, timestamp) for z in ("ALTA", "BAJA")}
+            self.time_due_zones = {z for z, info in self.time_due_info.items() if info["due"]}
+
         agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
         agent_keys = ["agent2", "agent3", "agent4", "agent6"]
 
@@ -2229,6 +2453,8 @@ class RouletteTable:
                                   threshold=config.get("threshold", 0.5))
                 amx_strength_val = amx_strength(self.level_history, periods)
             favored = trend_favored_dozens(trend)
+            if long_trend_dozens is not None:
+                favored = favored & trend_favored_dozens(long_trend_dozens)
 
             blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
@@ -2246,7 +2472,8 @@ class RouletteTable:
             zagente.update(self.zone_history, timestamp, blocked=blocked,
                            amx_strength_val=amx_strength_val,
                            rebound_direction=self.last_rebound_direction,
-                           last_number=number, live_enabled=live_ok)
+                           last_number=number, live_enabled=live_ok,
+                           trend_zones=zone_trend_favored)
 
         all_agents = agent_list + zone_agents
         self._signal_included = False
@@ -2321,6 +2548,7 @@ class RouletteTable:
             "current_attempt": self.current_attempt_index + 1 if self.signal_status == "active" else 0,
             "total_attempts": ZONE_MAX_ATTEMPTS if self.signal_status == "active" else 0,
             "last_nonzero_zone": self.last_nonzero_zone,
+            "time_due_info": self.time_due_info,
         }
 
 
@@ -2683,11 +2911,10 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Gráfico ALTOS (19-36) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 4/8/20 · Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Gráfico ALTOS (19-36) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 20/50 · Soporte/Resistencia</span>
             <div class="ema-legend">
-                <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
-                <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
-                <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 20</span>
+                <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 20</span>
+                <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 50</span>
                 <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
                 <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
                 <span style="color:#00b894;">▲ Pivotes</span>
@@ -2698,11 +2925,10 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> Gráfico BAJOS (1-18) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 4/8/20 · Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> Gráfico BAJOS (1-18) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 20/50 · Soporte/Resistencia</span>
             <div class="ema-legend">
-                <span><span class="ema-dot" style="background:#ffd700;"></span> EMA 4</span>
-                <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 8</span>
-                <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 20</span>
+                <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 20</span>
+                <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 50</span>
                 <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
                 <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
                 <span style="color:#00b894;">▲ Pivotes</span>
@@ -2786,6 +3012,7 @@ DASHBOARD_HTML = r"""
     const S4_MAX_SEQ = 25;
     const DEFAULT_SEQ = [1,1,1,1,1,1,1,1,1,1];
     let pollingInterval = null;
+    let pollingTimeout = null;
 
     const ZONE_LABEL = { 'ALTA': 'ALTA (19-36)', 'BAJA': 'BAJA (1-18)', 'VERDE': 'VERDE (0)' };
     const ZONE_CLASS = { 'ALTA': 'alta', 'BAJA': 'baja', 'VERDE': 'verde' };
@@ -2944,9 +3171,8 @@ DASHBOARD_HTML = r"""
         const labels = levels.map(d => d.index);
         const values = levels.map(d => d.value);
         const numbers = series.numbers || [];
-        const ema4 = calcEMA(values, 4);
-        const ema8 = calcEMA(values, 8);
         const ema20 = calcEMA(values, 20);
+        const ema50 = calcEMA(values, 50);
         const supports = series.support_levels || [];
         const resistances = series.resistance_levels || [];
 
@@ -2960,9 +3186,8 @@ DASHBOARD_HTML = r"""
                 pointBackgroundColor: pointColors, pointBorderColor: 'rgba(0,0,0,.35)', pointBorderWidth: 1,
                 pointNumbers: numbers
             },
-            { label: 'EMA 20', data: ema20, borderColor: '#ff4d4d', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.15 },
-            { label: 'EMA 8',  data: ema8,  borderColor: '#ff8c00', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.15, borderDash: [4, 2] },
-            { label: 'EMA 4',  data: ema4,  borderColor: '#ffd700', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.15, borderDash: [2, 2] },
+            { label: 'EMA 50', data: ema50, borderColor: '#ff4d4d', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.15 },
+            { label: 'EMA 20', data: ema20, borderColor: '#ff8c00', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.15, borderDash: [4, 2] },
         ];
 
         supports.forEach((s, idx) => {
@@ -3002,7 +3227,11 @@ DASHBOARD_HTML = r"""
         const opts = {
             responsive: true, maintainAspectRatio: false, animation: false,
             plugins: {
-                legend: { labels: { color: '#b0caf0', font: { size: 9 } } },
+                // La leyenda ya se muestra arriba del gráfico con los <span>
+                // personalizados (EMA 4/8/20, Soporte, Resistencia, Pivotes).
+                // Si además Chart.js dibuja su propia leyenda automática con
+                // las mismas referencias, queda duplicada. Se desactiva acá.
+                legend: { display: false },
                 tooltip: { callbacks: { label: function(ctx) {
                     let label = ctx.dataset.label || '';
                     let val = ctx.parsed.y;
@@ -3021,19 +3250,47 @@ DASHBOARD_HTML = r"""
             }
         };
         if (!chart) {
+            // Por si el canvas ya tiene una instancia de Chart.js asociada
+            // (p.ej. tras un re-render inesperado) se destruye antes de
+            // crear una nueva; si no, Chart.js dibuja la nueva encima de
+            // la vieja y se ven los indicadores "duplicados".
+            const existing = Chart.getChart(canvasId);
+            if (existing) existing.destroy();
             chart = new Chart(document.getElementById(canvasId), { type: 'line', data: built, options: opts });
         } else {
             chart.data.labels = built.labels;
             chart.data.datasets = built.datasets;
-            chart.update();
+            chart.update('none');
         }
         return chart;
     }
 
+    // Firma barata de una serie para saber si realmente cambió desde el
+    // último poll (mismo largo + mismo último valor + mismo último
+    // número). Si no cambió, no tiene sentido recalcular EMAs, clusters
+    // de soporte/resistencia y volver a dibujar: ahorra CPU cada 2s y es
+    // otra causa menos de que el navegador se sienta "pegado".
+    let lastZoneSig = { alto: null, bajo: null };
+    function zoneSeriesSig(series) {
+        if (!series) return null;
+        const lv = series.level_data || [];
+        const last = lv.length ? lv[lv.length - 1] : null;
+        const nums = series.numbers || [];
+        return lv.length + '|' + (last ? last.index + ':' + last.value : '') + '|' + nums[nums.length - 1];
+    }
+
     function renderCharts(zoneAnalysis) {
         if (!zoneAnalysis) return;
-        chartAltos = renderZoneChart(chartAltos, 'chartAltos', zoneAnalysis.alto, '#4fa8ff', 'rgba(79,168,255,.12)');
-        chartBajos = renderZoneChart(chartBajos, 'chartBajos', zoneAnalysis.bajo, '#a0703c', 'rgba(160,112,60,.14)');
+        const sigAlto = zoneSeriesSig(zoneAnalysis.alto);
+        if (sigAlto !== lastZoneSig.alto || !chartAltos) {
+            chartAltos = renderZoneChart(chartAltos, 'chartAltos', zoneAnalysis.alto, '#4fa8ff', 'rgba(79,168,255,.12)');
+            lastZoneSig.alto = sigAlto;
+        }
+        const sigBajo = zoneSeriesSig(zoneAnalysis.bajo);
+        if (sigBajo !== lastZoneSig.bajo || !chartBajos) {
+            chartBajos = renderZoneChart(chartBajos, 'chartBajos', zoneAnalysis.bajo, '#a0703c', 'rgba(160,112,60,.14)');
+            lastZoneSig.bajo = sigBajo;
+        }
     }
 
     // ============================================================
@@ -3133,20 +3390,42 @@ DASHBOARD_HTML = r"""
     // ============================================================
     //  POLLING
     // ============================================================
+    let pollInFlight = false;
+
     async function poll() {
-        const state = await fetchState();
-        const zoneAnalysis = await fetchZoneAnalysis();
-        if (state) updateUI(state, zoneAnalysis);
-        else {
-            document.getElementById('connectionLed').className = 'led red';
-            document.getElementById('connectionText').textContent = 'Desconectado';
+        // Evita solapamientos: si el ciclo anterior (fetchState +
+        // fetchZoneAnalysis) todavía no terminó -por red lenta o el
+        // "cold start" del hosting- no se lanza uno nuevo encima. Antes,
+        // con setInterval fijo cada 2s, los fetch lentos se acumulaban
+        // uno sobre otro y la página terminaba "pegada"/congelada.
+        if (pollInFlight) return;
+        pollInFlight = true;
+        try {
+            const state = await fetchState();
+            const zoneAnalysis = await fetchZoneAnalysis();
+            if (state) updateUI(state, zoneAnalysis);
+            else {
+                document.getElementById('connectionLed').className = 'led red';
+                document.getElementById('connectionText').textContent = 'Desconectado';
+            }
+        } finally {
+            pollInFlight = false;
         }
     }
 
     function startPolling() {
-        if (pollingInterval) clearInterval(pollingInterval);
-        pollingInterval = setInterval(poll, 2000);
-        poll();
+        // setTimeout que se reprograma DESPUÉS de terminar cada ciclo,
+        // en vez de setInterval (que dispara a horario fijo sin importar
+        // si el ciclo anterior sigue en curso). Así el intervalo real
+        // entre actualizaciones nunca es menor a 2s, pero tampoco se
+        // amontonan peticiones cuando la red va lenta.
+        if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
+        if (pollingTimeout) { clearTimeout(pollingTimeout); pollingTimeout = null; }
+        const loop = async () => {
+            await poll();
+            pollingTimeout = setTimeout(loop, 2000);
+        };
+        loop();
     }
 
     // ============================================================
