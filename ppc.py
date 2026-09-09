@@ -2899,6 +2899,8 @@ DASHBOARD_HTML = r"""
         .signal-zone { font-size:1.1rem; font-weight:900; }
         .signal-zone.baja { color:#e8b57f; }
         .signal-zone.alta { color:#7fc0ff; }
+        .sound-toggle { margin-left:auto; cursor:pointer; font-size:0.85rem; font-weight:700; padding:4px 12px; border-radius:40px; background:rgba(80,130,220,0.15); border:1px solid rgba(80,130,220,0.3); color:#cfe0ff; user-select:none; }
+        .sound-toggle.muted { background:rgba(220,60,60,0.15); border-color:rgba(220,60,60,0.4); color:#ff9d9d; }
 
         .sx-wrap { margin-top:4px; }
         .sx-header { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; background:linear-gradient(135deg,rgba(0,25,60,.9),rgba(0,12,35,.95)); border:1px solid rgba(80,130,220,.22); border-radius:14px; cursor:pointer; user-select:none; }
@@ -3032,6 +3034,7 @@ DASHBOARD_HTML = r"""
             <span class="signal-zone" id="signalZone">-</span>
             <span id="signalAttempt">-</span>
             <span id="signalLastResult" style="font-size:0.8rem;opacity:0.7;"></span>
+            <span class="sound-toggle" id="soundToggle" onclick="toggleSound()">🔊 Sonido ON</span>
         </div>
     </div>
 
@@ -3095,6 +3098,80 @@ DASHBOARD_HTML = r"""
     let chartBajos = null;
     let lastSignalState = null;
     let lastProcessedAttemptSeq = null; // null = aún no inicializado (evita reproducir historial viejo al cargar)
+
+    // ============================================================
+    //  SONIDO DE NUEVA SEÑAL (Telegram)
+    // ============================================================
+    let soundEnabled = (localStorage.getItem('zonas_sound_enabled') !== 'off');
+    let audioCtx = null;
+
+    function updateSoundToggleUI() {
+        const el = document.getElementById('soundToggle');
+        if (!el) return;
+        el.textContent = soundEnabled ? '🔊 Sonido ON' : '🔇 Sonido OFF';
+        el.classList.toggle('muted', !soundEnabled);
+    }
+
+    function toggleSound() {
+        soundEnabled = !soundEnabled;
+        localStorage.setItem('zonas_sound_enabled', soundEnabled ? 'on' : 'off');
+        updateSoundToggleUI();
+        if (soundEnabled) ensureAudioCtx(); // reintenta desbloquear si el usuario reactiva
+    }
+
+    function ensureAudioCtx() {
+        if (audioCtx) return audioCtx;
+        try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) {
+            audioCtx = null;
+        }
+        return audioCtx;
+    }
+
+    // Los navegadores bloquean el audio automático hasta que el usuario
+    // interactúa con la página. Con el primer click/touch en cualquier
+    // parte, "desbloqueamos" el contexto para que las alertas posteriores
+    // (que llegan solas, sin interacción) sí puedan sonar.
+    ['click', 'touchstart', 'keydown'].forEach(function(evt) {
+        document.addEventListener(evt, function unlockAudioOnce() {
+            const ctx = ensureAudioCtx();
+            if (ctx && ctx.state === 'suspended') ctx.resume().catch(function(){});
+        }, { once: true, passive: true });
+    });
+
+    // Beep de dos tonos ascendentes, generado con Web Audio (sin archivos
+    // externos que puedan fallar al cargar).
+    function playBeep(freqs, duration) {
+        if (!soundEnabled) return;
+        const ctx = ensureAudioCtx();
+        if (!ctx) return;
+        if (ctx.state === 'suspended') { ctx.resume().catch(function(){}); }
+        const now = ctx.currentTime;
+        freqs.forEach(function(freq, i) {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            const start = now + i * duration;
+            gain.gain.setValueAtTime(0.0001, start);
+            gain.gain.exponentialRampToValueAtTime(0.35, start + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(start);
+            osc.stop(start + duration + 0.02);
+        });
+    }
+
+    // Sonido al llegar una señal nueva de Telegram (BAJA/ALTA).
+    function playNewSignalSound() {
+        playBeep([880, 1175], 0.16);
+    }
+    // Sonido distinto para WIN / LOSS.
+    function playResultSound(win) {
+        playBeep(win ? [880, 1175, 1568] : [440, 330], 0.14);
+    }
     let s4Active = false;
     let s4Bal = 100, s4Cap = 100, s4Base = 1, s4Seq = [], s4Bet = 0, s4InitSeq = [], s4Ent = 0, s4W = 0, s4L = 0;
     const S4_MAX_SEQ = 25;
@@ -3450,6 +3527,20 @@ DASHBOARD_HTML = r"""
         const attemptEl = document.getElementById('signalAttempt');
         const resultEl = document.getElementById('signalLastResult');
 
+        // Detecta el FRENTE de subida de la señal (inactiva -> activa) para
+        // sonar solo UNA vez cuando llega, no en cada poll mientras sigue activa.
+        // Se exige que ya exista un poll previo (lastSignalState !== null) para
+        // no disparar sonido con el estado "heredado" del primer fetch al cargar
+        // la página (igual criterio que se usa para el log de intentos).
+        if (lastSignalState) {
+            if (state.signal_active && !lastSignalState.signal_active) {
+                playNewSignalSound();
+            }
+            if (state.last_signal_outcome && state.last_signal_outcome !== lastSignalState.last_signal_outcome) {
+                playResultSound(state.last_signal_outcome === 'win');
+            }
+        }
+
         if (state.signal_active) {
             badge.textContent = '🔔 ACTIVA';
             badge.className = 'signal-badge active';
@@ -3754,6 +3845,7 @@ DASHBOARD_HTML = r"""
     s4UI();
     s4Live();
 
+    updateSoundToggleUI();
     startPolling();
 
     window.s4Toggle = sxToggle;
