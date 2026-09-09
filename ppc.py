@@ -87,23 +87,21 @@ SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
 # ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
 ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
 
-# ── Predictor de TIEMPO por zona (réplica del Spaceman "rebote 3x-5x") ──
-# Registra en qué ronda (giro) cayó cada zona; si la misma zona suele repetirse
-# cada 3-5 rondas, promedia el intervalo entre las últimas apariciones y predice
-# en qué ronda caerá la próxima. Las señales de docenas/zonas SOLO disparan si
-# su zona objetivo está dentro de la ventana de rondas predicha Y el nivel de
-# esa zona confirma del lado correcto de sus EMA 20/50 (equiv. al filtro
-# "precio sobre las EMAs" del Spaceman). Cada fallo amplía la ventana posterior.
-TIMING_ZONE_ENABLED  = os.environ.get("TIMING_ZONE_ENABLED", "1") == "1"
-TIMING_HISTORY_MAX   = int(os.environ.get("TIMING_HISTORY_MAX", "15"))   # ocurrencias conservadas por zona
-TIMING_SAMPLE_WINDOW = int(os.environ.get("TIMING_SAMPLE_WINDOW", "5"))  # cuántas separaciones promedian
-TIMING_MIN_GAP       = int(os.environ.get("TIMING_MIN_GAP", "3"))        # separación mínima "repetición 3-5 rondas"
-TIMING_MAX_GAP       = int(os.environ.get("TIMING_MAX_GAP", "12"))       # separación máxima válida
-TIMING_MIN_SAMPLES   = int(os.environ.get("TIMING_MIN_SAMPLES", "3"))    # separaciones mínimas para predecir
-TIMING_AHEAD_MAX     = int(os.environ.get("TIMING_AHEAD_MAX", "2"))      # dispara hasta N rondas antes de la predicha
-TIMING_POST_WINDOW   = int(os.environ.get("TIMING_POST_WINDOW", "2"))    # y hasta N rondas después
-TIMING_FAIL_EXPAND   = int(os.environ.get("TIMING_FAIL_EXPAND", "1"))    # +N rondas posteriores por cada fallo
-TIMING_EXPIRE_MARGIN = int(os.environ.get("TIMING_EXPIRE_MARGIN", "10")) # rondas tras las que vence la predicción
+# ── Predictor de "ronda de repetición de zona" (BAJA/ALTA) — réplica en
+#    RONDAS del predictor de tiempo de Spaceman (calcularPrediccionInteligente
+#    / checkAutoPredictions), pero contando giros en vez de segundos: cada vez
+#    que una zona hace una racha de ZONE_STREAK_MIN, se guarda en qué giro
+#    ocurrió; el promedio de giros entre las últimas repeticiones (recortado
+#    siempre a la ventana de ROUND_PREDICT_WINDOW_MIN–MAX rondas pedida)
+#    predice en qué ronda futura debería volver a caer esa misma zona. Solo
+#    se confirma "en ronda" si además el filtro EMA20/50 (ema_long_trend)
+#    favorece esa zona en ese momento. Se usa como filtro COMPARTIDO de
+#    docenas Y zonas (las docenas ya se resuelven a BAJA/ALTA antes de este
+#    punto, así que el mismo filtro aplica a ambas).
+ROUND_PREDICT_SAMPLE_WINDOW = int(os.environ.get("ROUND_PREDICT_SAMPLE_WINDOW", "5"))
+ROUND_PREDICT_WINDOW_MIN = int(os.environ.get("ROUND_PREDICT_WINDOW_MIN", "3"))
+ROUND_PREDICT_WINDOW_MAX = int(os.environ.get("ROUND_PREDICT_WINDOW_MAX", "5"))
+ROUND_PREDICT_HISTORY_MAX = int(os.environ.get("ROUND_PREDICT_HISTORY_MAX", "15"))
 
 # ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
@@ -651,37 +649,6 @@ if bot is not None:
                 await bot.reply_to(message, text[i:i + 3800])
         except Exception as e:
             log.warning(f"[Telegram] Error respondiendo /mlstatus: {e}")
-
-    @bot.message_handler(commands=["timing"])
-    async def handle_timing_command(message):
-        if _server_state is None:
-            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
-            return
-        try:
-            await bot.reply_to(message, build_timing_message(_server_state))
-        except Exception as e:
-            log.warning(f"[Telegram] Error respondiendo /timing: {e}")
-
-
-def build_timing_message(server_state) -> str:
-    """Estado del predictor de tiempo por zona (réplica Spaceman): ocurrencias
-    registradas y próxima ronda prevista para la repetición de cada zona."""
-    lines = ["⏰ PREDICTOR DE TIEMPO POR ZONA (réplica Spaceman · repetición 3-5 rondas)"]
-    for key, table in server_state.tables.items():
-        st = table.timing.get_state()
-        lines.append(f"🎲 Mesa {key} ({TABLE_NAME}) · giro #{table.total_spins_seen}")
-        for zone in ("BAJA", "ALTA"):
-            occ = st["occurrences"].get(zone, [])
-            pred = st["predictions"].get(zone)
-            occ_txt = f"{len(occ)} ocurrencias" + (f" · última en ronda #{occ[-1]}" if occ else "")
-            if pred:
-                diff = pred["predicted"] - table.total_spins_seen
-                ventana = f"en {diff} rondas" if diff >= 0 else f"hace {-diff} rondas"
-                lines.append(f"{ZONE_EMOJI.get(zone, '')} {zone}: {occ_txt} → próxima ~ronda #{pred['predicted']} "
-                             f"({ventana} · fail_count={pred.get('fail_count', 0)})")
-            else:
-                lines.append(f"{ZONE_EMOJI.get(zone, '')} {zone}: {occ_txt} → sin predicción aún")
-    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────
@@ -1880,136 +1847,6 @@ class StreakZoneAgent:
 
 
 # ══════════════════════════════════════════════
-#  PREDICTOR DE TIEMPO POR ZONA — réplica Spaceman (rebote 3x-5x)
-# ══════════════════════════════════════════════
-class TimingZonePredictor:
-    """Réplica de calcularPrediccionInteligente()/check_timing_round_trigger()
-    del bot Spaceman, adaptada a zonas de ruleta:
-
-    · Cada giro nuevo registra la zona que cayó (ALTA/BAJA; VERDE no cuenta).
-    · De las separaciones entre apariciones consecutivas de la MISMA zona se
-      toman solo las que están en [TIMING_MIN_GAP, TIMING_MAX_GAP] rondas —
-      es el "mismo valor se repite cada 3-5 rondas" que se busca.
-    · Con TIMING_SAMPLE_WINDOW separaciones válidas se predice la próxima
-      ronda: ultima_aparicion + promedio.
-    · zone_due(): la señal de docenas/zonas solo es disparable mientras la
-      ronda actual esté dentro de [predicha - TIMING_AHEAD_MAX,
-      predicha + TIMING_POST_WINDOW] (+ expansión por fallos, igual que el
-      Spaceman amplía la ventana tras cada pérdida).
-    · ema_confirmed(): equivale a "precio sobre las EMAs" del Spaceman — el
-      nivel actual de la zona debe estar del lado correcto de EMA 20 y 50
-      (arriba de ambas para ALTA, abajo de ambas para BAJA). Sin historial
-      suficiente no bloquea (criterio en frío, igual que los demás filtros).
-    · notify_result(): un acierto cierra la predicción; una pérdida sube
-      fail_count y amplía la ventana posterior, aumentando la chance de
-      reintento acertado (acumulación de fuerza por fallo, como Spaceman).
-    """
-
-    def __init__(self):
-        self.occurrences = {"ALTA": [], "BAJA": []}   # rondas (giros) en que cayó cada zona
-        self.predictions = {}                          # zona -> {"predicted": int, "fail_count": int}
-
-    def record(self, zone: str, spin_index: int):
-        """Llamar con cada giro nuevo. spin_index debe ser un contador
-        creciente de rondas (se usa total_spins_seen de la mesa)."""
-        if zone not in ("ALTA", "BAJA"):
-            return
-        occ = self.occurrences[zone]
-        occ.append(spin_index)
-        if len(occ) > TIMING_HISTORY_MAX * 4:
-            del occ[:len(occ) - TIMING_HISTORY_MAX * 4]
-        self._recalc(zone, spin_index)
-
-    def _recalc(self, zone: str, last_occ: int):
-        occ = self.occurrences[zone]
-        if len(occ) < 2:
-            return
-        gaps = [occ[i] - occ[i - 1] for i in range(1, len(occ))]
-        valid = [g for g in gaps if TIMING_MIN_GAP <= g <= TIMING_MAX_GAP]
-        if len(valid) < TIMING_MIN_SAMPLES:
-            return
-        sample = valid[-TIMING_SAMPLE_WINDOW:]
-        avg = sum(sample) / len(sample)
-        predicted = int(round(last_occ + avg))
-        pred = self.predictions.get(zone)
-        if pred is None:
-            self.predictions[zone] = {"predicted": predicted, "fail_count": 0}
-            log.info(f"[Timing] 🔮 {zone}: próxima repetición prevista en la ronda ~#{predicted} "
-                     f"(promedio {avg:.1f} rondas, {len(sample)} muestras)")
-        else:
-            pred["predicted"] = predicted
-
-    def zone_due(self, zone: str, current_spin: int) -> bool:
-        """True si la ronda actual está dentro de la ventana de tiempo de la
-        predicción de esa zona (con expansión posterior por fallos)."""
-        pred = self.predictions.get(zone)
-        if not pred:
-            return False
-        diff = pred["predicted"] - current_spin
-        post = TIMING_POST_WINDOW + pred.get("fail_count", 0) * TIMING_FAIL_EXPAND
-        if diff < -(post + TIMING_EXPIRE_MARGIN):
-            log.info(f"[Timing] ⏰ Predicción {zone} vencida (ronda {current_spin}, "
-                     f"prevista #{pred['predicted']}) — se espera nueva ocurrencia")
-            del self.predictions[zone]
-            return False
-        return -post <= diff <= TIMING_AHEAD_MAX
-
-    def ema_confirmed(self, zone: str, alto_hist: list, bajo_hist: list) -> bool:
-        """Filtro EMA 20/50 (equiv. 'precio sobre las EMAs' del Spaceman):
-        nivel de la zona del lado correcto de AMBAS EMAs. En frío no bloquea."""
-        hist = alto_hist if zone == "ALTA" else bajo_hist
-        if len(hist) < EMA_LONG_SLOW + 1:
-            return True
-        ema20 = calc_ema(hist, EMA_LONG_FAST)
-        ema50 = calc_ema(hist, EMA_LONG_SLOW)
-        e20, e50 = ema20[-1], ema50[-1]
-        if e20 is None or e50 is None:
-            return True
-        nivel = hist[-1]
-        if zone == "ALTA":
-            return nivel > e20 and nivel > e50
-        return nivel < e20 and nivel < e50
-
-    def notify_result(self, zone: str, win: bool):
-        """Al resolverse la señal jugada a esa zona: acierto cierra la
-        predicción; fallo acumula fuerza (amplía la ventana posterior)."""
-        if zone not in ("ALTA", "BAJA"):
-            return
-        pred = self.predictions.get(zone)
-        if pred is None:
-            return
-        if win:
-            self.predictions.pop(zone, None)
-        else:
-            pred["fail_count"] = pred.get("fail_count", 0) + 1
-            log.info(f"[Timing] 🔼 {zone}: fallo — fail_count={pred['fail_count']} "
-                     f"(ventana posterior ampliada)")
-
-    def get_state(self) -> dict:
-        return {
-            "enabled": TIMING_ZONE_ENABLED,
-            "occurrences": {z: o[-10:] for z, o in self.occurrences.items()},
-            "predictions": dict(self.predictions),
-        }
-
-    def to_persist(self):
-        return {"occurrences": self.occurrences, "predictions": self.predictions}
-
-    def load_persist(self, data):
-        if not data:
-            return
-        occ = data.get("occurrences")
-        if isinstance(occ, dict):
-            self.occurrences = {
-                "ALTA": list(occ.get("ALTA", [])),
-                "BAJA": list(occ.get("BAJA", [])),
-            }
-        preds = data.get("predictions")
-        if isinstance(preds, dict):
-            self.predictions = {z: dict(p) for z, p in preds.items() if z in ("ALTA", "BAJA")}
-
-
-# ══════════════════════════════════════════════
 #  ROULETTE TABLE
 # ══════════════════════════════════════════════
 class RouletteTable:
@@ -2036,6 +1873,17 @@ class RouletteTable:
         self.time_due_info = {"ALTA": {"due": False, "avg_minutes": None, "elapsed_minutes": None},
                                "BAJA": {"due": False, "avg_minutes": None, "elapsed_minutes": None}}
         self.time_due_zones = set()
+
+        # Predictor de "ronda de repetición de zona" (ver ROUND_PREDICT_*
+        # arriba): guarda en qué giro (índice de ronda) se completó cada
+        # racha de ZONE_STREAK_MIN en BAJA/ALTA, para predecir en qué ronda
+        # futura (ventana 3–5 rondas) debería repetirse esa misma zona,
+        # confirmado con EMA20/50.
+        self.zone_round_events = {"ALTA": [], "BAJA": []}
+        self._prev_zone_streak_round = (None, 0)
+        self.round_due_info = {"ALTA": {"due": False, "avg_rounds": None, "elapsed_rounds": None, "predicted_round": None},
+                                "BAJA": {"due": False, "avg_rounds": None, "elapsed_rounds": None, "predicted_round": None}}
+        self.round_due_zones = set()
 
         self.signal_sequence = []
         self.current_attempt_index = 0
@@ -2071,7 +1919,6 @@ class RouletteTable:
         self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa · repite a)", daily_marker=self.daily_marker)
         self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa · repite a)", daily_marker=self.daily_marker)
         self.zone_agent_streak = StreakZoneAgent(min_streak=ZONE_STREAK_MIN, name="ZONE_STREAK", label=f"🔥 RACHA (>={ZONE_STREAK_MIN}x misma zona)", daily_marker=self.daily_marker)
-        self.timing = TimingZonePredictor()   # filtro de tiempo por zona (réplica Spaceman)
 
         self.level_history = []
         self.level_current = 0
@@ -2174,11 +2021,6 @@ class RouletteTable:
 
         self.last_signal_outcome = "win" if win else "loss"
         self.last_signal_number = self.attempt_numbers[-1] if self.attempt_numbers else None
-
-        # Filtro de tiempo: acierto cierra la predicción; fallo amplía la ventana
-        played_zone = self.attempt_zones[0] if self.attempt_zones else None
-        if played_zone and TIMING_ZONE_ENABLED:
-            self.timing.notify_result(played_zone, win)
 
         extra_text = ""
         new_signal = self._pending_new_signal
@@ -2375,6 +2217,58 @@ class RouletteTable:
         due = avg_minutes > 0 and elapsed_minutes >= avg_minutes
         return {"due": due, "avg_minutes": round(avg_minutes, 1), "elapsed_minutes": round(elapsed_minutes, 1)}
 
+    def _record_zone_streak_round_event(self):
+        """Réplica en RONDAS de _record_zone_streak_time_event: registra (una
+        sola vez por racha, en el giro en que cruza el mínimo) el número de
+        ronda en que BAJA o ALTA alcanza ZONE_STREAK_MIN seguidas. Sirve para
+        calcular después cada cuántas rondas suele repetirse ese fenómeno en
+        cada zona (igual idea que calcularPrediccionInteligente de Spaceman,
+        pero contando giros en vez de segundos)."""
+        zone, streak = current_zone_streak(self.zone_history)
+        prev_zone, prev_streak = self._prev_zone_streak_round
+        just_crossed = (zone in ("ALTA", "BAJA") and streak >= ZONE_STREAK_MIN
+                         and not (prev_zone == zone and prev_streak >= ZONE_STREAK_MIN))
+        if just_crossed:
+            round_idx = len(self.zone_history)
+            events = self.zone_round_events.setdefault(zone, [])
+            events.append(round_idx)
+            if len(events) > ROUND_PREDICT_HISTORY_MAX:
+                del events[0]
+        self._prev_zone_streak_round = (zone, streak)
+
+    def _zone_round_due(self, zone: str) -> dict:
+        """Con el historial de rondas en que 'zone' hizo una racha de
+        ZONE_STREAK_MIN, calcula el intervalo promedio (en RONDAS) entre una
+        repetición y la siguiente —recortado siempre a la ventana pedida de
+        ROUND_PREDICT_WINDOW_MIN–MAX rondas—, predice en qué giro futuro
+        debería volver a caer esa misma zona, y confirma "en ronda" solo si
+        además el filtro EMA20/50 (ema_long_trend sobre alto_level_history)
+        favorece esa zona en este momento. Réplica exacta de _zone_time_due
+        pero adaptada por rondas en vez de tiempo real."""
+        events = self.zone_round_events.get(zone, [])
+        current_round = len(self.zone_history)
+        out = {"due": False, "avg_rounds": None, "elapsed_rounds": None, "predicted_round": None}
+        if len(events) < 2:
+            return out
+        ultimos = events[-min(ROUND_PREDICT_SAMPLE_WINDOW, len(events)):]
+        diffs = [ultimos[i] - ultimos[i - 1] for i in range(1, len(ultimos))]
+        if not diffs:
+            return out
+        promedio = sum(diffs) / len(diffs)
+        # Se aplica siempre el mismo valor entre 3 y 5 rondas (recorte pedido),
+        # en vez de dejar el promedio sin límites como en la versión de tiempo.
+        promedio_rondas = max(ROUND_PREDICT_WINDOW_MIN, min(ROUND_PREDICT_WINDOW_MAX, promedio))
+        ultimo_evento = events[-1]
+        predicted_round = ultimo_evento + round(promedio_rondas)
+        elapsed_rounds = current_round - ultimo_evento
+
+        long_trend_zone = ema_long_trend(self.alto_level_history)
+        trend_favorece = (long_trend_zone == "bullish" and zone == "ALTA") or \
+                          (long_trend_zone == "bearish" and zone == "BAJA")
+        due = (ROUND_PREDICT_WINDOW_MIN <= elapsed_rounds <= ROUND_PREDICT_WINDOW_MAX) and trend_favorece
+        return {"due": due, "avg_rounds": round(promedio_rondas, 1),
+                "elapsed_rounds": elapsed_rounds, "predicted_round": predicted_round}
+
     def _handle_signal_sequence(self, all_agents, last_number, bet_amount):
         candidates = []
         confirmation_resolved = False
@@ -2462,27 +2356,34 @@ class RouletteTable:
                 filtered.append((agente, score, cand))
             candidates = filtered
 
-        # ── Filtro de TIEMPO (réplica Spaceman): la señal solo dispara si la
-        # zona objetivo está dentro de la ventana de rondas predicha (la misma
-        # zona se repite cada ~3-5 rondas) Y su nivel confirma del lado correcto
-        # de EMA 20/50. Aplica por igual a señales de docenas y de zonas. ──
-        if TIMING_ZONE_ENABLED and candidates:
-            filtered_t = []
+        # Freno por "ronda predicha" (BAJA/ALTA): igual que el freno por
+        # frecuencia horaria de arriba, pero contando RONDAS en vez de
+        # minutos. Si para la zona del candidato ya hay un promedio de
+        # rondas calculado (>=2 rachas de ZONE_STREAK_MIN previas) y todavía
+        # no cayó dentro de la ventana de 3–5 rondas predicha (confirmada
+        # con EMA20/50), esa señal se descarta esta vuelta -> el bot espera.
+        # Si sí está "en ronda", se le da prioridad (mayor score). Aplica
+        # por igual a docenas y a zonas, ya que ambas ya vienen resueltas a
+        # una zona (bet_zone) en este punto.
+        if candidates:
+            filtered = []
             for agente, score, cand in candidates:
                 bz = cand.get("bet_zone")
                 zone = bz[0] if bz else None
-                if zone is None:
-                    # D1+D3: la zona real se decide como opuesta a la última no nula
-                    zone = "ALTA" if self.last_nonzero_zone == "BAJA" else "BAJA"
-                if not self.timing.zone_due(zone, self.total_spins_seen):
-                    log.info(f"⏳ {agente.name}: {zone} fuera de la ventana de tiempo prevista — señal retenida")
+                info = self.round_due_info.get(zone) if zone else None
+                if info is not None and info.get("avg_rounds") is not None and not info.get("due"):
+                    log.info(f"⏳ {agente.name}: señal a {zone} esperando ronda predicha "
+                             f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                             f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
                     continue
-                if not self.timing.ema_confirmed(zone, self.alto_level_history, self.bajo_level_history):
-                    log.info(f"📉 {agente.name}: nivel de {zone} no confirma sobre EMA 20/50 — señal retenida")
-                    continue
-                cand["timing_confirmed"] = True
-                filtered_t.append((agente, score, cand))
-            candidates = filtered_t
+                if zone in self.round_due_zones:
+                    cand["round_confirmed"] = True
+                    cand["round_due_info"] = info
+                    score = score * 1.25 + 0.05
+                else:
+                    cand["round_confirmed"] = False
+                filtered.append((agente, score, cand))
+            candidates = filtered
 
         # Secuencia activa
         if self.signal_status == "active":
@@ -2579,9 +2480,6 @@ class RouletteTable:
         if number != 0:
             self.last_nonzero_zone = z
 
-        # Predictor de tiempo: registrar en qué ronda cayó esta zona
-        self.timing.record(z, self.total_spins_seen)
-
         # ── Niveles de zona (ALTOS/BAJOS) para gráficos y S/R ──
         last_alto = self.alto_level_history[-1] if self.alto_level_history else 0
         last_bajo = self.bajo_level_history[-1] if self.bajo_level_history else 0
@@ -2645,6 +2543,14 @@ class RouletteTable:
             self._record_zone_streak_time_event(timestamp)
             self.time_due_info = {z: self._zone_time_due(z, timestamp) for z in ("ALTA", "BAJA")}
             self.time_due_zones = {z for z, info in self.time_due_info.items() if info["due"]}
+
+        # El predictor de "ronda de repetición" corre siempre (también durante
+        # el entrenamiento con histórico), a diferencia del de tiempo real: no
+        # depende de timestamps reales, solo de giros, así que se calienta con
+        # el historial igual que el resto de los agentes.
+        self._record_zone_streak_round_event()
+        self.round_due_info = {z: self._zone_round_due(z) for z in ("ALTA", "BAJA")}
+        self.round_due_zones = {z for z, info in self.round_due_info.items() if info["due"]}
 
         agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
         agent_keys = ["agent2", "agent3", "agent4", "agent6"]
@@ -2759,7 +2665,7 @@ class RouletteTable:
             "total_attempts": ZONE_MAX_ATTEMPTS if self.signal_status == "active" else 0,
             "last_nonzero_zone": self.last_nonzero_zone,
             "time_due_info": self.time_due_info,
-            "timing": self.timing.get_state(),
+            "round_due_info": self.round_due_info,
         }
 
 
@@ -3197,7 +3103,7 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
 
-    <div class="footer">La gestión Labouchère de este panel corre en tu navegador, independiente del Labouchère interno del bot. Soportes/resistencias: picos y valles agrupados (umbral 1.0) calculados en el servidor para los niveles ALTOS y BAJOS por separado. El 2º intento de las señales considera el rebote actual (ALCISTA→BAJA, BAJISTA→ALTA).</div>
+    <div class="footer">La gestión Labouchère de este panel corre en tu navegador, independiente del Labouchère interno del bot. Soportes/resistencias: picos/valleys agrupados (umbral 1.0) calculados en el servidor para los niveles ALTOS y BAJOS por separado. El 2º intento de las señales considera el rebote actual (ALCISTA→BAJA, BAJISTA→ALTA).</div>
 </div>
 
 <div id="signalAlert" class="signal-alert hidden">
@@ -3275,17 +3181,17 @@ DASHBOARD_HTML = r"""
         const hist = (state.spin_history || []).slice(-40);
         const zones = (state.zone_history || []).slice(-40);
         wrap.innerHTML = '';
-        // Orden: el número MÁS ANTIGUO va a la izquierda y el más reciente a
-        // la derecha. Los giros nuevos entran por la derecha y empujan a los
-        // anteriores hacia la izquierda (inserción derecha→izquierda), tanto
-        // con el lote inicial de ~20 rondas del servidor como con los giros
-        // en vivo. Solo cambia esta barra; la dirección del gráfico se mantiene.
-        for (let i = 0; i < hist.length; i++) {
+        // Se recorre de más reciente a más antiguo: el más reciente queda
+        // primero en el DOM (arriba a la izquierda) y los antiguos van
+        // quedando a la derecha. Esto NO afecta a los gráficos, que siguen
+        // dibujándose de izquierda a derecha con los más recientes a la derecha.
+        for (let i = hist.length - 1; i >= 0; i--) {
+            const spin = hist[i];
             const zone = zones[i] || 'VERDE';
             const cls = ZONE_CLASS[zone] || 'verde';
             const b = document.createElement('div');
             b.className = 'ball ' + cls;
-            b.textContent = hist[i].number;
+            b.textContent = spin.number;
             b.title = ZONE_LABEL[zone] || zone;
             wrap.appendChild(b);
         }
@@ -4108,7 +4014,6 @@ class ServerState:
                 table.zone_agent_streak.load_persist(data.get("zone_agent_streak"))
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
-                table.timing.load_persist(data.get("timing"))
                 log.info(f"Modelo cargado para mesa {key}")
         except Exception as e:
             log.warning(f"Error cargando modelo mesa {key}: {e}")
@@ -4131,7 +4036,6 @@ class ServerState:
             "zone_agent_streak": table.zone_agent_streak.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
             "history_seed_trained": self.history_seed_trained.get(key, False),
-            "timing": table.timing.to_persist(),
         }
         filename = f"model_{key}.json"
         try:
