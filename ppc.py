@@ -1,4 +1,5 @@
 
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT UNIFICADO — SPEED ROULETTE 2 (key 205)                 ║
@@ -3275,9 +3276,12 @@ DASHBOARD_HTML = r"""
         const hist = (state.spin_history || []).slice(-40);
         const zones = (state.zone_history || []).slice(-40);
         wrap.innerHTML = '';
-        // Orden: el ÚLTIMO número (más reciente) va arriba a la izquierda y
-        // los más antiguos se disponen hacia la derecha (y siguen filas abajo).
-        for (let i = hist.length - 1; i >= 0; i--) {
+        // Orden: el número MÁS ANTIGUO va a la izquierda y el más reciente a
+        // la derecha. Los giros nuevos entran por la derecha y empujan a los
+        // anteriores hacia la izquierda (inserción derecha→izquierda), tanto
+        // con el lote inicial de ~20 rondas del servidor como con los giros
+        // en vivo. Solo cambia esta barra; la dirección del gráfico se mantiene.
+        for (let i = 0; i < hist.length; i++) {
             const zone = zones[i] || 'VERDE';
             const cls = ZONE_CLASS[zone] || 'verde';
             const b = document.createElement('div');
