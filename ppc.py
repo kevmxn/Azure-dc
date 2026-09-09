@@ -1812,14 +1812,30 @@ class StreakZoneAgent:
         # acierto histórica no esté por debajo del mínimo exigido al resto
         # de los patrones (DOZEN_MIN_WIN_RATE). Sin entrenar todavía, se
         # deja pasar (igual que los demás agentes al arrancar en frío).
+        #
+        # Si la racha va EN CONTRA de la tendencia justo en su longitud
+        # normal, ya no se descarta directo: se espera 1 giro más (streak+1).
+        # Si en ese giro extra la tendencia se alineó, sigue como señal
+        # normal. Si sigue en contra, se envía igual pero marcada con
+        # "fallback_opposite" para que, si el 1er intento real falla, el
+        # reintento apueste a la zona OPUESTA en vez de repetir la racha.
         zone, streak = current_zone_streak(zone_history)
         streak_matches = (streak == self.min_streak) if self.exact_length else (streak >= self.min_streak)
-        if (zone is not None and streak_matches
+        streak_matches_extended = (streak == self.min_streak + 1) if self.exact_length else (streak >= self.min_streak + 1)
+        if (zone is not None and (streak_matches or streak_matches_extended)
                 and not self.train_state["active"] and not blocked
                 and self.cooldown_remaining <= 0):
-            if trend_zones is not None and zone not in trend_zones:
-                log.info(f"⛔ {self.name}: racha de {streak}x {zone} en contra de la tendencia EMA20/50, se descarta")
-                return
+            against_trend = trend_zones is not None and zone not in trend_zones
+            fallback_opposite = False
+            if against_trend:
+                if not streak_matches_extended:
+                    log.info(f"⏳ {self.name}: racha de {streak}x {zone} en contra de la tendencia EMA20/50, "
+                              f"se espera 1 giro más antes de decidir")
+                    return
+                fallback_opposite = True
+                log.info(f"⚠️ {self.name}: racha de {streak}x {zone} sigue en contra de la tendencia EMA20/50 "
+                          f"tras esperar 1 giro más → se envía igual, pero si falla el 1er intento el reintento "
+                          f"apostará a la zona OPUESTA")
             rate = self._win_rate(("RACHA", zone))
             if rate is not None and rate < DOZEN_MIN_WIN_RATE:
                 log.info(f"⛔ {self.name}: racha de {streak}x {zone} con tasa histórica {rate:.2f} < mínimo {DOZEN_MIN_WIN_RATE:.2f}, se descarta")
@@ -1839,7 +1855,7 @@ class StreakZoneAgent:
             self.candidate_signal = {
                 "pattern": ("RACHA", zone),
                 "bet_zone": (zone,),
-                "zone_sequence": [zone, zone],
+                "zone_sequence": [zone, ("ALTA" if zone == "BAJA" else "BAJA") if fallback_opposite else zone],
                 "context": context,
                 "streak": streak,
                 "amx_strength": 0.0,
@@ -1850,6 +1866,7 @@ class StreakZoneAgent:
                 "rebound_direction": rebound_direction,
                 "near_zero": False,
                 "start_attempt": start_attempt,
+                "fallback_opposite": fallback_opposite,
                 "recommended_attempt_by_rebound": rec_attempt_dir,
                 "recommended_attempt_by_rebound_pct": rec_pct_dir,
             }
@@ -1864,7 +1881,7 @@ class StreakZoneAgent:
                 "context": context, "current_attempt": 0, "start_attempt": 1,
                 "rebound_direction": rebound_direction,
             }
-            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'}, intento inicial: {start_attempt})")
+            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'}, intento inicial: {start_attempt}, fallback opuesto: {fallback_opposite})")
 
     def _close_shadow(self, win: bool, result_zone, attempt, timestamp):
         zone = self.train_state["bet_zone"]
@@ -2252,11 +2269,23 @@ class RouletteTable:
     REBOUND_FAVORED_ZONE = {"ALCISTA": "BAJA", "BAJISTA": "ALTA"}
 
     def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
-        # Ambos intentos de la señal apuntan siempre a la MISMA zona: ya no
-        # se invierte al lado opuesto en el 2º intento por racha, rebote,
+        # Por defecto ambos intentos de la señal apuntan a la MISMA zona: ya
+        # no se invierte al lado opuesto en el 2º intento por rebote,
         # cercanía al cero, tasa de 2º intento o AMX débil.
+        #
+        # EXCEPCIÓN: cuando la racha se envió "fallback_opposite" (iba en
+        # contra de la tendencia EMA20/50 incluso tras esperar 1 giro más),
+        # el reintento (el intento que sigue si falla el primero real) sí
+        # apuesta a la zona OPUESTA. Si además la señal arranca directo en
+        # intento 2 (start_attempt=2, se salta el 1), se agrega un "relleno"
+        # inicial (mismo valor que el primer intento real) para que los
+        # índices absolutos sigan alineados con current_signal_start_index.
         zone = bet_zone_tuple[0]
-        return [zone, zone]
+        start_attempt = candidate.get("start_attempt", 1)
+        fallback_opposite = bool(candidate.get("fallback_opposite"))
+        retry_zone = ("ALTA" if zone == "BAJA" else "BAJA") if fallback_opposite else zone
+        padding = max(start_attempt - 1, 0)
+        return [zone] * padding + [zone, retry_zone]
 
     def _prepare_new_signal(self, agent, candidate, last_number):
         bet_zone_tuple = candidate.get("bet_zone")
@@ -2543,7 +2572,7 @@ class RouletteTable:
             if attempt_idx < len(zone_sequence):
                 bet_zone = zone_sequence[attempt_idx]
             else:
-                bet_zone = zone_sequence[0]
+                bet_zone = zone_sequence[-1]
 
             is_win = zone_win(bet_zone, last_number)
             self.attempt_numbers.append(last_number if last_number is not None else 0)
