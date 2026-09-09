@@ -87,6 +87,12 @@ SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
 # ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
 ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
 
+# ── Segundo agente de RACHAS, fijo en 4 repeticiones exactas de la misma
+#    zona (independiente de ZONE_STREAK_MIN, que puede configurarse distinto
+#    por variable de entorno). Corre en paralelo al de arriba buscando la
+#    posibilidad de que la misma zona repita una vez más. ──
+ZONE_STREAK4_MIN = 4
+
 # ── Predictor de "ronda de repetición de zona" (BAJA/ALTA) — réplica en
 #    RONDAS del predictor de tiempo de Spaceman (calcularPrediccionInteligente
 #    / checkAutoPredictions), pero contando giros en vez de segundos: cada vez
@@ -518,7 +524,7 @@ def build_daily_marker_message(stats: dict) -> str:
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak"]
+    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak", "zone_agent_streak4"]
     lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -608,7 +614,7 @@ def _agent_ml_block(agente) -> str:
 
 def build_mlstatus_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak"]
+    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4", "zone_agent_streak", "zone_agent_streak4"]
     lines = ["🧠 ESTADO DEL MODELO (ML)"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -1916,6 +1922,7 @@ class RouletteTable:
         self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa · repite a)", daily_marker=self.daily_marker)
         self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa · repite a)", daily_marker=self.daily_marker)
         self.zone_agent_streak = StreakZoneAgent(min_streak=ZONE_STREAK_MIN, name="ZONE_STREAK", label=f"🔥 RACHA (>={ZONE_STREAK_MIN}x misma zona)", daily_marker=self.daily_marker)
+        self.zone_agent_streak4 = StreakZoneAgent(min_streak=ZONE_STREAK4_MIN, name="ZONE_STREAK4", label=f"🔥 RACHA x{ZONE_STREAK4_MIN} (repetición misma zona)", daily_marker=self.daily_marker)
 
         self.level_history = []
         self.level_current = 0
@@ -2543,7 +2550,7 @@ class RouletteTable:
                           last_number=number, live_enabled=live_ok,
                           rebound_direction=self.last_rebound_direction)
 
-        zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4, self.zone_agent_streak]
+        zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4, self.zone_agent_streak, self.zone_agent_streak4]
         for zagente in zone_agents:
             blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
@@ -2606,6 +2613,7 @@ class RouletteTable:
             "zone_agent3": self.zone_agent3.get_state(),
             "zone_agent4": self.zone_agent4.get_state(),
             "zone_agent_streak": self.zone_agent_streak.get_state(),
+            "zone_agent_streak4": self.zone_agent_streak4.get_state(),
             "trend": self.trend,
             "trend_favored_dozens": sorted(NUM_DOZEN[d] for d in trend_favored_dozens(self.trend)),
             "rebound_direction": self.last_rebound_direction,
@@ -3919,7 +3927,7 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
                 await asyncio.sleep(0)
         agents = [table.agent2, table.agent3, table.agent4, table.agent6,
                   table.zone_agent1, table.zone_agent2, table.zone_agent3, table.zone_agent4,
-                  table.zone_agent_streak]
+                  table.zone_agent_streak, table.zone_agent_streak4]
         for agent in agents:
             agent.force_train(timestamp)
         log.info(f"[Entrenamiento] Mesa {table.key}: entrenamiento forzado tras bloque {start//BATCH_SIZE + 1}")
@@ -3975,6 +3983,7 @@ class ServerState:
                 table.zone_agent3.load_persist(data.get("zone_agent3"))
                 table.zone_agent4.load_persist(data.get("zone_agent4"))
                 table.zone_agent_streak.load_persist(data.get("zone_agent_streak"))
+                table.zone_agent_streak4.load_persist(data.get("zone_agent_streak4"))
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
                 log.info(f"Modelo cargado para mesa {key}")
@@ -3997,6 +4006,7 @@ class ServerState:
             "zone_agent3": table.zone_agent3.to_persist(),
             "zone_agent4": table.zone_agent4.to_persist(),
             "zone_agent_streak": table.zone_agent_streak.to_persist(),
+            "zone_agent_streak4": table.zone_agent_streak4.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
             "history_seed_trained": self.history_seed_trained.get(key, False),
         }
