@@ -1436,11 +1436,8 @@ class ZonePatternAgent:
                         log.info(f"🔄 {self.name}: cero cerca (distancia {distance_from_end} desde el final), se invertirá la secuencia")
 
                 context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
-                opposite = "ALTA" if predicted_zone == "BAJA" else "BAJA"
-                if near_zero:
-                    zone_sequence = [opposite, predicted_zone]
-                else:
-                    zone_sequence = [predicted_zone, opposite]
+                # Ambos intentos apuntan a la misma zona (ver _determine_zone_sequence).
+                zone_sequence = [predicted_zone, predicted_zone]
 
                 rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(pattern_tuple, rebound_direction)
                 self.candidate_signal = {
@@ -2091,45 +2088,11 @@ class RouletteTable:
     REBOUND_FAVORED_ZONE = {"ALCISTA": "BAJA", "BAJISTA": "ALTA"}
 
     def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
-        rebound_dir = candidate.get("rebound_direction", "NEUTRAL")
-        favored = self.REBOUND_FAVORED_ZONE.get(rebound_dir)
-        if candidate.get("is_streak"):
-            # RACHA: intento 1 a favor de la racha. Si el intento 1 pierde, el intento 2
-            # cambia de dirección (va a la zona contraria).
-            zone = bet_zone_tuple[0]
-            opposite = "ALTA" if zone == "BAJA" else "BAJA"
-            return [zone, opposite]
-        if isinstance(agent, ZonePatternAgent):
-            seq = list(candidate.get("zone_sequence") or [])
-            # El rebote manda en la predicción del segundo intento (salvo inversión por cero)
-            if favored and len(seq) >= 2 and not candidate.get("near_zero"):
-                if seq[1] != favored:
-                    log.info(f"🌊 {agent.name}: rebote {rebound_dir} favorece {favored} → 2º intento a {favored}")
-                seq[1] = favored
-            return seq
-        else:
-            zone = bet_zone_tuple[0]
-            # 1) Rebote con señal clara: el 2º intento va a la zona favorecida por el rebote
-            if favored:
-                log.info(f"🌊 {agent.name}: rebote {rebound_dir} favorece {favored} → 2º intento a {favored}")
-                return [zone, favored]
-            # 2) Sin rebote claro: lógica previa (tasa de 2º intento del modelo / AMX)
-            pattern = candidate["pattern"]
-            second_rate = agent._second_attempt_win_rate(pattern)
-            use_opposite = False
-            if second_rate is not None:
-                if second_rate < SECOND_ATTEMPT_OPPOSITE_THRESHOLD:
-                    use_opposite = True
-                    log.info(f"🔄 {agent.name} patrón {pattern}: segundo intento al mismo lado tiene tasa {second_rate:.2f} < umbral, se usará opuesto")
-            else:
-                if amx_strength < AMX_STRENGTH_THRESHOLDS["weak"]:
-                    use_opposite = True
-                    log.info(f"🔄 {agent.name} patrón {pattern}: sin datos de segundo intento, AMX débil ({amx_strength:.2f}), se usará opuesto")
-            if use_opposite:
-                opposite = "ALTA" if zone == "BAJA" else "BAJA"
-                return [zone, opposite]
-            else:
-                return [zone, zone]
+        # Ambos intentos de la señal apuntan siempre a la MISMA zona: ya no
+        # se invierte al lado opuesto en el 2º intento por racha, rebote,
+        # cercanía al cero, tasa de 2º intento o AMX débil.
+        zone = bet_zone_tuple[0]
+        return [zone, zone]
 
     def _prepare_new_signal(self, agent, candidate, last_number):
         bet_zone_tuple = candidate.get("bet_zone")
