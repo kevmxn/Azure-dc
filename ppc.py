@@ -123,7 +123,7 @@ def _parse_streak_lengths(raw: str, fallback):
     except Exception:
         return list(fallback)
 
-ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS", "3,4,5,6,7"), [3, 4, 5, 6, 7])
+ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS", "2,3,4,5,6,7"), [2, 3, 4, 5, 6, 7])
 
 # ── Umbral mínimo (%) de aciertos en INTENTO 2 vs INTENTO 1, condicionado al
 #    rebote actual, para que un agente de racha decida ENTRAR DIRECTAMENTE EN
@@ -131,6 +131,27 @@ ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS"
 #    este umbral (o sin datos suficientes) se sigue entrando en el intento 1,
 #    como siempre. ──
 STREAK_SECOND_ENTRY_MIN_PCT = float(os.environ.get("STREAK_SECOND_ENTRY_MIN_PCT", "60.0"))
+
+# ── Detección de mercado LATERAL: si en las últimas LATERAL_LOOKBACK_ROUNDS
+#    rondas (ALTA/BAJA, sin contar VERDE) hay cambios de dirección muy
+#    seguidos entre rachas (>= LATERAL_MIN_CHANGE_RATIO de los giros cambian
+#    respecto al anterior), la ruleta viene "picada"/sin tendencia clara. En
+#    ese caso, los agentes de racha entran DIRECTO en el intento 2 (se saltan
+#    el 1), sin importar lo que diga el análisis por rebote. ──
+LATERAL_LOOKBACK_ROUNDS = int(os.environ.get("LATERAL_LOOKBACK_ROUNDS", "60"))
+LATERAL_MIN_CHANGE_RATIO = float(os.environ.get("LATERAL_MIN_CHANGE_RATIO", "0.5"))
+
+
+def is_lateral_market(zone_history, lookback=LATERAL_LOOKBACK_ROUNDS, min_ratio=LATERAL_MIN_CHANGE_RATIO):
+    """True si en las últimas `lookback` rondas la zona (ALTA/BAJA) cambia de
+    dirección respecto a la anterior en al menos `min_ratio` de los casos
+    (mercado lateral/sin tendencia). Ignora los VERDE al comparar."""
+    recent = [z for z in zone_history[-lookback:] if z in ("ALTA", "BAJA")]
+    if len(recent) < 10:
+        return False
+    comparisons = len(recent) - 1
+    changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i - 1])
+    return (changes / comparisons) >= min_ratio
 
 
 # ── Predictor de "ronda de repetición de zona" (BAJA/ALTA) — réplica en
@@ -1614,15 +1635,17 @@ class ZonePatternAgent:
 
 
 def current_zone_streak(zone_history):
-    """Devuelve (zona, largo) de la racha actual de la misma zona (VERDE corta la racha)."""
+    """Devuelve (zona, largo) de la racha actual de la misma zona.
+    El 0 (VERDE) ya NO corta la racha: se cuenta como parte de ella."""
     streak = 0
     zone = None
     for z in reversed(zone_history):
         if z == "VERDE":
-            break
+            streak += 1
+            continue
         if zone is None:
             zone = z
-            streak = 1
+            streak += 1
         elif z == zone:
             streak += 1
         else:
@@ -1833,7 +1856,12 @@ class StreakZoneAgent:
             # este rebote) conviene entrar directo en el INTENTO 2? ──
             rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(zone, rebound_direction)
             start_attempt = 1
-            if (rec_attempt_dir == 2 and rec_pct_dir is not None
+            lateral = is_lateral_market(zone_history)
+            if lateral:
+                start_attempt = 2
+                log.info(f"↔️ {self.name}: mercado LATERAL (cambios de dirección seguidos en últimas "
+                          f"{LATERAL_LOOKBACK_ROUNDS} rondas) → ENTRAR DIRECTO EN INTENTO 2 para {zone}")
+            elif (rec_attempt_dir == 2 and rec_pct_dir is not None
                     and rec_pct_dir >= STREAK_SECOND_ENTRY_MIN_PCT):
                 start_attempt = 2
                 log.info(f"🎯 {self.name}: análisis de rondas → ENTRAR DIRECTO EN INTENTO 2 para {zone} "
