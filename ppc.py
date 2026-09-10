@@ -1,34 +1,33 @@
 
-
 """
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘   BOT UNIFICADO â€” SPEED ROULETTE 2 (key 205)                 â•‘
-â•‘   - DetecciÃ³n: 4 agentes de PATRONES DE DOCENAS              â•‘
-â•‘       V2: aaba (4)  |  V3: aaaba (5)                        â•‘
-â•‘       V4: abaa (4)  |  V6: aaaabaa (7)                     â•‘
-â•‘   - Agentes de ZONA: baaaabbb, aaaabbbbaa,                 â•‘
-â•‘     aaabaa (a,a,a,b,a,a) y aaabbaa (a,a,a,b,b,a,a)         â•‘
-â•‘   - Agente de RACHAS: seÃ±al permisiva si la misma zona     â•‘
-â•‘     sale ZONE_STREAK_MIN veces seguidas (sin patrÃ³n ni ML) â•‘
-â•‘   - SeÃ±ales D1+D2/D2+D3: todos los agentes, sin modelo      â•‘
-â•‘   - SeÃ±ales D1+D3: solo agentes de 4 valores y             â•‘
-â•‘     requieren modelo entrenado                              â•‘
-â•‘   - ConversiÃ³n: D1+D2 -> BAJA, D2+D3 -> ALTA,              â•‘
-â•‘     D1+D3 -> opuesto de Ãºltima zona                        â•‘
-â•‘   - Para D1+D2 y D2+D3, el segundo intento puede ser       â•‘
-â•‘     opuesto si el modelo indica baja efectividad del        â•‘
-â•‘     segundo intento al mismo lado (tendencia agotamiento)  â•‘
-â•‘   - ConfirmaciÃ³n de patrÃ³n "-1 valor"                       â•‘
-â•‘   - 2 intentos para ZONA (apuestas), 3 intentos para ML      â•‘
-â•‘   - GestiÃ³n LabouchÃ¨re + marcador diario (win1/win2/loss)   â•‘
-â•‘   - Mensajes combinados: resoluciÃ³n + nueva seÃ±al          â•‘
-â•‘   - Telegram / HTTP API / self-ping / persistencia           â•‘
-â•‘   - Tendencia global basada en 20 giros                      â•‘
-â•‘   - 2Âº intento considera rebote (ALCISTAâ†’BAJA/BAJISTAâ†’ALTA) â•‘
-â•‘   - Interfaz web (/dashboard) con DOS grÃ¡ficos (ALTOS y    â•‘
-â•‘     BAJOS) + lÃ­neas de soporte/resistencia y gestiÃ³n        â•‘
-â•‘     LabouchÃ¨re integrada                                    â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+╔══════════════════════════════════════════════════════════════╗
+║   BOT UNIFICADO — SPEED ROULETTE 2 (key 205)                 ║
+║   - Detección: 4 agentes de PATRONES DE DOCENAS              ║
+║       V2: aaba (4)  |  V3: aaaba (5)                        ║
+║       V4: abaa (4)  |  V6: aaaabaa (7)                     ║
+║   - Agentes de ZONA: baaaabbb, aaaabbbbaa,                 ║
+║     aaabaa (a,a,a,b,a,a) y aaabbaa (a,a,a,b,b,a,a)         ║
+║   - Agente de RACHAS: señal permisiva si la misma zona     ║
+║     sale ZONE_STREAK_MIN veces seguidas (sin patrón ni ML) ║
+║   - Señales D1+D2/D2+D3: todos los agentes, sin modelo      ║
+║   - Señales D1+D3: solo agentes de 4 valores y             ║
+║     requieren modelo entrenado                              ║
+║   - Conversión: D1+D2 -> BAJA, D2+D3 -> ALTA,              ║
+║     D1+D3 -> opuesto de última zona                        ║
+║   - Para D1+D2 y D2+D3, el segundo intento puede ser       ║
+║     opuesto si el modelo indica baja efectividad del        ║
+║     segundo intento al mismo lado (tendencia agotamiento)  ║
+║   - Confirmación de patrón "-1 valor"                       ║
+║   - 2 intentos para ZONA (apuestas), 3 intentos para ML      ║
+║   - Gestión Labouchère + marcador diario (win1/win2/loss)   ║
+║   - Mensajes combinados: resolución + nueva señal          ║
+║   - Telegram / HTTP API / self-ping / persistencia           ║
+║   - Tendencia global basada en 20 giros                      ║
+║   - 2º intento considera rebote (ALCISTA→BAJA/BAJISTA→ALTA) ║
+║   - Interfaz web (/dashboard) con DOS gráficos (ALTOS y    ║
+║     BAJOS) + líneas de soporte/resistencia y gestión        ║
+║     Labouchère integrada                                    ║
+╚══════════════════════════════════════════════════════════════
 """
 
 import asyncio
@@ -51,9 +50,9 @@ except ImportError:
     AsyncTeleBot = None
     TELEBOT_OK = False
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  CONFIGURACIÃ“N
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────
+#  CONFIGURACIÓN
+# ──────────────────────────────────────────────
 WS_URL        = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID     = "ppcdk00000005349"
 CURRENCY_ID   = "BRL"
@@ -62,23 +61,23 @@ SAVE_INTERVAL = 30
 
 ROULETTE_KEYS = {205: 205}   # Speed Roulette 2
 
-# â”€â”€ LÃ³gica de docenas (detecciÃ³n) â”€â”€
+# ── Lógica de docenas (detección) ──
 DOZEN_MAX_ATTEMPTS = 3          # para entrenamiento del modelo
-ZONE_MAX_ATTEMPTS = 2           # para apuestas reales (seÃ±ales de zona)
+ZONE_MAX_ATTEMPTS = 2           # para apuestas reales (señales de zona)
 DOZEN_BACKTEST_WINDOW = 60
 DOZEN_CONTEXT_WINDOW = 20
 DOZEN_MIN_SAMPLES_GATE = 6
 DOZEN_MIN_WIN_RATE = 0.30
 DOZEN_MIN_SPIN_TO_SIGNAL = 21
 
-# â”€â”€ Umbral final de EFECTIVIDAD para que una seÃ±al se envÃ­e a Telegram.
+# ── Umbral final de EFECTIVIDAD para que una señal se envíe a Telegram.
 #    Los patrones se siguen detectando, confirmando y entrenando (shadow)
-#    normalmente aunque su tasa estÃ© por debajo de esto; lo Ãºnico que
-#    cambia es que no se disparan como seÃ±al real hasta que su win-rate
-#    entrenado alcance este mÃ­nimo. â”€â”€
+#    normalmente aunque su tasa esté por debajo de esto; lo único que
+#    cambia es que no se disparan como señal real hasta que su win-rate
+#    entrenado alcance este mínimo. ──
 SIGNAL_SEND_MIN_WIN_RATE = 0.80
 
-# â”€â”€ Entrenamiento ML â”€â”€
+# ── Entrenamiento ML ──
 ML_MIN_SIGNALS_TO_TRAIN = 50
 ML_RETRAIN_INTERVAL_SECONDS = 30 * 60
 
@@ -89,25 +88,25 @@ AMX_ADJUST_FACTOR_WEAK = 1.2
 DOZEN_COOLDOWN_AFTER_LOSSES = 3
 DOZEN_COOLDOWN_ROUNDS = 5
 
-# â”€â”€ Umbral para decidir opuesto en segundo intento â”€â”€
+# ── Umbral para decidir opuesto en segundo intento ──
 SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
 
-# â”€â”€ Agente de RACHAS: seÃ±al permisiva cuando la misma zona sale N veces seguidas â”€â”€
+# ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
 ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
 
-# â”€â”€ Segundo agente de RACHAS, fijo en 4 repeticiones exactas de la misma
+# ── Segundo agente de RACHAS, fijo en 4 repeticiones exactas de la misma
 #    zona (independiente de ZONE_STREAK_MIN, que puede configurarse distinto
 #    por variable de entorno). Corre en paralelo al de arriba buscando la
-#    posibilidad de que la misma zona repita una vez mÃ¡s. â”€â”€
+#    posibilidad de que la misma zona repita una vez más. ──
 ZONE_STREAK4_MIN = 4
 
-# â”€â”€ Familia de agentes de RACHA por longitud exacta: 3,4,5,6,7 repeticiones
-#    seguidas de la misma zona (configurable vÃ­a ZONE_STREAK_LENGTHS, coma-
-#    separado). Cada longitud tiene su propio agente y su propia estadÃ­stica
+# ── Familia de agentes de RACHA por longitud exacta: 3,4,5,6,7 repeticiones
+#    seguidas de la misma zona (configurable vía ZONE_STREAK_LENGTHS, coma-
+#    separado). Cada longitud tiene su propio agente y su propia estadística
 #    (win-rate, intento recomendado, etc.), de forma que una racha de 5 no
-#    se mezcla con la de 3 o la de 7: cada una analiza "su" situaciÃ³n por
-#    separado. La longitud MÃS LARGA configurada queda abierta (>=) para
-#    seguir cubriendo rachas todavÃ­a mÃ¡s largas (8, 9, ...); las demÃ¡s
+#    se mezcla con la de 3 o la de 7: cada una analiza "su" situación por
+#    separado. La longitud MÁS LARGA configurada queda abierta (>=) para
+#    seguir cubriendo rachas todavía más largas (8, 9, ...); las demás
 #    disparan solo en el momento EXACTO en que la racha llega a esa
 #    longitud (para no relanzar la misma racha varias veces).
 def _parse_streak_lengths(raw: str, fallback):
@@ -119,31 +118,31 @@ def _parse_streak_lengths(raw: str, fallback):
 
 ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS", "3,4,5,6,7"), [3, 4, 5, 6, 7])
 
-# â”€â”€ Umbral mÃ­nimo (%) de aciertos en INTENTO 2 vs INTENTO 1, condicionado al
+# ── Umbral mínimo (%) de aciertos en INTENTO 2 vs INTENTO 1, condicionado al
 #    rebote actual, para que un agente de racha decida ENTRAR DIRECTAMENTE EN
-#    EL INTENTO 2 (saltÃ¡ndose el 1) y avisar asÃ­ por Telegram. Por debajo de
+#    EL INTENTO 2 (saltándose el 1) y avisar así por Telegram. Por debajo de
 #    este umbral (o sin datos suficientes) se sigue entrando en el intento 1,
-#    como siempre. â”€â”€
+#    como siempre. ──
 STREAK_SECOND_ENTRY_MIN_PCT = float(os.environ.get("STREAK_SECOND_ENTRY_MIN_PCT", "60.0"))
 
 
-# â”€â”€ Predictor de "ronda de repeticiÃ³n de zona" (BAJA/ALTA) â€” rÃ©plica en
+# ── Predictor de "ronda de repetición de zona" (BAJA/ALTA) — réplica en
 #    RONDAS del predictor de tiempo de Spaceman (calcularPrediccionInteligente
 #    / checkAutoPredictions), pero contando giros en vez de segundos: cada vez
-#    que una zona hace una racha de ZONE_STREAK_MIN, se guarda en quÃ© giro
-#    ocurriÃ³; el promedio de giros entre las Ãºltimas repeticiones (recortado
-#    siempre a la ventana de ROUND_PREDICT_WINDOW_MINâ€“MAX rondas pedida)
-#    predice en quÃ© ronda futura deberÃ­a volver a caer esa misma zona. Solo
-#    se confirma "en ronda" si ademÃ¡s el filtro EMA20/50 (ema_long_trend)
+#    que una zona hace una racha de ZONE_STREAK_MIN, se guarda en qué giro
+#    ocurrió; el promedio de giros entre las últimas repeticiones (recortado
+#    siempre a la ventana de ROUND_PREDICT_WINDOW_MIN–MAX rondas pedida)
+#    predice en qué ronda futura debería volver a caer esa misma zona. Solo
+#    se confirma "en ronda" si además el filtro EMA20/50 (ema_long_trend)
 #    favorece esa zona en ese momento. Se usa como filtro COMPARTIDO de
 #    docenas Y zonas (las docenas ya se resuelven a BAJA/ALTA antes de este
-#    punto, asÃ­ que el mismo filtro aplica a ambas).
+#    punto, así que el mismo filtro aplica a ambas).
 ROUND_PREDICT_SAMPLE_WINDOW = int(os.environ.get("ROUND_PREDICT_SAMPLE_WINDOW", "5"))
 ROUND_PREDICT_WINDOW_MIN = int(os.environ.get("ROUND_PREDICT_WINDOW_MIN", "3"))
 ROUND_PREDICT_WINDOW_MAX = int(os.environ.get("ROUND_PREDICT_WINDOW_MAX", "5"))
 ROUND_PREDICT_HISTORY_MAX = int(os.environ.get("ROUND_PREDICT_HISTORY_MAX", "15"))
 
-# â”€â”€ LabouchÃ¨re (gestiÃ³n de capital, de Roulette 1) â”€â”€
+# ── Labouchère (gestión de capital, de Roulette 1) ──
 LABOUCHERE_BASE_AMOUNT = 500
 LABOUCHERE_INITIAL_SEQUENCE = [1, 1, 1, 1, 1]
 
@@ -160,9 +159,9 @@ DOZEN_VALUES = ("D1", "D2", "D3")
 DOZEN_NUM = {"D1": 1, "D2": 2, "D3": 3, "VERDE": 0}
 NUM_DOZEN = {1: "D1", 2: "D2", 3: "D3"}
 
-# â”€â”€ Zonas (apuesta real, mensajes de Roulette 1) â”€â”€
+# ── Zonas (apuesta real, mensajes de Roulette 1) ──
 ZONE_VALUES = ("BAJA", "ALTA", "VERDE")
-ZONE_EMOJI = {"BAJA": "ðŸ”µ", "ALTA": "ðŸŸ ", "VERDE": "ðŸŸ¢"}
+ZONE_EMOJI = {"BAJA": "🔵", "ALTA": "🟠", "VERDE": "🟢"}
 ZONE_NUM = {"BAJA": 1, "ALTA": 2, "VERDE": 0}
 NUM_ZONE = {1: "BAJA", 2: "ALTA", 0: "VERDE"}
 
@@ -180,7 +179,7 @@ AGENT_TREND_CONFIG = {
     "agent6": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
 }
 
-# â”€â”€ Telegram â”€â”€
+# ── Telegram ──
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHAT_ID_BASE   = int(os.environ.get("CHAT_ID_BASE", "-1003986868798"))
 THREAD_SIGNALS = int(os.environ.get("THREAD_SIGNALS", "4396"))
@@ -193,18 +192,18 @@ TABLE_NAME     = "Ruleta: Speed Roulette 2"   # <-- CAMBIO SOLICITADO
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────
 #  LOGGING
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     datefmt="%H:%M:%S", handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger(__name__)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  FUNCIONES AUXILIARES
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 def color_of(n):
     return REAL_COLOR_MAP.get(n, "VERDE")
 
@@ -223,7 +222,7 @@ def zone_win(zone: str, number) -> bool:
     if number is None:
         return False
     if number == 0:
-        # El cero se considera acierto (gana) para cualquier seÃ±al de zona.
+        # El cero se considera acierto (gana) para cualquier señal de zona.
         return True
     if zone == "BAJA":
         return 1 <= number <= 18
@@ -342,11 +341,11 @@ EMA_LONG_SLOW = 50
 def ema_long_trend(level_history, fast=EMA_LONG_FAST, slow=EMA_LONG_SLOW):
     """Filtro de tendencia de largo plazo (EMA20 vs EMA50) sobre un historial
     de nivel (funciona tanto para el nivel de docenas como para el de zonas,
-    ya que ambos son el mismo tipo de "paseo" numÃ©rico +1/-1).
+    ya que ambos son el mismo tipo de "paseo" numérico +1/-1).
     'bullish': nivel actual > EMA20 > EMA50 (favorece D2/D3 o ALTA).
     'bearish': nivel actual < EMA20 < EMA50 (favorece D1/D2 o BAJA).
-    Devuelve None si todavÃ­a no hay suficiente historial (no se aplica el
-    filtro en frÃ­o, para no bloquear el bot al arrancar)."""
+    Devuelve None si todavía no hay suficiente historial (no se aplica el
+    filtro en frío, para no bloquear el bot al arrancar)."""
     if len(level_history) < slow + 1:
         return None
     ema_fast = calc_ema(level_history, fast)
@@ -364,9 +363,9 @@ def ema_long_trend(level_history, fast=EMA_LONG_FAST, slow=EMA_LONG_SLOW):
     return "neutral"
 
 def trend_favored_zones(trend):
-    """AnÃ¡logo a trend_favored_dozens pero para ALTA/BAJA. A diferencia de
-    las docenas (3 categorÃ­as), acÃ¡ 'neutral' o sin datos no restringe
-    ninguna zona, ya que no hay una tercera opciÃ³n intermedia."""
+    """Análogo a trend_favored_dozens pero para ALTA/BAJA. A diferencia de
+    las docenas (3 categorías), acá 'neutral' o sin datos no restringe
+    ninguna zona, ya que no hay una tercera opción intermedia."""
     if trend == "bullish":
         return {"ALTA"}
     if trend == "bearish":
@@ -374,9 +373,9 @@ def trend_favored_zones(trend):
     return {"ALTA", "BAJA"}
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-#  LABOUCHÃˆRE MANAGER
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
+#  LABOUCHÈRE MANAGER
+# ══════════════════════════════════════════════
 class LabouchereManager:
     def __init__(self, base_amount: int = LABOUCHERE_BASE_AMOUNT,
                  initial_sequence: List[int] = None):
@@ -407,9 +406,9 @@ class LabouchereManager:
         self.base_amount = LABOUCHERE_BASE_AMOUNT
         self.sequence = list(self.initial_sequence)
         self.current_bet = self._calculate_bet()
-        log.info(f"â™¾ï¸ GESTIÃ“N REINICIADA Â· Acumulado: {'+' if self.balance >= 0 else '-'}"
-                 f"{format_cop(abs(self.balance))} Â· "
-                 f"Base: {format_cop(self.base_amount)} Â· Secuencia: [{self.seq_str()}] Â· "
+        log.info(f"♾️ GESTIÓN REINICIADA · Acumulado: {'+' if self.balance >= 0 else '-'}"
+                 f"{format_cop(abs(self.balance))} · "
+                 f"Base: {format_cop(self.base_amount)} · Secuencia: [{self.seq_str()}] · "
                  f"Apuesta: {format_cop(self.current_bet)}")
 
     def update(self, win: bool) -> bool:
@@ -438,7 +437,7 @@ class LabouchereManager:
 
         if not self.sequence:
             self.cycles_completed += 1
-            log.info(f"ðŸ’° CICLO LABOUCHÃˆRE COMPLETADO #{self.cycles_completed}")
+            log.info(f"💰 CICLO LABOUCHÈRE COMPLETADO #{self.cycles_completed}")
             self._restart_cycle()
             return True
         else:
@@ -460,12 +459,12 @@ class LabouchereManager:
         }
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  TELEGRAM
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 bot = AsyncTeleBot(BOT_TOKEN, parse_mode="HTML") if (TELEBOT_OK and BOT_TOKEN) else None
 if bot is None:
-    log.warning("Telegram deshabilitado (falta BOT_TOKEN o la librerÃ­a 'telebot').")
+    log.warning("Telegram deshabilitado (falta BOT_TOKEN o la librería 'telebot').")
 
 async def send_msg(text: str, thread_id: int, retries: int = 3) -> Optional[int]:
     if bot is None: return None
@@ -511,31 +510,31 @@ async def delete_msg(msg_id: int) -> bool:
 
 def build_entry_message_zone(last_number, bet_zone, bet_amount=None, start_attempt=1, sequence_str: str = "") -> str:
     numero = last_number if last_number is not None else "-"
-    numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "ðŸŸ¢") if last_number is not None else ""
+    numero_emoji = ZONE_EMOJI.get(zone_of(last_number), "🟢") if last_number is not None else ""
     zone = bet_zone
     emoji = ZONE_EMOJI.get(zone, "")
     if zone == "BAJA":
-        zone_line = f"ðŸ§¨ ZONA BAJA: 1-18 ({emoji})"
+        zone_line = f"🧨 ZONA BAJA: 1-18 ({emoji})"
     elif zone == "ALTA":
-        zone_line = f"ðŸ§¨ ZONA ALTA: 19-36 ({emoji})"
+        zone_line = f"🧨 ZONA ALTA: 19-36 ({emoji})"
     else:
-        zone_line = f"ðŸ§¨ ZONA: -"
+        zone_line = f"🧨 ZONA: -"
     if bet_amount is not None:
-        apuesta_line = f"\nðŸ‡¨ðŸ‡´ APUESTA: {format_cop(bet_amount)}"
+        apuesta_line = f"\n🇨🇴 APUESTA: {format_cop(bet_amount)}"
     else:
         apuesta_line = ""
-    link_line = f'ðŸŽ® <a href="{TABLE_LINK}">{TABLE_NAME}</a>' if TABLE_LINK else f"ðŸŽ® {TABLE_NAME}"
-    return (f"ðŸ‘‰ INGRESAR DESPUÃ‰S: {numero} ({numero_emoji})\n"
+    link_line = f'🎮 <a href="{TABLE_LINK}">{TABLE_NAME}</a>' if TABLE_LINK else f"🎮 {TABLE_NAME}"
+    return (f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"{zone_line}\n"
             f"{apuesta_line}\n\n"
-            f"ðŸ’« Â¡Juegue con Responsabilidad!\n{link_line}")
+            f"💫 ¡Juegue con Responsabilidad!\n{link_line}")
 
 def build_resolution_message(win: bool, numbers: list, balance: int) -> str:
     numbers_str = " | ".join(str(n) for n in numbers)
     if win:
-        header = "âœ…âœ… ðŸ‘ðŸ»"
+        header = "✅✅ 👍🏻"
     else:
-        header = "âŒâŒ ðŸ‘ŽðŸ»"
+        header = "❌❌ 👎🏻"
     return f"{header} ({numbers_str}) | Apuesta: {format_cop(balance)}"
 
 def build_daily_marker_message(stats: dict) -> str:
@@ -544,29 +543,29 @@ def build_daily_marker_message(stats: dict) -> str:
     loss = stats.get("loss", 0)
     total = win1 + win2 + loss
     if total == 0:
-        return "ðŸ“† MARCADOR DIARIO\nSin seÃ±ales aÃºn."
+        return "📆 MARCADOR DIARIO\nSin señales aún."
     win1_pct = (win1 / total) * 100
     win2_pct = (win2 / total) * 100
     loss_pct = (loss / total) * 100
     global_pct = ((win1 + win2) / total) * 100
-    return (f"ðŸ“† MARCADOR DIARIO\n"
-            f"âœ… Win 1: {win1} | Acierto: {win1_pct:.2f}%\n"
-            f"âœ… Win 2: {win2} | Acierto: {win2_pct:.2f}%\n"
-            f"âŒ Loss: {loss} | Fallos: {loss_pct:.2f}%\n"
-            f"ðŸŽ¯ Total seÃ±ales: {total}\n"
-            f"ðŸ“ˆ Efectividad Global: {global_pct:.2f}%")
+    return (f"📆 MARCADOR DIARIO\n"
+            f"✅ Win 1: {win1} | Acierto: {win1_pct:.2f}%\n"
+            f"✅ Win 2: {win2} | Acierto: {win2_pct:.2f}%\n"
+            f"❌ Loss: {loss} | Fallos: {loss_pct:.2f}%\n"
+            f"🎯 Total señales: {total}\n"
+            f"📈 Efectividad Global: {global_pct:.2f}%")
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
     zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
-    lines = ["ðŸ“Š ESTADÃSTICAS POR PATRÃ“N"]
+    lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
     for key, table in server_state.tables.items():
-        lines.append(f"ðŸŽ² Mesa {key} ({TABLE_NAME})")
+        lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
         lab_state = table.labouchere.get_state()
         seq_str = ','.join(str(x) for x in lab_state['sequence'])
         sign = '+' if lab_state['balance'] >= 0 else '-'
-        lines.append(f"ðŸ’¹ LabouchÃ¨re | Acum: {sign}{format_cop(abs(lab_state['balance']))} | Sec: [{seq_str}] | Sig: {format_cop(lab_state['bet_amount'])} | Ciclos: {lab_state['cycles_completed']}")
-        lines.append(f"ðŸ”„ Rebote actual: {table.last_rebound_direction}")
+        lines.append(f"💹 Labouchère | Acum: {sign}{format_cop(abs(lab_state['balance']))} | Sec: [{seq_str}] | Sig: {format_cop(lab_state['bet_amount'])} | Ciclos: {lab_state['cycles_completed']}")
+        lines.append(f"🔄 Rebote actual: {table.last_rebound_direction}")
         for akey in agent_keys:
             agente = getattr(table, akey, None)
             if agente is None:
@@ -576,19 +575,19 @@ def build_status_message(server_state) -> str:
             won = s.get("won", 0)
             lost = s.get("lost", 0)
             rate = round((won / total) * 100, 1) if total else 0.0
-            estado = "ðŸŸ¢ activa" if agente.train_state["active"] else "âšª inactiva"
+            estado = "🟢 activa" if agente.train_state["active"] else "⚪ inactiva"
             rec_attempt, rec_pct = agente.overall_recommended_attempt()
-            rec_line = (f"ðŸ§  Intento recomendado: {rec_attempt} ({rec_pct}%)"
-                        if rec_attempt else "ðŸ§  Intento recomendado: aÃºn sin datos suficientes")
+            rec_line = (f"🧠 Intento recomendado: {rec_attempt} ({rec_pct}%)"
+                        if rec_attempt else "🧠 Intento recomendado: aún sin datos suficientes")
             rec_attempt_dir, rec_pct_dir = agente.overall_recommended_attempt_for_direction(table.last_rebound_direction)
-            rec_dir_line = (f"ðŸŒŠ Intento segÃºn rebote ({table.last_rebound_direction}): {rec_attempt_dir}"
+            rec_dir_line = (f"🌊 Intento según rebote ({table.last_rebound_direction}): {rec_attempt_dir}"
                              + (f" ({rec_pct_dir}%)" if rec_pct_dir is not None else " (usando general, pocos datos por rebote)")
-                             if rec_attempt_dir else "ðŸŒŠ Intento segÃºn rebote: aÃºn sin datos suficientes")
+                             if rec_attempt_dir else "🌊 Intento según rebote: aún sin datos suficientes")
             if agente.trained:
-                modelo_line = "ðŸ¤– Modelo: entrenado"
+                modelo_line = "🤖 Modelo: entrenado"
             else:
-                modelo_line = f"ðŸ¤– Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} seÃ±ales)"
-            lines.append(f"{agente.label}\nâœ… {won}  âŒ {lost}  ðŸŽ¯ {total}  ðŸ“ˆ {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
+                modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
+            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
         for zkey in zone_keys:
             agente = getattr(table, zkey, None)
             if agente is None:
@@ -598,19 +597,19 @@ def build_status_message(server_state) -> str:
             won = s.get("won", 0)
             lost = s.get("lost", 0)
             rate = round((won / total) * 100, 1) if total else 0.0
-            estado = "ðŸŸ¢ activa" if agente.train_state["active"] else "âšª inactiva"
+            estado = "🟢 activa" if agente.train_state["active"] else "⚪ inactiva"
             rec_attempt, rec_pct = agente.overall_recommended_attempt()
-            rec_line = (f"ðŸ§  Intento recomendado: {rec_attempt} ({rec_pct}%)"
-                        if rec_attempt else "ðŸ§  Intento recomendado: aÃºn sin datos suficientes")
+            rec_line = (f"🧠 Intento recomendado: {rec_attempt} ({rec_pct}%)"
+                        if rec_attempt else "🧠 Intento recomendado: aún sin datos suficientes")
             rec_attempt_dir, rec_pct_dir = agente.overall_recommended_attempt_for_direction(table.last_rebound_direction)
-            rec_dir_line = (f"ðŸŒŠ Intento segÃºn rebote ({table.last_rebound_direction}): {rec_attempt_dir}"
+            rec_dir_line = (f"🌊 Intento según rebote ({table.last_rebound_direction}): {rec_attempt_dir}"
                              + (f" ({rec_pct_dir}%)" if rec_pct_dir is not None else " (usando general, pocos datos por rebote)")
-                             if rec_attempt_dir else "ðŸŒŠ Intento segÃºn rebote: aÃºn sin datos suficientes")
+                             if rec_attempt_dir else "🌊 Intento según rebote: aún sin datos suficientes")
             if agente.trained:
-                modelo_line = "ðŸ¤– Modelo: entrenado"
+                modelo_line = "🤖 Modelo: entrenado"
             else:
-                modelo_line = f"ðŸ¤– Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} seÃ±ales)"
-            lines.append(f"{agente.label}\nâœ… {won}  âŒ {lost}  ðŸŽ¯ {total}  ðŸ“ˆ {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
+                modelo_line = f"🤖 Modelo: en entrenamiento ({agente.total_processed}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
+            lines.append(f"{agente.label}\n✅ {won}  ❌ {lost}  🎯 {total}  📈 {rate}%  {estado}\n{modelo_line}\n{rec_line}\n{rec_dir_line}")
     return "\n\n".join(lines)
 
 def _format_ago(timestamp: float) -> str:
@@ -626,9 +625,9 @@ def _format_ago(timestamp: float) -> str:
 def _agent_ml_block(agente) -> str:
     total = agente.total_processed
     if not agente.trained:
-        estado = f"âšª en entrenamiento ({total}/{ML_MIN_SIGNALS_TO_TRAIN} seÃ±ales)"
+        estado = f"⚪ en entrenamiento ({total}/{ML_MIN_SIGNALS_TO_TRAIN} señales)"
     else:
-        estado = f"ðŸŸ¢ entrenado Â· actualizado {_format_ago(agente.last_train_ts)} Â· prÃ³x. reentrenamiento cada {ML_RETRAIN_INTERVAL_SECONDS // 60}min"
+        estado = f"🟢 entrenado · actualizado {_format_ago(agente.last_train_ts)} · próx. reentrenamiento cada {ML_RETRAIN_INTERVAL_SECONDS // 60}min"
 
     snapshot = agente.trained_snapshot or {}
     patrones_con_datos = [(k, v) for k, v in snapshot.items() if len(v) >= DOZEN_MIN_SAMPLES_GATE]
@@ -636,29 +635,29 @@ def _agent_ml_block(agente) -> str:
     n_patrones = len(patrones_con_datos)
     n_total_patrones = len(snapshot)
 
-    lines = [f"{agente.label}", estado, f"ðŸ§¬ Patrones observados: {n_total_patrones} Â· con muestra suficiente (â‰¥{DOZEN_MIN_SAMPLES_GATE}): {n_patrones}"]
+    lines = [f"{agente.label}", estado, f"🧬 Patrones observados: {n_total_patrones} · con muestra suficiente (≥{DOZEN_MIN_SAMPLES_GATE}): {n_patrones}"]
     if patrones_con_datos:
-        lines.append("ðŸ” Top patrones por muestra:")
+        lines.append("🔝 Top patrones por muestra:")
         for key, arr in patrones_con_datos[:3]:
             c1 = sum(1 for e in arr if agente._entry_attempt(e) == 1)
             c2 = sum(1 for e in arr if agente._entry_attempt(e) == 2)
             win_rate = sum(1 for e in arr if agente._entry_attempt(e) > 0) / len(arr) * 100
-            lines.append(f"   Â· {key}: {len(arr)} muestras Â· {win_rate:.1f}% acierto Â· int1={c1} int2={c2}")
+            lines.append(f"   · {key}: {len(arr)} muestras · {win_rate:.1f}% acierto · int1={c1} int2={c2}")
     return "\n".join(lines)
 
 def build_mlstatus_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4", "agent6"]
     zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
-    lines = ["ðŸ§  ESTADO DEL MODELO (ML)"]
+    lines = ["🧠 ESTADO DEL MODELO (ML)"]
     for key, table in server_state.tables.items():
-        lines.append(f"ðŸŽ² Mesa {key} ({TABLE_NAME})")
-        lines.append("â€” Patrones de DOCENAS â€”")
+        lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
+        lines.append("— Patrones de DOCENAS —")
         for akey in agent_keys:
             agente = getattr(table, akey, None)
             if agente is None:
                 continue
             lines.append(_agent_ml_block(agente))
-        lines.append("â€” Patrones de ZONAS â€”")
+        lines.append("— Patrones de ZONAS —")
         for zkey in zone_keys:
             agente = getattr(table, zkey, None)
             if agente is None:
@@ -670,7 +669,7 @@ if bot is not None:
     @bot.message_handler(commands=["status"])
     async def handle_status_command(message):
         if _server_state is None:
-            await bot.reply_to(message, "â³ El servidor todavÃ­a se estÃ¡ iniciando, intenta de nuevo en unos segundos.")
+            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
             return
         try:
             await bot.reply_to(message, build_status_message(_server_state))
@@ -680,7 +679,7 @@ if bot is not None:
     @bot.message_handler(commands=["mlstatus"])
     async def handle_mlstatus_command(message):
         if _server_state is None:
-            await bot.reply_to(message, "â³ El servidor todavÃ­a se estÃ¡ iniciando, intenta de nuevo en unos segundos.")
+            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
             return
         try:
             text = build_mlstatus_message(_server_state)
@@ -691,9 +690,9 @@ if bot is not None:
             log.warning(f"[Telegram] Error respondiendo /mlstatus: {e}")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────
 #  DAILY MARKER
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────
 class DailyMarker:
     def __init__(self, thread_signals=None):
         self.stats = {"win1": 0, "win2": 0, "loss": 0}
@@ -708,9 +707,9 @@ class DailyMarker:
             self.stats["loss"] = self.stats.get("loss", 0) + 1
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-#  AGENTE DE PATRÃ“N DE DOCENAS
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
+#  AGENTE DE PATRÓN DE DOCENAS
+# ══════════════════════════════════════════════
 class DozenPatternAgent:
     def __init__(self, pattern_len: int, name: str, label: str, mode: str, daily_marker=None,
                  thread_signals=None, thread_stats=None):
@@ -751,7 +750,7 @@ class DozenPatternAgent:
         self.trained_snapshot = {}
         self.last_rebound_direction = "NEUTRAL"
 
-    # â”€â”€ Matching de patrones completos â”€â”€
+    # ── Matching de patrones completos ──
     def _match(self, window):
         if len(window) != self.pattern_len:
             return None
@@ -777,7 +776,7 @@ class DozenPatternAgent:
             return None
         return (a, b)
 
-    # â”€â”€ Matching parcial (confirmaciÃ³n "-1 valor") â”€â”€
+    # ── Matching parcial (confirmación "-1 valor") ──
     def _match_partial(self, window):
         if len(window) != self.pattern_len - 1:
             return None
@@ -879,8 +878,8 @@ class DozenPatternAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _recommended_attempt_for_direction(self, pattern, rebound_direction):
-        """Intento recomendado condicionado a la direcciÃ³n de rebote actual, con
-        fallback al recomendado general del patrÃ³n si no hay muestras suficientes."""
+        """Intento recomendado condicionado a la dirección de rebote actual, con
+        fallback al recomendado general del patrón si no hay muestras suficientes."""
         if not self.trained:
             return None, 0.0
         arr = self.trained_snapshot.get(self._key(pattern), [])
@@ -898,8 +897,8 @@ class DozenPatternAgent:
         return 2, round(c2 / len(filtered) * 100, 1)
 
     def overall_recommended_attempt_for_direction(self, rebound_direction):
-        """Igual que overall_recommended_attempt() pero solo con seÃ±ales que ocurrieron
-        con la misma direcciÃ³n de rebote; si no hay datos suficientes, cae al general."""
+        """Igual que overall_recommended_attempt() pero solo con señales que ocurrieron
+        con la misma dirección de rebote; si no hay datos suficientes, cae al general."""
         if not self.trained:
             return None, 0.0
         c1 = c2 = 0
@@ -918,22 +917,22 @@ class DozenPatternAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _ml_should_signal(self, pattern, trend_dozens, amx_strength_val):
-        # NOTA: se eliminÃ³ el filtro de direcciÃ³n de tendencia EMA/AMX
-        # (bloqueaba seÃ±ales cuando la docena esperada no coincidÃ­a con
-        # `trend_dozens`, y quedaba vacÃ­o -> bloqueo total- cada vez que
-        # el trend de corto plazo devolvÃ­a None en modos strict/very_strict)
-        # y el ajuste dinÃ¡mico del umbral de win-rate segÃºn fuerza AMX.
-        # El Ãºnico filtro de calidad ahora es el gate de win-rate base
-        # (DOZEN_MIN_WIN_RATE) para permitir el seguimiento/confirmaciÃ³n;
+        # NOTA: se eliminó el filtro de dirección de tendencia EMA/AMX
+        # (bloqueaba señales cuando la docena esperada no coincidía con
+        # `trend_dozens`, y quedaba vacío -> bloqueo total- cada vez que
+        # el trend de corto plazo devolvía None en modos strict/very_strict)
+        # y el ajuste dinámico del umbral de win-rate según fuerza AMX.
+        # El único filtro de calidad ahora es el gate de win-rate base
+        # (DOZEN_MIN_WIN_RATE) para permitir el seguimiento/confirmación;
         # el corte real de EFECTIVIDAD para enviar a Telegram se aplica
-        # despuÃ©s, en _handle_signal_sequence, con SIGNAL_SEND_MIN_WIN_RATE.
+        # después, en _handle_signal_sequence, con SIGNAL_SEND_MIN_WIN_RATE.
         if self.cooldown_remaining > 0:
             return False
         if self._gated(pattern, DOZEN_MIN_WIN_RATE):
             return False
         return True
 
-    # â”€â”€ NUEVO: calcula la tasa de acierto del segundo intento dado que el primero fallÃ³ â”€â”€
+    # ── NUEVO: calcula la tasa de acierto del segundo intento dado que el primero falló ──
     def _second_attempt_win_rate(self, pattern):
         if not self.trained:
             return None
@@ -999,7 +998,7 @@ class DozenPatternAgent:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        # 3) Buscar patrÃ³n parcial para confirmaciÃ³n
+        # 3) Buscar patrón parcial para confirmación
         if (not self.train_state["active"] and not self.confirming
                 and len(dozen_history) >= self.pattern_len - 1
                 and len(dozen_history) >= DOZEN_MIN_SPIN_TO_SIGNAL
@@ -1017,10 +1016,10 @@ class DozenPatternAgent:
                         "expected_last": expected,
                         "amx_strength": amx_strength_val,
                     }
-                    log.info(f"ðŸ” {self.name} confirmaciÃ³n pendiente: {a},{b} -> esperado {expected}")
+                    log.info(f"🔍 {self.name} confirmación pendiente: {a},{b} -> esperado {expected}")
                     return
 
-        # 4) Evaluar confirmaciÃ³n
+        # 4) Evaluar confirmación
         if self.confirming and self.pending_pattern:
             a, b, expected = self.pending_pattern
             if last == expected:
@@ -1042,7 +1041,7 @@ class DozenPatternAgent:
                     "recommended_attempt_by_rebound": rec_attempt_dir,
                     "recommended_attempt_by_rebound_pct": rec_pct_dir,
                 }
-                log.info(f"âœ… {self.name} confirmaciÃ³n correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'} | Rebote: {rebound_direction}")
+                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'} | Rebote: {rebound_direction}")
                 self.train_state = {
                     "active": True, "pattern": pattern, "bet_dozens": bet_dozens,
                     "bet_zone": zone,
@@ -1051,7 +1050,7 @@ class DozenPatternAgent:
                     "rebound_direction": rebound_direction,
                 }
             else:
-                log.info(f"âŒ {self.name} confirmaciÃ³n fallida: esperaba {expected}, saliÃ³ {last}")
+                log.info(f"❌ {self.name} confirmación fallida: esperaba {expected}, salió {last}")
             self.confirming = False
             self.pending_pattern = None
 
@@ -1163,9 +1162,9 @@ class DozenPatternAgent:
         self.trained_snapshot = data.get("trained_snapshot", {})
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-#  AGENTE DE PATRÃ“N DE ZONAS
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
+#  AGENTE DE PATRÓN DE ZONAS
+# ══════════════════════════════════════════════
 class ZonePatternAgent:
     def __init__(self, pattern: str, name: str, label: str, daily_marker=None,
                  thread_signals=None, thread_stats=None):
@@ -1180,7 +1179,7 @@ class ZonePatternAgent:
         self.letter_to_zone = {'a': 'BAJA', 'b': 'ALTA'}
         self.predicted_zone = self.letter_to_zone.get(pattern[-1]) if pattern[-1] in ('a','b') else None
         if self.predicted_zone is None:
-            log.warning(f"El patrÃ³n {pattern} termina en '{pattern[-1]}', no se puede predecir zona. Se desactivarÃ¡.")
+            log.warning(f"El patrón {pattern} termina en '{pattern[-1]}', no se puede predecir zona. Se desactivará.")
             self.active = False
         else:
             self.active = True
@@ -1317,8 +1316,8 @@ class ZonePatternAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _recommended_attempt_for_direction(self, pattern_tuple, rebound_direction):
-        """Intento recomendado condicionado a la direcciÃ³n de rebote actual, con
-        fallback al recomendado general del patrÃ³n si no hay muestras suficientes."""
+        """Intento recomendado condicionado a la dirección de rebote actual, con
+        fallback al recomendado general del patrón si no hay muestras suficientes."""
         if not self.trained:
             return None, 0.0
         arr = self.trained_snapshot.get(self._key(pattern_tuple), [])
@@ -1336,8 +1335,8 @@ class ZonePatternAgent:
         return 2, round(c2 / len(filtered) * 100, 1)
 
     def overall_recommended_attempt_for_direction(self, rebound_direction):
-        """Igual que overall_recommended_attempt() pero solo con seÃ±ales que ocurrieron
-        con la misma direcciÃ³n de rebote; si no hay datos suficientes, cae al general."""
+        """Igual que overall_recommended_attempt() pero solo con señales que ocurrieron
+        con la misma dirección de rebote; si no hay datos suficientes, cae al general."""
         if not self.trained:
             return None, 0.0
         c1 = c2 = 0
@@ -1357,8 +1356,8 @@ class ZonePatternAgent:
 
     def _ml_should_signal(self, pattern_tuple, amx_strength_val, trend_zones=None):
         # Mismo criterio que en DozenPatternAgent: se quita el filtro de
-        # direcciÃ³n EMA20/50 (trend_zones) y el ajuste dinÃ¡mico por fuerza
-        # AMX. El corte de efectividad real para enviar se hace despuÃ©s
+        # dirección EMA20/50 (trend_zones) y el ajuste dinámico por fuerza
+        # AMX. El corte de efectividad real para enviar se hace después
         # con SIGNAL_SEND_MIN_WIN_RATE.
         if self.cooldown_remaining > 0:
             return False
@@ -1427,7 +1426,7 @@ class ZonePatternAgent:
                 pattern_tuple = partial
                 predicted_zone = pattern_tuple[-1]
                 if predicted_zone == "VERDE":
-                    log.info(f"â›” {self.name}: patrÃ³n termina en VERDE, no se genera seÃ±al")
+                    log.info(f"⛔ {self.name}: patrón termina en VERDE, no se genera señal")
                     return
                 if self._ml_should_signal(pattern_tuple, amx_strength_val, trend_zones):
                     self.confirming = True
@@ -1439,7 +1438,7 @@ class ZonePatternAgent:
                         "expected_last": predicted_zone,
                         "amx_strength": amx_strength_val,
                     }
-                    log.info(f"ðŸ” {self.name} confirmaciÃ³n pendiente: patrÃ³n {pattern_tuple} -> esperado {predicted_zone}")
+                    log.info(f"🔍 {self.name} confirmación pendiente: patrón {pattern_tuple} -> esperado {predicted_zone}")
                     return
 
         if self.confirming and self.pending_pattern:
@@ -1448,7 +1447,7 @@ class ZonePatternAgent:
             if last_zone == expected_last:
                 predicted_zone = pattern_tuple[-1]
                 if predicted_zone == "VERDE":
-                    log.info(f"â›” {self.name}: patrÃ³n confirmado pero termina en VERDE, no se genera seÃ±al")
+                    log.info(f"⛔ {self.name}: patrón confirmado pero termina en VERDE, no se genera señal")
                     self.confirming = False
                     self.pending_pattern = None
                     self.pending_window = None
@@ -1462,7 +1461,7 @@ class ZonePatternAgent:
                     distance_from_end = self.pattern_len - 1 - closest_zero
                     if distance_from_end <= self.zero_proximity_threshold:
                         near_zero = True
-                        log.info(f"ðŸ”„ {self.name}: cero cerca (distancia {distance_from_end} desde el final), se invertirÃ¡ la secuencia")
+                        log.info(f"🔄 {self.name}: cero cerca (distancia {distance_from_end} desde el final), se invertirá la secuencia")
 
                 context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
                 # Ambos intentos apuntan a la misma zona (ver _determine_zone_sequence).
@@ -1483,7 +1482,7 @@ class ZonePatternAgent:
                     "recommended_attempt_by_rebound": rec_attempt_dir,
                     "recommended_attempt_by_rebound_pct": rec_pct_dir,
                 }
-                log.info(f"âœ… {self.name} confirmaciÃ³n correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence} | Rebote: {rebound_direction}")
+                log.info(f"✅ {self.name} confirmación correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence} | Rebote: {rebound_direction}")
                 self.train_state = {
                     "active": True, "pattern": pattern_tuple, "bet_zone": predicted_zone,
                     "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
@@ -1491,7 +1490,7 @@ class ZonePatternAgent:
                     "rebound_direction": rebound_direction,
                 }
             else:
-                log.info(f"âŒ {self.name} confirmaciÃ³n fallida: esperaba {expected_last}, saliÃ³ {last_zone}")
+                log.info(f"❌ {self.name} confirmación fallida: esperaba {expected_last}, salió {last_zone}")
             self.confirming = False
             self.pending_pattern = None
             self.pending_window = None
@@ -1622,17 +1621,17 @@ def current_zone_streak(zone_history):
 
 
 class StreakZoneAgent:
-    """SeÃ±al de RACHA: cuando la misma zona sale N veces seguidas, genera una
-    seÃ±al permisiva para SEGUIR la racha aunque ningÃºn patrÃ³n de docenas ni de
-    zonas coincida. Sin confirmaciÃ³n (la racha es la confirmaciÃ³n) y sin gates
+    """Señal de RACHA: cuando la misma zona sale N veces seguidas, genera una
+    señal permisiva para SEGUIR la racha aunque ningún patrón de docenas ni de
+    zonas coincida. Sin confirmación (la racha es la confirmación) y sin gates
     de ML: la recency de la racha es el criterio. Los 2 intentos van a la zona
     de la racha.
 
-    AdemÃ¡s, analiza -por situaciÃ³n de rebote (ALCISTA/BAJISTA/NEUTRAL)- si
-    histÃ³ricamente esta racha (de esta longitud exacta) rinde mejor en el
+    Además, analiza -por situación de rebote (ALCISTA/BAJISTA/NEUTRAL)- si
+    históricamente esta racha (de esta longitud exacta) rinde mejor en el
     intento 1 o en el intento 2. Si el intento 2 es claramente mejor
-    (>= STREAK_SECOND_ENTRY_MIN_PCT y con muestra suficiente), la seÃ±al que se
-    envÃ­a a Telegram arranca DIRECTAMENTE en el intento 2 (se salta el 1)."""
+    (>= STREAK_SECOND_ENTRY_MIN_PCT y con muestra suficiente), la señal que se
+    envía a Telegram arranca DIRECTAMENTE en el intento 2 (se salta el 1)."""
     def __init__(self, min_streak: int, name: str, label: str, daily_marker=None,
                  thread_signals=None, thread_stats=None, exact_length: bool = True):
         self.min_streak = min_streak
@@ -1643,9 +1642,9 @@ class StreakZoneAgent:
         self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS_ZONE
         # Si exact_length=True, el agente solo dispara cuando la racha llega
         # EXACTAMENTE a min_streak (evita que la de longitud 3 vuelva a
-        # disparar cuando la misma racha ya llegÃ³ a 6). El agente de la
-        # longitud mÃ¡s larga configurada usa exact_length=False (>=) para
-        # seguir cubriendo rachas mÃ¡s largas que las configuradas.
+        # disparar cuando la misma racha ya llegó a 6). El agente de la
+        # longitud más larga configurada usa exact_length=False (>=) para
+        # seguir cubriendo rachas más largas que las configuradas.
         self.exact_length = exact_length
 
         self.train_state = {
@@ -1720,7 +1719,7 @@ class StreakZoneAgent:
         return 2, round(c2 / total * 100, 1)
 
     def _recommended_attempt_for_direction(self, zone, rebound_direction):
-        """Intento recomendado (1 o 2) condicionado a la direcciÃ³n de rebote
+        """Intento recomendado (1 o 2) condicionado a la dirección de rebote
         actual, con fallback al recomendado general de esta racha si no hay
         muestras suficientes para ese rebote en particular."""
         if not self.trained:
@@ -1740,8 +1739,8 @@ class StreakZoneAgent:
         return 2, round(c2 / len(filtered) * 100, 1)
 
     def overall_recommended_attempt_for_direction(self, rebound_direction):
-        """Igual que overall_recommended_attempt() pero solo con seÃ±ales que
-        ocurrieron con la misma direcciÃ³n de rebote; si no hay datos
+        """Igual que overall_recommended_attempt() pero solo con señales que
+        ocurrieron con la misma dirección de rebote; si no hay datos
         suficientes, cae al general."""
         if not self.trained:
             return None, 0.0
@@ -1767,9 +1766,9 @@ class StreakZoneAgent:
 
     def _maybe_train(self, timestamp: float):
         # Antes la racha nunca se reentrenaba sola en vivo (solo con el
-        # entrenamiento inicial sobre el histÃ³rico). Ahora se actualiza
-        # como los demÃ¡s agentes: cada ML_MIN_SIGNALS_TO_TRAIN seÃ±ales
-        # cerradas, o cada ML_RETRAIN_INTERVAL_SECONDS si ya estÃ¡ entrenada.
+        # entrenamiento inicial sobre el histórico). Ahora se actualiza
+        # como los demás agentes: cada ML_MIN_SIGNALS_TO_TRAIN señales
+        # cerradas, o cada ML_RETRAIN_INTERVAL_SECONDS si ya está entrenada.
         if self.total_processed < ML_MIN_SIGNALS_TO_TRAIN:
             return
         if not self.trained or (timestamp - self.last_train_ts) >= ML_RETRAIN_INTERVAL_SECONDS:
@@ -1785,7 +1784,7 @@ class StreakZoneAgent:
         if not zone_history:
             return
 
-        # 1) Shadow tracking de una seÃ±al de racha en curso
+        # 1) Shadow tracking de una señal de racha en curso
         if self.train_state["active"]:
             self.train_state["current_attempt"] += 1
             attempt = self.train_state["start_attempt"] + self.train_state["current_attempt"] - 1
@@ -1802,13 +1801,13 @@ class StreakZoneAgent:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
 
-        # 2) Racha: seÃ±al "inteligente" -> ya no dispara solo por longitud.
-        # Se exige Ãºnicamente: a) que la racha no estÃ© ya activa (train_state)
-        # y b) que no estÃ© bloqueada por otra seÃ±al en curso ni en cooldown.
+        # 2) Racha: señal "inteligente" -> ya no dispara solo por longitud.
+        # Se exige únicamente: a) que la racha no esté ya activa (train_state)
+        # y b) que no esté bloqueada por otra señal en curso ni en cooldown.
         # Ya no hay filtro de tendencia EMA20/50 ni descarte temprano por
         # win-rate: la racha genera candidato apenas se cumple la longitud
         # exacta, y el corte real de efectividad para enviar a Telegram se
-        # aplica despuÃ©s, en _handle_signal_sequence, con
+        # aplica después, en _handle_signal_sequence, con
         # SIGNAL_SEND_MIN_WIN_RATE.
         zone, streak = current_zone_streak(zone_history)
         streak_matches = (streak == self.min_streak) if self.exact_length else (streak >= self.min_streak)
@@ -1820,14 +1819,14 @@ class StreakZoneAgent:
             context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
 
 
-            # â”€â”€ AnÃ¡lisis de rondas: Â¿en esta situaciÃ³n (racha de este largo +
-            # este rebote) conviene entrar directo en el INTENTO 2? â”€â”€
+            # ── Análisis de rondas: ¿en esta situación (racha de este largo +
+            # este rebote) conviene entrar directo en el INTENTO 2? ──
             rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(zone, rebound_direction)
             start_attempt = 1
             if (rec_attempt_dir == 2 and rec_pct_dir is not None
                     and rec_pct_dir >= STREAK_SECOND_ENTRY_MIN_PCT):
                 start_attempt = 2
-                log.info(f"ðŸŽ¯ {self.name}: anÃ¡lisis de rondas â†’ ENTRAR DIRECTO EN INTENTO 2 para {zone} "
+                log.info(f"🎯 {self.name}: análisis de rondas → ENTRAR DIRECTO EN INTENTO 2 para {zone} "
                           f"(rebote {rebound_direction}, {rec_pct_dir}% de aciertos en intento 2 vs intento 1)")
 
             self.candidate_signal = {
@@ -1852,14 +1851,14 @@ class StreakZoneAgent:
                 "active": True, "pattern": ("RACHA", zone), "bet_zone": zone,
                 "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
                 # El "shadow" (seguimiento interno para seguir aprendiendo)
-                # SIEMPRE simula desde el intento 1, sin importar en quÃ©
-                # intento arrancÃ³ la seÃ±al real: asÃ­ se sigue midiendo si el
+                # SIEMPRE simula desde el intento 1, sin importar en qué
+                # intento arrancó la señal real: así se sigue midiendo si el
                 # intento 1 hubiera ganado o no, para poder recalcular la
-                # recomendaciÃ³n en la prÃ³xima racha de este mismo largo.
+                # recomendación en la próxima racha de este mismo largo.
                 "context": context, "current_attempt": 0, "start_attempt": 1,
                 "rebound_direction": rebound_direction,
             }
-            log.info(f"ðŸ”¥ {self.name}: racha de {streak}x {zone} â†’ seÃ±al (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'}, intento inicial: {start_attempt}, fallback opuesto: {fallback_opposite})")
+            log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'}, intento inicial: {start_attempt}, fallback opuesto: {fallback_opposite})")
 
     def _close_shadow(self, win: bool, result_zone, attempt, timestamp):
         zone = self.train_state["bet_zone"]
@@ -1959,9 +1958,9 @@ class StreakZoneAgent:
         self.trained_snapshot = data.get("trained_snapshot", {})
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  ROULETTE TABLE
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 class RouletteTable:
     def __init__(self, key: int):
         self.key = key
@@ -1977,20 +1976,20 @@ class RouletteTable:
         self.labouchere = LabouchereManager(base_amount=LABOUCHERE_BASE_AMOUNT)
         self.cycle_pending = 0
 
-        # Frecuencia horaria de rachas: guarda cuÃ¡ndo (timestamp real) se
-        # cumpliÃ³ por Ãºltima vez una racha de ZONE_STREAK_MIN en cada zona,
-        # para calcular cada cuÃ¡ntos minutos suele repetirse y usarlo como
-        # confirmaciÃ³n extra cuando "toca" que vuelva a salir.
+        # Frecuencia horaria de rachas: guarda cuándo (timestamp real) se
+        # cumplió por última vez una racha de ZONE_STREAK_MIN en cada zona,
+        # para calcular cada cuántos minutos suele repetirse y usarlo como
+        # confirmación extra cuando "toca" que vuelva a salir.
         self.zone_streak_event_times = {"ALTA": [], "BAJA": []}
         self._prev_zone_streak = (None, 0)
         self.time_due_info = {"ALTA": {"due": False, "avg_minutes": None, "elapsed_minutes": None},
                                "BAJA": {"due": False, "avg_minutes": None, "elapsed_minutes": None}}
         self.time_due_zones = set()
 
-        # Predictor de "ronda de repeticiÃ³n de zona" (ver ROUND_PREDICT_*
-        # arriba): guarda en quÃ© giro (Ã­ndice de ronda) se completÃ³ cada
-        # racha de ZONE_STREAK_MIN en BAJA/ALTA, para predecir en quÃ© ronda
-        # futura (ventana 3â€“5 rondas) deberÃ­a repetirse esa misma zona,
+        # Predictor de "ronda de repetición de zona" (ver ROUND_PREDICT_*
+        # arriba): guarda en qué giro (índice de ronda) se completó cada
+        # racha de ZONE_STREAK_MIN en BAJA/ALTA, para predecir en qué ronda
+        # futura (ventana 3–5 rondas) debería repetirse esa misma zona,
         # confirmado con EMA20/50.
         self.zone_round_events = {"ALTA": [], "BAJA": []}
         self._prev_zone_streak_round = (None, 0)
@@ -2000,10 +1999,10 @@ class RouletteTable:
 
         self.signal_sequence = []
         self.current_attempt_index = 0
-        # Ãndice (0-based) en el que arrancÃ³ la seÃ±al activa actual: 0 si
-        # empezÃ³ en el intento 1 de siempre, 1 si se saltÃ³ el intento 1 y
-        # entrÃ³ directo en el intento 2 (recomendaciÃ³n por rondas/racha).
-        # Sirve para que, aunque se entre directo en intento 2, la seÃ±al
+        # Índice (0-based) en el que arrancó la señal activa actual: 0 si
+        # empezó en el intento 1 de siempre, 1 si se saltó el intento 1 y
+        # entró directo en el intento 2 (recomendación por rondas/racha).
+        # Sirve para que, aunque se entre directo en intento 2, la señal
         # siga arriesgando capital real en 2 intentos (2 y 3), no solo 1.
         self.current_signal_start_index = 0
         self.signal_status = None
@@ -2022,32 +2021,32 @@ class RouletteTable:
         self.last_signal_outcome = None   # "win" o "loss"
         self.last_signal_number = None
 
-        # â”€â”€ Log de resoluciones POR INTENTO (para que el panel HTML procese tambiÃ©n el intento 1) â”€â”€
+        # ── Log de resoluciones POR INTENTO (para que el panel HTML procese también el intento 1) ──
         self.attempt_log = []       # lista de {"seq": int, "attempt": int, "win": bool, "number": int}
         self.attempt_log_seq = 0
 
-        # â”€â”€ AGENTES DE DOCENAS â”€â”€
-        self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 ðŸ’Ž (aaba)", mode="aaba", daily_marker=self.daily_marker)
-        self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 ðŸ’Ž (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
-        self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 ðŸ’Ž (abaa)", mode="abaa", daily_marker=self.daily_marker)
-        self.agent6 = DozenPatternAgent(pattern_len=7, name="AGENTE_6", label="PATRON V6 ðŸ’Ž (aaaabaa)", mode="aaaabaa", daily_marker=self.daily_marker)
+        # ── AGENTES DE DOCENAS ──
+        self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
+        self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
+        self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎 (abaa)", mode="abaa", daily_marker=self.daily_marker)
+        self.agent6 = DozenPatternAgent(pattern_len=7, name="AGENTE_6", label="PATRON V6 💎 (aaaabaa)", mode="aaaabaa", daily_marker=self.daily_marker)
 
-        # â”€â”€ AGENTES DE ZONA â”€â”€
+        # ── AGENTES DE ZONA ──
         self.zone_agent1 = ZonePatternAgent(pattern='baaaabbb', name="ZONE_AGENT_1", label="ZONA LARGA 1 (b+4a+3b)", daily_marker=self.daily_marker)
         self.zone_agent2 = ZonePatternAgent(pattern='aaaabbbbaa', name="ZONE_AGENT_2", label="ZONA LARGA 2 (4a+4b+2a)", daily_marker=self.daily_marker)
-        self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa Â· repite a)", daily_marker=self.daily_marker)
-        self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa Â· repite a)", daily_marker=self.daily_marker)
-        # â”€â”€ AGENTES DE RACHA por longitud exacta (3,4,5,6,7 por defecto,
+        self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa · repite a)", daily_marker=self.daily_marker)
+        self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa · repite a)", daily_marker=self.daily_marker)
+        # ── AGENTES DE RACHA por longitud exacta (3,4,5,6,7 por defecto,
         # configurable con ZONE_STREAK_LENGTHS). Cada longitud tiene su
-        # propio agente/estadÃ­stica, y cada uno analiza por separado si en
-        # su situaciÃ³n conviene entrar directo en el intento 2 (ver
-        # STREAK_SECOND_ENTRY_MIN_PCT y StreakZoneAgent). â”€â”€
+        # propio agente/estadística, y cada uno analiza por separado si en
+        # su situación conviene entrar directo en el intento 2 (ver
+        # STREAK_SECOND_ENTRY_MIN_PCT y StreakZoneAgent). ──
         self.streak_agents = {}
         _max_streak_len = max(ZONE_STREAK_LENGTHS)
         for _len in ZONE_STREAK_LENGTHS:
             _agent = StreakZoneAgent(
                 min_streak=_len, name=f"ZONE_STREAK{_len}",
-                label=f"ðŸ”¥ RACHA x{_len} (repeticiÃ³n misma zona)",
+                label=f"🔥 RACHA x{_len} (repetición misma zona)",
                 daily_marker=self.daily_marker,
                 exact_length=(_len != _max_streak_len),
             )
@@ -2065,10 +2064,10 @@ class RouletteTable:
         self.trend = "neutral"
         self.last_nonzero_zone = "BAJA"
         self.last_rebound_direction = "NEUTRAL"
-        # Niveles de zona independientes (grÃ¡ficos ALTOS/BAJOS + S/R)
+        # Niveles de zona independientes (gráficos ALTOS/BAJOS + S/R)
         self.alto_level_history = []
         self.bajo_level_history = []
-        self.zone_number_history = []   # nÃºmeros reales alineados Ã­ndice a Ã­ndice con alto/bajo_level_history
+        self.zone_number_history = []   # números reales alineados índice a índice con alto/bajo_level_history
 
     def _level_change(self, number: int, real_dozen_num: int) -> int:
         if real_dozen_num == 1: return 1
@@ -2091,7 +2090,7 @@ class RouletteTable:
             bet_amount=bet_amount,
             sequence_str=seq_txt
         )
-        new_header = f"ðŸš¨ðŸš¨ ENTRADA INTENTO {attempt_number} ðŸš¨ðŸš¨"
+        new_header = f"🚨🚨 ENTRADA INTENTO {attempt_number} 🚨🚨"
         entry_text = f"{new_header}\n\n{original}"
         msg_id = await send_msg(entry_text, agent.thread_signals)
 
@@ -2108,14 +2107,14 @@ class RouletteTable:
     async def _send_resolution(self, win: bool, numbers: list, balance: int, extra_text: str = ""):
         res_text = build_resolution_message(win, numbers, balance)
         if extra_text:
-            full_text = f"{res_text}\nâ€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”\n{extra_text}"
+            full_text = f"{res_text}\n————————————————————\n{extra_text}"
         else:
             full_text = res_text
         await send_msg(full_text, THREAD_SIGNALS)
         if win:
-            simple = "âœ… WIN"
+            simple = "✅ WIN"
         else:
-            simple = "ðŸš« LOSS"
+            simple = "🚫 LOSS"
         await send_msg(simple, THREAD_STATS)
 
     async def _send_daily_marker_and_cycle(self):
@@ -2127,16 +2126,16 @@ class RouletteTable:
         if self.cycle_pending > 0:
             lab_state = self.labouchere.get_state()
             sign = '+' if lab_state['balance'] >= 0 else '-'
-            msg = (f"ðŸŽ‰ðŸŽ‰ CICLO #{self.cycle_pending} COMPLETA ðŸŽ‰ðŸŽ‰\n"
-                   f"ðŸ“ˆ Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\n"
-                   f"ðŸ‡¨ðŸ‡´ Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
+            msg = (f"🎉🎉 CICLO #{self.cycle_pending} COMPLETA 🎉🎉\n"
+                   f"📈 Acumulado: {sign}{format_cop(abs(lab_state['balance']))}\n"
+                   f"🇨🇴 Apuesta Base: {format_cop(lab_state['base_amount'])}\n")
             await send_msg(msg, THREAD_SIGNALS)
             self.cycle_pending = 0
 
     def _log_attempt_result(self, attempt: int, win: bool, number: int):
-        """Registra la resoluciÃ³n de CADA intento (1 y 2), no solo el resultado final
-        de la seÃ±al. El panel HTML usa esto para avanzar su gestiÃ³n LabouchÃ¨re tambiÃ©n
-        cuando el intento 1 pierde (antes solo se procesaba al cerrar la seÃ±al completa)."""
+        """Registra la resolución de CADA intento (1 y 2), no solo el resultado final
+        de la señal. El panel HTML usa esto para avanzar su gestión Labouchère también
+        cuando el intento 1 pierde (antes solo se procesaba al cerrar la señal completa)."""
         self.attempt_log_seq += 1
         self.attempt_log.append({
             "seq": self.attempt_log_seq,
@@ -2148,10 +2147,10 @@ class RouletteTable:
             self.attempt_log = self.attempt_log[-50:]
 
     def _finalize_sequence(self, win: bool, winning_attempt: int = None):
-        # b1/b2 = las DOS apuestas reales de la seÃ±al (en orden), sin importar
-        # si arrancaron en el Ã­ndice absoluto 0/1 (intento normal) o 1/2
-        # (seÃ±al que se saltÃ³ el intento 1): siempre se cuentan desde
-        # current_signal_start_index, que es donde empezÃ³ a arriesgarse capital.
+        # b1/b2 = las DOS apuestas reales de la señal (en orden), sin importar
+        # si arrancaron en el índice absoluto 0/1 (intento normal) o 1/2
+        # (señal que se saltó el intento 1): siempre se cuentan desde
+        # current_signal_start_index, que es donde empezó a arriesgarse capital.
         start = self.current_signal_start_index
         b1 = self.attempt_bets[start] if len(self.attempt_bets) > start else 0
         b2 = self.attempt_bets[start + 1] if len(self.attempt_bets) > start + 1 else 0
@@ -2173,9 +2172,9 @@ class RouletteTable:
             zone_sequence = new_signal["zone_sequence"]
             new_start_attempt = new_signal.get("start_attempt", 1)
             if self.current_attempt_index == self.current_signal_start_index:
-                header = "ðŸ”¥ðŸ”¥ NUEVA SEÃ‘AL CONFIRMADA ðŸ”¥ðŸ”¥"
+                header = "🔥🔥 NUEVA SEÑAL CONFIRMADA 🔥🔥"
             else:
-                header = "ðŸ”¥ðŸ”¥ REPETIR SEÃ‘AL CONFIRMADA ðŸ”¥ðŸ”¥"
+                header = "🔥🔥 REPETIR SEÑAL CONFIRMADA 🔥🔥"
             last_num = agent._last_raw_number
             zone = zone_sequence[new_start_attempt - 1] if new_start_attempt - 1 < len(zone_sequence) else zone_sequence[0]
             new_bet_amount = self.labouchere.get_bet()
@@ -2201,7 +2200,7 @@ class RouletteTable:
             self.confirmation_msg_id = None
 
         if new_signal is not None:
-            # La nueva seÃ±al ya se anunciÃ³ (combinada con el mensaje de resoluciÃ³n):
+            # La nueva señal ya se anunció (combinada con el mensaje de resolución):
             # ahora se activa de verdad para que sus intentos/resultados se procesen.
             new_entry = {
                 "agent": new_signal["agent"],
@@ -2213,9 +2212,9 @@ class RouletteTable:
             self.signal_sequence = [new_entry]
             self.signal_status = "active"
             if new_start_attempt == 2:
-                # Igual que en _activate_new_signal: no se apostÃ³ el intento 1
-                # (b1=0), pero la seÃ±al sigue teniendo 2 intentos REALES con
-                # capital (2 y, si hace falta, 3) â€” ver current_signal_start_index.
+                # Igual que en _activate_new_signal: no se apostó el intento 1
+                # (b1=0), pero la señal sigue teniendo 2 intentos REALES con
+                # capital (2 y, si hace falta, 3) — ver current_signal_start_index.
                 self.current_attempt_index = 1
                 self.current_signal_start_index = 1
                 self.attempt_bets = [0, new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
@@ -2224,11 +2223,11 @@ class RouletteTable:
                 self.current_signal_start_index = 0
                 self.attempt_bets = [new_bet_amount if new_bet_amount is not None else self.labouchere.get_bet()]
             # El intento anunciado en extra_text fue publicado DENTRO del
-            # mensaje de resoluciÃ³n, no vÃ­a _send_entry, asÃ­ que no hay
+            # mensaje de resolución, no vía _send_entry, así que no hay
             # mensaje real que borrar para ese intento. Se deja un
             # placeholder (None) para que, si se pierde y avanza al
             # siguiente intento, _send_entry no borre por error el mensaje
-            # reciÃ©n enviado (antes usaba ese Ã­ndice vacÃ­o como si fuera el
+            # recién enviado (antes usaba ese índice vacío como si fuera el
             # id del intento nuevo).
             self.entry_msg_ids = [None]
         else:
@@ -2247,19 +2246,19 @@ class RouletteTable:
     REBOUND_FAVORED_ZONE = {"ALCISTA": "BAJA", "BAJISTA": "ALTA"}
 
     def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
-        # Por defecto ambos intentos de la seÃ±al apuntan a la MISMA zona: ya
-        # no se invierte al lado opuesto en el 2Âº intento por rebote,
-        # cercanÃ­a al cero, tasa de 2Âº intento o AMX dÃ©bil.
+        # Por defecto ambos intentos de la señal apuntan a la MISMA zona: ya
+        # no se invierte al lado opuesto en el 2º intento por rebote,
+        # cercanía al cero, tasa de 2º intento o AMX débil.
         #
-        # EXCEPCIÃ“N: si "fallback_opposite" viniera marcado en la seÃ±al, el
+        # EXCEPCIÓN: si "fallback_opposite" viniera marcado en la señal, el
         # reintento (el intento que sigue si falla el primero real) apuesta
-        # a la zona OPUESTA en vez de repetir la misma. Actualmente ningÃºn
+        # a la zona OPUESTA en vez de repetir la misma. Actualmente ningún
         # agente marca "fallback_opposite" (se generaba por el filtro de
         # tendencia EMA20/50 en rachas, ya eliminado); se deja el soporte
         # por compatibilidad con `candidate_signal` por si se reactiva.
-        # Si ademÃ¡s la seÃ±al arranca directo en intento 2 (start_attempt=2,
+        # Si además la señal arranca directo en intento 2 (start_attempt=2,
         # se salta el 1), se agrega un "relleno" inicial (mismo valor que
-        # el primer intento real) para que los Ã­ndices absolutos sigan
+        # el primer intento real) para que los índices absolutos sigan
         # alineados con current_signal_start_index.
         zone = bet_zone_tuple[0]
         start_attempt = candidate.get("start_attempt", 1)
@@ -2277,7 +2276,7 @@ class RouletteTable:
             last_zone = self.last_nonzero_zone
             opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
             zone_sequence = [opposite, opposite]
-            log.info(f"ðŸ”€ SeÃ±al D1+D3 â†’ opuesto de Ãºltima zona ({last_zone}) â†’ {opposite} en ambos intentos")
+            log.info(f"🔀 Señal D1+D3 → opuesto de última zona ({last_zone}) → {opposite} en ambos intentos")
 
         self._pending_new_signal = {
             "agent": agent,
@@ -2296,7 +2295,7 @@ class RouletteTable:
             last_zone = self.last_nonzero_zone
             opposite = "ALTA" if last_zone == "BAJA" else "BAJA"
             zone_sequence = [opposite, opposite]
-            log.info(f"ðŸ”€ SeÃ±al D1+D3 â†’ opuesto de Ãºltima zona ({last_zone}) â†’ {opposite} en ambos intentos")
+            log.info(f"🔀 Señal D1+D3 → opuesto de última zona ({last_zone}) → {opposite} en ambos intentos")
 
         new_entry = {
             "agent": agent,
@@ -2311,16 +2310,16 @@ class RouletteTable:
             self.signal_status = "active"
             self.attempt_bets.append(bet_amount)
             asyncio.create_task(self._send_entry(agent, zone_sequence[1], bet_amount, 2))
-            log.info(f"ðŸ”” NUEVO PATRÃ“N TRAS CERO -> INTENTO 2: {agent.name} -> ZONA {zone_sequence[1]}")
+            log.info(f"🔔 NUEVO PATRÓN TRAS CERO -> INTENTO 2: {agent.name} -> ZONA {zone_sequence[1]}")
             return
 
-        # â”€â”€ Intento inicial de la seÃ±al: normalmente 1, pero si el agente
-        # (tÃ­picamente uno de racha) calculÃ³ que en esta situaciÃ³n conviene
+        # ── Intento inicial de la señal: normalmente 1, pero si el agente
+        # (típicamente uno de racha) calculó que en esta situación conviene
         # entrar directo en el intento 2 real (start_attempt=2), se salta el 1:
         # no se apuesta nada en ese intento. De cara al usuario el mensaje
         # sigue mostrando el formato normal ("ENTRADA INTENTO 1" / "INTENTO 2"),
-        # igual que cualquier otra seÃ±al: el salto de capital es solo interno
-        # (current_signal_start_index), no se refleja en la numeraciÃ³n mostrada. â”€â”€
+        # igual que cualquier otra señal: el salto de capital es solo interno
+        # (current_signal_start_index), no se refleja en la numeración mostrada. ──
         start_attempt = candidate.get("start_attempt", 1)
         self.signal_sequence = [new_entry]
         self.signal_status = "active"
@@ -2332,21 +2331,21 @@ class RouletteTable:
             self.attempt_bets = [0, bet_amount]
             self.entry_msg_ids = [None]
             asyncio.create_task(self._send_entry(agent, zone_sequence[1], bet_amount, 1))
-            log.info(f"ðŸ”” SEÃ‘AL DIRECTA INTENTO 2 real (racha analizada, se salta intento 1; se muestra como INTENTO 1): {agent.name} -> ZONA {zone_sequence[1]}")
+            log.info(f"🔔 SEÑAL DIRECTA INTENTO 2 real (racha analizada, se salta intento 1; se muestra como INTENTO 1): {agent.name} -> ZONA {zone_sequence[1]}")
         else:
             self.current_attempt_index = 0
             self.current_signal_start_index = 0
             self.attempt_bets = [bet_amount]
             self.entry_msg_ids = []
             asyncio.create_task(self._send_entry(agent, zone_sequence[0], bet_amount, 1))
-            log.info(f"ðŸ”” SEÃ‘AL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
+            log.info(f"🔔 SEÑAL INTENTO 1: {agent.name} -> ZONA {zone_sequence[0]}")
         agent.candidate_signal = None
 
     def _record_zone_streak_time_event(self, timestamp):
         """Registra (una sola vez por racha, en el momento en que cruza el
-        mÃ­nimo) el instante real en que una zona alcanza ZONE_STREAK_MIN
-        seguidas. Sirve para calcular despuÃ©s cada cuÃ¡ntos minutos suele
-        repetirse ese fenÃ³meno en cada zona."""
+        mínimo) el instante real en que una zona alcanza ZONE_STREAK_MIN
+        seguidas. Sirve para calcular después cada cuántos minutos suele
+        repetirse ese fenómeno en cada zona."""
         zone, streak = current_zone_streak(self.zone_history)
         prev_zone, prev_streak = self._prev_zone_streak
         just_crossed = (zone is not None and streak >= ZONE_STREAK_MIN
@@ -2361,8 +2360,8 @@ class RouletteTable:
     def _zone_time_due(self, zone, timestamp):
         """Con el historial de instantes en que 'zone' hizo una racha de
         ZONE_STREAK_MIN, calcula el intervalo promedio (en minutos) entre
-        una repeticiÃ³n y la siguiente, y si ya pasÃ³ ese tiempo desde la
-        Ãºltima vez (o sea, estadÃ­sticamente "toca" que vuelva a salir)."""
+        una repetición y la siguiente, y si ya pasó ese tiempo desde la
+        última vez (o sea, estadísticamente "toca" que vuelva a salir)."""
         events = self.zone_streak_event_times.get(zone, [])
         if len(events) < 2:
             return {"due": False, "avg_minutes": None, "elapsed_minutes": None}
@@ -2373,10 +2372,10 @@ class RouletteTable:
         return {"due": due, "avg_minutes": round(avg_minutes, 1), "elapsed_minutes": round(elapsed_minutes, 1)}
 
     def _record_zone_streak_round_event(self):
-        """RÃ©plica en RONDAS de _record_zone_streak_time_event: registra (una
-        sola vez por racha, en el giro en que cruza el mÃ­nimo) el nÃºmero de
+        """Réplica en RONDAS de _record_zone_streak_time_event: registra (una
+        sola vez por racha, en el giro en que cruza el mínimo) el número de
         ronda en que BAJA o ALTA alcanza ZONE_STREAK_MIN seguidas. Sirve para
-        calcular despuÃ©s cada cuÃ¡ntas rondas suele repetirse ese fenÃ³meno en
+        calcular después cada cuántas rondas suele repetirse ese fenómeno en
         cada zona (igual idea que calcularPrediccionInteligente de Spaceman,
         pero contando giros en vez de segundos)."""
         zone, streak = current_zone_streak(self.zone_history)
@@ -2394,11 +2393,11 @@ class RouletteTable:
     def _zone_round_due(self, zone: str) -> dict:
         """Con el historial de rondas en que 'zone' hizo una racha de
         ZONE_STREAK_MIN, calcula el intervalo promedio (en RONDAS) entre una
-        repeticiÃ³n y la siguiente â€”recortado siempre a la ventana pedida de
-        ROUND_PREDICT_WINDOW_MINâ€“MAX rondasâ€”, predice en quÃ© giro futuro
-        deberÃ­a volver a caer esa misma zona, y confirma "en ronda" solo si
-        ademÃ¡s el filtro EMA20/50 (ema_long_trend sobre alto_level_history)
-        favorece esa zona en este momento. RÃ©plica exacta de _zone_time_due
+        repetición y la siguiente —recortado siempre a la ventana pedida de
+        ROUND_PREDICT_WINDOW_MIN–MAX rondas—, predice en qué giro futuro
+        debería volver a caer esa misma zona, y confirma "en ronda" solo si
+        además el filtro EMA20/50 (ema_long_trend sobre alto_level_history)
+        favorece esa zona en este momento. Réplica exacta de _zone_time_due
         pero adaptada por rondas en vez de tiempo real."""
         events = self.zone_round_events.get(zone, [])
         current_round = len(self.zone_history)
@@ -2411,7 +2410,7 @@ class RouletteTable:
             return out
         promedio = sum(diffs) / len(diffs)
         # Se aplica siempre el mismo valor entre 3 y 5 rondas (recorte pedido),
-        # en vez de dejar el promedio sin lÃ­mites como en la versiÃ³n de tiempo.
+        # en vez de dejar el promedio sin límites como en la versión de tiempo.
         promedio_rondas = max(ROUND_PREDICT_WINDOW_MIN, min(ROUND_PREDICT_WINDOW_MAX, promedio))
         ultimo_evento = events[-1]
         predicted_round = ultimo_evento + round(promedio_rondas)
@@ -2428,9 +2427,9 @@ class RouletteTable:
         candidates = []
         confirmation_resolved = False
         new_confirming_agent = None
-        # Estados en los que el bot puede aceptar/activar una seÃ±al nueva:
-        # None (sin secuencia) o "waiting_pattern" (esperando confirmaciÃ³n
-        # tras un CERO en el intento 1). Antes solo se permitÃ­a "None", por lo
+        # Estados en los que el bot puede aceptar/activar una señal nueva:
+        # None (sin secuencia) o "waiting_pattern" (esperando confirmación
+        # tras un CERO en el intento 1). Antes solo se permitía "None", por lo
         # que el bot se quedaba trabado para siempre en "waiting_pattern".
         open_for_signal = self.signal_status in (None, "waiting_pattern")
 
@@ -2451,12 +2450,12 @@ class RouletteTable:
                 pattern = agente.candidate_signal.get("pattern")
                 amx_str = agente.candidate_signal.get("amx_strength", 0.0)
 
-                # â”€â”€ Corte final de EFECTIVIDAD (Ãºnico filtro de calidad que
-                #    decide si una seÃ±al se envÃ­a a Telegram): se exige
+                # ── Corte final de EFECTIVIDAD (único filtro de calidad que
+                #    decide si una señal se envía a Telegram): se exige
                 #    win-rate entrenado y >= SIGNAL_SEND_MIN_WIN_RATE. Un
-                #    patrÃ³n sin entrenar todavÃ­a (win_rate is None) sigue
-                #    detectÃ¡ndose, confirmÃ¡ndose y sumando muestras para su
-                #    modelo, pero no dispara seÃ±al real hasta cumplir esto. â”€â”€
+                #    patrón sin entrenar todavía (win_rate is None) sigue
+                #    detectándose, confirmándose y sumando muestras para su
+                #    modelo, pero no dispara señal real hasta cumplir esto. ──
                 if agente.candidate_signal.get("is_streak"):
                     if bet_zone is None:
                         continue
@@ -2498,12 +2497,12 @@ class RouletteTable:
 
         # Freno real por frecuencia horaria: si para la zona del candidato
         # ya tenemos un promedio calculado (>=2 rachas de ZONE_STREAK_MIN
-        # anteriores) y todavÃ­a NO pasÃ³ ese tiempo promedio desde la
-        # Ãºltima vez ("no estÃ¡ en tiempo"), esa seÃ±al se descarta esta
-        # vuelta -> el bot espera, aunque el patrÃ³n estÃ© confirmado. Si
-        # todavÃ­a no hay datos suficientes para calcular el promedio, no
+        # anteriores) y todavía NO pasó ese tiempo promedio desde la
+        # última vez ("no está en tiempo"), esa señal se descarta esta
+        # vuelta -> el bot espera, aunque el patrón esté confirmado. Si
+        # todavía no hay datos suficientes para calcular el promedio, no
         # se bloquea nada (igual que el resto de los filtros del bot).
-        # Si sÃ­ estÃ¡ "en tiempo", ademÃ¡s se le da prioridad (mayor score)
+        # Si sí está "en tiempo", además se le da prioridad (mayor score)
         # frente a otros candidatos que compitan en el mismo giro.
         if candidates:
             filtered = []
@@ -2512,7 +2511,7 @@ class RouletteTable:
                 zone = bz[0] if bz else None
                 info = self.time_due_info.get(zone) if zone else None
                 if info is not None and info.get("avg_minutes") is not None and not info.get("due"):
-                    log.info(f"â³ {agente.name}: seÃ±al a {zone} esperando frecuencia horaria "
+                    log.info(f"⏳ {agente.name}: señal a {zone} esperando frecuencia horaria "
                              f"({info.get('elapsed_minutes')}min / {info.get('avg_minutes')}min prom.)")
                     continue
                 if zone in self.time_due_zones:
@@ -2527,10 +2526,10 @@ class RouletteTable:
         # Freno por "ronda predicha" (BAJA/ALTA): igual que el freno por
         # frecuencia horaria de arriba, pero contando RONDAS en vez de
         # minutos. Si para la zona del candidato ya hay un promedio de
-        # rondas calculado (>=2 rachas de ZONE_STREAK_MIN previas) y todavÃ­a
-        # no cayÃ³ dentro de la ventana de 3â€“5 rondas predicha (confirmada
-        # con EMA20/50), esa seÃ±al se descarta esta vuelta -> el bot espera.
-        # Si sÃ­ estÃ¡ "en ronda", se le da prioridad (mayor score). Aplica
+        # rondas calculado (>=2 rachas de ZONE_STREAK_MIN previas) y todavía
+        # no cayó dentro de la ventana de 3–5 rondas predicha (confirmada
+        # con EMA20/50), esa señal se descarta esta vuelta -> el bot espera.
+        # Si sí está "en ronda", se le da prioridad (mayor score). Aplica
         # por igual a docenas y a zonas, ya que ambas ya vienen resueltas a
         # una zona (bet_zone) en este punto.
         if candidates:
@@ -2540,7 +2539,7 @@ class RouletteTable:
                 zone = bz[0] if bz else None
                 info = self.round_due_info.get(zone) if zone else None
                 if info is not None and info.get("avg_rounds") is not None and not info.get("due"):
-                    log.info(f"â³ {agente.name}: seÃ±al a {zone} esperando ronda predicha "
+                    log.info(f"⏳ {agente.name}: señal a {zone} esperando ronda predicha "
                              f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
                              f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
                     continue
@@ -2575,17 +2574,17 @@ class RouletteTable:
             cycle_completed = self.labouchere.update(is_win)
             if cycle_completed:
                 self.cycle_pending = self.labouchere.cycles_completed
-            # NumeraciÃ³n MOSTRADA (relativa a esta seÃ±al): siempre 1 o 2,
-            # sin importar si internamente arrancÃ³ en el Ã­ndice absoluto 0
-            # o 1 (seÃ±al que se saltÃ³ el intento 1) â€” asÃ­ el formato de
-            # mensajes/registro es igual al de cualquier otra seÃ±al.
+            # Numeración MOSTRADA (relativa a esta señal): siempre 1 o 2,
+            # sin importar si internamente arrancó en el índice absoluto 0
+            # o 1 (señal que se saltó el intento 1) — así el formato de
+            # mensajes/registro es igual al de cualquier otra señal.
             display_attempt = self.current_attempt_index - self.current_signal_start_index + 1
             self._log_attempt_result(display_attempt, is_win, last_number if last_number is not None else 0)
 
             if is_win:
                 self.signal_status = "won"
                 winning_attempt = display_attempt
-                log.info(f"âœ… SECUENCIA GANADA en intento {winning_attempt} (zona {bet_zone})")
+                log.info(f"✅ SECUENCIA GANADA en intento {winning_attempt} (zona {bet_zone})")
                 if candidates:
                     best_agent, best_candidate = self._select_best_candidate(candidates)
                     if best_agent is not None:
@@ -2593,10 +2592,10 @@ class RouletteTable:
                 self._finalize_sequence(True, winning_attempt)
                 return True
             else:
-                # Tope dinÃ¡mico: normalmente ZONE_MAX_ATTEMPTS-1 (intentos 1â†’2),
-                # pero si la seÃ±al arrancÃ³ directo en intento 2 (se saltÃ³ el 1),
-                # el tope se corre una posiciÃ³n para que siga habiendo 2 intentos
-                # REALES con capital en juego (2â†’3), no solo el intento 2 suelto.
+                # Tope dinámico: normalmente ZONE_MAX_ATTEMPTS-1 (intentos 1→2),
+                # pero si la señal arrancó directo en intento 2 (se saltó el 1),
+                # el tope se corre una posición para que siga habiendo 2 intentos
+                # REALES con capital en juego (2→3), no solo el intento 2 suelto.
                 max_index = self.current_signal_start_index + ZONE_MAX_ATTEMPTS - 1
                 if self.current_attempt_index < max_index:
                     self.current_attempt_index += 1
@@ -2605,11 +2604,11 @@ class RouletteTable:
                     next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
                     next_display_attempt = self.current_attempt_index - self.current_signal_start_index + 1
                     asyncio.create_task(self._send_entry(agent, next_zone, new_bet, next_display_attempt))
-                    log.info(f"ðŸ”„ INTENTO {next_display_attempt} (Ã­ndice interno {self.current_attempt_index+1}): zona {next_zone}")
+                    log.info(f"🔄 INTENTO {next_display_attempt} (índice interno {self.current_attempt_index+1}): zona {next_zone}")
                     return True
                 else:
                     self.signal_status = "lost"
-                    log.info("âŒ SECUENCIA PERDIDA (2 intentos fallidos)")
+                    log.info("❌ SECUENCIA PERDIDA (2 intentos fallidos)")
                     if candidates:
                         best_agent, best_candidate = self._select_best_candidate(candidates)
                         if best_agent is not None:
@@ -2637,7 +2636,7 @@ class RouletteTable:
             self.pending_candidate = new_confirming_agent.candidate_signal
             self.confirming = True
             asyncio.create_task(self._send_confirmation())
-            log.info(f"ðŸ” ConfirmaciÃ³n de patrÃ³n pendiente para {new_confirming_agent.name}")
+            log.info(f"🔍 Confirmación de patrón pendiente para {new_confirming_agent.name}")
             new_confirming_agent.candidate_signal = None
             return True
 
@@ -2659,11 +2658,11 @@ class RouletteTable:
         if number != 0:
             self.last_nonzero_zone = z
 
-        # â”€â”€ Niveles de zona (ALTOS/BAJOS) para grÃ¡ficos y S/R â”€â”€
+        # ── Niveles de zona (ALTOS/BAJOS) para gráficos y S/R ──
         last_alto = self.alto_level_history[-1] if self.alto_level_history else 0
         last_bajo = self.bajo_level_history[-1] if self.bajo_level_history else 0
         if number == 0:
-            # El cero repite la contribuciÃ³n de la Ãºltima zona no nula
+            # El cero repite la contribución de la última zona no nula
             if self.last_nonzero_zone == "ALTA":
                 self.alto_level_history.append(last_alto + 1)
                 self.bajo_level_history.append(last_bajo - 1)
@@ -2709,7 +2708,7 @@ class RouletteTable:
         self.last_rebound_direction = detect_rebound_direction(self.level_history)
 
         # Filtro adicional de tendencia de largo plazo (EMA20 vs EMA50),
-        # aplicado sobre docenas y zonas. Si aÃºn no hay suficiente
+        # aplicado sobre docenas y zonas. Si aún no hay suficiente
         # historial (< 51 giros) no se aplica y no bloquea nada.
         long_trend_dozens = ema_long_trend(self.level_history)
         long_trend_zone = ema_long_trend(self.alto_level_history)
@@ -2717,15 +2716,15 @@ class RouletteTable:
 
         # Frecuencia horaria de rachas (ver _record_zone_streak_time_event /
         # _zone_time_due): no se calcula durante el entrenamiento con
-        # histÃ³rico porque ahÃ­ los timestamps no son reales.
+        # histórico porque ahí los timestamps no son reales.
         if not training:
             self._record_zone_streak_time_event(timestamp)
             self.time_due_info = {z: self._zone_time_due(z, timestamp) for z in ("ALTA", "BAJA")}
             self.time_due_zones = {z for z, info in self.time_due_info.items() if info["due"]}
 
-        # El predictor de "ronda de repeticiÃ³n" corre siempre (tambiÃ©n durante
-        # el entrenamiento con histÃ³rico), a diferencia del de tiempo real: no
-        # depende de timestamps reales, solo de giros, asÃ­ que se calienta con
+        # El predictor de "ronda de repetición" corre siempre (también durante
+        # el entrenamiento con histórico), a diferencia del de tiempo real: no
+        # depende de timestamps reales, solo de giros, así que se calienta con
         # el historial igual que el resto de los agentes.
         self._record_zone_streak_round_event()
         self.round_due_info = {z: self._zone_round_due(z) for z in ("ALTA", "BAJA")}
@@ -2784,11 +2783,11 @@ class RouletteTable:
         last10 = ",".join(self.dozen_history[-10:])
         seq_status = f"Sec: {self.signal_status}" if self.signal_status else "Sin secuencia"
         log.info(
-            f"ðŸŽ° Mesa {self.key} | Giro #{len(self.dozen_history)}: {number} ({real_color}) â†’ {dz} "
+            f"🎰 Mesa {self.key} | Giro #{len(self.dozen_history)}: {number} ({real_color}) → {dz} "
             f"(docena {real_dozen_num}) | Zona: {z} | Nivel: {self.level_current} | "
-            f"{seq_status} | Lab: [{lab_seq}] {format_cop(lab_bet)} | Ãšltimas 10 docenas: [{last10}] | "
+            f"{seq_status} | Lab: [{lab_seq}] {format_cop(lab_bet)} | Últimas 10 docenas: [{last10}] | "
             f"Live spins: {self.live_spins_seen}/{DOZEN_MIN_SPIN_TO_SIGNAL} | Tendencia (20g): {self.trend} | "
-            f"Rebote: {self.last_rebound_direction} | Ãšltima zona no nula: {self.last_nonzero_zone}"
+            f"Rebote: {self.last_rebound_direction} | Última zona no nula: {self.last_nonzero_zone}"
         )
 
     def get_state(self, limit: int = 40):
@@ -2801,9 +2800,9 @@ class RouletteTable:
             signal_zone_sequence = zone_seq
             if self.current_attempt_index < len(zone_seq):
                 signal_zone = zone_seq[self.current_attempt_index]
-            # Relativo a esta seÃ±al (1 o 2), igual que en Telegram: aunque
-            # arrancÃ³ saltÃ¡ndose el intento 1 (Ã­ndice absoluto 1/2), el
-            # dashboard tambiÃ©n debe mostrar "Intento 1/2" y "Intento 2/2".
+            # Relativo a esta señal (1 o 2), igual que en Telegram: aunque
+            # arrancó saltándose el intento 1 (índice absoluto 1/2), el
+            # dashboard también debe mostrar "Intento 1/2" y "Intento 2/2".
             signal_attempt = self.current_attempt_index - self.current_signal_start_index + 1
         elif self.signal_status == "waiting_pattern":
             signal_zone = None
@@ -2856,9 +2855,9 @@ class RouletteTable:
         return base_state
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-#  ANÃLISIS DE SOPORTE / RESISTENCIA
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
+#  ANÁLISIS DE SOPORTE / RESISTENCIA
+# ══════════════════════════════════════════════
 def detect_pivots(level_history, lookback=60, pivot_window=3):
     if len(level_history) < lookback:
         lookback = len(level_history)
@@ -2909,7 +2908,7 @@ def cluster_levels(points, threshold=1.0):
 def detect_rebound_direction(level_history, lookback=40, pivot_window=3,
                               cluster_threshold=1.0, near_distance=1.5, confirm_span=3):
     """
-    Detecta la direcciÃ³n del rebote del nivel de zona:
+    Detecta la dirección del rebote del nivel de zona:
       - "ALCISTA": el nivel acaba de rebotar hacia arriba desde un soporte (favorece ALTA / D2-D3)
       - "BAJISTA": el nivel acaba de rebotar hacia abajo desde una resistencia (favorece BAJA / D1-D2)
       - "NEUTRAL": no hay un rebote reciente y claro desde soporte/resistencia
@@ -2956,9 +2955,9 @@ def _zone_analysis_payload(level_history, lookback, number_history=None):
 
     numbers_slice = []
     if number_history:
-        # number_history estÃ¡ alineado Ã­ndice a Ã­ndice con level_history
+        # number_history está alineado índice a índice con level_history
         numbers_slice = number_history[-lookback:] if len(number_history) >= lookback else number_history
-        # aseguramos misma longitud que levels (por si difieren en algÃºn borde)
+        # aseguramos misma longitud que levels (por si difieren en algún borde)
         if len(numbers_slice) != len(levels):
             numbers_slice = numbers_slice[-len(levels):] if len(numbers_slice) > len(levels) else numbers_slice
 
@@ -2973,13 +2972,13 @@ def _zone_analysis_payload(level_history, lookback, number_history=None):
     }
 
 async def http_analysis_zones(request: web.Request):
-    """Soportes/resistencias y niveles para los DOS grÃ¡ficos de zona (ALTOS y BAJOS)."""
+    """Soportes/resistencias y niveles para los DOS gráficos de zona (ALTOS y BAJOS)."""
     if _server_state is None:
         return web.json_response({"error": "server not ready"}, status=503)
     try:
         mesa = int(request.match_info["mesa"])
     except (KeyError, ValueError):
-        return web.json_response({"error": "mesa invÃ¡lida"}, status=400)
+        return web.json_response({"error": "mesa inválida"}, status=400)
     if mesa not in ROULETTE_KEYS.values():
         return web.json_response({"error": "mesa no soportada"}, status=404)
     table = _server_state.tables.get(mesa)
@@ -3002,7 +3001,7 @@ async def http_analysis(request: web.Request):
     try:
         mesa = int(request.match_info["mesa"])
     except (KeyError, ValueError):
-        return web.json_response({"error": "mesa invÃ¡lida"}, status=400)
+        return web.json_response({"error": "mesa inválida"}, status=400)
     if mesa not in ROULETTE_KEYS.values():
         return web.json_response({"error": "mesa no soportada"}, status=404)
 
@@ -3039,16 +3038,16 @@ async def http_analysis(request: web.Request):
     return web.json_response(response)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  DASHBOARD HTML (raw string para evitar warnings de escape)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes">
-    <title>Sistema de Zonas Â· ALTOS/BAJOS Â· Soporte/Resistencia</title>
+    <title>Sistema de Zonas · ALTOS/BAJOS · Soporte/Resistencia</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
@@ -3173,18 +3172,18 @@ DASHBOARD_HTML = r"""
 <div class="container">
 
     <div class="card main-title">
-        <h1>ðŸŽ¯ Sistema de Zonas Â· ALTOS / BAJOS</h1>
-        <div class="sub">SeÃ±ales del bot de Telegram Â· Soporte/Resistencia en ambos grÃ¡ficos Â· 2Âº intento con rebote</div>
+        <h1>🎯 Sistema de Zonas · ALTOS / BAJOS</h1>
+        <div class="sub">Señales del bot de Telegram · Soporte/Resistencia en ambos gráficos · 2º intento con rebote</div>
         <div class="info-bar">
             <span class="table-tag"><span class="led" id="connectionLed"></span><span id="connectionText">Conectando...</span></span>
-            <span class="table-tag" id="tableTag">Mesa â€”</span>
-            <span class="trend-badge neutral" id="trendBadge">âž¡ TENDENCIA: â€”</span>
-            <span class="rebound-badge neutral" id="reboundBadge">ðŸ”„ REBOTE: â€”</span>
+            <span class="table-tag" id="tableTag">Mesa —</span>
+            <span class="trend-badge neutral" id="trendBadge">➡ TENDENCIA: —</span>
+            <span class="rebound-badge neutral" id="reboundBadge">🔄 REBOTE: —</span>
             <div class="counters">
                 <span><i class="fas fa-database"></i> <span id="spinCount">0</span></span>
                 <span><i class="fas fa-clock"></i> <span id="lastUpdate">--:--:--</span></span>
             </div>
-            <button class="btn-reset-conf" onclick="resetConfig()">â†º Reset</button>
+            <button class="btn-reset-conf" onclick="resetConfig()">↺ Reset</button>
         </div>
     </div>
 
@@ -3200,7 +3199,7 @@ DASHBOARD_HTML = r"""
     </div>
 
     <div class="card balls-row">
-        <span><i class="fas fa-history"></i> Ãšltimas zonas:</span>
+        <span><i class="fas fa-history"></i> Últimas zonas:</span>
         <div id="historyBalls" style="display:flex;gap:5px;flex-wrap:wrap;"></div>
     </div>
 
@@ -3209,7 +3208,7 @@ DASHBOARD_HTML = r"""
         <div class="ln-info">
             <div class="ln-top">
                 <span class="ln-zone-tag" id="lnZoneTag">SIN DATOS</span>
-                <span class="ln-signal-badge sig-no" id="lnSignalBadge">â¸ï¸ Sin seÃ±al</span>
+                <span class="ln-signal-badge sig-no" id="lnSignalBadge">⏸️ Sin señal</span>
             </div>
             <div class="ln-waiting-text" id="lnWaitingText">Esperando primer giro...</div>
         </div>
@@ -3217,13 +3216,13 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> GrÃ¡fico ALTOS (19-36) Â· ðŸ”µ Alto  ðŸŸ¤ Bajo  ðŸŸ¢ Cero Â· EMA 20/50 Â· Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#4fa8ff;"></i> Gráfico ALTOS (19-36) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 20/50 · Soporte/Resistencia</span>
             <div class="ema-legend">
                 <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 20</span>
                 <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 50</span>
                 <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
                 <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
-                <span style="color:#00b894;">â–² Pivotes</span>
+                <span style="color:#00b894;">▲ Pivotes</span>
             </div>
         </div>
         <div class="chart-container"><canvas id="chartAltos"></canvas></div>
@@ -3231,13 +3230,13 @@ DASHBOARD_HTML = r"""
 
     <div class="chart-box">
         <div class="chart-header">
-            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> GrÃ¡fico BAJOS (1-18) Â· ðŸ”µ Alto  ðŸŸ¤ Bajo  ðŸŸ¢ Cero Â· EMA 20/50 Â· Soporte/Resistencia</span>
+            <span><i class="fas fa-chart-line" style="color:#c98a4a;"></i> Gráfico BAJOS (1-18) · 🔵 Alto  🟤 Bajo  🟢 Cero · EMA 20/50 · Soporte/Resistencia</span>
             <div class="ema-legend">
                 <span><span class="ema-dot" style="background:#ff8c00;"></span> EMA 20</span>
                 <span><span class="ema-dot" style="background:#ff4d4d;"></span> EMA 50</span>
                 <span><span class="legend-dash" style="border-color:#00d4ff;"></span> Soporte</span>
                 <span><span class="legend-dash" style="border-color:#ff6b6b;"></span> Resistencia</span>
-                <span style="color:#00b894;">â–² Pivotes</span>
+                <span style="color:#00b894;">▲ Pivotes</span>
             </div>
         </div>
         <div class="chart-container"><canvas id="chartBajos"></canvas></div>
@@ -3245,55 +3244,55 @@ DASHBOARD_HTML = r"""
 
     <div class="card signal-panel" id="signalPanel">
         <div class="signal-status">
-            <span>ðŸ“¡ SeÃ±al Telegram:</span>
+            <span>📡 Señal Telegram:</span>
             <span class="signal-badge" id="signalBadge">Inactiva</span>
             <span class="signal-zone" id="signalZone">-</span>
             <span id="signalAttempt">-</span>
             <span id="signalLastResult" style="font-size:0.8rem;opacity:0.7;"></span>
-            <span class="sound-toggle" id="soundToggle" onclick="toggleSound()">ðŸ”Š Sonido ON</span>
+            <span class="sound-toggle" id="soundToggle" onclick="toggleSound()">🔊 Sonido ON</span>
         </div>
     </div>
 
     <div class="sx-wrap">
         <div class="sx-header sxopen" id="s4Header" onclick="sxToggle('s4')">
-            <div><h3>ðŸ”¢ GESTIÃ“N INDEPENDIENTE â€” LABOUCHÃˆRE</h3><div class="sx-sub">Secuencia <span id="s4SeqLabel">1,1,1,1,1,1,1,1,1,1</span></div></div>
-            <span class="sx-arrow" id="s4Arrow" style="transform:rotate(180deg)">â–¼</span>
+            <div><h3>🔢 GESTIÓN INDEPENDIENTE — LABOUCHÈRE</h3><div class="sx-sub">Secuencia <span id="s4SeqLabel">1,1,1,1,1,1,1,1,1,1</span></div></div>
+            <span class="sx-arrow" id="s4Arrow" style="transform:rotate(180deg)">▼</span>
         </div>
         <div class="sx-body sxopen" id="s4Body">
             <div class="sx-info">
-                <div class="sx-box"><div class="sx-lbl">ðŸ’° Balance</div><div class="sx-val sv-green" id="s4Balance">$100.00</div></div>
-                <div class="sx-box"><div class="sx-lbl">ðŸ“ˆ Margen</div><div class="sx-val sv-green" id="s4Margen">+$0.00</div></div>
-                <div class="sx-box"><div class="sx-lbl">ðŸ”¢ Fichas</div><div class="sx-val" id="s4SeqLen" style="color:#30d8c0">10</div></div>
-                <div class="sx-box"><div class="sx-lbl">ðŸ’µ Apuesta</div><div class="sx-val sv-gold" id="s4Apuesta">$2.00</div></div>
+                <div class="sx-box"><div class="sx-lbl">💰 Balance</div><div class="sx-val sv-green" id="s4Balance">$100.00</div></div>
+                <div class="sx-box"><div class="sx-lbl">📈 Margen</div><div class="sx-val sv-green" id="s4Margen">+$0.00</div></div>
+                <div class="sx-box"><div class="sx-lbl">🔢 Fichas</div><div class="sx-val" id="s4SeqLen" style="color:#30d8c0">10</div></div>
+                <div class="sx-box"><div class="sx-lbl">💵 Apuesta</div><div class="sx-val sv-gold" id="s4Apuesta">$2.00</div></div>
             </div>
-            <div class="sx-alert-box" id="s4Alerta">â³ Esperando inicio...</div>
+            <div class="sx-alert-box" id="s4Alerta">⏳ Esperando inicio...</div>
             <div class="s4-seq-row" id="s4SeqRow"></div>
-            <div id="s4Goal" style="text-align:center; font-size:0.68rem; color:rgba(48,216,192,.75); letter-spacing:.5px; margin:4px 0 8px;">ðŸŽ¯ Meta ciclo: --</div>
-            <div class="sx-auto-badge" id="s4AutoStatus">ðŸ¤– MODO AUTOMÃTICO â€” SeÃ±ales del bot de Telegram</div>
+            <div id="s4Goal" style="text-align:center; font-size:0.68rem; color:rgba(48,216,192,.75); letter-spacing:.5px; margin:4px 0 8px;">🎯 Meta ciclo: --</div>
+            <div class="sx-auto-badge" id="s4AutoStatus">🤖 MODO AUTOMÁTICO — Señales del bot de Telegram</div>
             <div class="sx-btns" id="s4Controls" style="display:none">
-                <button class="sx-btn sx-btn-reset" onclick="s4Reset()">ðŸ”„ RESET</button>
+                <button class="sx-btn sx-btn-reset" onclick="s4Reset()">🔄 RESET</button>
             </div>
-            <button class="sx-btn-start" id="s4BtnStart" onclick="s4Start()">ðŸ”¢ INICIAR LABOUCHÃˆRE</button>
+            <button class="sx-btn-start" id="s4BtnStart" onclick="s4Start()">🔢 INICIAR LABOUCHÈRE</button>
             <div class="sx-hist" id="s4Hist" style="display:none">
                 <table><thead><tr><th>#</th><th>Fichas</th><th>$Ap</th><th>Res</th><th>Bal</th></tr></thead>
                 <tbody id="s4HistBody"><tr><td colspan="5" style="color:rgba(255,255,255,.25);padding:6px">Sin datos</td></tr></tbody>
                 </table>
             </div>
-            <div class="sx-cfg-toggle" onclick="sxCfgToggle('s4')">âš™ï¸ Configurar capital, apuesta base y secuencia</div>
+            <div class="sx-cfg-toggle" onclick="sxCfgToggle('s4')">⚙️ Configurar capital, apuesta base y secuencia</div>
             <div class="sx-cfg" id="s4Cfg">
-                <label>ðŸ’° CAPITAL INICIAL</label>
+                <label>💰 CAPITAL INICIAL</label>
                 <input type="number" id="s4CapIn" value="100" min="0.01" step="0.01">
-                <label>ðŸ’µ APUESTA BASE (1 ficha)</label>
+                <label>💵 APUESTA BASE (1 ficha)</label>
                 <input type="number" id="s4BetIn" value="1" min="0.01" step="0.01">
-                <label>ðŸ”¢ SECUENCIA (fichas, separadas por coma)</label>
+                <label>🔢 SECUENCIA (fichas, separadas por coma)</label>
                 <input type="text" id="s4SeqIn" value="1,1,1,1,1,1,1,1,1,1">
                 <div id="s4CfgPreview" style="margin-top:8px;text-align:center;font-size:0.66rem;color:rgba(48,216,192,.7);"></div>
-                <button class="sx-apply" onclick="s4Apply()">âœ… APLICAR</button>
+                <button class="sx-apply" onclick="s4Apply()">✅ APLICAR</button>
             </div>
         </div>
     </div>
 
-    <div class="footer">La gestiÃ³n LabouchÃ¨re de este panel corre en tu navegador, independiente del LabouchÃ¨re interno del bot. Soportes/resistencias: picos/valleys agrupados (umbral 1.0) calculados en el servidor para los niveles ALTOS y BAJOS por separado. El 2Âº intento de las seÃ±ales considera el rebote actual (ALCISTAâ†’BAJA, BAJISTAâ†’ALTA).</div>
+    <div class="footer">La gestión Labouchère de este panel corre en tu navegador, independiente del Labouchère interno del bot. Soportes/resistencias: picos/valleys agrupados (umbral 1.0) calculados en el servidor para los niveles ALTOS y BAJOS por separado. El 2º intento de las señales considera el rebote actual (ALCISTA→BAJA, BAJISTA→ALTA).</div>
 </div>
 
 <div id="signalAlert" class="signal-alert hidden">
@@ -3305,7 +3304,7 @@ DASHBOARD_HTML = r"""
 
 <script>
     // ============================================================
-    //  CONFIGURACIÃ“N
+    //  CONFIGURACIÓN
     // ============================================================
     const API_BASE = window.location.origin;
     const currentMesa = {mesa_key};
@@ -3313,10 +3312,10 @@ DASHBOARD_HTML = r"""
     let chartAltos = null;
     let chartBajos = null;
     let lastSignalState = null;
-    let lastProcessedAttemptSeq = null; // null = aÃºn no inicializado (evita reproducir historial viejo al cargar)
+    let lastProcessedAttemptSeq = null; // null = aún no inicializado (evita reproducir historial viejo al cargar)
 
     // ============================================================
-    //  SONIDO DE NUEVA SEÃ‘AL (Telegram)
+    //  SONIDO DE NUEVA SEÑAL (Telegram)
     // ============================================================
     let soundEnabled = (localStorage.getItem('zonas_sound_enabled') !== 'off');
     let audioCtx = null;
@@ -3324,7 +3323,7 @@ DASHBOARD_HTML = r"""
     function updateSoundToggleUI() {
         const el = document.getElementById('soundToggle');
         if (!el) return;
-        el.textContent = soundEnabled ? 'ðŸ”Š Sonido ON' : 'ðŸ”‡ Sonido OFF';
+        el.textContent = soundEnabled ? '🔊 Sonido ON' : '🔇 Sonido OFF';
         el.classList.toggle('muted', !soundEnabled);
     }
 
@@ -3345,10 +3344,10 @@ DASHBOARD_HTML = r"""
         return audioCtx;
     }
 
-    // Los navegadores bloquean el audio automÃ¡tico hasta que el usuario
-    // interactÃºa con la pÃ¡gina. Con el primer click/touch en cualquier
+    // Los navegadores bloquean el audio automático hasta que el usuario
+    // interactúa con la página. Con el primer click/touch en cualquier
     // parte, "desbloqueamos" el contexto para que las alertas posteriores
-    // (que llegan solas, sin interacciÃ³n) sÃ­ puedan sonar.
+    // (que llegan solas, sin interacción) sí puedan sonar.
     ['click', 'touchstart', 'keydown'].forEach(function(evt) {
         document.addEventListener(evt, function unlockAudioOnce() {
             const ctx = ensureAudioCtx();
@@ -3380,7 +3379,7 @@ DASHBOARD_HTML = r"""
         });
     }
 
-    // Sonido al llegar una seÃ±al nueva de Telegram (BAJA/ALTA).
+    // Sonido al llegar una señal nueva de Telegram (BAJA/ALTA).
     function playNewSignalSound() {
         playBeep([880, 1175], 0.16);
     }
@@ -3445,10 +3444,10 @@ DASHBOARD_HTML = r"""
         const hist = (state.spin_history || []).slice(-40);
         const zones = (state.zone_history || []).slice(-40);
         wrap.innerHTML = '';
-        // Se recorre de mÃ¡s reciente a mÃ¡s antiguo: el mÃ¡s reciente queda
+        // Se recorre de más reciente a más antiguo: el más reciente queda
         // primero en el DOM (arriba a la izquierda) y los antiguos van
-        // quedando a la derecha. Esto NO afecta a los grÃ¡ficos, que siguen
-        // dibujÃ¡ndose de izquierda a derecha con los mÃ¡s recientes a la derecha.
+        // quedando a la derecha. Esto NO afecta a los gráficos, que siguen
+        // dibujándose de izquierda a derecha con los más recientes a la derecha.
         for (let i = hist.length - 1; i >= 0; i--) {
             const spin = hist[i];
             const zone = zones[i] || 'VERDE';
@@ -3462,7 +3461,7 @@ DASHBOARD_HTML = r"""
     }
 
     // ============================================================
-    //  ÃšLTIMO NÃšMERO / SEÃ‘AL
+    //  ÚLTIMO NÚMERO / SEÑAL
     // ============================================================
     function renderLastNumber(state) {
         const hist = state.spin_history || [];
@@ -3478,7 +3477,7 @@ DASHBOARD_HTML = r"""
             zoneTag.textContent = 'SIN DATOS';
             zoneTag.className = 'ln-zone-tag';
             waitTxt.textContent = 'Esperando primer giro...';
-            sigBadge.textContent = 'â¸ï¸ Sin seÃ±al';
+            sigBadge.textContent = '⏸️ Sin señal';
             sigBadge.className = 'ln-signal-badge sig-no';
             return;
         }
@@ -3492,22 +3491,22 @@ DASHBOARD_HTML = r"""
         zoneTag.className = 'ln-zone-tag ' + cls;
 
         if (state.signal_active && state.signal_zone) {
-            sigBadge.textContent = 'ðŸ”” SeÃ±al ' + state.signal_zone + ' Â· Intento ' + state.signal_attempt + '/' + state.signal_total_attempts;
+            sigBadge.textContent = '🔔 Señal ' + state.signal_zone + ' · Intento ' + state.signal_attempt + '/' + state.signal_total_attempts;
             sigBadge.className = 'ln-signal-badge sig-active';
             waitTxt.textContent = '';
         } else {
-            sigBadge.textContent = 'â¸ï¸ Sin seÃ±al activa';
+            sigBadge.textContent = '⏸️ Sin señal activa';
             sigBadge.className = 'ln-signal-badge sig-no';
             waitTxt.textContent = state.last_signal_outcome
-                ? 'Ãšltimo resultado: ' + (state.last_signal_outcome === 'win' ? 'âœ… WIN' : 'âŒ LOSS') + ' (' + (state.last_signal_number || '?') + ')'
-                : 'Esperando patrÃ³n...';
+                ? 'Último resultado: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')'
+                : 'Esperando patrón...';
         }
     }
 
     // ============================================================
     //  TENDENCIA / REBOTE
     //  El nivel de docenas SUBE con bajas (D1/D2) y BAJA con altas (D3):
-    //  ALCISTA => favorece BAJA Â· BAJISTA => favorece ALTA
+    //  ALCISTA => favorece BAJA · BAJISTA => favorece ALTA
     // ============================================================
     function renderTrend(state) {
         const el = document.getElementById('trendBadge');
@@ -3515,13 +3514,13 @@ DASHBOARD_HTML = r"""
         el.classList.remove('bullish', 'bearish', 'neutral');
         if (trend === 'bullish') {
             el.classList.add('bullish');
-            el.textContent = 'â–² TENDENCIA: ALCISTA (favorece BAJA)';
+            el.textContent = '▲ TENDENCIA: ALCISTA (favorece BAJA)';
         } else if (trend === 'bearish') {
             el.classList.add('bearish');
-            el.textContent = 'â–¼ TENDENCIA: BAJISTA (favorece ALTA)';
+            el.textContent = '▼ TENDENCIA: BAJISTA (favorece ALTA)';
         } else {
             el.classList.add('neutral');
-            el.textContent = 'âž¡ TENDENCIA: NEUTRAL';
+            el.textContent = '➡ TENDENCIA: NEUTRAL';
         }
     }
 
@@ -3531,21 +3530,21 @@ DASHBOARD_HTML = r"""
         el.classList.remove('alcista', 'bajista', 'neutral');
         if (dir === 'ALCISTA') {
             el.classList.add('alcista');
-            el.textContent = 'ðŸ”„ REBOTE: ALCISTA (soporte â†’ BAJA)';
+            el.textContent = '🔄 REBOTE: ALCISTA (soporte → BAJA)';
         } else if (dir === 'BAJISTA') {
             el.classList.add('bajista');
-            el.textContent = 'ðŸ”„ REBOTE: BAJISTA (resistencia â†’ ALTA)';
+            el.textContent = '🔄 REBOTE: BAJISTA (resistencia → ALTA)';
         } else {
             el.classList.add('neutral');
-            el.textContent = 'ðŸ”„ REBOTE: NEUTRAL';
+            el.textContent = '🔄 REBOTE: NEUTRAL';
         }
     }
 
     // ============================================================
-    //  GRÃFICOS DE ZONA â€” estilo "Johan" (puntos por nÃºmero/color)
+    //  GRÁFICOS DE ZONA — estilo "Johan" (puntos por número/color)
     //  + EMA 4/8/20 + Soporte/Resistencia + Pivotes
     // ============================================================
-    // Azul para ALTO (19-36), marrÃ³n para BAJO (1-18), verde para el 0
+    // Azul para ALTO (19-36), marrón para BAJO (1-18), verde para el 0
     function zoneNumColor(num) {
         if (num === null || num === undefined) return '#ffffff';
         if (num === 0) return '#5fd17c';
@@ -3613,10 +3612,10 @@ DASHBOARD_HTML = r"""
         const opts = {
             responsive: true, maintainAspectRatio: false, animation: false,
             plugins: {
-                // La leyenda ya se muestra arriba del grÃ¡fico con los <span>
+                // La leyenda ya se muestra arriba del gráfico con los <span>
                 // personalizados (EMA 4/8/20, Soporte, Resistencia, Pivotes).
-                // Si ademÃ¡s Chart.js dibuja su propia leyenda automÃ¡tica con
-                // las mismas referencias, queda duplicada. Se desactiva acÃ¡.
+                // Si además Chart.js dibuja su propia leyenda automática con
+                // las mismas referencias, queda duplicada. Se desactiva acá.
                 legend: { display: false },
                 tooltip: { callbacks: { label: function(ctx) {
                     let label = ctx.dataset.label || '';
@@ -3625,7 +3624,7 @@ DASHBOARD_HTML = r"""
                     let txt = label + ': ' + (Number.isInteger(val) ? val : val.toFixed(2));
                     if (label === 'Nivel' && ctx.dataset.pointNumbers) {
                         const num = ctx.dataset.pointNumbers[ctx.dataIndex];
-                        if (num !== undefined && num !== null) txt += '  Â·  NÃºmero: ' + num;
+                        if (num !== undefined && num !== null) txt += '  ·  Número: ' + num;
                     }
                     return txt;
                 } } }
@@ -3651,9 +3650,9 @@ DASHBOARD_HTML = r"""
         return chart;
     }
 
-    // Firma barata de una serie para saber si realmente cambiÃ³ desde el
-    // Ãºltimo poll (mismo largo + mismo Ãºltimo valor + mismo Ãºltimo
-    // nÃºmero). Si no cambiÃ³, no tiene sentido recalcular EMAs, clusters
+    // Firma barata de una serie para saber si realmente cambió desde el
+    // último poll (mismo largo + mismo último valor + mismo último
+    // número). Si no cambió, no tiene sentido recalcular EMAs, clusters
     // de soporte/resistencia y volver a dibujar: ahorra CPU cada 2s y es
     // otra causa menos de que el navegador se sienta "pegado".
     let lastZoneSig = { alto: null, bajo: null };
@@ -3707,7 +3706,7 @@ DASHBOARD_HTML = r"""
         document.getElementById('alertBet').style.display = 'none';
         const res = document.getElementById('alertResult');
         res.style.display = 'block';
-        res.textContent = win ? 'âœ… WIN' : 'âŒ LOSS';
+        res.textContent = win ? '✅ WIN' : '❌ LOSS';
         alert.classList.remove('hidden');
         setTimeout(() => {
             if (!lastSignalState || !lastSignalState.signal_active) {
@@ -3723,7 +3722,7 @@ DASHBOARD_HTML = r"""
         if (!state) return;
         document.getElementById('spinCount').textContent = state.total_spins_seen || 0;
         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('es-ES',{hour12:false});
-        document.getElementById('tableTag').textContent = 'Mesa ' + state.key + ' Â· ' + (state.table_name || '');
+        document.getElementById('tableTag').textContent = 'Mesa ' + state.key + ' · ' + (state.table_name || '');
 
         const led = document.getElementById('connectionLed');
         const txt = document.getElementById('connectionText');
@@ -3743,11 +3742,11 @@ DASHBOARD_HTML = r"""
         const attemptEl = document.getElementById('signalAttempt');
         const resultEl = document.getElementById('signalLastResult');
 
-        // Detecta el FRENTE de subida de la seÃ±al (inactiva -> activa) para
+        // Detecta el FRENTE de subida de la señal (inactiva -> activa) para
         // sonar solo UNA vez cuando llega, no en cada poll mientras sigue activa.
         // Se exige que ya exista un poll previo (lastSignalState !== null) para
         // no disparar sonido con el estado "heredado" del primer fetch al cargar
-        // la pÃ¡gina (igual criterio que se usa para el log de intentos).
+        // la página (igual criterio que se usa para el log de intentos).
         if (lastSignalState) {
             if (state.signal_active && !lastSignalState.signal_active) {
                 playNewSignalSound();
@@ -3758,28 +3757,28 @@ DASHBOARD_HTML = r"""
         }
 
         if (state.signal_active) {
-            badge.textContent = 'ðŸ”” ACTIVA';
+            badge.textContent = '🔔 ACTIVA';
             badge.className = 'signal-badge active';
             const zone = state.signal_zone || '?';
             zoneEl.textContent = zone;
             zoneEl.className = 'signal-zone ' + (zone === 'BAJA' ? 'baja' : 'alta');
             attemptEl.textContent = 'Intento ' + (state.signal_attempt || 1) + '/' + (state.signal_total_attempts || 2);
             resultEl.textContent = state.last_signal_outcome
-                ? 'Ãšltimo: ' + (state.last_signal_outcome === 'win' ? 'âœ… WIN' : 'âŒ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
+                ? 'Último: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
             if (state.signal_zone) showSignalAlert(state.signal_zone, state.signal_attempt, state.signal_total_attempts);
         } else {
-            badge.textContent = 'â¸ï¸ Inactiva';
+            badge.textContent = '⏸️ Inactiva';
             badge.className = 'signal-badge';
             zoneEl.textContent = '-'; zoneEl.className = 'signal-zone';
             attemptEl.textContent = '';
             resultEl.textContent = state.last_signal_outcome
-                ? 'Ãšltimo: ' + (state.last_signal_outcome === 'win' ? 'âœ… WIN' : 'âŒ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
+                ? 'Último: ' + (state.last_signal_outcome === 'win' ? '✅ WIN' : '❌ LOSS') + ' (' + (state.last_signal_number || '?') + ')' : '';
             hideSignalAlert();
         }
 
-        // Procesa CADA intento resuelto (intento 1 y tambiÃ©n intento 2), no solo el
-        // resultado final de la seÃ±al. AsÃ­ el LOSS del intento 1 sÃ­ se aplica a la
-        // gestiÃ³n aunque la seÃ±al continÃºe al intento 2.
+        // Procesa CADA intento resuelto (intento 1 y también intento 2), no solo el
+        // resultado final de la señal. Así el LOSS del intento 1 sí se aplica a la
+        // gestión aunque la señal continúe al intento 2.
         processAttemptLog(state.attempt_log);
         lastSignalState = state;
 
@@ -3794,10 +3793,10 @@ DASHBOARD_HTML = r"""
 
     async function poll() {
         // Evita solapamientos: si el ciclo anterior (fetchState +
-        // fetchZoneAnalysis) todavÃ­a no terminÃ³ -por red lenta o el
+        // fetchZoneAnalysis) todavía no terminó -por red lenta o el
         // "cold start" del hosting- no se lanza uno nuevo encima. Antes,
         // con setInterval fijo cada 2s, los fetch lentos se acumulaban
-        // uno sobre otro y la pÃ¡gina terminaba "pegada"/congelada.
+        // uno sobre otro y la página terminaba "pegada"/congelada.
         if (pollInFlight) return;
         pollInFlight = true;
         try {
@@ -3814,9 +3813,9 @@ DASHBOARD_HTML = r"""
     }
 
     function startPolling() {
-        // setTimeout que se reprograma DESPUÃ‰S de terminar cada ciclo,
+        // setTimeout que se reprograma DESPUÉS de terminar cada ciclo,
         // en vez de setInterval (que dispara a horario fijo sin importar
-        // si el ciclo anterior sigue en curso). AsÃ­ el intervalo real
+        // si el ciclo anterior sigue en curso). Así el intervalo real
         // entre actualizaciones nunca es menor a 2s, pero tampoco se
         // amontonan peticiones cuando la red va lenta.
         if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
@@ -3841,7 +3840,7 @@ DASHBOARD_HTML = r"""
     });
 
     // ============================================================
-    //  GESTIÃ“N LABOUCHÃˆRE (independiente del bot de Telegram)
+    //  GESTIÓN LABOUCHÈRE (independiente del bot de Telegram)
     // ============================================================
     function s4Sum(arr){ return _r2(arr.reduce(function(a,b){ return a + b; }, 0)); }
     function s4Fichas(){
@@ -3864,14 +3863,14 @@ DASHBOARD_HTML = r"""
             chip.textContent = _units(v);
             row.appendChild(chip);
         });
-        if (!s4Seq.length) row.innerHTML = '<span style="color:#30d8c0;font-size:0.75rem;letter-spacing:1px;">âœ… SECUENCIA VACÃA</span>';
+        if (!s4Seq.length) row.innerHTML = '<span style="color:#30d8c0;font-size:0.75rem;letter-spacing:1px;">✅ SECUENCIA VACÍA</span>';
     }
 
     function s4Goal(){
         var el = document.getElementById('s4Goal');
         if (!el) return;
-        el.innerHTML = 'ðŸŽ¯ Meta ciclo <b>+$' + _money(s4Objetivo()) + '</b> Â· ficha $' + _money(s4Base) +
-                       ' Â· pendiente $' + _money(_r2(s4Sum(s4Seq) * s4Base));
+        el.innerHTML = '🎯 Meta ciclo <b>+$' + _money(s4Objetivo()) + '</b> · ficha $' + _money(s4Base) +
+                       ' · pendiente $' + _money(_r2(s4Sum(s4Seq) * s4Base));
     }
 
     function s4ClearHist(){
@@ -3928,14 +3927,14 @@ DASHBOARD_HTML = r"""
         lastProcessedAttemptSeq = null; // no aplicar intentos resueltos antes de iniciar
         s4ClearHist();
         _sxShow('s4', true);
-        _sxSetAlert('s4', 'ðŸ¤– AUTO Â· [' + s4Txt(s4Seq) + '] Â· $' + _money(s4Bet) + ' Â· Esperando seÃ±al...');
+        _sxSetAlert('s4', '🤖 AUTO · [' + s4Txt(s4Seq) + '] · $' + _money(s4Bet) + ' · Esperando señal...');
         s4UI();
     }
 
     // Procesa el log de intentos resueltos que llega del backend. Cada intento
     // (1 y 2) tiene su propio "seq" incremental; se procesan en orden y solo los
-    // que no se hayan visto antes, asÃ­ el LOSS del intento 1 SÃ avanza la gestiÃ³n
-    // aunque la seÃ±al siga viva esperando el intento 2.
+    // que no se hayan visto antes, así el LOSS del intento 1 SÍ avanza la gestión
+    // aunque la señal siga viva esperando el intento 2.
     function processAttemptLog(log){
         if (!log || !log.length) return;
         if (lastProcessedAttemptSeq === null) {
@@ -3961,13 +3960,13 @@ DASHBOARD_HTML = r"""
             else { s4Seq.shift(); s4Seq.pop(); }
             if (!s4Seq.length){
                 s4Bet = 0; s4UI();
-                _sxSetAlert('s4', 'ðŸ CICLO COMPLETADO Â· +$' + _money(_r2(s4Bal - s4Cap)), false);
+                _sxSetAlert('s4', '🏁 CICLO COMPLETADO · +$' + _money(_r2(s4Bal - s4Cap)), false);
                 showResultAlert(true);
                 s4End();
                 return;
             }
             s4Bet = s4Calc();
-            _sxSetAlert('s4', 'âœ… WIN Â· Cancela extremos â†’ [' + s4Txt(s4Seq) + '] Â· $' + _money(s4Bet), false);
+            _sxSetAlert('s4', '✅ WIN · Cancela extremos → [' + s4Txt(s4Seq) + '] · $' + _money(s4Bet), false);
         } else {
             var added = s4Fichas();
             s4Bal = _r2(s4Bal - s4Bet); s4L++;
@@ -3980,8 +3979,8 @@ DASHBOARD_HTML = r"""
                 s4End();
                 return;
             }
-            var warn = (s4Bet > s4Bal) ? ' Â· âš ï¸ apuesta > saldo' : '';
-            _sxSetAlert('s4', 'âŒ LOSS Â· AÃ±ade ' + _units(added) + ' â†’ [' + s4Txt(s4Seq) + '] Â· $' + _money(s4Bet) + warn, true);
+            var warn = (s4Bet > s4Bal) ? ' · ⚠️ apuesta > saldo' : '';
+            _sxSetAlert('s4', '❌ LOSS · Añade ' + _units(added) + ' → [' + s4Txt(s4Seq) + '] · $' + _money(s4Bet) + warn, true);
         }
         s4UI();
     }
@@ -3989,7 +3988,7 @@ DASHBOARD_HTML = r"""
     function s4End(){
         s4Active = false;
         _sxShow('s4', false);
-        _sxSetAlert('s4', 'â³ GestiÃ³n finalizada', false);
+        _sxSetAlert('s4', '⏳ Gestión finalizada', false);
     }
 
     function s4Reset(){
@@ -4000,7 +3999,7 @@ DASHBOARD_HTML = r"""
         s4Ent = s4W = s4L = 0;
         _sxShow('s4', false);
         s4ClearHist();
-        _sxSetAlert('s4', 'â³ Esperando inicio...');
+        _sxSetAlert('s4', '⏳ Esperando inicio...');
         s4UI();
     }
 
@@ -4020,9 +4019,9 @@ DASHBOARD_HTML = r"""
         if (!isFinite(base) || base <= 0) base = s4Base;
         if (!seq.length) seq = s4InitSeq;
         var first = _r2((seq.length > 1 ? seq[0] + seq[seq.length - 1] : seq[0]) * base);
-        prev.innerHTML = 'ðŸ‘‰ ' + seq.length + ' fichas Â· 1Âª apuesta <b>$' + _money(first) +
-                         '</b> Â· meta <b>+$' + _money(_r2(s4Sum(seq) * base)) + '</b>' +
-                         (isFinite(cap) && cap > 0 ? ' Â· capital $' + _money(cap) : '');
+        prev.innerHTML = '👉 ' + seq.length + ' fichas · 1ª apuesta <b>$' + _money(first) +
+                         '</b> · meta <b>+$' + _money(_r2(s4Sum(seq) * base)) + '</b>' +
+                         (isFinite(cap) && cap > 0 ? ' · capital $' + _money(cap) : '');
     }
 
     function s4Apply(){
@@ -4036,7 +4035,7 @@ DASHBOARD_HTML = r"""
         document.getElementById('s4BetIn').value = s4Base;
         document.getElementById('s4SeqIn').value = s4Txt(s4InitSeq);
         if (!s4Active){ s4Bal = s4Cap; s4Seq = s4InitSeq.slice(); s4Bet = s4Calc(); }
-        _sxSetAlert('s4', 'âœ… Capital $' + _money(s4Cap) + ' Â· Ficha $' + _money(s4Base) + ' Â· Meta +$' + _money(s4Objetivo()));
+        _sxSetAlert('s4', '✅ Capital $' + _money(s4Cap) + ' · Ficha $' + _money(s4Base) + ' · Meta +$' + _money(s4Objetivo()));
         s4UI(); s4Live();
         document.getElementById('s4Cfg').style.display = 'none';
     }
@@ -4078,10 +4077,10 @@ DASHBOARD_HTML = r"""
 """.replace("{mesa_key}", str(list(ROULETTE_KEYS.values())[0]))
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  HTTP APP
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-_server_state: Optional["ServerState"] = None   # forward reference: ServerState se define mÃ¡s abajo
+# ══════════════════════════════════════════════
+_server_state: Optional["ServerState"] = None   # forward reference: ServerState se define más abajo
 
 async def http_ping(request: web.Request):
     return web.json_response({"status": "pong", "ts": time.time()})
@@ -4101,7 +4100,7 @@ async def http_api_state(request: web.Request):
     try:
         mesa = int(request.match_info["mesa"])
     except (KeyError, ValueError):
-        return web.json_response({"error": "mesa invÃ¡lida"}, status=400)
+        return web.json_response({"error": "mesa inválida"}, status=400)
     if mesa not in ROULETTE_KEYS.values():
         return web.json_response({"error": "mesa no soportada"}, status=404)
     try:
@@ -4137,9 +4136,9 @@ def build_http_app() -> web.Application:
     return app
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  WEBSOCKET HANDLER
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 class PragmaticWebSocketHandler:
     def __init__(self, key: int, on_spin_callback: Callable[[int, bool, bool], Awaitable[None]]):
         self.key = key
@@ -4153,7 +4152,7 @@ class PragmaticWebSocketHandler:
             try:
                 async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
                     await ws.send(json.dumps(sub))
-                    log.info(f"âœ… WS Pragmatic conectado (key={self.key})")
+                    log.info(f"✅ WS Pragmatic conectado (key={self.key})")
                     delay = 5
                     async for raw in ws:
                         try:
@@ -4165,7 +4164,7 @@ class PragmaticWebSocketHandler:
 
                         results = data.get("last20Results")
                         if isinstance(results, list):
-                            log.debug(f"ðŸ“¦ Recibido last20Results con {len(results)} elementos")
+                            log.debug(f"📦 Recibido last20Results con {len(results)} elementos")
                             for r in results:
                                 await self._feed(r.get("gameId"), r.get("result"), emit=True)
 
@@ -4173,7 +4172,7 @@ class PragmaticWebSocketHandler:
                             await self._feed(data.get("gameId"), data.get("result"), emit=True)
 
             except Exception as e:
-                log.warning(f"ðŸ”Œ WS key={self.key}: {e}. Reconectando en {delay}sâ€¦")
+                log.warning(f"🔌 WS key={self.key}: {e}. Reconectando en {delay}s…")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
@@ -4187,24 +4186,24 @@ class PragmaticWebSocketHandler:
         if not (0 <= num <= 36):
             return
         if gid in self.seen:
-            log.debug(f"â© gameId {gid} ya procesado (nÃºmero {num})")
+            log.debug(f"⏩ gameId {gid} ya procesado (número {num})")
             return
         self.seen.add(gid)
         if len(self.seen) > 3000:
             self.seen.clear()
-        log.info(f"ðŸ”„ Nuevo giro: gameId={gid}, nÃºmero={num}")
+        log.info(f"🔄 Nuevo giro: gameId={gid}, número={num}")
         if self.on_spin_callback:
             await self.on_spin_callback(num, emit, training=not emit)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  ENTRENAMIENTO CON HISTORIAL
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 BATCH_SIZE = 250
 
 def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_SEED_TABLE) -> list:
     if not path or not os.path.exists(path):
-        log.warning(f"[Historial] No se encontrÃ³ '{path}'; se arranca sin pre-entrenamiento.")
+        log.warning(f"[Historial] No se encontró '{path}'; se arranca sin pre-entrenamiento.")
         return []
     try:
         conn = sqlite3.connect(":memory:")
@@ -4222,7 +4221,7 @@ def load_history_seed(path: str = HISTORY_SEED_PATH, table_name: str = HISTORY_S
 async def train_table_from_history(table: "RouletteTable", spins: list, timestamp: float) -> None:
     if not spins:
         return
-    log.info(f"[Entrenamiento] Mesa {table.key}: procesando {len(spins)} giros histÃ³ricos en bloques de {BATCH_SIZE}...")
+    log.info(f"[Entrenamiento] Mesa {table.key}: procesando {len(spins)} giros históricos en bloques de {BATCH_SIZE}...")
     total = len(spins)
     for start in range(0, total, BATCH_SIZE):
         batch = spins[start:start + BATCH_SIZE]
@@ -4250,9 +4249,9 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
     )
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-#  SERVER STATE (DEFINICIÃ“N FINAL)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
+#  SERVER STATE (DEFINICIÓN FINAL)
+# ══════════════════════════════════════════════
 class ServerState:
     def __init__(self):
         self.tables = {k: RouletteTable(k) for k in ROULETTE_KEYS.values()}
@@ -4293,7 +4292,7 @@ class ServerState:
                 for _len, _agent in table.streak_agents.items():
                     _persist = data.get(f"zone_agent_streak{_len}")
                     if _persist is None and _len == ZONE_STREAK_MIN:
-                        # MigraciÃ³n desde el esquema viejo (un solo agente
+                        # Migración desde el esquema viejo (un solo agente
                         # "zone_agent_streak" sin longitud en el nombre).
                         _persist = data.get("zone_agent_streak")
                     if _persist is None and _len == 4:
@@ -4348,16 +4347,16 @@ class ServerState:
             self._save_model(key)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  SELF-PING Y BOT POLLING
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 async def self_ping_loop():
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not render_url or "localhost" in render_url:
         log.info("Self-ping desactivado (no URL)")
         return
     await asyncio.sleep(30)
-    log.info(f"Self-ping activo â†’ {render_url}/ping cada {PING_INTERVAL}s")
+    log.info(f"Self-ping activo → {render_url}/ping cada {PING_INTERVAL}s")
     timeout = ClientTimeout(total=15)
     async with ClientSession(timeout=timeout) as session:
         while True:
@@ -4397,19 +4396,19 @@ async def bot_polling_loop():
             delay = min(delay * 2, 120)
         else:
             delay = 5
-        log.warning(f"[Telegram] Reintentando polling en {delay}sâ€¦")
+        log.warning(f"[Telegram] Reintentando polling en {delay}s…")
         await asyncio.sleep(delay)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 #  MAIN
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════
 async def main():
     global _server_state
-    log.info("â•" * 60)
-    log.info("BOT UNIFICADO â€” DOCENAS â†’ ZONAS | SPEED ROULETTE 2 (solo backend)")
+    log.info("═" * 60)
+    log.info("BOT UNIFICADO — DOCENAS → ZONAS | SPEED ROULETTE 2 (solo backend)")
     log.info(f"Mesas: {', '.join(str(k) for k in ROULETTE_KEYS.values())}")
-    log.info("â•" * 60)
+    log.info("═" * 60)
 
     server_state = ServerState()
     server_state.load_all_models()
