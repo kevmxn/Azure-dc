@@ -75,10 +75,10 @@ DOZEN_MIN_SPIN_TO_SIGNAL = 21
 #    normalmente aunque su tasa esté por debajo de esto; lo único que
 #    cambia es que no se disparan como señal real hasta que su win-rate
 #    entrenado alcance este mínimo. ──
-SIGNAL_SEND_MIN_WIN_RATE = 0.80
+SIGNAL_SEND_MIN_WIN_RATE = 0.85
 
 # ── Entrenamiento ML ──
-ML_MIN_SIGNALS_TO_TRAIN = 50
+ML_MIN_SIGNALS_TO_TRAIN = 10
 ML_RETRAIN_INTERVAL_SECONDS = 30 * 60
 
 AMX_STRENGTH_THRESHOLDS = {"strong": 1.0, "weak": 0.5}
@@ -176,7 +176,6 @@ AGENT_TREND_CONFIG = {
     "agent2": {"method": "ema", "strictness": "strict", "min_diff": 0.5, "amx_periods": None},
     "agent3": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
     "agent4": {"method": "amx", "strictness": "very_strict", "min_diff": None, "amx_periods": [3, 8, 15]},
-    "agent6": {"method": "amx", "strictness": "relaxed", "min_diff": None, "amx_periods": [5, 10, 20]},
 }
 
 # ── Telegram ──
@@ -556,8 +555,8 @@ def build_daily_marker_message(stats: dict) -> str:
             f"📈 Efectividad Global: {global_pct:.2f}%")
 
 def build_status_message(server_state) -> str:
-    agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+    agent_keys = ["agent2", "agent3", "agent4"]
+    zone_keys = ["zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
     lines = ["📊 ESTADÍSTICAS POR PATRÓN"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -646,8 +645,8 @@ def _agent_ml_block(agente) -> str:
     return "\n".join(lines)
 
 def build_mlstatus_message(server_state) -> str:
-    agent_keys = ["agent2", "agent3", "agent4", "agent6"]
-    zone_keys = ["zone_agent1", "zone_agent2", "zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+    agent_keys = ["agent2", "agent3", "agent4"]
+    zone_keys = ["zone_agent3", "zone_agent4"] + [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
     lines = ["🧠 ESTADO DEL MODELO (ML)"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -969,14 +968,35 @@ class DozenPatternAgent:
 
     def update(self, dozen_history, timestamp, blocked: bool = False,
                trend_dozens=None, amx_strength_val=0.0, last_number=None,
-               live_enabled: bool = True, rebound_direction: str = "NEUTRAL"):
+               live_enabled: bool = True, rebound_direction: str = "NEUTRAL",
+               round_due_info=None):
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
         self.last_rebound_direction = rebound_direction
         self.candidate_signal = None
+        if not hasattr(self, "pending_round"):
+            self.pending_round = None
         if not dozen_history:
             return
         last = dozen_history[-1]
+
+        # 0) Resolver señal pendiente por ronda predicha (si había una
+        # confirmada pero esperando que toque la ronda).
+        if self.pending_round is not None:
+            pz = self.pending_round["zone"]
+            info = (round_due_info or {}).get(pz) if pz is not None else None
+            due = info is not None and info.get("due")
+            no_data = info is None or info.get("avg_rounds") is None
+            if pz is None or due or no_data:
+                self.candidate_signal = self.pending_round["candidate"]
+                self.train_state = self.pending_round["train_state"]
+                log.info(f"✅ {self.name}: ronda confirmada → señal enviada")
+                self.pending_round = None
+            else:
+                log.info(f"⏳ {self.name}: señal esperando ronda predicha "
+                         f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                         f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
+            return
 
         # 1) Shadow tracking
         if self.train_state["active"]:
@@ -1028,7 +1048,7 @@ class DozenPatternAgent:
                 zone = dozen_bet_to_zone(bet_dozens, pattern)
                 context = list(dozen_history[-DOZEN_CONTEXT_WINDOW:])
                 rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(pattern, rebound_direction)
-                self.candidate_signal = {
+                candidate = {
                     "pattern": pattern,
                     "bet_dozens": bet_dozens,
                     "bet_zone": (zone,) if zone is not None else None,
@@ -1041,14 +1061,25 @@ class DozenPatternAgent:
                     "recommended_attempt_by_rebound": rec_attempt_dir,
                     "recommended_attempt_by_rebound_pct": rec_pct_dir,
                 }
-                log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'} | Rebote: {rebound_direction}")
-                self.train_state = {
+                prospective_train_state = {
                     "active": True, "pattern": pattern, "bet_dozens": bet_dozens,
                     "bet_zone": zone,
                     "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
                     "context": context, "current_attempt": 0, "start_attempt": 1,
                     "rebound_direction": rebound_direction,
                 }
+                info = (round_due_info or {}).get(zone) if zone is not None else None
+                if info is not None and info.get("avg_rounds") is not None and not info.get("due"):
+                    # Ya confirmado, pero esperando que toque la ronda predicha:
+                    # no se traba train_state, se resuelve en giros siguientes.
+                    self.pending_round = {"zone": zone, "candidate": candidate, "train_state": prospective_train_state}
+                    log.info(f"⏳ {self.name} confirmado: {pattern} -> ZONA {zone}, esperando ronda predicha "
+                             f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                             f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
+                else:
+                    self.candidate_signal = candidate
+                    self.train_state = prospective_train_state
+                    log.info(f"✅ {self.name} confirmación correcta: {pattern} -> ZONA {zone if zone else 'a decidir (opuesto)'} | Rebote: {rebound_direction}")
             else:
                 log.info(f"❌ {self.name} confirmación fallida: esperaba {expected}, salió {last}")
             self.confirming = False
@@ -1388,16 +1419,37 @@ class ZonePatternAgent:
     def update(self, zone_history, timestamp, blocked: bool = False,
                amx_strength_val=0.0, last_number=None,
                live_enabled: bool = True, rebound_direction: str = "NEUTRAL",
-               trend_zones=None):
+               trend_zones=None, round_due_info=None):
         if not self.active:
             return
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
         self.last_rebound_direction = rebound_direction
         self.candidate_signal = None
+        if not hasattr(self, "pending_round"):
+            self.pending_round = None
         if not zone_history:
             return
         last_zone = zone_history[-1]
+
+        # 0) Resolver señal pendiente por ronda predicha (patrón ya
+        # confirmado, esperando que toque la ronda para recién ahí enviar).
+        if self.pending_round is not None:
+            pz = self.pending_round["zone"]
+            info = (round_due_info or {}).get(pz) if pz is not None else None
+            due = info is not None and info.get("due")
+            no_data = info is None or info.get("avg_rounds") is None
+            if pz is None or due or no_data:
+                self.candidate_signal = self.pending_round["candidate"]
+                self.train_state = self.pending_round["train_state"]
+                log.info(f"✅ {self.name}: ronda confirmada → señal enviada")
+                self.pending_round = None
+            else:
+                log.info(f"⏳ {self.name}: señal esperando ronda predicha "
+                         f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                         f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
+            return
+
 
         if self.train_state["active"]:
             self.train_state["current_attempt"] += 1
@@ -1468,7 +1520,7 @@ class ZonePatternAgent:
                 zone_sequence = [predicted_zone, predicted_zone]
 
                 rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(pattern_tuple, rebound_direction)
-                self.candidate_signal = {
+                candidate = {
                     "pattern": pattern_tuple,
                     "bet_zone": (predicted_zone,),
                     "zone_sequence": zone_sequence,
@@ -1482,13 +1534,22 @@ class ZonePatternAgent:
                     "recommended_attempt_by_rebound": rec_attempt_dir,
                     "recommended_attempt_by_rebound_pct": rec_pct_dir,
                 }
-                log.info(f"✅ {self.name} confirmación correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence} | Rebote: {rebound_direction}")
-                self.train_state = {
+                prospective_train_state = {
                     "active": True, "pattern": pattern_tuple, "bet_zone": predicted_zone,
                     "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
                     "context": context, "current_attempt": 0, "start_attempt": 1,
                     "rebound_direction": rebound_direction,
                 }
+                info = (round_due_info or {}).get(predicted_zone)
+                if info is not None and info.get("avg_rounds") is not None and not info.get("due"):
+                    self.pending_round = {"zone": predicted_zone, "candidate": candidate, "train_state": prospective_train_state}
+                    log.info(f"⏳ {self.name} confirmado: {pattern_tuple} -> ZONA {predicted_zone}, esperando ronda predicha "
+                             f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                             f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
+                else:
+                    self.candidate_signal = candidate
+                    self.train_state = prospective_train_state
+                    log.info(f"✅ {self.name} confirmación correcta: {pattern_tuple} -> ZONA {predicted_zone}, secuencia {zone_sequence} | Rebote: {rebound_direction}")
             else:
                 log.info(f"❌ {self.name} confirmación fallida: esperaba {expected_last}, salió {last_zone}")
             self.confirming = False
@@ -1776,7 +1837,8 @@ class StreakZoneAgent:
 
     def update(self, zone_history, timestamp, blocked: bool = False,
                amx_strength_val=0.0, rebound_direction="NEUTRAL",
-               last_number=None, live_enabled: bool = True, trend_zones=None):
+               last_number=None, live_enabled: bool = True, trend_zones=None,
+               round_due_info=None):
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
         self.last_rebound_direction = rebound_direction
@@ -1809,7 +1871,35 @@ class StreakZoneAgent:
         # exacta, y el corte real de efectividad para enviar a Telegram se
         # aplica después, en _handle_signal_sequence, con
         # SIGNAL_SEND_MIN_WIN_RATE.
+        if not hasattr(self, "pending_round"):
+            self.pending_round = None
+
         zone, streak = current_zone_streak(zone_history)
+
+        # 2a) Si ya había una racha esperando su "ronda predicha", resolverla
+        # PRIMERO: mientras la zona no se corte, la señal se mantiene viva
+        # giro a giro (sin trabar train_state) hasta que toque la ronda, o
+        # se cancela si la racha se corta antes de tiempo.
+        if self.pending_round is not None:
+            pz = self.pending_round["zone"]
+            if zone != pz:
+                log.info(f"🚫 {self.name}: se canceló la espera de ronda para {pz} (la racha se cortó antes de tiempo)")
+                self.pending_round = None
+            else:
+                info = (round_due_info or {}).get(pz)
+                due = info is not None and info.get("due")
+                no_data = info is None or info.get("avg_rounds") is None
+                if due or no_data:
+                    self.candidate_signal = self.pending_round["candidate"]
+                    self.train_state = self.pending_round["train_state"]
+                    log.info(f"✅ {self.name}: ronda confirmada para {pz} → señal enviada")
+                    self.pending_round = None
+                else:
+                    log.info(f"⏳ {self.name}: señal a {pz} esperando ronda predicha "
+                             f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                             f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
+                return
+
         streak_matches = (streak == self.min_streak) if self.exact_length else (streak >= self.min_streak)
         if (zone is not None and streak_matches
                 and not self.train_state["active"] and not blocked
@@ -1829,7 +1919,7 @@ class StreakZoneAgent:
                 log.info(f"🎯 {self.name}: análisis de rondas → ENTRAR DIRECTO EN INTENTO 2 para {zone} "
                           f"(rebote {rebound_direction}, {rec_pct_dir}% de aciertos en intento 2 vs intento 1)")
 
-            self.candidate_signal = {
+            candidate = {
                 "pattern": ("RACHA", zone),
                 "bet_zone": (zone,),
                 "zone_sequence": [zone, ("ALTA" if zone == "BAJA" else "BAJA") if fallback_opposite else zone],
@@ -1847,7 +1937,7 @@ class StreakZoneAgent:
                 "recommended_attempt_by_rebound": rec_attempt_dir,
                 "recommended_attempt_by_rebound_pct": rec_pct_dir,
             }
-            self.train_state = {
+            prospective_train_state = {
                 "active": True, "pattern": ("RACHA", zone), "bet_zone": zone,
                 "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
                 # El "shadow" (seguimiento interno para seguir aprendiendo)
@@ -1858,7 +1948,23 @@ class StreakZoneAgent:
                 "context": context, "current_attempt": 0, "start_attempt": 1,
                 "rebound_direction": rebound_direction,
             }
+
+            # Freno por "ronda predicha": si ya hay promedio de rondas
+            # calculado para esta zona y todavía no toca, la señal queda
+            # "pendiente" (no se trava train_state, no se manda todavía) y se
+            # re-evalúa giro a giro hasta que toque la ronda o se corte la racha.
+            info = (round_due_info or {}).get(zone)
+            if info is not None and info.get("avg_rounds") is not None and not info.get("due"):
+                self.pending_round = {"zone": zone, "candidate": candidate, "train_state": prospective_train_state}
+                log.info(f"⏳ {self.name}: racha de {streak}x {zone} detectada, esperando ronda predicha "
+                         f"({info.get('elapsed_rounds')} giros / ronda {info.get('predicted_round')} "
+                         f"prevista, ~{info.get('avg_rounds')} rondas prom.)")
+                return
+
+            self.candidate_signal = candidate
+            self.train_state = prospective_train_state
             log.info(f"🔥 {self.name}: racha de {streak}x {zone} → señal (tasa hist.: {f'{rate:.2f}' if rate is not None else 'sin datos'}, intento inicial: {start_attempt}, fallback opuesto: {fallback_opposite})")
+
 
     def _close_shadow(self, win: bool, result_zone, attempt, timestamp):
         zone = self.train_state["bet_zone"]
@@ -2029,11 +2135,8 @@ class RouletteTable:
         self.agent2 = DozenPatternAgent(pattern_len=4, name="AGENTE_2", label="PATRON V2 💎 (aaba)", mode="aaba", daily_marker=self.daily_marker)
         self.agent3 = DozenPatternAgent(pattern_len=5, name="AGENTE_3", label="PATRON V3 💎 (aaaba)", mode="aaaba", daily_marker=self.daily_marker)
         self.agent4 = DozenPatternAgent(pattern_len=4, name="AGENTE_4", label="PATRON V4 💎 (abaa)", mode="abaa", daily_marker=self.daily_marker)
-        self.agent6 = DozenPatternAgent(pattern_len=7, name="AGENTE_6", label="PATRON V6 💎 (aaaabaa)", mode="aaaabaa", daily_marker=self.daily_marker)
 
         # ── AGENTES DE ZONA ──
-        self.zone_agent1 = ZonePatternAgent(pattern='baaaabbb', name="ZONE_AGENT_1", label="ZONA LARGA 1 (b+4a+3b)", daily_marker=self.daily_marker)
-        self.zone_agent2 = ZonePatternAgent(pattern='aaaabbbbaa', name="ZONE_AGENT_2", label="ZONA LARGA 2 (4a+4b+2a)", daily_marker=self.daily_marker)
         self.zone_agent3 = ZonePatternAgent(pattern='aaabaa', name="ZONE_AGENT_3", label="ZONA V3 (aaabaa · repite a)", daily_marker=self.daily_marker)
         self.zone_agent4 = ZonePatternAgent(pattern='aaabbaa', name="ZONE_AGENT_4", label="ZONA V4 (aaabbaa · repite a)", daily_marker=self.daily_marker)
         # ── AGENTES DE RACHA por longitud exacta (3,4,5,6,7 por defecto,
@@ -2495,33 +2598,10 @@ class RouletteTable:
             self.pending_agent = None
             self.pending_candidate = None
 
-        # Freno real por frecuencia horaria: si para la zona del candidato
-        # ya tenemos un promedio calculado (>=2 rachas de ZONE_STREAK_MIN
-        # anteriores) y todavía NO pasó ese tiempo promedio desde la
-        # última vez ("no está en tiempo"), esa señal se descarta esta
-        # vuelta -> el bot espera, aunque el patrón esté confirmado. Si
-        # todavía no hay datos suficientes para calcular el promedio, no
-        # se bloquea nada (igual que el resto de los filtros del bot).
-        # Si sí está "en tiempo", además se le da prioridad (mayor score)
-        # frente a otros candidatos que compitan en el mismo giro.
-        if candidates:
-            filtered = []
-            for agente, score, cand in candidates:
-                bz = cand.get("bet_zone")
-                zone = bz[0] if bz else None
-                info = self.time_due_info.get(zone) if zone else None
-                if info is not None and info.get("avg_minutes") is not None and not info.get("due"):
-                    log.info(f"⏳ {agente.name}: señal a {zone} esperando frecuencia horaria "
-                             f"({info.get('elapsed_minutes')}min / {info.get('avg_minutes')}min prom.)")
-                    continue
-                if zone in self.time_due_zones:
-                    cand["time_confirmed"] = True
-                    cand["time_due_info"] = info
-                    score = score * 1.25 + 0.05
-                else:
-                    cand["time_confirmed"] = False
-                filtered.append((agente, score, cand))
-            candidates = filtered
+        # Freno por frecuencia horaria: DESACTIVADO para todos los patrones.
+        # Todas las señales (racha, docenas y zonas) se rigen únicamente por
+        # el freno de "ronda predicha" de más abajo, no por tiempo real.
+        # Se deja el bloque documentado pero sin filtrar ni descartar nada.
 
         # Freno por "ronda predicha" (BAJA/ALTA): igual que el freno por
         # frecuencia horaria de arriba, pero contando RONDAS en vez de
@@ -2730,8 +2810,8 @@ class RouletteTable:
         self.round_due_info = {z: self._zone_round_due(z) for z in ("ALTA", "BAJA")}
         self.round_due_zones = {z for z, info in self.round_due_info.items() if info["due"]}
 
-        agent_list = [self.agent2, self.agent3, self.agent4, self.agent6]
-        agent_keys = ["agent2", "agent3", "agent4", "agent6"]
+        agent_list = [self.agent2, self.agent3, self.agent4]
+        agent_keys = ["agent2", "agent3", "agent4"]
 
         for agente, key in zip(agent_list, agent_keys):
             config = AGENT_TREND_CONFIG.get(key, {})
@@ -2756,9 +2836,10 @@ class RouletteTable:
             agente.update(self.dozen_history, timestamp, blocked=blocked,
                           trend_dozens=favored, amx_strength_val=amx_strength_val,
                           last_number=number, live_enabled=live_ok,
-                          rebound_direction=self.last_rebound_direction)
+                          rebound_direction=self.last_rebound_direction,
+                          round_due_info=self.round_due_info)
 
-        zone_agents = [self.zone_agent1, self.zone_agent2, self.zone_agent3, self.zone_agent4] + list(self.streak_agents.values())
+        zone_agents = [self.zone_agent3, self.zone_agent4] + list(self.streak_agents.values())
         for zagente in zone_agents:
             blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
             live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
@@ -2767,7 +2848,8 @@ class RouletteTable:
                            amx_strength_val=amx_strength_val,
                            rebound_direction=self.last_rebound_direction,
                            last_number=number, live_enabled=live_ok,
-                           trend_zones=zone_trend_favored)
+                           trend_zones=zone_trend_favored,
+                           round_due_info=self.round_due_info)
 
         all_agents = agent_list + zone_agents
         self._signal_included = False
@@ -2818,9 +2900,6 @@ class RouletteTable:
             "agent2": self.agent2.get_state(),
             "agent3": self.agent3.get_state(),
             "agent4": self.agent4.get_state(),
-            "agent6": self.agent6.get_state(),
-            "zone_agent1": self.zone_agent1.get_state(),
-            "zone_agent2": self.zone_agent2.get_state(),
             "zone_agent3": self.zone_agent3.get_state(),
             "zone_agent4": self.zone_agent4.get_state(),
             "trend": self.trend,
@@ -4232,8 +4311,8 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
             table.update(number, color_of(number), timestamp=timestamp, training=True)
             if i % 100 == 0:
                 await asyncio.sleep(0)
-        agents = [table.agent2, table.agent3, table.agent4, table.agent6,
-                  table.zone_agent1, table.zone_agent2, table.zone_agent3, table.zone_agent4]
+        agents = [table.agent2, table.agent3, table.agent4,
+                  table.zone_agent3, table.zone_agent4]
         agents += list(table.streak_agents.values())
         for agent in agents:
             agent.force_train(timestamp)
@@ -4284,9 +4363,6 @@ class ServerState:
                 table.agent2.load_persist(data.get("agent2"))
                 table.agent3.load_persist(data.get("agent3"))
                 table.agent4.load_persist(data.get("agent4"))
-                table.agent6.load_persist(data.get("agent6"))
-                table.zone_agent1.load_persist(data.get("zone_agent1"))
-                table.zone_agent2.load_persist(data.get("zone_agent2"))
                 table.zone_agent3.load_persist(data.get("zone_agent3"))
                 table.zone_agent4.load_persist(data.get("zone_agent4"))
                 for _len, _agent in table.streak_agents.items():
@@ -4314,9 +4390,6 @@ class ServerState:
             "agent2": table.agent2.to_persist(),
             "agent3": table.agent3.to_persist(),
             "agent4": table.agent4.to_persist(),
-            "agent6": table.agent6.to_persist(),
-            "zone_agent1": table.zone_agent1.to_persist(),
-            "zone_agent2": table.zone_agent2.to_persist(),
             "zone_agent3": table.zone_agent3.to_persist(),
             "zone_agent4": table.zone_agent4.to_persist(),
             "table_total_spins_seen": table.total_spins_seen,
