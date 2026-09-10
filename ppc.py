@@ -1,5 +1,4 @@
 
-
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT UNIFICADO — SPEED ROULETTE 2 (key 205)                 ║
@@ -156,7 +155,19 @@ LATERAL_MIN_CHANGE_RATIO = float(os.environ.get("LATERAL_MIN_CHANGE_RATIO", "0.5
 BACKTEST60_MIN_SAMPLES = 4
 BACKTEST60_MIN_ACCURACY = 0.45
 
-
+# ── Secuencia cíclica reciente (últimas CYCLE_LOOKBACK rondas): busca si
+#    la zona viene repitiendo un patrón corto (ej. ALTA,ALTA,BAJA,ALTA,
+#    ALTA,BAJA...). Si la zona predicha por el patrón/racha coincide con lo
+#    que marca el ciclo para la PRÓXIMA ronda, se refuerza el envío en
+#    intento 1; si el ciclo indica que aparece recién un paso más tarde, se
+#    entra directo en intento 2. CYCLE_MIN_CONSISTENCY alto (0.72) y
+#    CYCLE_MIN_OCCURRENCES (6 repeticiones completas del período) evitan
+#    falsos positivos sobre ruido aleatorio. ──
+CYCLE_LOOKBACK = 60
+CYCLE_MIN_PERIOD = 2
+CYCLE_MAX_PERIOD = 4
+CYCLE_MIN_CONSISTENCY = float(os.environ.get("CYCLE_MIN_CONSISTENCY", "0.72"))
+CYCLE_MIN_OCCURRENCES = int(os.environ.get("CYCLE_MIN_OCCURRENCES", "6"))
 
 def is_lateral_market(zone_history, lookback=LATERAL_LOOKBACK_ROUNDS, min_ratio=LATERAL_MIN_CHANGE_RATIO):
     """True si en las últimas `lookback` rondas la zona (ALTA/BAJA) cambia de
@@ -1240,7 +1251,7 @@ class DozenPatternAgent:
                trend_dozens=None, amx_strength_val=0.0, last_number=None,
                live_enabled: bool = True, rebound_direction: str = "NEUTRAL",
                trend_label: str = "neutral", near_resistance: bool = False,
-               near_support: bool = False):
+               near_support: bool = False, recent_zone_history=None):
         self._last_raw_number = last_number
         self.live_enabled = live_enabled
         self.last_rebound_direction = rebound_direction
@@ -1326,12 +1337,29 @@ class DozenPatternAgent:
                     fallback_opposite = True
                     log.info(f"🧱 {self.name}: nivel tocando {zona_sr} → posibilidad de cambio de dirección, "
                               f"el reintento apostará según la zona real del intento fallido si falla el 1er intento")
+
+                # ── Secuencia cíclica reciente (últimas 60 rondas), igual
+                # criterio que en StreakZoneAgent: si la zona convertida
+                # del patrón (zone) coincide con lo que marca un ciclo
+                # corto repetido, se refuerza intento 1; si el ciclo dice
+                # que aparece un paso más tarde, se arranca en intento 2. ──
+                start_attempt = 1
+                if zone is not None and recent_zone_history:
+                    cycle_hint, cycle_consistency = cyclic_attempt_hint(recent_zone_history, zone)
+                    if cycle_hint == "SHIFT_2":
+                        start_attempt = 2
+                        log.info(f"🔁 {self.name}: secuencia cíclica reciente ({cycle_consistency*100:.0f}% consistente) "
+                                  f"indica que {zone} se acerca un paso más tarde → ENTRAR DIRECTO EN INTENTO 2")
+                    elif cycle_hint == "CONFIRM_1":
+                        log.info(f"🔁 {self.name}: secuencia cíclica reciente ({cycle_consistency*100:.0f}% consistente) "
+                                  f"acompaña la tendencia hacia {zone} → se refuerza envío en intento 1")
+
                 self.candidate_signal = {
                     "pattern": pattern,
                     "bet_dozens": bet_dozens,
                     "bet_zone": (zone,) if zone is not None else None,
                     "context": context,
-                    "start_attempt": 1,
+                    "start_attempt": start_attempt,
                     "fallback_opposite": fallback_opposite,
                     "adaptive_retry": adaptive_retry,
                     "amx_strength": amx_strength_val,
@@ -1825,6 +1853,21 @@ class StreakZoneAgent:
                 start_attempt = 2
                 log.info(f"🎯 {self.name}: análisis de rondas → ENTRAR DIRECTO EN INTENTO 2 para {bet_zone} "
                           f"(rebote {rebound_direction}, {rec_pct_dir}% de aciertos en intento 2 vs intento 1)")
+
+            # ── Secuencia cíclica reciente (últimas 60 rondas): si la
+            # racha de resultados viene repitiendo un patrón corto (ej.
+            # ALTA,ALTA,BAJA,ALTA,ALTA,BAJA...), se compara contra la zona
+            # predicha. Si el ciclo la confirma para la próxima ronda, se
+            # refuerza el envío en intento 1; si el ciclo indica que
+            # aparece recién un paso después, se entra directo en intento 2. ──
+            cycle_hint, cycle_consistency = cyclic_attempt_hint(zone_history, bet_zone)
+            if cycle_hint == "SHIFT_2" and start_attempt == 1:
+                start_attempt = 2
+                log.info(f"🔁 {self.name}: secuencia cíclica reciente ({cycle_consistency*100:.0f}% consistente) "
+                          f"indica que {bet_zone} se acerca un paso más tarde → ENTRAR DIRECTO EN INTENTO 2")
+            elif cycle_hint == "CONFIRM_1":
+                log.info(f"🔁 {self.name}: secuencia cíclica reciente ({cycle_consistency*100:.0f}% consistente) "
+                          f"acompaña la tendencia hacia {bet_zone} → se refuerza envío en intento 1")
 
             if countertrend_zone is not None:
                 log.info(f"🔀 {self.name}: CONTRATENDENCIA detectada (pares alternados de a 2) → "
@@ -2756,7 +2799,8 @@ class RouletteTable:
                           last_number=number, live_enabled=live_ok,
                           rebound_direction=self.last_rebound_direction,
                           trend_label=self.trend,
-                          near_resistance=self.near_resistance, near_support=self.near_support)
+                          near_resistance=self.near_resistance, near_support=self.near_support,
+                          recent_zone_history=self.zone_history)
 
         zone_agents = list(self.streak_agents.values())
         for zagente in zone_agents:
@@ -2874,35 +2918,32 @@ def detect_pivots(level_history, lookback=60, pivot_window=3):
     return peaks, valleys
 
 def cluster_levels(points, threshold=1.0):
+    """Agrupa picos/valles por NIVEL EXACTO del gráfico (1,2,3,4... o
+    -1,-2,-3,-4...), en vez de fusionar niveles vecinos por un umbral de
+    distancia. El nivel se mueve siempre de a 1 (+1/-1 por ronda según la
+    zona), así que cada entero es su propio soporte/resistencia: la
+    'frequency' de cada nivel es cuántas veces se detectó un cambio de
+    dirección (pivote) justo en ese nivel exacto -mientras más repeticiones,
+    más fuerte ese soporte/resistencia-. El parámetro `threshold` se
+    mantiene por compatibilidad de firma pero ya no se usa para fusionar.
+    """
     if not points:
         return []
-    sorted_points = sorted(points, key=lambda x: x[1])
+    groups = {}
+    for idx, val in points:
+        key = round(val)
+        bucket = groups.setdefault(key, {"idxs": [], "vals": []})
+        bucket["idxs"].append(idx)
+        bucket["vals"].append(val)
     clusters = []
-    current_cluster = [sorted_points[0]]
-    for p in sorted_points[1:]:
-        if abs(p[1] - current_cluster[-1][1]) <= threshold:
-            current_cluster.append(p)
-        else:
-            values = [v for _, v in current_cluster]
-            avg_value = sum(values) / len(values)
-            last_idx = max(i for i, _ in current_cluster)
-            clusters.append({
-                "level": round(avg_value, 2),
-                "frequency": len(current_cluster),
-                "last_index": last_idx,
-                "points": [(i, v) for i, v in current_cluster]
-            })
-            current_cluster = [p]
-    if current_cluster:
-        values = [v for _, v in current_cluster]
-        avg_value = sum(values) / len(values)
-        last_idx = max(i for i, _ in current_cluster)
+    for level, bucket in groups.items():
         clusters.append({
-            "level": round(avg_value, 2),
-            "frequency": len(current_cluster),
-            "last_index": last_idx,
-            "points": [(i, v) for i, v in current_cluster]
+            "level": level,
+            "frequency": len(bucket["idxs"]),
+            "last_index": max(bucket["idxs"]),
+            "points": list(zip(bucket["idxs"], bucket["vals"])),
         })
+    clusters.sort(key=lambda c: c["level"])
     return clusters
 
 def is_near_support_resistance(level_history, lookback=40, pivot_window=3,
@@ -2991,6 +3032,64 @@ def detect_rebound_direction(level_history, lookback=40, pivot_window=3,
     if bounced_down:
         return "BAJISTA"
     return "NEUTRAL"
+
+def detect_repeating_cycle(series, lookback=CYCLE_LOOKBACK, min_period=CYCLE_MIN_PERIOD,
+                            max_period=CYCLE_MAX_PERIOD, min_consistency=CYCLE_MIN_CONSISTENCY,
+                            min_occurrences=CYCLE_MIN_OCCURRENCES):
+    """Busca si la secuencia reciente (valores categóricos de zona, ej.
+    ALTA/BAJA) viene repitiendo un ciclo corto -ej: ALTA,ALTA,BAJA,
+    ALTA,ALTA,BAJA...-. Ignora VERDE/None (no cuentan como zona). Prueba
+    períodos de min_period a max_period y se queda con el de mejor
+    consistencia (qué tan seguido data[i] == data[i-period]) siempre que
+    supere min_consistency y haya aparecido al menos min_occurrences veces
+    completas dentro del lookback.
+    Devuelve (period, data) donde data es la sub-serie ya filtrada (sin
+    VERDE) usada para el análisis, o (None, []) si no hay ciclo claro.
+    """
+    data = [v for v in series[-lookback:] if v not in (None, "VERDE")]
+    best_period, best_consistency = None, 0.0
+    if len(data) < min_period * (min_occurrences + 1):
+        return None, data
+    for period in range(min_period, max_period + 1):
+        comparisons = len(data) - period
+        if comparisons < period * min_occurrences:
+            continue
+        matches = sum(1 for i in range(period, len(data)) if data[i] == data[i - period])
+        consistency = matches / comparisons
+        if consistency >= min_consistency and consistency > best_consistency:
+            best_period, best_consistency = period, consistency
+    return best_period, data
+
+def cyclic_attempt_hint(series, predicted_zone, lookback=CYCLE_LOOKBACK):
+    """Usa el ciclo corto detectado en `series` (ver detect_repeating_cycle)
+    para decidir qué conviene hacer con la zona predicha por el patrón:
+      - "CONFIRM_1": el ciclo coincide con la zona predicha para la
+        PRÓXIMA ronda -> la secuencia acompaña la tendencia, se refuerza el
+        envío ya en el intento 1.
+      - "SHIFT_2": el ciclo indica que la zona predicha no aparece en la
+        próxima ronda sino en la siguiente -> conviene esperar y entrar
+        directo en el intento 2 (se nota que "se acerca" un paso después).
+      - None: sin ciclo claro o sin coincidencia -> no cambia nada.
+    Devuelve (hint, consistency).
+    """
+    if predicted_zone is None:
+        return None, 0.0
+    period, data = detect_repeating_cycle(series, lookback=lookback)
+    if period is None or len(data) < period:
+        return None, 0.0
+    # Valor que el ciclo predice para la PRÓXIMA ronda (lo que salió
+    # exactamente hace `period` rondas, ya que el patrón se repite cada
+    # `period` rondas).
+    next_by_cycle = data[-period]
+    if next_by_cycle == predicted_zone:
+        return "CONFIRM_1", round(sum(1 for i in range(period, len(data)) if data[i] == data[i - period]) / (len(data) - period), 3)
+    # Valor que el ciclo predice para la ronda SIGUIENTE a esa (un paso más
+    # tarde -> equivale al intento 2 si se salta el 1).
+    if period >= 2:
+        next_plus_one_by_cycle = data[-(period - 1)]
+        if next_plus_one_by_cycle == predicted_zone:
+            return "SHIFT_2", round(sum(1 for i in range(period, len(data)) if data[i] == data[i - period]) / (len(data) - period), 3)
+    return None, 0.0
 
 def _zone_analysis_payload(level_history, lookback, number_history=None):
     levels = level_history[-lookback:] if len(level_history) >= lookback else level_history
