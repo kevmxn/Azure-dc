@@ -15,6 +15,8 @@
 ║   - Comandos Telegram: /status (stats + umbral 85% por      ║
 ║     patrón), /mlstatus (detalle ML), /mlentrenar (fuerza    ║
 ║     reentrenamiento de todos los patrones)                  ║
+║   - Agentes de PATRONES DE ZONA Z1–Z4 (C…C,D,C,D) con      ║
+║     confirmación "-1 valor" y elección C/D por datos      ║
 ║   - Confirmación de patrón "-1 valor"                       ║
 ║   - 2 intentos para ZONA (apuestas), 3 intentos para ML      ║
 ║   - Gestión Labouchère + marcador diario (win1/win2/loss)   ║
@@ -244,6 +246,52 @@ def streak2_countertrend_zone(zone_history, current_zone, min_prior_pairs=STREAK
         if blocks[k] != (want_zone, 2):
             return None
     return opposite
+
+
+# ── Agentes de PATRONES DE ZONA Z1–Z4: secuencias alternadas que terminan
+#    SIEMPRE en el mismo tríptico (D,C,D):
+#      Z1 = (C,C,D,C,D)         -> C×2 + D,C,D
+#      Z2 = (C,C,C,D,C,D)       -> C×3 + D,C,D
+#      Z3 = (C,C,C,C,D,C,D)     -> C×4 + D,C,D
+#      Z4 = (C,C,C,C,C,D,C,D)   -> C×5 + D,C,D
+#    C y D son las dos zonas (BAJA/ALTA) con C != D; los VERDE rompen el
+#    patrón (igual que en los patrones de docenas). Cada agente detecta el
+#    patrón PARCIAL (le falta el D final, confirmación "-1 valor") y, al
+#    confirmarse, decide EN QUÉ ZONA ENTRAR (C o D) según lo recopilado.
+ZONE_PATTERN_C_RUNS = {1: 2, 2: 3, 3: 4, 4: 5}
+
+# ── Filtro COMPARTIDO del tríptico (D,C,D): ventana máxima de muestras del
+#    resultado real tras cada (D,C,D), usada por Z1–Z4 para decidir entre
+#    C y D cuando el patrón propio aún no tiene muestra suficiente. ──
+Z_SUFFIX_CONTEXT_MAX = 150
+
+
+def suffix_option_rates(suffix_context, c_zone):
+    """Con las muestras compartidas del tríptico (D,C,D) —resultados REALES
+    de las 2 rondas siguientes a cada (D,C,D), sin importar qué se apostó—
+    calcula la tasa de acierto de entrar en C y de entrar en D para las
+    rondas 1-2. Prefiere muestras con la MISMA orientación (mismo C); si no
+    llegan al mínimo, usa todas las orientaciones juntas.
+    Devuelve (rate_C, rate_D, n) o None si no hay muestra suficiente."""
+    if not suffix_context:
+        return None
+    d_zone = "ALTA" if c_zone == "BAJA" else "BAJA"
+
+    def _hit_attempt(zone, e):
+        if zone_win(zone, e["n1"]):
+            return 1
+        if zone_win(zone, e["n2"]):
+            return 2
+        return 0
+
+    oriented = [e for e in suffix_context if e["c"] == c_zone]
+    arr = oriented if len(oriented) >= DOZEN_MIN_SAMPLES_GATE else list(suffix_context)
+    if len(arr) < DOZEN_MIN_SAMPLES_GATE:
+        return None
+    n = len(arr)
+    rate_c = sum(1 for e in arr if 1 <= _hit_attempt(c_zone, e) <= 2) / n
+    rate_d = sum(1 for e in arr if 1 <= _hit_attempt(d_zone, e) <= 2) / n
+    return rate_c, rate_d, n
 
 
 # ── Predictor de "ronda de repetición de zona" (BAJA/ALTA) — réplica en
@@ -698,7 +746,9 @@ def _signal_eligibility_block(agente) -> str:
     return header + "\n" + "\n".join(lines)
 
 def _short_pattern_label(agente) -> str:
-    """Etiqueta corta tipo 'V2(aaba)' para patrones de docenas o 'x3' para rachas."""
+    """Etiqueta corta tipo 'V2(aaba)' para docenas, 'x3' para rachas o 'Z1' para patrones de zona."""
+    if hasattr(agente, "pattern_id"):
+        return f"Z{agente.pattern_id}(C×{agente.c_runs},DCD)"
     if hasattr(agente, "mode"):
         num = ''.join(ch for ch in agente.name if ch.isdigit())
         return f"V{num}({agente.mode})"
@@ -727,7 +777,8 @@ def _resumen_agent_line(agente) -> str:
 
 def build_status_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4"]
-    zone_keys = [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+    zone_keys = ([f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+                       + [f"zone_agent_z{_i}" for _i in sorted(ZONE_PATTERN_C_RUNS)])
     lines = []
     for key, table in server_state.tables.items():
         lines.append(f"📆 RESUMEN ESTADÍSTICAS - MESA {key} ({TABLE_NAME})")
@@ -750,7 +801,7 @@ def build_status_message(server_state) -> str:
             total_won += won; total_lost += lost
             lines.append(line)
 
-        lines.append("🔥 RACHAS:")
+        lines.append("🔥 RACHAS Y PATRONES Z (D,C,D):")
         for zkey in zone_keys:
             agente = getattr(table, zkey, None)
             if agente is None:
@@ -794,7 +845,8 @@ def _status_agent_block(agente, table) -> str:
 
 def build_status_message_detallado(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4"]
-    zone_keys = [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+    zone_keys = ([f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+                       + [f"zone_agent_z{_i}" for _i in sorted(ZONE_PATTERN_C_RUNS)])
     lines = ["📊 ESTADÍSTICAS DETALLADAS POR PATRÓN"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -809,7 +861,7 @@ def build_status_message_detallado(server_state) -> str:
             if agente is None:
                 continue
             lines.append(_status_agent_block(agente, table))
-        lines.append("— RACHAS —")
+        lines.append("— RACHAS Y PATRONES Z (D,C,D) —")
         for zkey in zone_keys:
             agente = getattr(table, zkey, None)
             if agente is None:
@@ -852,7 +904,8 @@ def _agent_ml_block(agente) -> str:
 
 def build_mlstatus_message(server_state) -> str:
     agent_keys = ["agent2", "agent3", "agent4"]
-    zone_keys = [f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+    zone_keys = ([f"zone_agent_streak{_n}" for _n in ZONE_STREAK_LENGTHS]
+                       + [f"zone_agent_z{_i}" for _i in sorted(ZONE_PATTERN_C_RUNS)])
     lines = ["🧠 ESTADO DEL MODELO (ML)"]
     for key, table in server_state.tables.items():
         lines.append(f"🎲 Mesa {key} ({TABLE_NAME})")
@@ -928,6 +981,9 @@ if bot is not None:
                     entrenados += 1
                 for zagente in table.streak_agents.values():
                     zagente.force_train(now)
+                    entrenados += 1
+                for _zp in getattr(table, "zone_pattern_agents", {}).values():
+                    _zp.force_train(now)
                     entrenados += 1
                 lines.append(f"🎲 Mesa {key} ({TABLE_NAME}): {entrenados} patrones reentrenados")
                 total_agentes += entrenados
@@ -1553,6 +1609,559 @@ def current_zone_streak(zone_history):
         else:
             break
     return zone, streak
+
+
+class ZonePatternAgent:
+    """Patrones de ZONA alternada que terminan SIEMPRE en el mismo tríptico
+    (D,C,D): Z1=(C,C,D,C,D), Z2=(C,C,C,D,C,D), Z3=(C,C,C,C,D,C,D) y
+    Z4=(C,C,C,C,C,D,C,D), donde C y D son las dos zonas (BAJA/ALTA) y C != D.
+
+    Funcionan como los agentes de docenas: primero detectan el patrón
+    PARCIAL (todo menos el último D, confirmación "-1 valor") y, cuando ese
+    D final confirma, ELIGEN EN QUÉ ZONA ENTRAR (C o D) según lo recopilado:
+      1) tasa histórica del PROPIO patrón para cada opción (el shadow-
+         tracking sigue AMBAS hipótesis a la vez, guardadas en
+         pattern_context bajo "Z{n}:{C}->C" y "Z{n}:{C}->D");
+      2) si no hay muestra suficiente, el FILTRO COMPARTIDO del tríptico
+         (D,C,D): qué salió realmente tras cada (D,C,D) reciente
+         (z_suffix_context de la mesa), común a Z1–Z4;
+      3) si tampoco hay, la continuación de la alternancia (C, siguiente de D).
+
+    Al candidato ya confirmado se le aplican los mismos análisis que a los
+    demás patrones: backtest de 60 rondas (reintento al opuesto si el patrón
+    viene rindiendo mal), soporte/resistencia de zonas (reintento adaptativo
+    a la zona real del intento fallido, o entrada directa al contrario si
+    rinde mejor), secuencia cíclica, mercado lateral, intento recomendado
+    según el rebote actual y el corte final de efectividad
+    SIGNAL_SEND_MIN_WIN_RATE para salir a Telegram."""
+    def __init__(self, pattern_id: int, c_runs: int, name: str, label: str,
+                 daily_marker=None, thread_signals=None, thread_stats=None):
+        self.pattern_id = pattern_id
+        self.c_runs = c_runs
+        self.pattern_len = c_runs + 3
+        self.name = name
+        self.label = label
+        self.daily_marker = daily_marker
+        self.thread_signals = thread_signals if thread_signals is not None else THREAD_SIGNALS_ZONE
+        self.thread_stats = thread_stats if thread_stats is not None else THREAD_STATS_ZONE
+
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "hyp_c": None, "hyp_d": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
+        }
+        self.train_attempt_results = []
+        self.live_enabled = True
+        self.candidate_signal = None
+        self.confirming = False
+        self.pending_pattern = None
+        self.history_log = []
+        self.history_counter = 0
+        self.stats = {"total": 0, "won": 0, "lost": 0}
+        self.pattern_context = {}
+        self.backtest = {"triggers": 0, "hits": 0, "accuracy": None}
+        self.consecutive_losses = 0
+        self.cooldown_remaining = 0
+        self.msg_id = None
+        self.entry_text = None
+        self._last_raw_number = None
+        self.total_processed = 0
+        self.trained = False
+        self.last_train_ts = 0.0
+        self.trained_snapshot = {}
+        self.last_rebound_direction = "NEUTRAL"
+
+    # ── Matching del patrón COMPLETO (…,C…C,D,C,D) ──
+    def _match(self, window):
+        n = self.c_runs
+        if len(window) != n + 3:
+            return None
+        c, d = window[0], window[n]
+        if c not in ("ALTA", "BAJA") or d not in ("ALTA", "BAJA") or c == d:
+            return None
+        if any(w != c for w in window[:n]):
+            return None
+        if window[n + 1] != c or window[n + 2] != d:
+            return None
+        return (c, d)
+
+    # ── Matching PARCIAL (falta el D final): confirmación "-1 valor" ──
+    def _match_partial(self, window):
+        n = self.c_runs
+        if len(window) != n + 2:
+            return None
+        c, d = window[0], window[n]
+        if c not in ("ALTA", "BAJA") or d not in ("ALTA", "BAJA") or c == d:
+            return None
+        if any(w != c for w in window[:n]):
+            return None
+        if window[n + 1] != c:
+            return None
+        return (c, d)
+
+    def _key(self, c_zone: str, option: str) -> str:
+        # option: "C" (continuación de la alternancia) o "D" (la otra zona).
+        # "?" se usa solo para el candidato en confirmación pendiente.
+        return f"Z{self.pattern_id}:{c_zone}->{option}"
+
+    @staticmethod
+    def _entry_attempt(entry):
+        return entry["a"] if isinstance(entry, dict) else entry
+
+    @staticmethod
+    def _entry_rebound(entry):
+        return entry.get("r", "NEUTRAL") if isinstance(entry, dict) else "NEUTRAL"
+
+    def _record_context(self, key, hit_attempt: int, rebound_direction: str = "NEUTRAL",
+                        streak: int = None, trend: str = "neutral", amx_strength_val: float = 0.0):
+        arr = self.pattern_context.setdefault(key, [])
+        arr.append({"a": hit_attempt, "r": rebound_direction, "s": streak,
+                    "t": trend, "x": round(amx_strength_val, 3)})
+        if len(arr) > DOZEN_CONTEXT_WINDOW:
+            del arr[0]
+
+    # ── Entrenamiento ML (mismo criterio que el resto de agentes) ──
+    def _maybe_train(self, timestamp: float):
+        if self.total_processed < ML_MIN_SIGNALS_TO_TRAIN:
+            return
+        if not self.trained or (timestamp - self.last_train_ts) >= ML_RETRAIN_INTERVAL_SECONDS:
+            self._train(timestamp)
+
+    def _train(self, timestamp: float):
+        self.trained_snapshot = {k: list(v) for k, v in self.pattern_context.items()}
+        self.trained = True
+        self.last_train_ts = timestamp
+
+    def force_train(self, timestamp: float):
+        self._train(timestamp)
+
+    # ── Win-rates (misma convención: solo aciertos en intentos 1-2 reales) ──
+    def _win_rate(self, pattern):
+        return self._win_rate_for_start(pattern, start_attempt=1)
+
+    def _win_rate_for_start(self, pattern, start_attempt: int = 1):
+        arr = self.trained_snapshot.get(pattern[0]) if self.trained else None
+        if not arr:
+            arr = self.pattern_context.get(pattern[0], [])
+        if len(arr) < SIGNAL_SEND_MIN_SAMPLES:
+            return None
+        lo, hi = start_attempt, start_attempt + ZONE_MAX_ATTEMPTS - 1
+        return sum(1 for e in arr if lo <= self._entry_attempt(e) <= hi) / len(arr)
+
+    def _win_rate_entry_2_3(self, pattern):
+        return self._win_rate_for_start(pattern, start_attempt=2)
+
+    def _option_rate(self, c_zone: str, option: str):
+        return self._win_rate((self._key(c_zone, option),))
+
+    def _choose_bet_zone(self, c_zone: str, suffix_context):
+        """Decide en qué zona entrar tras la confirmación del patrón:
+        1) tasas propias de cada opción; 2) filtro compartido del tríptico
+        (D,C,D); 3) por defecto, C (continuación de la alternancia)."""
+        d_zone = "ALTA" if c_zone == "BAJA" else "BAJA"
+        rc = self._option_rate(c_zone, "C")
+        rd = self._option_rate(c_zone, "D")
+        if rc is not None and rd is not None:
+            return (c_zone, "C", rc) if rc >= rd else (d_zone, "D", rd)
+        if rc is not None and rc >= 0.5:
+            return c_zone, "C", rc
+        if rd is not None and rd >= 0.5:
+            return d_zone, "D", rd
+        suf = suffix_option_rates(suffix_context, c_zone)
+        if suf is not None:
+            s_rc, s_rd, n = suf
+            pick = "C" if s_rc >= s_rd else "D"
+            log.info(f"🧩 {self.name}: sin muestra propia suficiente → filtro del tríptico "
+                     f"(D,C,D) compartido ({n} muestras, C={s_rc:.2f} vs D={s_rd:.2f}) "
+                     f"→ se entra en {pick}")
+            return (c_zone, "C", s_rc) if pick == "C" else (d_zone, "D", s_rd)
+        log.info(f"🧩 {self.name}: sin datos ni propios ni del tríptico → se entra en C "
+                 f"(continuación de la alternancia)")
+        return c_zone, "C", None
+
+    def run_backtest(self, zone_history):
+        """Recorre las últimas DOZEN_BACKTEST_WINDOW (60) rondas buscando cada
+        ocurrencia del patrón COMPLETO y chequea si la continuación de la
+        alternancia (C, siguiente de D) aparece dentro de los
+        ZONE_MAX_ATTEMPTS intentos reales (VERDE cuenta). Si el patrón viene
+        rindiendo mal, hay riesgo de falso positivo -> reintento al OPUESTO."""
+        window = zone_history[-DOZEN_BACKTEST_WINDOW:]
+        triggers, hits = 0, 0
+        L = self.pattern_len
+        for i in range(L, len(window) + 1):
+            m = self._match(window[i - L:i])
+            if not m:
+                continue
+            c_zone = m[0]
+            future = window[i:i + ZONE_MAX_ATTEMPTS]
+            triggers += 1
+            if c_zone in future or "VERDE" in future:
+                hits += 1
+        self.backtest = {
+            "triggers": triggers, "hits": hits,
+            "accuracy": round(hits / triggers, 4) if triggers else None
+        }
+
+    def overall_recommended_attempt(self):
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            c1 += sum(1 for e in arr if self._entry_attempt(e) == 1)
+            c2 += sum(1 for e in arr if self._entry_attempt(e) == 2)
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return None, 0.0
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
+
+    def _recommended_attempt_for_direction(self, bet_zone, rebound_direction):
+        """Intento recomendado condicionado a la dirección de rebote actual,
+        con fallback al recomendado general si no hay muestras suficientes."""
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            for e in arr:
+                if self._entry_rebound(e) != rebound_direction:
+                    continue
+                v = self._entry_attempt(e)
+                if v == 1:
+                    c1 += 1
+                elif v == 2:
+                    c2 += 1
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            fallback, _ = self.overall_recommended_attempt()
+            return fallback, None
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
+
+    def overall_recommended_attempt_for_direction(self, rebound_direction):
+        if not self.trained:
+            return None, 0.0
+        c1 = c2 = 0
+        for arr in self.trained_snapshot.values():
+            for e in arr:
+                if self._entry_rebound(e) != rebound_direction:
+                    continue
+                v = self._entry_attempt(e)
+                if v == 1:
+                    c1 += 1
+                elif v == 2:
+                    c2 += 1
+        total = c1 + c2
+        if total < DOZEN_MIN_SAMPLES_GATE:
+            return self.overall_recommended_attempt()
+        if c1 >= c2:
+            return 1, round(c1 / total * 100, 1)
+        return 2, round(c2 / total * 100, 1)
+
+    def update(self, zone_history, timestamp, blocked: bool = False,
+               amx_strength_val=0.0, rebound_direction="NEUTRAL",
+               last_number=None, live_enabled=True, trend_label="neutral",
+               near_resistance=False, near_support=False, suffix_context=None):
+        self._last_raw_number = last_number
+        self.live_enabled = live_enabled
+        self.last_rebound_direction = rebound_direction
+        self.candidate_signal = None
+        if not zone_history:
+            return
+        last = zone_history[-1]
+
+        # 1) Shadow tracking de AMBAS hipótesis (C y D) a la vez. El shadow
+        #    SIEMPRE simula desde el intento 1 (igual que los demás agentes),
+        #    así se sigue midiendo si cada opción hubiera ganado en 1, 2 o 3.
+        if self.train_state["active"]:
+            self.train_state["current_attempt"] += 1
+            attempt = self.train_state["start_attempt"] + self.train_state["current_attempt"] - 1
+            ts = self.train_state
+            for hyp in (ts["hyp_c"], ts["hyp_d"]):
+                if hyp["open"] and zone_win(hyp["zone"], last_number):
+                    hyp["hit"] = attempt
+                    hyp["open"] = False
+            ts["attempts_left"] -= 1
+            self.train_attempt_results.append(last_number)
+            if (not ts["hyp_c"]["open"] and not ts["hyp_d"]["open"]) or ts["attempts_left"] <= 0:
+                self._close_shadow(ts, last, attempt, timestamp)
+
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+        self._maybe_train(timestamp)
+        self.run_backtest(zone_history)
+
+        # 2) Detección del patrón PARCIAL (confirmación "-1 valor"): todo el
+        #    patrón salvo el último D. Gate de tasa mínima igual que docenas.
+        if (not self.train_state["active"] and not self.confirming
+                and len(zone_history) >= self.pattern_len - 1
+                and len(zone_history) >= DOZEN_MIN_SPIN_TO_SIGNAL
+                and not blocked and self.cooldown_remaining <= 0):
+            partial = self._match_partial(zone_history[-(self.pattern_len - 1):])
+            if partial:
+                c_zone, d_zone = partial
+                rate_c = self._option_rate(c_zone, "C")
+                rate_d = self._option_rate(c_zone, "D")
+                best = max((r for r in (rate_c, rate_d) if r is not None), default=None)
+                if best is not None and best < DOZEN_MIN_WIN_RATE:
+                    log.info(f"⛔ {self.name}: patrón parcial {c_zone}×{self.c_runs},{d_zone},{c_zone} "
+                             f"descartado (mejor tasa {best:.2f} < {DOZEN_MIN_WIN_RATE:.2f})")
+                else:
+                    self.confirming = True
+                    self.pending_pattern = (c_zone, d_zone)
+                    self.candidate_signal = {
+                        "pattern": (self._key(c_zone, "?"),),
+                        "confirming": True,
+                        "expected_last": d_zone,
+                    }
+                    log.info(f"🔍 {self.name} confirmación pendiente: "
+                             f"{','.join([c_zone] * self.c_runs + [d_zone, c_zone])} -> esperado {d_zone}")
+                    return
+
+        # 3) Resolución de la confirmación: el último D confirma el patrón y
+        #    se decide la zona de entrada (C o D) con los datos recopilados.
+        if self.confirming and self.pending_pattern:
+            c_zone, d_zone = self.pending_pattern
+            if last == d_zone:
+                self._on_pattern_confirmed(c_zone, d_zone, zone_history, timestamp,
+                                           rebound_direction, amx_strength_val,
+                                           trend_label, near_resistance, near_support,
+                                           suffix_context or [])
+            else:
+                log.info(f"❌ {self.name} confirmación fallida: esperaba {d_zone}, salió {last}")
+            self.confirming = False
+            self.pending_pattern = None
+
+    def _on_pattern_confirmed(self, c_zone, d_zone, zone_history, timestamp,
+                              rebound_direction, amx_strength_val, trend_label,
+                              near_resistance, near_support, suffix_context):
+        bet_zone, option, rate = self._choose_bet_zone(c_zone, suffix_context)
+        context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
+        rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(bet_zone, rebound_direction)
+
+        # ── Backtest de 60 rondas: ¿este patrón viene rindiendo mal? -> el
+        #    reintento (2do intento real) apuesta al OPUESTO. ──
+        fallback_opposite = False
+        bt = self.backtest or {}
+        if (bt.get("triggers", 0) >= BACKTEST60_MIN_SAMPLES
+                and bt.get("accuracy") is not None
+                and bt["accuracy"] < BACKTEST60_MIN_ACCURACY):
+            fallback_opposite = True
+            log.info(f"📉 {self.name}: backtest de {DOZEN_BACKTEST_WINDOW} rondas para el patrón "
+                     f"({bt['hits']}/{bt['triggers']} = {bt['accuracy']:.2f}) por debajo del mínimo "
+                     f"({BACKTEST60_MIN_ACCURACY:.2f}) → el reintento apostará al OPUESTO si falla el 1er intento")
+
+        # ── Nivel tocando soporte/resistencia AHORA MISMO: posible cambio de
+        #    dirección. Si la otra opción (C↔D) rinde mejor, se entra DIRECTO
+        #    a ella; si no, se sigue la elegida pero con reintento adaptativo
+        #    (apostar a la zona real del intento fallido). ──
+        adaptive_retry = False
+        if near_resistance or near_support:
+            zona_sr = "resistencia" if near_resistance else "soporte"
+            other_option = "D" if option == "C" else "C"
+            other_zone = d_zone if option == "C" else c_zone
+            other_rate = self._option_rate(c_zone, other_option)
+            adaptive_retry = True
+            if other_rate is not None and (rate is None or other_rate > rate):
+                log.info(f"🧱 {self.name}: nivel tocando {zona_sr} y {other_option} ({other_zone}) rinde mejor "
+                         f"({other_rate:.2f} vs {f'{rate:.2f}' if rate is not None else 'sin datos'}) "
+                         f"→ se entra DIRECTO en {other_zone}")
+                bet_zone, option, rate = other_zone, other_option, other_rate
+            else:
+                fallback_opposite = True
+                log.info(f"🧱 {self.name}: nivel tocando {zona_sr} → posibilidad de cambio de dirección, "
+                         f"el reintento apostará según la zona real del intento fallido si falla el 1er intento")
+
+        # ── Intento inicial: mercado LATERAL o análisis por rebote pueden
+        #    hacer que se entre DIRECTO en el intento 2. ──
+        lateral = is_lateral_market(zone_history)
+        start_attempt = 1
+        if lateral:
+            start_attempt = 2
+            log.info(f"↔️ {self.name}: mercado LATERAL (cambios de dirección seguidos en últimas "
+                     f"{LATERAL_LOOKBACK_ROUNDS} rondas) → ENTRAR DIRECTO EN INTENTO 2 para {bet_zone}")
+        elif (rec_attempt_dir == 2 and rec_pct_dir is not None
+                and rec_pct_dir >= STREAK_SECOND_ENTRY_MIN_PCT):
+            start_attempt = 2
+            log.info(f"🎯 {self.name}: análisis de rondas → ENTRAR DIRECTO EN INTENTO 2 para {bet_zone} "
+                     f"(rebote {rebound_direction}, {rec_pct_dir}% de aciertos en intento 2 vs intento 1)")
+
+        # ── Secuencia cíclica reciente: si el ciclo confirma la zona para la
+        #    próxima ronda se refuerza el intento 1; si indica que aparece un
+        #    paso más tarde, se entra directo en el intento 2. ──
+        cycle_hint, cycle_consistency = cyclic_attempt_hint(zone_history, bet_zone)
+        if cycle_hint == "SHIFT_2" and start_attempt == 1:
+            start_attempt = 2
+            log.info(f"🔁 {self.name}: secuencia cíclica reciente ({cycle_consistency * 100:.0f}% consistente) "
+                     f"indica que {bet_zone} se acerca un paso más tarde → ENTRAR DIRECTO EN INTENTO 2")
+        elif cycle_hint == "CONFIRM_1":
+            log.info(f"🔁 {self.name}: secuencia cíclica reciente ({cycle_consistency * 100:.0f}% consistente) "
+                     f"acompaña la tendencia hacia {bet_zone} → se refuerza envío en intento 1")
+
+        retry_zone = ("ALTA" if bet_zone == "BAJA" else "BAJA") if fallback_opposite else bet_zone
+        opt_key = self._key(c_zone, option)
+        self.candidate_signal = {
+            "pattern": (opt_key,),
+            "bet_zone": (bet_zone,),
+            "zone_sequence": [bet_zone, retry_zone],
+            "context": context,
+            "streak": None,
+            "amx_strength": 0.0,
+            "score": rate or 0.0,
+            "confirming": False,
+            "is_streak": True,
+            "countertrend": False,
+            "rebound_direction": rebound_direction,
+            "near_zero": False,
+            "start_attempt": start_attempt,
+            "fallback_opposite": fallback_opposite,
+            "adaptive_retry": adaptive_retry,
+            "recommended_attempt_by_rebound": rec_attempt_dir,
+            "recommended_attempt_by_rebound_pct": rec_pct_dir,
+            "chosen_option": option,
+        }
+        self.train_state = {
+            "active": True, "pattern": (opt_key,), "bet_zone": bet_zone,
+            # Shadow de AMBAS hipótesis: así el win-rate de cada opción se
+            # mide con el resultado real, no con la zona que se apostó.
+            "hyp_c": {"zone": c_zone, "open": True, "hit": 0},
+            "hyp_d": {"zone": d_zone, "open": True, "hit": 0},
+            "attempts_left": DOZEN_MAX_ATTEMPTS, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": context, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": rebound_direction,
+            "streak": None, "trend": trend_label, "amx_strength": amx_strength_val,
+        }
+        log.info(f"✅ {self.name} confirmado: {','.join([c_zone] * self.c_runs + [d_zone, c_zone, d_zone])} "
+                 f"→ ENTRAR EN {bet_zone} (opción {option}, tasa: "
+                 f"{f'{rate:.2f}' if rate is not None else 'sin datos propios'}, intento inicial: {start_attempt}, "
+                 f"fallback opuesto: {fallback_opposite}) | Rebote: {rebound_direction}")
+
+    def _close_shadow(self, ts, result_zone, attempt, timestamp):
+        c_zone = ts["hyp_c"]["zone"]
+        chosen = ts["bet_zone"]
+        won = False
+        detail = []
+        for option, hyp in (("C", ts["hyp_c"]), ("D", ts["hyp_d"])):
+            key = self._key(c_zone, option)
+            self._record_context(key, hyp["hit"], ts.get("rebound_direction", "NEUTRAL"),
+                                 streak=ts.get("streak"), trend=ts.get("trend", "neutral"),
+                                 amx_strength_val=ts.get("amx_strength", 0.0))
+            detail.append(f"{option}={hyp['zone']}:{hyp['hit'] or '-'}")
+            if hyp["zone"] == chosen and hyp["hit"] > 0:
+                won = True
+        self.history_counter += 1
+        self.history_log.append({
+            "n": self.history_counter, "pattern": ts["pattern"][0],
+            "bet_zone": chosen, "result": result_zone, "attempt": attempt,
+            "win": won, "hit_attempt": attempt if won else 0,
+            "context": ts.get("context"), "time": timestamp, "shadow": True,
+        })
+        self.history_log = self.history_log[-200:]
+        self.stats["total"] += 1
+        self.stats["won" if won else "lost"] += 1
+        self.total_processed += 1
+        self._maybe_train(timestamp)
+
+        if won:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= DOZEN_COOLDOWN_AFTER_LOSSES:
+                self.cooldown_remaining = DOZEN_COOLDOWN_ROUNDS
+
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "hyp_c": None, "hyp_d": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
+        }
+        self.train_attempt_results = []
+        log.info(f"🏁 {self.name}: shadow cerrado ({', '.join(detail)}) → {'WIN' if won else 'LOSS'}")
+
+    def reset_transient(self):
+        self.confirming = False
+        self.pending_pattern = None
+        self.candidate_signal = None
+        self.train_state = {
+            "active": False, "pattern": None, "bet_zone": None,
+            "hyp_c": None, "hyp_d": None,
+            "attempts_left": 0, "total_attempts": DOZEN_MAX_ATTEMPTS,
+            "context": None, "current_attempt": 0, "start_attempt": 1,
+            "rebound_direction": "NEUTRAL",
+        }
+        self.train_attempt_results = []
+
+    def get_state(self):
+        rec_attempt, rec_pct = self.overall_recommended_attempt()
+        rec_attempt_dir, rec_pct_dir = self.overall_recommended_attempt_for_direction(self.last_rebound_direction)
+        pattern_win_rate_1_2 = {}
+        pattern_win_rate_2_3 = {}
+        for key in self.pattern_context:
+            r12 = self._win_rate_for_start((key,), 1)
+            r23 = self._win_rate_for_start((key,), 2)
+            if r12 is not None:
+                pattern_win_rate_1_2[key] = round(r12, 3)
+            if r23 is not None:
+                pattern_win_rate_2_3[key] = round(r23, 3)
+        return {
+            "name": self.name,
+            "pattern_len": self.pattern_len,
+            "pattern": f"Z{self.pattern_id}: " + ",".join(["C"] * self.c_runs + ["D", "C", "D"]),
+            "train_state": self.train_state,
+            "stats": self.stats,
+            "history": self.history_log[-30:],
+            "backtest_60": self.backtest,
+            "pattern_context": self.pattern_context,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "recommended_attempt": rec_attempt,
+            "recommended_attempt_pct": rec_pct,
+            "rebound_direction": self.last_rebound_direction,
+            "recommended_attempt_by_rebound": rec_attempt_dir,
+            "recommended_attempt_by_rebound_pct": rec_pct_dir,
+            "pattern_recommendations": {},
+            "pattern_win_rate_1_2": pattern_win_rate_1_2,
+            "pattern_win_rate_2_3": pattern_win_rate_2_3,
+            "confirming": self.confirming,
+            "live_enabled": self.live_enabled,
+            "ml_model": {
+                "trained": self.trained,
+                "total_processed": self.total_processed,
+                "min_signals_to_train": ML_MIN_SIGNALS_TO_TRAIN,
+                "last_train_ts": self.last_train_ts,
+                "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
+            },
+        }
+
+    def to_persist(self):
+        return {
+            "pattern_context": self.pattern_context,
+            "stats": self.stats,
+            "history_counter": self.history_counter,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining,
+            "total_processed": self.total_processed,
+            "trained": self.trained,
+            "last_train_ts": self.last_train_ts,
+            "trained_snapshot": self.trained_snapshot,
+        }
+
+    def load_persist(self, data):
+        if not data:
+            return
+        self.pattern_context = data.get("pattern_context", {})
+        self.stats = data.get("stats", self.stats)
+        self.history_counter = data.get("history_counter", 0)
+        self.consecutive_losses = data.get("consecutive_losses", 0)
+        self.cooldown_remaining = data.get("cooldown_remaining", 0)
+        self.total_processed = data.get("total_processed", 0)
+        self.trained = data.get("trained", False)
+        self.last_train_ts = data.get("last_train_ts", 0.0)
+        self.trained_snapshot = data.get("trained_snapshot", {})
 
 
 class StreakZoneAgent:
@@ -2256,6 +2865,24 @@ class RouletteTable:
         self.zone_agent_streak = self.streak_agents.get(ZONE_STREAK_MIN) or next(iter(self.streak_agents.values()))
         self.zone_agent_streak4 = self.streak_agents.get(4) or self.zone_agent_streak
 
+        # ── AGENTES DE PATRONES DE ZONA Z1–Z4 (tríptico D,C,D común) ──
+        self.zone_pattern_agents = {}
+        for _pid, _runs in ZONE_PATTERN_C_RUNS.items():
+            _zp = ZonePatternAgent(
+                pattern_id=_pid, c_runs=_runs,
+                name=f"ZONE_Z{_pid}",
+                label=f"💠 PATRON Z{_pid} (C×{_runs},D,C,D)",
+                daily_marker=self.daily_marker,
+            )
+            self.zone_pattern_agents[_pid] = _zp
+            setattr(self, f"zone_agent_z{_pid}", _zp)
+        # Filtro COMPARTIDO del tríptico (D,C,D): resultados reales de las 2
+        # rondas siguientes a cada (D,C,D), usados por Z1–Z4 para decidir
+        # entre entrar en C o en D cuando su propio historial no alcanza.
+        self.z_suffix_probes = []
+        self.z_suffix_context = []
+        self._last_suffix_idx = -1
+
         self.level_history = []
         self.level_current = 0
         self.last_dozen_num = None
@@ -2884,6 +3511,37 @@ class RouletteTable:
         self.near_resistance_zone = near_sr_zone["near_resistance"]
         self.near_support_zone = near_sr_zone["near_support"]
 
+        # ── Tríptico (D,C,D) compartido Z1–Z4: sondas de resultados reales ──
+        # Cada vez que la secuencia de zonas cierra un (D,C,D) con D != C, se
+        # abre una sonda que guarda los números de las próximas
+        # ZONE_MAX_ATTEMPTS rondas (sin importar qué se apostó). Los agentes
+        # Z1–Z4 usan estas muestras COMPARTIDAS para decidir entre C y D.
+        # Se procesan primero las sondas abiertas (con el número actual) y
+        # recién después se registra el tríptico que cierra AHORA, así la
+        # sonda nueva empieza a contar desde la PRÓXIMA ronda.
+        if self.z_suffix_probes and number is not None:
+            _still_open = []
+            for _probe in self.z_suffix_probes:
+                _probe["results"].append(number)
+                if len(_probe["results"]) >= ZONE_MAX_ATTEMPTS:
+                    self.z_suffix_context.append({
+                        "c": _probe["c_zone"], "d": _probe["d_zone"],
+                        "n1": _probe["results"][0], "n2": _probe["results"][1],
+                    })
+                    if len(self.z_suffix_context) > Z_SUFFIX_CONTEXT_MAX:
+                        self.z_suffix_context = self.z_suffix_context[-Z_SUFFIX_CONTEXT_MAX:]
+                else:
+                    _still_open.append(_probe)
+            self.z_suffix_probes = _still_open
+        if len(self.zone_history) >= 3:
+            _tri = self.zone_history[-3:]
+            if (_tri[0] in ("ALTA", "BAJA") and _tri[1] in ("ALTA", "BAJA")
+                    and _tri[0] != _tri[1] and _tri[2] == _tri[0]):
+                _idx = len(self.zone_history) - 1
+                if _idx != self._last_suffix_idx:
+                    self.z_suffix_probes.append({"results": [], "c_zone": _tri[1], "d_zone": _tri[0]})
+                    self._last_suffix_idx = _idx
+
         # Filtro adicional de tendencia de largo plazo (EMA20 vs EMA50),
         # aplicado sobre docenas y zonas. Si aún no hay suficiente
         # historial (< 51 giros) no se aplica y no bloquea nada.
@@ -2951,7 +3609,19 @@ class RouletteTable:
                            trend_label=self.trend,
                            near_resistance=self.near_resistance_zone, near_support=self.near_support_zone)
 
-        all_agents = agent_list + zone_agents
+        zpat_agents = list(self.zone_pattern_agents.values())
+        for zpagent in zpat_agents:
+            blocked = (self.signal_status not in (None, "waiting_pattern")) or self.confirming
+            live_ok = (not training) and (self.live_spins_seen >= DOZEN_MIN_SPIN_TO_SIGNAL)
+            zpagent.update(self.zone_history, timestamp, blocked=blocked,
+                           rebound_direction=self.last_rebound_direction,
+                           last_number=number, live_enabled=live_ok,
+                           trend_label=self.trend,
+                           near_resistance=self.near_resistance_zone,
+                           near_support=self.near_support_zone,
+                           suffix_context=self.z_suffix_context)
+
+        all_agents = agent_list + zone_agents + zpat_agents
         self._signal_included = False
 
         if not training:
@@ -4539,6 +5209,7 @@ async def train_table_from_history(table: "RouletteTable", spins: list, timestam
                 await asyncio.sleep(0)
         agents = [table.agent2, table.agent3, table.agent4]
         agents += list(table.streak_agents.values())
+        agents += list(getattr(table, "zone_pattern_agents", {}).values())
         for agent in agents:
             agent.force_train(timestamp)
         log.info(f"[Entrenamiento] Mesa {table.key}: entrenamiento forzado tras bloque {start//BATCH_SIZE + 1}")
@@ -4597,6 +5268,8 @@ class ServerState:
                     if _persist is None and _len == 4:
                         _persist = data.get("zone_agent_streak4")
                     _agent.load_persist(_persist)
+                for _pid, _agent in getattr(table, "zone_pattern_agents", {}).items():
+                    _agent.load_persist(data.get(f"zone_agent_z{_pid}"))
                 table.total_spins_seen = data.get("table_total_spins_seen", table.total_spins_seen)
                 self.history_seed_trained[key] = data.get("history_seed_trained", False)
                 log.info(f"Modelo cargado para mesa {key}")
@@ -4618,6 +5291,8 @@ class ServerState:
         }
         for _len, _agent in table.streak_agents.items():
             data[f"zone_agent_streak{_len}"] = _agent.to_persist()
+        for _pid, _agent in table.zone_pattern_agents.items():
+            data[f"zone_agent_z{_pid}"] = _agent.to_persist()
         filename = f"model_{key}.json"
         try:
             with open(filename, "w") as f:
