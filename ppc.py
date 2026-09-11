@@ -169,6 +169,24 @@ CYCLE_MAX_PERIOD = 4
 CYCLE_MIN_CONSISTENCY = float(os.environ.get("CYCLE_MIN_CONSISTENCY", "0.72"))
 CYCLE_MIN_OCCURRENCES = int(os.environ.get("CYCLE_MIN_OCCURRENCES", "6"))
 
+# ── Predictor CONTEXTUAL de intento+dirección para rachas: en vez de asumir
+#    que los 2 intentos van siempre a la zona de la racha (con parches
+#    puntuales como countertrend/backtest60/cycle-hint decidiendo cada uno
+#    por separado si conviene el opuesto o el intento 2), esto registra el
+#    resultado REAL (qué zona salió, ALTA o BAJA) en el intento 1 y en el
+#    intento 2 de CADA señal de racha que se generó (haya o no haya sido
+#    enviada a Telegram), sin importar qué zona se apostó. Con esos datos
+#    agrupados por contexto similar (misma racha + mismo rebote), calcula
+#    la tasa de acierto real de las 4 combinaciones posibles — (intento 1,
+#    ALTA), (intento 1, BAJA), (intento 2, ALTA), (intento 2, BAJA) — y usa
+#    la de mejor tasa histórica para decidir en qué intento entrar y a qué
+#    dirección, siempre que haya muestra suficiente y una ventaja clara
+#    sobre la segunda mejor opción (para no cambiar de intento/dirección
+#    por pura casualidad estadística). ──
+STREAK_CONTEXT_MIN_SAMPLES = int(os.environ.get("STREAK_CONTEXT_MIN_SAMPLES", "12"))
+STREAK_CONTEXT_MIN_EDGE = float(os.environ.get("STREAK_CONTEXT_MIN_EDGE", "0.05"))
+STREAK_CONTEXT_WINDOW = int(os.environ.get("STREAK_CONTEXT_WINDOW", "200"))
+
 def is_lateral_market(zone_history, lookback=LATERAL_LOOKBACK_ROUNDS, min_ratio=LATERAL_MIN_CHANGE_RATIO):
     """True si en las últimas `lookback` rondas la zona (ALTA/BAJA) cambia de
     dirección respecto a la anterior en al menos `min_ratio` de los casos
@@ -1591,6 +1609,18 @@ class StreakZoneAgent:
         self.trained_snapshot = {}
         self.last_rebound_direction = "NEUTRAL"
 
+        # ── Predictor contextual de intento+dirección (ver STREAK_CONTEXT_*
+        # arriba). `direction_probes` son sondas EN CURSO: por cada racha que
+        # dispara un candidato (haya o no salido a Telegram) se abre una
+        # sonda que, en las próximas 2 rondas reales, guarda qué número salió
+        # en cada una -sin importar qué zona se apostó-. Al completarse pasa
+        # a `direction_history` (o a `direction_history_snapshot` una vez
+        # entrenado el modelo, igual criterio que pattern_context/
+        # trained_snapshot). ──
+        self.direction_probes = []
+        self.direction_history = []
+        self.direction_history_snapshot = []
+
     @staticmethod
     def _key(zone):
         return f"RACHA_{zone}"
@@ -1637,6 +1667,47 @@ class StreakZoneAgent:
 
     def _win_rate_entry_2_3(self, pattern):
         return self._win_rate_for_start(pattern, start_attempt=2)
+
+    def _contextual_choice(self, racha_zone, rebound_direction, lateral):
+        """Busca en direction_history (o direction_history_snapshot si ya
+        entrenó) señales de racha con contexto similar -misma zona de racha
+        y mismo rebote, afinando por lateral/no-lateral si hay muestra- y
+        calcula, para las 4 combinaciones posibles (intento 1 o 2, dirección
+        ALTA o BAJA), la tasa de acierto REAL observada (no la de la zona
+        que se apostó en su momento, sino la del número que realmente salió
+        en cada intento). Devuelve (intento, zona, tasa, muestra) para la
+        mejor combinación si hay muestra suficiente y una ventaja clara
+        sobre la segunda mejor; si no, None (se sigue con la heurística de
+        countertrend/backtest60/cycle-hint de siempre)."""
+        source = self.direction_history_snapshot if (self.trained and self.direction_history_snapshot) else self.direction_history
+        if not source:
+            return None
+
+        def _filtered(match_lateral):
+            return [e for e in source
+                    if e["racha_zone"] == racha_zone and e["rebound"] == rebound_direction
+                    and (not match_lateral or e["lateral"] == lateral)]
+
+        filtered = _filtered(True)
+        if len(filtered) < STREAK_CONTEXT_MIN_SAMPLES:
+            filtered = _filtered(False)
+        if len(filtered) < STREAK_CONTEXT_MIN_SAMPLES:
+            filtered = [e for e in source if e["racha_zone"] == racha_zone]
+        if len(filtered) < STREAK_CONTEXT_MIN_SAMPLES:
+            return None
+
+        total = len(filtered)
+        combos = []
+        for attempt, direction in ((1, "ALTA"), (1, "BAJA"), (2, "ALTA"), (2, "BAJA")):
+            key = "n1" if attempt == 1 else "n2"
+            wins = sum(1 for e in filtered if zone_win(direction, e[key]))
+            combos.append((attempt, direction, wins / total))
+        combos.sort(key=lambda c: c[2], reverse=True)
+        best_attempt, best_zone, best_rate = combos[0]
+        second_rate = combos[1][2]
+        if best_rate - second_rate < STREAK_CONTEXT_MIN_EDGE:
+            return None
+        return best_attempt, best_zone, round(best_rate, 3), total
 
     def run_backtest(self, zone_history):
         """Recorre las últimas DOZEN_BACKTEST_WINDOW (60) rondas buscando
@@ -1724,6 +1795,7 @@ class StreakZoneAgent:
 
     def force_train(self, timestamp: float):
         self.trained_snapshot = {k: list(v) for k, v in self.pattern_context.items()}
+        self.direction_history_snapshot = list(self.direction_history)
         self.trained = True
         self.last_train_ts = timestamp
 
@@ -1762,6 +1834,28 @@ class StreakZoneAgent:
                 if self.train_state["attempts_left"] <= 0:
                     self._close_shadow(False, zone_history[-1], attempt, timestamp)
 
+        # 1b) Sondas del predictor contextual: independientes del shadow de
+        # arriba (que solo sigue la zona apostada). Cada sonda abierta en el
+        # punto 2) va acumulando, ronda a ronda, el NÚMERO real que salió
+        # -sin importar qué se apostó- hasta juntar los 2 intentos reales;
+        # ahí se cierra y pasa a direction_history con el resultado objetivo
+        # de ambos intentos.
+        if self.direction_probes and last_number is not None:
+            still_open = []
+            for probe in self.direction_probes:
+                probe["results"].append(last_number)
+                if len(probe["results"]) >= ZONE_MAX_ATTEMPTS:
+                    self.direction_history.append({
+                        "racha_zone": probe["racha_zone"], "rebound": probe["rebound"],
+                        "lateral": probe["lateral"], "trend": probe["trend"],
+                        "n1": probe["results"][0], "n2": probe["results"][1],
+                    })
+                    if len(self.direction_history) > STREAK_CONTEXT_WINDOW:
+                        del self.direction_history[0]
+                else:
+                    still_open.append(probe)
+            self.direction_probes = still_open
+
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
         self._maybe_train(timestamp)
@@ -1783,15 +1877,35 @@ class StreakZoneAgent:
             fallback_opposite = False
             lateral = is_lateral_market(zone_history)
 
-            # ── Contratendencia (solo racha x2): exige AMBAS condiciones —
-            # mercado LATERAL (is_lateral_market) Y que antes de la racha
-            # actual vengan bloques previos de largo 2 alternando de zona
-            # (BAJA,BAJA,ALTA,ALTA,...). Si se cumplen las dos, se apuesta
-            # al OPUESTO de la racha actual en vez de seguirla. ──
+            # ── Predictor CONTEXTUAL (ver STREAK_CONTEXT_* arriba): antes de
+            # recurrir a la heurística de countertrend/soporte-resistencia,
+            # se pregunta si hay suficiente historial de ESTA racha con
+            # rebote similar como para saber, con datos reales, cuál de las
+            # 4 combinaciones (intento 1 o 2 · ALTA o BAJA) acertó más
+            # seguido. Si hay ventaja clara, esa combinación manda tanto la
+            # dirección como el intento inicial, y se salta la heurística de
+            # countertrend/soporte-resistencia (que quedan reemplazadas por
+            # el dato real). El backtest60 (fallback_opposite del reintento)
+            # y el cycle-hint (empujar a intento 2) se siguen aplicando
+            # siempre, porque no deciden la dirección, solo afinan el
+            # reintento y el momento de entrada. ──
+            ctx_choice = self._contextual_choice(zone, rebound_direction, lateral)
             countertrend_zone = None
-            if self.min_streak == 2 and lateral:
-                countertrend_zone = streak2_countertrend_zone(zone_history, zone)
-            bet_zone = countertrend_zone if countertrend_zone is not None else zone
+            if ctx_choice is not None:
+                ctx_attempt, ctx_dir, ctx_rate, ctx_samples = ctx_choice
+                bet_zone = ctx_dir
+                log.info(f"🧭 {self.name}: contexto histórico similar ({ctx_samples} señales de racha {zone} "
+                          f"con rebote {rebound_direction}) → mejor combinación real: intento {ctx_attempt} "
+                          f"a {ctx_dir} ({ctx_rate*100:.1f}% de acierto observado)")
+            else:
+                # ── Contratendencia (solo racha x2): exige AMBAS condiciones —
+                # mercado LATERAL (is_lateral_market) Y que antes de la racha
+                # actual vengan bloques previos de largo 2 alternando de zona
+                # (BAJA,BAJA,ALTA,ALTA,...). Si se cumplen las dos, se apuesta
+                # al OPUESTO de la racha actual en vez de seguirla. ──
+                if self.min_streak == 2 and lateral:
+                    countertrend_zone = streak2_countertrend_zone(zone_history, zone)
+                bet_zone = countertrend_zone if countertrend_zone is not None else zone
 
             rate = self._win_rate(("RACHA", bet_zone))
             context = list(zone_history[-DOZEN_CONTEXT_WINDOW:])
@@ -1821,9 +1935,10 @@ class StreakZoneAgent:
             # "adaptive_retry": si el reintento llega a hacer falta, en vez
             # de apostar a un opuesto fijo, apuesta a la zona del número
             # que REALMENTE salió en el intento fallido (la "nueva
-            # dirección" confirmada en vivo, no una suposición previa). ──
+            # dirección" confirmada en vivo, no una suposición previa).
+            # Se salta si ya hubo una decisión contextual con datos reales. ──
             adaptive_retry = False
-            if near_resistance or near_support:
+            if ctx_choice is None and (near_resistance or near_support):
                 zona_sr = "resistencia" if near_resistance else "soporte"
                 opposite_zone = "ALTA" if bet_zone == "BAJA" else "BAJA"
                 opposite_rate = self._win_rate(("RACHA", opposite_zone))
@@ -1841,9 +1956,13 @@ class StreakZoneAgent:
 
 
             # ── Análisis de rondas: ¿en esta situación (racha de este largo +
-            # este rebote) conviene entrar directo en el INTENTO 2? ──
+            # este rebote) conviene entrar directo en el INTENTO 2? Si el
+            # predictor contextual ya decidió el intento con datos reales, se
+            # arranca directamente desde ahí; el resto de las señales
+            # (lateral, análisis por rebote, ciclo) solo pueden EMPUJAR de 1
+            # a 2, nunca bajar un 2 ya decidido. ──
             rec_attempt_dir, rec_pct_dir = self._recommended_attempt_for_direction(bet_zone, rebound_direction)
-            start_attempt = 1
+            start_attempt = ctx_choice[0] if ctx_choice is not None else 1
             if lateral:
                 start_attempt = 2
                 log.info(f"↔️ {self.name}: mercado LATERAL (cambios de dirección seguidos en últimas "
@@ -1873,6 +1992,16 @@ class StreakZoneAgent:
                 log.info(f"🔀 {self.name}: CONTRATENDENCIA detectada (pares alternados de a 2) → "
                           f"racha de {streak}x {zone} pero se apuesta al OPUESTO ({bet_zone})")
 
+            # ── Sonda del predictor contextual: sin importar si esta señal
+            # termina saliendo a Telegram o no, se registra qué número sale
+            # realmente en las próximas ZONE_MAX_ATTEMPTS rondas -sin atarse
+            # a qué zona se apostó- para seguir nutriendo direction_history
+            # de cara a la próxima racha de este mismo largo. ──
+            self.direction_probes.append({
+                "results": [], "racha_zone": zone, "rebound": rebound_direction,
+                "lateral": lateral, "trend": trend_label,
+            })
+
             self.candidate_signal = {
                 "pattern": ("RACHA", bet_zone),
                 "bet_zone": (bet_zone,),
@@ -1892,6 +2021,9 @@ class StreakZoneAgent:
                 "adaptive_retry": adaptive_retry,
                 "recommended_attempt_by_rebound": rec_attempt_dir,
                 "recommended_attempt_by_rebound_pct": rec_pct_dir,
+                "contextual_choice": ctx_choice is not None,
+                "contextual_rate": ctx_choice[2] if ctx_choice is not None else None,
+                "contextual_samples": ctx_choice[3] if ctx_choice is not None else None,
             }
             self.train_state = {
                 "active": True, "pattern": ("RACHA", bet_zone), "bet_zone": bet_zone,
@@ -2012,6 +2144,8 @@ class StreakZoneAgent:
             "trained": self.trained,
             "last_train_ts": self.last_train_ts,
             "trained_snapshot": self.trained_snapshot,
+            "direction_history": self.direction_history,
+            "direction_history_snapshot": self.direction_history_snapshot,
         }
 
     def load_persist(self, data):
@@ -2025,6 +2159,8 @@ class StreakZoneAgent:
         self.trained = data.get("trained", False)
         self.last_train_ts = data.get("last_train_ts", 0.0)
         self.trained_snapshot = data.get("trained_snapshot", {})
+        self.direction_history = data.get("direction_history", [])
+        self.direction_history_snapshot = data.get("direction_history_snapshot", [])
 
 
 # ══════════════════════════════════════════════
