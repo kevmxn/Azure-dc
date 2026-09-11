@@ -125,7 +125,7 @@ def _parse_streak_lengths(raw: str, fallback):
     except Exception:
         return list(fallback)
 
-ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS", "2,3,4,5,6,7"), [2, 3, 4, 5, 6, 7])
+ZONE_STREAK_LENGTHS = _parse_streak_lengths(os.environ.get("ZONE_STREAK_LENGTHS", "4,5,6,7"), [4, 5, 6, 7])
 
 # ── Umbral mínimo (%) de aciertos en INTENTO 2 vs INTENTO 1, condicionado al
 #    rebote actual, para que un agente de racha decida ENTRAR DIRECTAMENTE EN
@@ -3435,16 +3435,16 @@ DASHBOARD_HTML = r"""
         .sxh-loss { color:#ff7070!important; font-weight:700; }
         .sx-auto-badge { text-align:center; padding:6px 10px; background:rgba(80,200,120,.06); border:1px solid rgba(80,200,120,.2); border-radius:8px; font-size:0.65rem; color:rgba(80,200,120,.7); letter-spacing:1px; margin-bottom:6px; display:none; }
 
-        .signal-alert { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:250px; height:250px; border-radius:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:1000; text-align:center; color:white; border:2px solid rgba(150,150,200,.4); background:radial-gradient(circle at center, rgba(20,30,60,.95), rgba(10,15,35,.98)); box-shadow:0 0 25px rgba(80,120,220,.2), inset 0 0 18px rgba(80,120,220,.06); pointer-events:none; backdrop-filter:blur(8px); padding:20px; transition:all .3s; }
+        .signal-alert { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:auto; height:auto; min-width:120px; aspect-ratio:1/1; border-radius:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:1000; text-align:center; color:white; border:2px solid rgba(150,150,200,.4); background:radial-gradient(circle at center, rgba(20,30,60,.35), rgba(10,15,35,.35)); box-shadow:0 0 18px rgba(80,120,220,.12), inset 0 0 12px rgba(80,120,220,.04); pointer-events:none; backdrop-filter:blur(6px); padding:16px 20px; transition:all .3s; }
         .signal-alert.hidden { display:none; }
-        .signal-alert.state-baja { background:radial-gradient(circle at center, rgba(120,70,20,.95), rgba(60,35,10,.98), rgba(20,10,0,1)); border-color:rgba(220,150,80,.65); }
-        .signal-alert.state-alta { background:radial-gradient(circle at center, rgba(10,50,120,.95), rgba(5,25,60,.98), rgba(0,10,20,1)); border-color:rgba(80,160,255,.65); }
-        .signal-alert .alert-zone { font-size:2.2rem; font-weight:900; letter-spacing:3px; }
-        .signal-alert .alert-attempt { font-size:0.8rem; opacity:.7; }
-        .signal-alert .alert-bet { font-size:0.7rem; color:#f0c040; margin-top:4px; }
-        .signal-alert .alert-result { font-size:1.6rem; font-weight:900; margin-top:8px; }
-        .signal-alert.state-win { border-color:rgba(0,220,100,.65); background:radial-gradient(circle at center, rgba(0,60,20,.95), rgba(0,30,10,.98)); }
-        .signal-alert.state-loss { border-color:rgba(220,30,50,.65); background:radial-gradient(circle at center, rgba(70,5,10,.95), rgba(35,3,6,.98)); }
+        .signal-alert.state-baja { background:radial-gradient(circle at center, rgba(120,70,20,.35), rgba(60,35,10,.35), rgba(20,10,0,.35)); border-color:rgba(220,150,80,.65); }
+        .signal-alert.state-alta { background:radial-gradient(circle at center, rgba(10,50,120,.35), rgba(5,25,60,.35), rgba(0,10,20,.35)); border-color:rgba(80,160,255,.65); }
+        .signal-alert .alert-zone { font-size:1.6rem; font-weight:900; letter-spacing:2px; }
+        .signal-alert .alert-attempt { font-size:0.68rem; opacity:.7; }
+        .signal-alert .alert-bet { font-size:0.62rem; color:#f0c040; margin-top:3px; }
+        .signal-alert .alert-result { font-size:1.2rem; font-weight:900; margin-top:6px; }
+        .signal-alert.state-win { border-color:rgba(0,220,100,.65); background:radial-gradient(circle at center, rgba(0,60,20,.35), rgba(0,30,10,.35)); }
+        .signal-alert.state-loss { border-color:rgba(220,30,50,.65); background:radial-gradient(circle at center, rgba(70,5,10,.35), rgba(35,3,6,.35)); }
 
         .footer { font-size:0.7rem; color:#4a6080; text-align:center; border-top:1px solid #1a2640; padding-top:14px; }
     </style>
@@ -3943,6 +3943,13 @@ DASHBOARD_HTML = r"""
         } else {
             chart.data.labels = built.labels;
             chart.data.datasets = built.datasets;
+            // La ventana vertical (min/max) se recalcula en buildZoneDatasets
+            // en cada render según los niveles/soportes/resistencias vigentes,
+            // pero antes solo se aplicaba al crear el chart la primera vez:
+            // en los updates posteriores Chart.js seguía usando los límites
+            // viejos y el gráfico no se reajustaba a las rondas nuevas.
+            chart.options.scales.y.min = built.yMin;
+            chart.options.scales.y.max = built.yMax;
             chart.update('none');
         }
         return chart;
