@@ -65,7 +65,7 @@ ROULETTE_KEYS = {205: 205}   # Speed Roulette 2
 
 # ── Lógica de docenas (detección) ──
 DOZEN_MAX_ATTEMPTS = 3          # para entrenamiento del modelo
-ZONE_MAX_ATTEMPTS = 2           # para apuestas reales (señales de zona)
+ZONE_MAX_ATTEMPTS = 3          # para apuestas reales (señales de zona)
 DOZEN_BACKTEST_WINDOW = 60
 DOZEN_CONTEXT_WINDOW = 20
 DOZEN_MIN_SAMPLES_GATE = 6
@@ -77,7 +77,7 @@ DOZEN_MIN_SPIN_TO_SIGNAL = 21
 #    normalmente aunque su tasa esté por debajo de esto; lo único que
 #    cambia es que no se disparan como señal real hasta que su win-rate
 #    entrenado alcance este mínimo. ──
-SIGNAL_SEND_MIN_WIN_RATE = 0.85
+SIGNAL_SEND_MIN_WIN_RATE = 0.90
 
 # ── Muestra mínima para poder calcular win-rate y enviar señal, aunque el
 #    modelo ML todavía no esté "entrenado" (eso requiere ML_MIN_SIGNALS_TO_TRAIN
@@ -100,7 +100,7 @@ DOZEN_COOLDOWN_AFTER_LOSSES = 3
 DOZEN_COOLDOWN_ROUNDS = 5
 
 # ── Umbral para decidir opuesto en segundo intento ──
-SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.35
+SECOND_ATTEMPT_OPPOSITE_THRESHOLD = 0.45
 
 # ── Agente de RACHAS: señal permisiva cuando la misma zona sale N veces seguidas ──
 ZONE_STREAK_MIN = int(os.environ.get("ZONE_STREAK_MIN", "4"))
