@@ -63,7 +63,7 @@ CURRENCY_ID   = "BRL"
 PING_INTERVAL = 240
 SAVE_INTERVAL = 30
 
-ROULETTE_KEYS = {201: 201}   # Roulette 2 Extra Time
+ROULETTE_KEYS = {203: 203}   # Roulette 2 Extra Time
 
 # ── Lógica de docenas (detección) ──
 # Zona horaria de Colombia (UTC-5, sin horario de verano) — usada para el
@@ -175,8 +175,8 @@ AGENT_TREND_CONFIG = {
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHANNEL_SIGNALS = int(os.environ.get("CHANNEL_SIGNALS", "-1004228660174"))
 CHANNEL_STATS   = int(os.environ.get("CHANNEL_STATS", "-1003963076616"))
-TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:roulette2")
-TABLE_NAME     = "Roulette 2 Extra Time"
+TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette1")
+TABLE_NAME     = "Speed Roulette 1"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
