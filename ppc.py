@@ -90,7 +90,7 @@ SIGNAL_SEND_MIN_WIN_RATE = 0.95
 #    señales en TOTAL). Con esto, un patrón puntual que ya acumuló
 #    SIGNAL_SEND_MIN_SAMPLES señales cerradas puede enviar señal real en base
 #    a su tasa histórica cruda, sin esperar a que el modelo global entrene. ──
-SIGNAL_SEND_MIN_SAMPLES = 25
+SIGNAL_SEND_MIN_SAMPLES = 15
 
 # ── Entrenamiento ML: se re-entrena cada 10 señales cerradas (alineado con
 #    SIGNAL_SEND_MIN_SAMPLES, la misma muestra mínima que exige el envío de
@@ -158,7 +158,7 @@ ZONE_EMOJI = {"BAJA": "🔵", "ALTA": "🟠", "VERDE": "🟢"}
 ZONE_NUM = {"BAJA": 1, "ALTA": 2, "VERDE": 0}
 NUM_ZONE = {1: "BAJA", 2: "ALTA", 0: "VERDE"}
 
-EMA_TREND_MIN_HISTORY = 20
+EMA_TREND_MIN_HISTORY = 30
 TREND_FAVORED_DOZENS = {
     "bullish": {1, 2},
     "bearish": {2, 3},
@@ -324,7 +324,7 @@ def amx_strength(level_history, periods):
     amx = sum(momentum_values) / len(periods)
     return abs(amx)
 
-EMA_LONG_FAST = 20
+EMA_LONG_FAST = 35
 EMA_LONG_SLOW = 50
 
 def ema_long_trend(level_history, fast=EMA_LONG_FAST, slow=EMA_LONG_SLOW):
