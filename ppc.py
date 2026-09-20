@@ -704,8 +704,9 @@ def _agent_ml_block(agente) -> str:
         for key, arr in patrones_con_datos[:3]:
             c1 = sum(1 for e in arr if agente._entry_attempt(e) == 1)
             c2 = sum(1 for e in arr if agente._entry_attempt(e) == 2)
+            c3 = sum(1 for e in arr if agente._entry_attempt(e) == 3)
             win_rate = sum(1 for e in arr if 0 < agente._entry_attempt(e) <= ZONE_MAX_ATTEMPTS) / len(arr) * 100
-            lines.append(f"   · {key}: {len(arr)} muestras · {win_rate:.1f}% acierto · int1={c1} int2={c2}")
+            lines.append(f"   · {key}: {len(arr)} muestras · {win_rate:.1f}% acierto · int1={c1} int2={c2} int3={c3}")
     return "\n".join(lines)
 
 def build_mlstatus_message(server_state) -> str:
@@ -1024,23 +1025,25 @@ class DozenPatternAgent:
             return None
         c1 = sum(1 for e in arr if self._entry_attempt(e) == 1)
         c2 = sum(1 for e in arr if self._entry_attempt(e) == 2)
-        if c1 == 0 and c2 == 0:
+        c3 = sum(1 for e in arr if self._entry_attempt(e) == 3)
+        if c1 == 0 and c2 == 0 and c3 == 0:
             return None
-        return 1 if c1 >= c2 else 2
+        return max((1, 2, 3), key=lambda n: (c1, c2, c3)[n - 1])
 
     def overall_recommended_attempt(self):
         if not self.trained:
             return None, 0.0
-        c1 = c2 = 0
+        c1 = c2 = c3 = 0
         for arr in self.trained_snapshot.values():
             c1 += sum(1 for e in arr if self._entry_attempt(e) == 1)
             c2 += sum(1 for e in arr if self._entry_attempt(e) == 2)
-        total = c1 + c2
+            c3 += sum(1 for e in arr if self._entry_attempt(e) == 3)
+        total = c1 + c2 + c3
         if total < DOZEN_MIN_SAMPLES_GATE:
             return None, 0.0
-        if c1 >= c2:
-            return 1, round(c1 / total * 100, 1)
-        return 2, round(c2 / total * 100, 1)
+        counts = (c1, c2, c3)
+        best_n = max((1, 2, 3), key=lambda n: counts[n - 1])
+        return best_n, round(counts[best_n - 1] / total * 100, 1)
 
     def _recommended_attempt_for_direction(self, pattern, rebound_direction):
         """Intento recomendado condicionado a la dirección de rebote actual, con
@@ -1054,19 +1057,20 @@ class DozenPatternAgent:
             return fallback, None
         c1 = sum(1 for v in filtered if v == 1)
         c2 = sum(1 for v in filtered if v == 2)
-        if c1 == 0 and c2 == 0:
+        c3 = sum(1 for v in filtered if v == 3)
+        if c1 == 0 and c2 == 0 and c3 == 0:
             fallback = self._recommended_attempt(pattern)
             return fallback, None
-        if c1 >= c2:
-            return 1, round(c1 / len(filtered) * 100, 1)
-        return 2, round(c2 / len(filtered) * 100, 1)
+        counts = (c1, c2, c3)
+        best_n = max((1, 2, 3), key=lambda n: counts[n - 1])
+        return best_n, round(counts[best_n - 1] / len(filtered) * 100, 1)
 
     def overall_recommended_attempt_for_direction(self, rebound_direction):
         """Igual que overall_recommended_attempt() pero solo con señales que ocurrieron
         con la misma dirección de rebote; si no hay datos suficientes, cae al general."""
         if not self.trained:
             return None, 0.0
-        c1 = c2 = 0
+        c1 = c2 = c3 = 0
         for arr in self.trained_snapshot.values():
             for e in arr:
                 if self._entry_rebound(e) != rebound_direction:
@@ -1074,12 +1078,13 @@ class DozenPatternAgent:
                 v = self._entry_attempt(e)
                 if v == 1: c1 += 1
                 elif v == 2: c2 += 1
-        total = c1 + c2
+                elif v == 3: c3 += 1
+        total = c1 + c2 + c3
         if total < DOZEN_MIN_SAMPLES_GATE:
             return self.overall_recommended_attempt()
-        if c1 >= c2:
-            return 1, round(c1 / total * 100, 1)
-        return 2, round(c2 / total * 100, 1)
+        counts = (c1, c2, c3)
+        best_n = max((1, 2, 3), key=lambda n: counts[n - 1])
+        return best_n, round(counts[best_n - 1] / total * 100, 1)
 
     def _ml_should_signal(self, pattern, trend_dozens, amx_strength_val):
         # NOTA: se eliminó el filtro de dirección de tendencia EMA/AMX
@@ -1675,25 +1680,32 @@ class RouletteTable:
     REBOUND_FAVORED_ZONE = {"ALCISTA": "BAJA", "BAJISTA": "ALTA"}
 
     def _determine_zone_sequence(self, agent, candidate, bet_zone_tuple, amx_strength):
-        # Por defecto ambos intentos de la señal apuntan a la MISMA zona: ya
-        # no se invierte al lado opuesto en el 2º intento por rebote,
-        # cercanía al cero, tasa de 2º intento o AMX débil.
+        # Por defecto los 3 intentos reales de la señal apuntan a la MISMA
+        # zona: ya no se invierte al lado opuesto por rebote, cercanía al
+        # cero, tasa de 2º intento o AMX débil.
         #
         # EXCEPCIÓN: si "fallback_opposite" viene marcado en la señal (por el
-        # backtest de 60 rondas de este patrón, ver BACKTEST60_MIN_ACCURACY),
-        # el reintento (el intento que sigue si
-        # falla el primero real) apuesta a la zona OPUESTA en vez de repetir
-        # la misma, para cubrir el riesgo de cambio de zona por repetición.
-        # Si además la señal arranca directo en intento 2 (start_attempt=2,
-        # se salta el 1), se agrega un "relleno" inicial (mismo valor que
-        # el primer intento real) para que los índices absolutos sigan
-        # alineados con current_signal_start_index.
+        # backtest de 60 rondas de este patrón, ver BACKTEST60_MIN_ACCURACY,
+        # o por near_resistance/near_support -> adaptive_retry), TODOS los
+        # reintentos (2º y 3º intento) apuestan a la zona OPUESTA por
+        # defecto, en vez de repetir la misma, para cubrir el riesgo de
+        # cambio de zona por repetición.
+        #
+        # La secuencia debe tener SIEMPRE largo = padding + ZONE_MAX_ATTEMPTS,
+        # porque una señal real puede llegar a jugar los 3 intentos
+        # (ZONE_MAX_ATTEMPTS), no solo 2 — si quedaba corta, el intento 3
+        # cualquiera fuera adaptativo o no, se evaluaba con [-1] en vez de la
+        # zona real (bug: un acierto real en el intento 3 se marcaba como
+        # pérdida). Si además la señal arranca directo en intento 2
+        # (start_attempt=2, se salta el 1), se agrega un "relleno" inicial
+        # (mismo valor que el primer intento real) para que los índices
+        # absolutos sigan alineados con current_signal_start_index.
         zone = bet_zone_tuple[0]
         start_attempt = candidate.get("start_attempt", 1)
         fallback_opposite = bool(candidate.get("fallback_opposite"))
         retry_zone = ("ALTA" if zone == "BAJA" else "BAJA") if fallback_opposite else zone
         padding = max(start_attempt - 1, 0)
-        return [zone] * padding + [zone, retry_zone]
+        return [zone] * padding + [zone] + [retry_zone] * (ZONE_MAX_ATTEMPTS - 1)
 
     def _prepare_new_signal(self, agent, candidate, last_number):
         bet_zone_tuple = candidate.get("bet_zone")
@@ -1901,6 +1913,20 @@ class RouletteTable:
                         log.info(f"🧭 {agent.name}: reintento adaptativo → zona real del último número ({last_number}) = {next_zone}")
                     else:
                         next_zone = zone_sequence[self.current_attempt_index] if self.current_attempt_index < len(zone_sequence) else zone_sequence[-1]
+                    # Se deja registrada la zona EXACTA que se va a anunciar/
+                    # apostar en este intento (index actual) dentro de la
+                    # propia zone_sequence de la señal, para que la próxima
+                    # evaluación (arriba, is_win = zone_win(bet_zone, ...))
+                    # compare contra lo mismo que se mostró al usuario, sea
+                    # o no adaptativa -- antes, si el índice quedaba fuera
+                    # del largo de zone_sequence, se evaluaba contra [-1]
+                    # (un valor viejo/estático) en vez de la zona real
+                    # anunciada, y una señal que sí acertaba se marcaba
+                    # como perdida.
+                    if self.current_attempt_index < len(zone_sequence):
+                        zone_sequence[self.current_attempt_index] = next_zone
+                    else:
+                        zone_sequence.append(next_zone)
                     next_display_attempt = self.current_attempt_index - self.current_signal_start_index + 1
                     asyncio.create_task(self._send_entry(agent, next_zone, new_bet, next_display_attempt))
                     log.info(f"🔄 INTENTO {next_display_attempt} (índice interno {self.current_attempt_index+1}): zona {next_zone}")
