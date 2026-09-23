@@ -57,8 +57,8 @@ CASINO_ID     = "ppcdk00000005349"
 CURRENCY_ID   = "BRL"
 PING_INTERVAL = 240
 
-ROULETTE_KEYS = {233: 233}          # Latina Roulette
-LATINA_KEY    = 233
+ROULETTE_KEYS = {234: 234}          # Latina Roulette
+LATINA_KEY    = 234
 
 COL_TZ = timezone(timedelta(hours=-5))
 
@@ -71,7 +71,7 @@ assert len(P_NUMBERS) + len(C_NUMBERS) == 37, "La clasificación debe cubrir 0-3
 DB_PATH = os.environ.get("DB_PATH", "latina_roulette.db")
 
 # ── Umbral de probabilidad P combinada para enviar la señal ──
-SIGNAL_MIN_P_PROB  = float(os.environ.get("SIGNAL_MIN_P_PROB", "0.65"))
+SIGNAL_MIN_P_PROB  = float(os.environ.get("SIGNAL_MIN_P_PROB", "0.75"))
 # ── Muestra mínima histórica (transiciones por número) ──
 SIGNAL_MIN_SAMPLES = int(os.environ.get("SIGNAL_MIN_SAMPLES", "8"))
 # ── Giros de espera entre señal y señal (tras resolver una) ──
