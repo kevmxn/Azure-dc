@@ -71,7 +71,7 @@ assert len(P_NUMBERS) + len(C_NUMBERS) == 37, "La clasificación debe cubrir 0-3
 DB_PATH = os.environ.get("DB_PATH", "latina_roulette.db")
 
 # ── Umbral de probabilidad P combinada para enviar la señal ──
-SIGNAL_MIN_P_PROB  = float(os.environ.get("SIGNAL_MIN_P_PROB", "0.75"))
+SIGNAL_MIN_P_PROB  = float(os.environ.get("SIGNAL_MIN_P_PROB", "0.90"))
 # ── Muestra mínima histórica (transiciones por número) ──
 SIGNAL_MIN_SAMPLES = int(os.environ.get("SIGNAL_MIN_SAMPLES", "8"))
 # ── Giros de espera entre señal y señal (tras resolver una) ──
