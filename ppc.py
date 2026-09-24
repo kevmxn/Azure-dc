@@ -73,7 +73,7 @@ CURRENCY_ID   = "BRL"
 PING_INTERVAL = 240
 SAVE_INTERVAL = 30
 
-ROULETTE_KEYS = {205: 205}   # Roulette 2 Extra Time
+ROULETTE_KEYS = {203: 203}   # Roulette 2 Extra Time
 
 # ── Lógica de docenas (detección) ──
 # Zona horaria de Colombia (UTC-5, sin horario de verano) — usada para el
@@ -97,7 +97,7 @@ DOZEN_MIN_SPIN_TO_SIGNAL = 21
 #    normalmente aunque su tasa esté por debajo de esto; lo único que
 #    cambia es que no se disparan como señal real hasta que su win-rate
 #    entrenado alcance este mínimo. ──
-SIGNAL_SEND_MIN_WIN_RATE = 0.90
+SIGNAL_SEND_MIN_WIN_RATE = 0.95
 
 # ── Muestra mínima para poder calcular win-rate y enviar señal, aunque el
 #    modelo ML todavía no esté "entrenado" (eso requiere ML_MIN_SIGNALS_TO_TRAIN
@@ -189,8 +189,8 @@ AGENT_TREND_CONFIG = {
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHANNEL_SIGNALS = int(os.environ.get("CHANNEL_SIGNALS", "-1004228660174"))
 CHANNEL_STATS   = int(os.environ.get("CHANNEL_STATS", "-1003963076616"))
-TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette2")
-TABLE_NAME     = "Speed Roulette 2"
+TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette1")
+TABLE_NAME     = "Speed Roulette 1"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
@@ -208,7 +208,26 @@ PLENO_HISTORY_MAX         = 3000    # giros que se persisten en model_<key>.json
 PLENO_RF_TREES            = 100
 PLENO_RF_MIN_LEAF         = 3       # suaviza las probabilidades (con 1 hoja quedan 0/1)
 PLENO_PROB_SMOOTHING      = 0.20    # mezcla con distribución uniforme
-PLENO_DOZEN_BOOST         = 2.0     # peso extra a los números de las docenas de la señal (el 0 cuenta)
+# ── ANÁLISIS DE ZONA DEL CILINDRO (reemplaza al análisis de docenas en los plenos) ──
+ZONA_VECINOS         = 1      # vecinos por lado de cada una de las 3 últimas rondas (3 x 3 = 9 números)
+ZONA_ARCO_MAX        = 10     # las 3 últimas rondas deben caber en un arco de N casillas de la rueda
+ZONA_MIN_MATCHES     = 12     # coincidencias históricas mínimas (3 rondas seguidas dentro de los 9)
+ZONA_PESO            = 0.4    # peso del histórico de la zona al calcular el centro (el RF recibe el resto)
+ZONA_SUAVIZADO       = 0.5    # suavizado Laplace de la distribución histórica de la ronda siguiente
+ZONA_MIN_COBERTURA   = 0.60   # % de las rondas siguientes históricas que caen dentro de las 19 casillas
+ZONA_CENTRO_TOL      = 3      # el centro del ML puede quedar hasta N casillas fuera del arco de la zona
+ZONA_ULTIMAS         = 10     # rondas recientes que se guardan para el análisis
+ZONA_MIN_EN_ULTIMAS  = 4      # de las últimas 10 rondas, mínimo N dentro de la zona (las 3 del disparo cuentan)
+# ── SENTIDO DE GIRO: la rueda gira siempre al mismo lado (contra las agujas del reloj), nunca cambia ──
+# WHEEL_ORDER está escrito en sentido horario; con giro antihorario los casilleros avanzan hacia
+# índices menores. Se mide el "salto" entre giros seguidos en ESE sentido (0..36 casillas, sin espejo).
+GIRO_ANTIHORARIO     = os.environ.get("GIRO_SENTIDO", "antihorario").lower() != "horario"
+GIRO_TOL             = 2      # tolerancia (casillas) al comparar los 2 últimos saltos con los históricos
+GIRO_MIN_MATCHES     = 15     # coincidencias mínimas para que el análisis de giro cuente
+GIRO_PESO            = 0.2    # peso del análisis de giro al calcular el centro
+GIRO_MIN_COBERTURA   = 0.55   # % de destinos históricos por salto que caen dentro de las 19 casillas
+# Señales de zona por docenas (motor anterior): apagadas porque el análisis de plenos las reemplaza.
+DOCENAS_ZONE_SIGNALS = os.environ.get("DOCENAS_ZONE_SIGNALS", "0") == "1"
 PLENO_STATS_WINDOW        = 50      # señales cerradas que entran en el win-rate
 PLENO_SEND_MIN_SAMPLES    = int(os.environ.get("PLENO_SEND_MIN_SAMPLES", "30"))
 PLENO_SEND_MIN_WIN_RATE   = float(os.environ.get("PLENO_SEND_MIN_WIN_RATE", "0.80"))
@@ -1508,11 +1527,10 @@ def pleno_baseline(attempts: int = None, n_numbers: int = None) -> float:
 
 class CenterPredictor:
     """
-    Predice el número más probable del próximo giro (RandomForest sobre los últimos
-    PLENO_WINDOW_SIZE giros, igual que roulette_prediction.py) pero en vez de quedarse
-    con un solo número usa predict_proba: combina esa distribución con las docenas de
-    la señal (peso PLENO_DOZEN_BOOST) y elige como CENTRO el número cuya ventana de
-    19 casillas (9 izq + centro + 9 der en la rueda) acumula más probabilidad.
+    Predice el próximo número (RandomForest sobre los últimos PLENO_WINDOW_SIZE giros, igual que
+    roulette_prediction.py) pero en vez de quedarse con un solo número usa predict_proba y la
+    mezcla con el histórico de la zona del cilindro (ZONA_PESO). El CENTRO es el número cuya
+    ventana de 19 casillas (9 izq + centro + 9 der en la rueda) acumula más probabilidad.
     """
     def __init__(self):
         self.numbers = []
@@ -1598,15 +1616,14 @@ class CenterPredictor:
             return [c / tot for c in cnt], "freq"
         return [u] * 37, "uniforme"
 
-    def predict_center(self, bet_dozens=None) -> dict:
+    def predict_center(self, zona_q=None, giro_q=None) -> dict:
         base, source = self._base_probs()
-        w = [1.0] * 37
-        if bet_dozens:
-            w[0] = PLENO_DOZEN_BOOST                       # el cero también gana en las señales de docenas
-            for n in range(1, 37):
-                if dozen_of(n) in bet_dozens:
-                    w[n] = PLENO_DOZEN_BOOST
-        comb = [b * x for b, x in zip(base, w)]
+        wz = ZONA_PESO if zona_q else 0.0
+        wg = GIRO_PESO if giro_q else 0.0
+        wb = 1.0 - wz - wg
+        zq = zona_q or [0.0] * 37
+        gq = giro_q or [0.0] * 37
+        comb = [wb * b + wz * z + wg * g for b, z, g in zip(base, zq, gq)]
         tot = sum(comb) or 1.0
         comb = [c / tot for c in comb]
         k = min(PLENO_NEIGHBORS_EACH_SIDE, (len(WHEEL_ORDER) - 1) // 2)
@@ -1623,6 +1640,151 @@ class CenterPredictor:
 
     def persist(self) -> list:
         return self.numbers[-PLENO_HISTORY_MAX:]
+
+
+def wheel_neighbors(n: int, each_side: int = None) -> list:
+    """El número y sus vecinos en la rueda (ej. 21 -> [4, 21, 2])."""
+    k = ZONA_VECINOS if each_side is None else each_side
+    i = WHEEL_POS[n]
+    L = len(WHEEL_ORDER)
+    return [WHEEL_ORDER[(i + d) % L] for d in range(-k, k + 1)]
+
+
+def zona_de_tres(last3):
+    """
+    Zona del cilindro que ocupan las 3 últimas rondas. Devuelve None si no están en la misma zona
+    (no caben en un arco de ZONA_ARCO_MAX casillas). S = las 3 rondas + sus vecinos (hasta 9 números);
+    'zona' = casillas del arco que cubre a S, en orden de rueda.
+    """
+    L = len(WHEEL_ORDER)
+    pos = sorted(WHEEL_POS[n] for n in last3)
+    huecos = [(pos[0], pos[1], pos[1] - pos[0]),
+              (pos[1], pos[2], pos[2] - pos[1]),
+              (pos[2], pos[0], L - (pos[2] - pos[0]))]
+    _, inicio, hueco = max(huecos, key=lambda h: h[2])   # el arco empieza justo después del mayor hueco
+    arco = L - hueco + 1
+    if arco > ZONA_ARCO_MAX:
+        return None
+    S = set()
+    for n in last3:
+        S.update(wheel_neighbors(n))
+    ini = (inicio - ZONA_VECINOS) % L
+    zona = [WHEEL_ORDER[(ini + i) % L] for i in range(arco + 2 * ZONA_VECINOS)]
+    return {"S": S, "zona": zona, "arco": arco}
+
+
+def zona_historial(numbers, S) -> list:
+    """
+    Historial: cada vez que en 3 rondas seguidas salieron 3 números de S, se guarda el número
+    de la ronda siguiente. (La tripleta actual, que aún no tiene siguiente, queda fuera.)
+    """
+    out = []
+    for i in range(2, len(numbers) - 1):
+        if numbers[i] in S and numbers[i - 1] in S and numbers[i - 2] in S:
+            out.append(numbers[i + 1])
+    return out
+
+
+def zona_q(nexts) -> list:
+    """Distribución (0..36) de la ronda siguiente según el histórico de la zona."""
+    cnt = [ZONA_SUAVIZADO] * 37
+    for n in nexts:
+        cnt[n] += 1.0
+    tot = sum(cnt)
+    return [c / tot for c in cnt]
+
+
+def giro_paso(a: int, b: int) -> int:
+    """Casillas que avanza la rueda, en su sentido de giro, desde el número a hasta el b (0..36)."""
+    L = len(WHEEL_ORDER)
+    if GIRO_ANTIHORARIO:
+        return (WHEEL_POS[a] - WHEEL_POS[b]) % L
+    return (WHEEL_POS[b] - WHEEL_POS[a]) % L
+
+
+def giro_destino(a: int, paso: int) -> int:
+    """Número al que se llega avanzando 'paso' casillas desde a en el sentido de giro."""
+    L = len(WHEEL_ORDER)
+    if GIRO_ANTIHORARIO:
+        return WHEEL_ORDER[(WHEEL_POS[a] - paso) % L]
+    return WHEEL_ORDER[(WHEEL_POS[a] + paso) % L]
+
+
+def _dist_circ(a: int, b: int) -> int:
+    L = len(WHEEL_ORDER)
+    return min((a - b) % L, (b - a) % L)
+
+
+def giro_analisis(numbers):
+    """
+    Saltos entre giros seguidos, siempre en el mismo sentido. Toma los 2 últimos saltos y busca en
+    el histórico cuándo ocurrieron saltos parecidos (±GIRO_TOL); el salto que vino después,
+    aplicado al último número, da los destinos probables. Devuelve (q, coincidencias, destinos).
+    """
+    if len(numbers) < 6:
+        return None, 0, []
+    pasos = [giro_paso(numbers[k], numbers[k + 1]) for k in range(len(numbers) - 1)]
+    u, v = pasos[-2], pasos[-1]
+    sigs = []
+    for k in range(1, len(pasos) - 1):
+        if _dist_circ(pasos[k - 1], u) <= GIRO_TOL and _dist_circ(pasos[k], v) <= GIRO_TOL:
+            sigs.append(pasos[k + 1])
+    ultimo = numbers[-1]
+    destinos = [giro_destino(ultimo, p) for p in sigs]
+    return zona_q(destinos), len(destinos), destinos
+
+
+def priors_plenos(numbers, S) -> dict:
+    """Histórico de zona (ronda siguiente a 3 rondas dentro de S) + análisis de sentido de giro."""
+    nexts = zona_historial(numbers, S)
+    gq, gm, destinos = giro_analisis(numbers)
+    return {"nexts": nexts, "zona_q": zona_q(nexts),
+            "giro_q": gq if gm >= GIRO_MIN_MATCHES else None, "giro_m": gm, "destinos": destinos}
+
+
+def zona_evaluar(numbers, predictor, ultimas):
+    """
+    Análisis de plenos por zona del cilindro + sentido de giro. Devuelve (señal, motivo): la señal
+    es None si algún filtro falla y 'motivo' explica cuál.
+    """
+    if len(numbers) < 3:
+        return None, "sin datos"
+    last3 = numbers[-3:]
+    z = zona_de_tres(last3)
+    if z is None:
+        return None, "3 rondas fuera de una misma zona"
+    pr = priors_plenos(numbers, z["S"])
+    nexts = pr["nexts"]
+    m = len(nexts)
+    if m < ZONA_MIN_MATCHES:
+        return None, f"pocas coincidencias históricas ({m})"
+    zset = set(z["zona"])
+    en_ultimas = sum(1 for n in ultimas if n in zset)
+    if en_ultimas < ZONA_MIN_EN_ULTIMAS:
+        return None, f"zona fría en las últimas {ZONA_ULTIMAS} ({en_ultimas})"
+    pred = predictor.predict_center(pr["zona_q"], pr["giro_q"])
+    L = len(WHEEL_ORDER)
+    cpos = WHEEL_POS[pred["center"]]
+    dist = min(min((cpos - WHEEL_POS[n]) % L, (WHEEL_POS[n] - cpos) % L) for n in z["zona"])
+    if dist > ZONA_CENTRO_TOL:
+        return None, f"centro ML {pred['center']} fuera de la zona (a {dist} casillas)"
+    win = set(pred["window"])
+    cobertura = sum(1 for n in nexts if n in win) / m
+    if cobertura < ZONA_MIN_COBERTURA:
+        return None, f"cobertura histórica baja ({cobertura*100:.0f}%)"
+    giro_cob = None
+    if pr["giro_q"]:
+        giro_cob = sum(1 for d in pr["destinos"] if d in win) / pr["giro_m"]
+        if giro_cob < GIRO_MIN_COBERTURA:
+            return None, f"cobertura de giro baja ({giro_cob*100:.0f}%)"
+    sig = {
+        "trio": list(last3), "S": sorted(z["S"]), "zona": z["zona"], "matches": m,
+        "cobertura": cobertura, "en_ultimas": en_ultimas, "center": pred["center"],
+        "window": pred["window"], "rf_top": pred["rf_top"], "fuente": pred["source"],
+        "giro_matches": pr["giro_m"], "giro_cobertura": giro_cob,
+        "attempt": 1, "numbers": [], "sent": False, "msg_id": None,
+    }
+    return sig, "ok"
 
 
 def _pleno_lines(window):
@@ -1659,6 +1821,7 @@ def build_pleno_resolution_message(win: bool, sig: dict) -> str:
 
 def build_pleno_status_message(server_state) -> str:
     lines = ["🎯 PLENOS (centro ± vecinos en la rueda)"]
+    lines.append(f"Sentido de giro: {'antihorario' if GIRO_ANTIHORARIO else 'horario'} (fijo, sin cambio de dirección)")
     base = pleno_baseline()
     lines.append(f"Cobertura: {pleno_window_size()} números | {PLENO_MAX_ATTEMPTS} intentos | "
                  f"azar puro = {base*100:.1f}%")
@@ -1673,6 +1836,8 @@ def build_pleno_status_message(server_state) -> str:
                      else ("sin sklearn (usa frecuencias)" if not SKLEARN_OK else "RF sin entrenar"))
         lines.append(f"\n🎲 Mesa {key} ({TABLE_NAME})")
         lines.append(f"• Giros en el predictor: {len(cp.numbers)} | {model_txt}")
+        if table.zona_ultimas10:
+            lines.append(f"• Últimas {len(table.zona_ultimas10)}: {'-'.join(str(n) for n in table.zona_ultimas10)}")
         if rate is None:
             lines.append("• Señales cerradas: 0")
         else:
@@ -1683,8 +1848,9 @@ def build_pleno_status_message(server_state) -> str:
                      f"≥{PLENO_SEND_MIN_SAMPLES} señales) | enviadas: {sent}")
         if table.pleno_active:
             a = table.pleno_active
-            lines.append(f"• Activa: centro {a['center']} intento {a['attempt']}/{PLENO_MAX_ATTEMPTS} "
-                         f"({'enviada' if a['sent'] else 'sombra'})")
+            lines.append(f"• Activa: {'-'.join(str(n) for n in a['trio'])} → centro {a['center']} "
+                         f"intento {a['attempt']}/{PLENO_MAX_ATTEMPTS} ({a['matches']} coincidencias, "
+                         f"{'enviada' if a['sent'] else 'sombra'})")
     return "\n".join(lines)
 
 
@@ -1760,6 +1926,7 @@ class RouletteTable:
         self.center_predictor = CenterPredictor()
         self.pleno_active = None
         self.pleno_results = []   # {"win","attempt","center","sent","agent","ts"}
+        self.zona_ultimas10 = []  # últimas ZONA_ULTIMAS rondas (se persisten)
 
     # ── PLENOS ───────────────────────────────────────────────
     def _pleno_recent(self):
@@ -1777,29 +1944,24 @@ class RouletteTable:
         if attempt > 1 and prev_id:
             await delete_msg(prev_id, CHANNEL_PLENOS)
 
-    def _pleno_try_open(self, agent_list, last_number):
-        """Abre una señal de plenos cuando algún agente de docenas confirma su patrón."""
-        if self.pleno_active is not None:
+    def _pleno_try_open(self, last_number):
+        """Abre una señal de plenos cuando las 3 últimas rondas cumplen el análisis de zona del cilindro."""
+        if self.pleno_active is not None or not self.center_predictor.ready():
             return
-        if self.live_spins_seen < DOZEN_MIN_SPIN_TO_SIGNAL or not self.center_predictor.ready():
+        sig, motivo = zona_evaluar(self.center_predictor.numbers, self.center_predictor, self.zona_ultimas10)
+        if sig is None:
+            log.debug(f"[Plenos] sin señal: {motivo}")
             return
-        cands = [(a, a.candidate_signal) for a in agent_list
-                 if a.candidate_signal and not a.candidate_signal.get("confirming")
-                 and a.candidate_signal.get("bet_dozens")]
-        if not cands:
-            return
-        agent, cand = max(cands, key=lambda x: x[1].get("score", 0.0))
-        bet_dozens = tuple(cand["bet_dozens"])
-        pred = self.center_predictor.predict_center(bet_dozens)
-        sig = {
-            "agent": agent.name, "agent_label": agent.label, "bet_dozens": bet_dozens,
-            "center": pred["center"], "window": pred["window"], "attempt": 1,
-            "numbers": [], "sent": self._pleno_gate_ok(), "msg_id": None,
-        }
+        sig["sent"] = self._pleno_gate_ok()
         self.pleno_active = sig
         n, w = self._pleno_recent()
-        log.info(f"🎯 PLENOS {agent.name}: docenas {'+'.join(bet_dozens)} → centro {sig['center']} "
-                 f"(RF top {pred['rf_top']}, fuente {pred['source']}, masa {pred['mass']*100:.1f}%) | "
+        gc = sig["giro_cobertura"]
+        giro_txt = f"{sig['giro_matches']} coinc" + ("" if gc is None else f", cobertura {gc*100:.0f}%")
+        log.info(f"🎯 PLENOS zona {'-'.join(str(x) for x in sig['trio'])} | 9 vecinos {sig['S']} | "
+                 f"{sig['matches']} coincidencias, cobertura {sig['cobertura']*100:.0f}%, "
+                 f"giro {giro_txt}, "
+                 f"{sig['en_ultimas']}/{ZONA_ULTIMAS} en zona → centro {sig['center']} "
+                 f"(RF top {sig['rf_top']}, fuente {sig['fuente']}) | "
                  f"{'ENVIADA' if sig['sent'] else 'sombra'} | win-rate {w}/{n}")
         if sig["sent"]:
             asyncio.create_task(self._pleno_send_entry(sig, last_number, 1))
@@ -1812,7 +1974,9 @@ class RouletteTable:
         hit = number in sig["window"]
         if hit or sig["attempt"] >= PLENO_MAX_ATTEMPTS:
             self.pleno_results.append({"win": hit, "attempt": sig["attempt"], "center": sig["center"],
-                                       "sent": sig["sent"], "agent": sig["agent"], "ts": time.time()})
+                                       "sent": sig["sent"], "trio": sig["trio"], "matches": sig["matches"],
+                                       "cobertura": round(sig["cobertura"], 3),
+                                       "giro_matches": sig["giro_matches"], "ts": time.time()})
             if len(self.pleno_results) > 200:
                 self.pleno_results = self.pleno_results[-200:]
             log.info(f"🎯 PLENOS cerrado: {'WIN' if hit else 'LOSS'} intento {sig['attempt']} | "
@@ -1823,20 +1987,23 @@ class RouletteTable:
             return
         # Reintento: se recalcula el centro con el modelo actualizado (mismas docenas)
         sig["attempt"] += 1
-        pred = self.center_predictor.predict_center(sig["bet_dozens"])
+        pr = priors_plenos(self.center_predictor.numbers, set(sig["S"]))
+        pred = self.center_predictor.predict_center(pr["zona_q"], pr["giro_q"])
         sig["center"], sig["window"] = pred["center"], pred["window"]
         log.info(f"🎯 PLENOS intento {sig['attempt']}: nuevo centro {sig['center']}")
         if sig["sent"]:
             asyncio.create_task(self._pleno_send_entry(sig, number, sig["attempt"]))
 
     def pleno_persist(self) -> dict:
-        return {"numbers": self.center_predictor.persist(), "results": self.pleno_results[-200:]}
+        return {"numbers": self.center_predictor.persist(), "results": self.pleno_results[-200:],
+                "ultimas10": self.zona_ultimas10[-ZONA_ULTIMAS:]}
 
     def pleno_load(self, data):
         if not data:
             return
         self.center_predictor.load_numbers(data.get("numbers", []))
         self.pleno_results = list(data.get("results", []))[-200:]
+        self.zona_ultimas10 = list(data.get("ultimas10") or self.center_predictor.numbers[-ZONA_ULTIMAS:])[-ZONA_ULTIMAS:]
         if self.center_predictor.ready():
             self.center_predictor.train()
 
@@ -2356,6 +2523,7 @@ class RouletteTable:
 
         # ── PLENOS: alimenta el predictor de centro y resuelve el pleno activo ──
         self.center_predictor.add(number, allow_train=not training)
+        self.zona_ultimas10 = (self.zona_ultimas10 + [number])[-ZONA_ULTIMAS:]
         if not training:
             self._pleno_resolve(number)
 
@@ -2439,8 +2607,9 @@ class RouletteTable:
         self._signal_included = False
 
         if not training:
-            self._pleno_try_open(agent_list, number)
-            self._handle_signal_sequence(all_agents, number, self.labouchere.get_bet())
+            self._pleno_try_open(number)
+            if DOCENAS_ZONE_SIGNALS:   # motor de señales de zona por docenas (reemplazado por plenos)
+                self._handle_signal_sequence(all_agents, number, self.labouchere.get_bet())
 
         if training:
             return
