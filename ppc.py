@@ -73,7 +73,7 @@ CURRENCY_ID   = "BRL"
 PING_INTERVAL = 240
 SAVE_INTERVAL = 30
 
-ROULETTE_KEYS = {203: 203}   # Roulette 2 Extra Time
+ROULETTE_KEYS = {205: 205}   # Roulette 2 Extra Time
 
 # ── Lógica de docenas (detección) ──
 # Zona horaria de Colombia (UTC-5, sin horario de verano) — usada para el
@@ -97,7 +97,7 @@ DOZEN_MIN_SPIN_TO_SIGNAL = 21
 #    normalmente aunque su tasa esté por debajo de esto; lo único que
 #    cambia es que no se disparan como señal real hasta que su win-rate
 #    entrenado alcance este mínimo. ──
-SIGNAL_SEND_MIN_WIN_RATE = 0.95
+SIGNAL_SEND_MIN_WIN_RATE = 0.90
 
 # ── Muestra mínima para poder calcular win-rate y enviar señal, aunque el
 #    modelo ML todavía no esté "entrenado" (eso requiere ML_MIN_SIGNALS_TO_TRAIN
@@ -189,8 +189,8 @@ AGENT_TREND_CONFIG = {
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHANNEL_SIGNALS = int(os.environ.get("CHANNEL_SIGNALS", "-1004228660174"))
 CHANNEL_STATS   = int(os.environ.get("CHANNEL_STATS", "-1003963076616"))
-TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette1")
-TABLE_NAME     = "Speed Roulette 1"
+TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette2")
+TABLE_NAME     = "Speed Roulette 2"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
