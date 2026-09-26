@@ -1,18 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT DE PLENOS — SPEED ROULETTE (centro + 9 vecinos por lado)║
-║   - Análisis de ZONA DEL CILINDRO: las 3 últimas rondas deben ║
-║     caer en la misma zona de la rueda; se toman sus vecinos   ║
-║     (3 x 3 = 9 números) y se mira en el histórico qué salió   ║
-║     en la ronda siguiente cuando 3 rondas seguidas cayeron    ║
-║     dentro de esos 9. Se guardan también las últimas 10.      ║
-║   - Análisis de SENTIDO DE GIRO: la rueda gira siempre al     ║
-║     mismo lado (antihorario); se estudian los saltos entre    ║
-║     giros seguidos en ese sentido, sin espejo.                ║
-║   - Centro: RandomForest (últimos 3 giros) + zona + giro; se  ║
+║   - Análisis de ZONA (secuencia): las 3 últimas rondas dan 3  ║
+║     ventanas de 5 números (2 vecinos por lado); se busca esa  ║
+║     misma secuencia de ventanas, en orden, en el histórico y  ║
+║     se mira qué zona salió después. En el intento 2: qué      ║
+║     suele salir tras una pérdida, o se repite la del intento 1║
+║   - Sentido de giro: horario por defecto, ajustable a mano    ║
+║     con /sentido (no se puede detectar de los números).       ║
+║   - Centro: RandomForest (hasta 9000 giros) + zona + giro; se ║
 ║     apuesta al centro y 9 vecinos a cada lado (19 números).   ║
 ║   - 2 intentos por señal; la ficha se duplica en el intento 2 ║
-║   - Comando Telegram: /plenos (win-rate vs azar, envío)       ║
+║   - Se guardan todas las señales cerradas, sin recorte.       ║
+║   - Comandos Telegram: /plenos, /mlstatus, /sentido           ║
 ║   - HTTP: /ping, /health, /api/state/{mesa}, /api/all         ║
 ║   - Persistencia en model_<key>.json + self-ping (Render)     ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -58,7 +58,7 @@ CURRENCY_ID   = "BRL"
 PING_INTERVAL = 240
 SAVE_INTERVAL = 30
 
-ROULETTE_KEYS = {205: 205}   # Roulette 2 Extra Time
+ROULETTE_KEYS = {203: 203}   # Roulette 2 Extra Time
 
 REAL_COLOR_MAP = {
     0: "VERDE", 1: "ROJO", 2: "NEGRO", 3: "ROJO", 4: "NEGRO", 5: "ROJO", 6: "NEGRO",
@@ -73,8 +73,8 @@ REAL_COLOR_MAP = {
 # ── Telegram: canales específicos (ya no un grupo con topics) ──
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw")
 CHANNEL_SIGNALS = int(os.environ.get("CHANNEL_SIGNALS", "-1004228660174"))
-TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette2")
-TABLE_NAME     = "Ruleta = Speed Roulette 2"
+TABLE_LINK     = os.environ.get("TABLE_LINK", "https://1win.com/es-MX/casino/play/v_pragmatic:speedroulette1")
+TABLE_NAME     = "Speed Roulette 1"
 
 HISTORY_SEED_PATH  = os.environ.get("HISTORY_SEED_PATH", "russian-azure.db")
 HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
@@ -86,30 +86,41 @@ PLENO_NEIGHBORS_EACH_SIDE = int(os.environ.get("PLENO_NEIGHBORS_EACH_SIDE", "9")
 PLENO_MAX_ATTEMPTS        = int(os.environ.get("PLENO_MAX_ATTEMPTS", "2"))
 PLENO_WINDOW_SIZE         = 3       # giros previos como features (igual que roulette_prediction.py)
 PLENO_TRAIN_MIN_SPINS     = 300     # giros mínimos para entrenar el RandomForest
-PLENO_TRAIN_MAX_SPINS     = 2000    # solo se entrena con los últimos N giros
+PLENO_TRAIN_MAX_SPINS     = 9000    # solo se entrena con los últimos N giros (máximo pedido para el RF)
 PLENO_RETRAIN_EVERY       = 25      # reentrena cada N giros en vivo
-PLENO_HISTORY_MAX         = 3000    # giros que se persisten en model_<key>.json
+PLENO_HISTORY_MAX         = 9000    # giros que se guardan en memoria y se persisten en model_<key>.json
 PLENO_RF_TREES            = 100
 PLENO_RF_MIN_LEAF         = 3       # suaviza las probabilidades (con 1 hoja quedan 0/1)
 PLENO_PROB_SMOOTHING      = 0.20    # mezcla con distribución uniforme
-# ── ANÁLISIS DE ZONA DEL CILINDRO ──
-ZONA_VECINOS         = 1      # vecinos por lado de cada una de las 3 últimas rondas (3 x 3 = 9 números)
-ZONA_ARCO_MAX        = 10     # las 3 últimas rondas deben caber en un arco de N casillas de la rueda
-ZONA_MIN_MATCHES     = 12     # coincidencias históricas mínimas (3 rondas seguidas dentro de los 9)
+# ── ANÁLISIS DE ZONA DEL CILINDRO: SECUENCIA de las 3 últimas rondas ──
+# Cada una de las 3 últimas rondas aporta su propia ventana de ZONA_VECINOS*2+1 números (5 por
+# defecto). Se busca en el histórico esa MISMA secuencia de 3 ventanas, EN EL MISMO ORDEN (no hace
+# falta que coincidan los números exactos, alcanza con que caigan en la ventana de cada posición).
+# Cuando esa secuencia se repitió antes, se mira qué zona salió justo después: si se repite con
+# frecuencia, es la confirmación para la señal.
+ZONA_VECINOS         = 2      # vecinos por lado de CADA una de las 3 últimas rondas (2+1+2 = 5 números c/u)
+ZONA_MIN_MATCHES     = 12     # coincidencias históricas mínimas de la secuencia de 3 ventanas
+ZONA_MIN_MATCHES_RETRY = 6    # coincidencias mínimas para el análisis de "qué sigue tras una pérdida"
 ZONA_PESO            = 0.4    # peso del histórico de la zona al calcular el centro (el RF recibe el resto)
 ZONA_SUAVIZADO       = 0.5    # suavizado Laplace de la distribución histórica de la ronda siguiente
 ZONA_MIN_COBERTURA   = 0.60   # % de las rondas siguientes históricas que caen dentro de las 19 casillas
-ZONA_CENTRO_TOL      = 3      # el centro del ML puede quedar hasta N casillas fuera del arco de la zona
+ZONA_CENTRO_TOL      = 3      # el centro del ML puede quedar hasta N casillas fuera de las 3 ventanas
 ZONA_ULTIMAS         = 10     # rondas recientes que se guardan para el análisis
-ZONA_MIN_EN_ULTIMAS  = 4      # de las últimas 10 rondas, mínimo N dentro de la zona (las 3 del disparo cuentan)
-# ── SENTIDO DE GIRO: la rueda gira siempre al mismo lado (contra las agujas del reloj), nunca cambia ──
+ZONA_MIN_EN_ULTIMAS  = 5      # de las últimas 10 rondas, mínimo N dentro de alguna de las 3 ventanas de 5
+# ── SENTIDO DE GIRO: cada crupier gira siempre hacia el mismo lado, pero no todos hacia el mismo.
+# Por defecto se asume sentido horario, ajustable por mesa con el comando /sentido. IMPORTANTE: el
+# sentido NO se puede detectar a partir de los números que salen (es matemáticamente indistinguible:
+# el "paso" en un sentido es siempre 37 menos el paso en el otro, así que cualquier patrón se ve
+# igual de fuerte en los dos sentidos). Por eso es un ajuste manual, no automático: solo se puede
+# saber mirando la mesa (qué crupier está, hacia qué lado tira la bola).
 # WHEEL_ORDER está escrito en sentido horario; con giro antihorario los casilleros avanzan hacia
 # índices menores. Se mide el "salto" entre giros seguidos en ESE sentido (0..36 casillas, sin espejo).
-GIRO_ANTIHORARIO     = os.environ.get("GIRO_SENTIDO", "antihorario").lower() != "horario"
+GIRO_ANTIHORARIO     = os.environ.get("GIRO_SENTIDO", "horario").lower() == "antihorario"
 GIRO_TOL             = 2      # tolerancia (casillas) al comparar los 2 últimos saltos con los históricos
 GIRO_MIN_MATCHES     = 15     # coincidencias mínimas para que el análisis de giro cuente
 GIRO_PESO            = 0.2    # peso del análisis de giro al calcular el centro
 GIRO_MIN_COBERTURA   = 0.55   # % de destinos históricos por salto que caen dentro de las 19 casillas
+GIRO_DIAG_MIN_SAMPLES = 150   # pruebas mínimas para mostrar el diagnóstico "¿hay patrón de saltos?"
 PLENO_STATS_WINDOW        = 50      # señales cerradas que entran en el win-rate
 PLENO_SEND_MIN_SAMPLES    = int(os.environ.get("PLENO_SEND_MIN_SAMPLES", "30"))
 PLENO_SEND_MIN_WIN_RATE   = float(os.environ.get("PLENO_SEND_MIN_WIN_RATE", "0.80"))
@@ -191,9 +202,44 @@ if bot is not None:
             await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
             return
         try:
+            for table in _server_state.tables.values():
+                await table.giro_diagnostico()
             await bot.reply_to(message, build_pleno_status_message(_server_state))
         except Exception as e:
             log.warning(f"[Telegram] Error respondiendo /plenos: {e}")
+
+    @bot.message_handler(commands=["mlstatus"])
+    async def handle_mlstatus_command(message):
+        if _server_state is None:
+            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
+            return
+        try:
+            # La validación entrena un RF aparte: se corre en un hilo para no frenar el WebSocket
+            validaciones = {}
+            for key, table in _server_state.tables.items():
+                validaciones[key] = await asyncio.to_thread(table.center_predictor.validar)
+            await bot.reply_to(message, build_mlstatus_message(_server_state, validaciones))
+        except Exception as e:
+            log.warning(f"[Telegram] Error respondiendo /mlstatus: {e}")
+
+    @bot.message_handler(commands=["sentido"])
+    async def handle_sentido_command(message):
+        if _server_state is None:
+            await bot.reply_to(message, "⏳ El servidor todavía se está iniciando, intenta de nuevo en unos segundos.")
+            return
+        partes = message.text.split()
+        tables = list(_server_state.tables.values())
+        if len(partes) < 2 or partes[1].lower() not in ("horario", "antihorario"):
+            actuales = " | ".join(f"mesa {t.key}: {'antihorario' if t.giro_antihorario else 'horario'}" for t in tables)
+            await bot.reply_to(message, f"Uso: /sentido horario|antihorario\nActual → {actuales}\n\n"
+                                        "El sentido no se puede detectar de los números que salen (es matemáticamente "
+                                        "indistinguible del espejo): hay que ajustarlo a mano según lo que se vea en la mesa.")
+            return
+        nuevo = partes[1].lower() == "antihorario"
+        for t in tables:
+            t.set_sentido(nuevo)
+        await bot.reply_to(message, f"✅ Sentido de giro puesto en {'antihorario' if nuevo else 'horario'} "
+                                    f"para {len(tables)} mesa(s).")
 
     async def _register_bot_commands():
         if BotCommand is None:
@@ -201,6 +247,8 @@ if bot is not None:
         try:
             await bot.set_my_commands([
                 BotCommand("plenos", "Centro ± vecinos: win-rate vs azar y estado del envío"),
+                BotCommand("mlstatus", "Cómo va el entrenamiento del ML (RandomForest)"),
+                BotCommand("sentido", "Ver/ajustar el sentido de giro (horario o antihorario)"),
             ])
         except Exception as e:
             log.warning(f"[Telegram] No se pudo registrar el menú de comandos: {e}")
@@ -327,6 +375,54 @@ class CenterPredictor:
             return [c / tot for c in cnt], "freq"
         return [u] * 37, "uniforme"
 
+    @staticmethod
+    def _mejor_ventana(comb):
+        """Centro cuya ventana de 19 casillas (9 + centro + 9 en la rueda) acumula más probabilidad."""
+        k = min(PLENO_NEIGHBORS_EACH_SIDE, (len(WHEEL_ORDER) - 1) // 2)
+        L = len(WHEEL_ORDER)
+        best_mass, best_i = -1.0, 0
+        for i in range(L):
+            mass = sum(comb[WHEEL_ORDER[(i + d) % L]] for d in range(-k, k + 1))
+            if mass > best_mass + 1e-12:
+                best_mass, best_i = mass, i
+        return WHEEL_ORDER[best_i], best_mass
+
+    def validar(self, n_test: int = 200):
+        """
+        Validación fuera de muestra: entrena un RF aparte con los giros anteriores a los últimos
+        n_test y mide, sobre esos n_test, el acierto exacto y cuántas veces el número que salió
+        cae dentro de la ventana de 19 casillas del centro predicho. Devuelve None si no hay datos.
+        """
+        if not SKLEARN_OK:
+            return None
+        data = list(self.numbers[-PLENO_TRAIN_MAX_SPINS:])
+        if len(data) < max(PLENO_TRAIN_MIN_SPINS, n_test + 100):
+            return None
+        try:
+            X, y = self._prepare(data[:-n_test], PLENO_WINDOW_SIZE)
+            model = RandomForestClassifier(n_estimators=PLENO_RF_TREES, random_state=42,
+                                           min_samples_leaf=PLENO_RF_MIN_LEAF, n_jobs=1)
+            model.fit(X, y)
+            Xt, yt = self._prepare(data[-n_test - PLENO_WINDOW_SIZE:], PLENO_WINDOW_SIZE)
+            probs = model.predict_proba(Xt)
+            classes = [int(c) for c in model.classes_]
+            u = 1.0 / 37.0
+            a = PLENO_PROB_SMOOTHING
+            top1 = cob = 0
+            for pr, real in zip(probs, yt):
+                p = [0.0] * 37
+                for c, v in zip(classes, pr):
+                    p[c] = float(v)
+                p = [(1 - a) * v + a * u for v in p]
+                top1 += 1 if max(range(37), key=lambda n: p[n]) == int(real) else 0
+                centro, _ = self._mejor_ventana(p)
+                cob += 1 if int(real) in wheel_window(centro) else 0
+            n = len(yt)
+            return {"n_train": len(data) - n_test, "n_test": n, "top1": top1 / n, "cob": cob / n}
+        except Exception as e:
+            log.warning(f"[Plenos] Error en validación del RF: {e}")
+            return None
+
     def predict_center(self, zona_q=None, giro_q=None) -> dict:
         base, source = self._base_probs()
         wz = ZONA_PESO if zona_q else 0.0
@@ -337,14 +433,7 @@ class CenterPredictor:
         comb = [wb * b + wz * z + wg * g for b, z, g in zip(base, zq, gq)]
         tot = sum(comb) or 1.0
         comb = [c / tot for c in comb]
-        k = min(PLENO_NEIGHBORS_EACH_SIDE, (len(WHEEL_ORDER) - 1) // 2)
-        L = len(WHEEL_ORDER)
-        best_mass, best_i = -1.0, 0
-        for i in range(L):
-            mass = sum(comb[WHEEL_ORDER[(i + d) % L]] for d in range(-k, k + 1))
-            if mass > best_mass + 1e-12:
-                best_mass, best_i = mass, i
-        center = WHEEL_ORDER[best_i]
+        center, best_mass = self._mejor_ventana(comb)
         rf_top = max(range(37), key=lambda n: base[n])
         return {"center": center, "window": wheel_window(center), "mass": best_mass,
                 "rf_top": rf_top, "source": source}
@@ -361,43 +450,30 @@ def wheel_neighbors(n: int, each_side: int = None) -> list:
     return [WHEEL_ORDER[(i + d) % L] for d in range(-k, k + 1)]
 
 
-def zona_de_tres(last3):
-    """
-    Zona del cilindro que ocupan las 3 últimas rondas. Devuelve None si no están en la misma zona
-    (no caben en un arco de ZONA_ARCO_MAX casillas). S = las 3 rondas + sus vecinos (hasta 9 números);
-    'zona' = casillas del arco que cubre a S, en orden de rueda.
-    """
-    L = len(WHEEL_ORDER)
-    pos = sorted(WHEEL_POS[n] for n in last3)
-    huecos = [(pos[0], pos[1], pos[1] - pos[0]),
-              (pos[1], pos[2], pos[2] - pos[1]),
-              (pos[2], pos[0], L - (pos[2] - pos[0]))]
-    _, inicio, hueco = max(huecos, key=lambda h: h[2])   # el arco empieza justo después del mayor hueco
-    arco = L - hueco + 1
-    if arco > ZONA_ARCO_MAX:
-        return None
-    S = set()
-    for n in last3:
-        S.update(wheel_neighbors(n))
-    ini = (inicio - ZONA_VECINOS) % L
-    zona = [WHEEL_ORDER[(ini + i) % L] for i in range(arco + 2 * ZONA_VECINOS)]
-    return {"S": S, "zona": zona, "arco": arco}
+def zona_ventanas(last3) -> list:
+    """Ventana de 5 números (o ZONA_VECINOS*2+1) para cada una de las 3 últimas rondas, EN ORDEN."""
+    return [wheel_neighbors(t) for t in last3]
 
 
-def zona_historial(numbers, S) -> list:
+def zona_matches(numbers, ventanas) -> list:
     """
-    Historial: cada vez que en 3 rondas seguidas salieron 3 números de S, se guarda el número
-    de la ronda siguiente. (La tripleta actual, que aún no tiene siguiente, queda fuera.)
+    Índices i (posición de la 3ra ronda del trío) donde 3 rondas seguidas del histórico cayeron,
+    EN EL MISMO ORDEN, dentro de las 3 ventanas (no hace falta que los números coincidan, alcanza
+    con que cada una caiga en la ventana de su posición). Se excluye el trío actual, que todavía no
+    tiene "ronda siguiente".
+    Ej: ventanas de 21, 10, 11 → busca tríos históricos (a, b, c) con a en la ventana de 21, b en la
+    de 10 y c en la de 11, en ese orden.
     """
-    out = []
+    W1, W2, W3 = (set(v) for v in ventanas)
+    idxs = []
     for i in range(2, len(numbers) - 1):
-        if numbers[i] in S and numbers[i - 1] in S and numbers[i - 2] in S:
-            out.append(numbers[i + 1])
-    return out
+        if numbers[i - 2] in W1 and numbers[i - 1] in W2 and numbers[i] in W3:
+            idxs.append(i)
+    return idxs
 
 
 def zona_q(nexts) -> list:
-    """Distribución (0..36) de la ronda siguiente según el histórico de la zona."""
+    """Distribución (0..36) de la ronda siguiente según el histórico de zona."""
     cnt = [ZONA_SUAVIZADO] * 37
     for n in nexts:
         cnt[n] += 1.0
@@ -405,18 +481,20 @@ def zona_q(nexts) -> list:
     return [c / tot for c in cnt]
 
 
-def giro_paso(a: int, b: int) -> int:
-    """Casillas que avanza la rueda, en su sentido de giro, desde el número a hasta el b (0..36)."""
+def giro_paso(a: int, b: int, antihorario: bool = None) -> int:
+    """Casillas que avanza la rueda, en el sentido dado, desde el número a hasta el b (0..36)."""
+    ah = GIRO_ANTIHORARIO if antihorario is None else antihorario
     L = len(WHEEL_ORDER)
-    if GIRO_ANTIHORARIO:
+    if ah:
         return (WHEEL_POS[a] - WHEEL_POS[b]) % L
     return (WHEEL_POS[b] - WHEEL_POS[a]) % L
 
 
-def giro_destino(a: int, paso: int) -> int:
-    """Número al que se llega avanzando 'paso' casillas desde a en el sentido de giro."""
+def giro_destino(a: int, paso: int, antihorario: bool = None) -> int:
+    """Número al que se llega avanzando 'paso' casillas desde a en el sentido dado."""
+    ah = GIRO_ANTIHORARIO if antihorario is None else antihorario
     L = len(WHEEL_ORDER)
-    if GIRO_ANTIHORARIO:
+    if ah:
         return WHEEL_ORDER[(WHEEL_POS[a] - paso) % L]
     return WHEEL_ORDER[(WHEEL_POS[a] + paso) % L]
 
@@ -426,7 +504,7 @@ def _dist_circ(a: int, b: int) -> int:
     return min((a - b) % L, (b - a) % L)
 
 
-def giro_analisis(numbers):
+def giro_analisis(numbers, antihorario: bool = None):
     """
     Saltos entre giros seguidos, siempre en el mismo sentido. Toma los 2 últimos saltos y busca en
     el histórico cuándo ocurrieron saltos parecidos (±GIRO_TOL); el salto que vino después,
@@ -434,53 +512,92 @@ def giro_analisis(numbers):
     """
     if len(numbers) < 6:
         return None, 0, []
-    pasos = [giro_paso(numbers[k], numbers[k + 1]) for k in range(len(numbers) - 1)]
+    pasos = [giro_paso(numbers[k], numbers[k + 1], antihorario) for k in range(len(numbers) - 1)]
     u, v = pasos[-2], pasos[-1]
     sigs = []
     for k in range(1, len(pasos) - 1):
         if _dist_circ(pasos[k - 1], u) <= GIRO_TOL and _dist_circ(pasos[k], v) <= GIRO_TOL:
             sigs.append(pasos[k + 1])
     ultimo = numbers[-1]
-    destinos = [giro_destino(ultimo, p) for p in sigs]
+    destinos = [giro_destino(ultimo, p, antihorario) for p in sigs]
     return zona_q(destinos), len(destinos), destinos
 
 
-def priors_plenos(numbers, S) -> dict:
-    """Histórico de zona (ronda siguiente a 3 rondas dentro de S) + análisis de sentido de giro."""
-    nexts = zona_historial(numbers, S)
-    gq, gm, destinos = giro_analisis(numbers)
-    return {"nexts": nexts, "zona_q": zona_q(nexts),
+def giro_predictibilidad(numbers, antihorario: bool, train_frac: float = 0.7):
+    """
+    Diagnóstico, NO detección de sentido (eso no se puede: ver nota en GIRO_ANTIHORARIO). Mide si la
+    SECUENCIA de saltos, en el sentido configurado, tiene algún patrón real: entrena con el primer
+    train_frac del historial (tabla salto_anterior+salto_actual -> saltos siguientes que se vieron) y
+    prueba con el resto. Un valor muy por encima de la línea base (≈(2·GIRO_TOL+1)/37 ≈ 13.5%)
+    sugiere que el crupier tiene alguna regularidad; cerca de la base, no. Da igual si el sentido
+    configurado es el real o su espejo: el resultado numérico es idéntico en ambos casos.
+    Devuelve (acierto, n_pruebas); (None, 0) si falta historial.
+    """
+    if len(numbers) < 120:
+        return None, 0
+    pasos = [giro_paso(numbers[k], numbers[k + 1], antihorario) for k in range(len(numbers) - 1)]
+    n = len(pasos)
+    cut = int(n * train_frac)
+    train, test = pasos[:cut], pasos[cut:]
+    if len(train) < 60 or len(test) < 30:
+        return None, 0
+    bucket_w = 2 * GIRO_TOL + 1
+    tabla = {}
+    for k in range(1, len(train) - 1):
+        key = (train[k - 1] // bucket_w, train[k] // bucket_w)
+        tabla.setdefault(key, []).append(train[k + 1])
+    hits = total = 0
+    for k in range(1, len(test) - 1):
+        u, v, w = test[k - 1], test[k], test[k + 1]
+        cand = tabla.get((u // bucket_w, v // bucket_w))
+        if not cand:
+            continue
+        pred = max(set(cand), key=cand.count)
+        total += 1
+        if _dist_circ(pred, w) <= GIRO_TOL:
+            hits += 1
+    if total < GIRO_DIAG_MIN_SAMPLES:
+        return None, total
+    return hits / total, total
+
+
+def priors_plenos(numbers, ventanas, antihorario: bool = None, idxs: list = None) -> dict:
+    """Histórico de la secuencia de ventanas (ver zona_matches) + análisis de sentido de giro."""
+    idxs = zona_matches(numbers, ventanas) if idxs is None else idxs
+    nexts1 = [numbers[i + 1] for i in idxs]
+    gq, gm, destinos = giro_analisis(numbers, antihorario)
+    return {"idxs": idxs, "nexts1": nexts1, "zona_q": zona_q(nexts1),
             "giro_q": gq if gm >= GIRO_MIN_MATCHES else None, "giro_m": gm, "destinos": destinos}
 
 
-def zona_evaluar(numbers, predictor, ultimas):
+def zona_evaluar(numbers, predictor, ultimas, antihorario: bool = None):
     """
-    Análisis de plenos por zona del cilindro + sentido de giro. Devuelve (señal, motivo): la señal
-    es None si algún filtro falla y 'motivo' explica cuál.
+    Análisis de plenos por secuencia de zona del cilindro + sentido de giro. Devuelve (señal,
+    motivo): la señal es None si algún filtro falla y 'motivo' explica cuál.
     """
     if len(numbers) < 3:
         return None, "sin datos"
     last3 = numbers[-3:]
-    z = zona_de_tres(last3)
-    if z is None:
-        return None, "3 rondas fuera de una misma zona"
-    pr = priors_plenos(numbers, z["S"])
-    nexts = pr["nexts"]
-    m = len(nexts)
+    ventanas = zona_ventanas(last3)
+    S = set()
+    for v in ventanas:
+        S.update(v)
+    pr = priors_plenos(numbers, ventanas, antihorario)
+    nexts1 = pr["nexts1"]
+    m = len(nexts1)
     if m < ZONA_MIN_MATCHES:
         return None, f"pocas coincidencias históricas ({m})"
-    zset = set(z["zona"])
-    en_ultimas = sum(1 for n in ultimas if n in zset)
+    en_ultimas = sum(1 for n in ultimas if n in S)
     if en_ultimas < ZONA_MIN_EN_ULTIMAS:
         return None, f"zona fría en las últimas {ZONA_ULTIMAS} ({en_ultimas})"
     pred = predictor.predict_center(pr["zona_q"], pr["giro_q"])
     L = len(WHEEL_ORDER)
     cpos = WHEEL_POS[pred["center"]]
-    dist = min(min((cpos - WHEEL_POS[n]) % L, (WHEEL_POS[n] - cpos) % L) for n in z["zona"])
+    dist = min(min((cpos - WHEEL_POS[n]) % L, (WHEEL_POS[n] - cpos) % L) for n in S)
     if dist > ZONA_CENTRO_TOL:
         return None, f"centro ML {pred['center']} fuera de la zona (a {dist} casillas)"
     win = set(pred["window"])
-    cobertura = sum(1 for n in nexts if n in win) / m
+    cobertura = sum(1 for n in nexts1 if n in win) / m
     if cobertura < ZONA_MIN_COBERTURA:
         return None, f"cobertura histórica baja ({cobertura*100:.0f}%)"
     giro_cob = None
@@ -489,7 +606,7 @@ def zona_evaluar(numbers, predictor, ultimas):
         if giro_cob < GIRO_MIN_COBERTURA:
             return None, f"cobertura de giro baja ({giro_cob*100:.0f}%)"
     sig = {
-        "trio": list(last3), "S": sorted(z["S"]), "zona": z["zona"], "matches": m,
+        "trio": list(last3), "S": sorted(S), "ventanas": ventanas, "matches": m,
         "cobertura": cobertura, "en_ultimas": en_ultimas, "center": pred["center"],
         "window": pred["window"], "rf_top": pred["rf_top"], "fuente": pred["source"],
         "giro_matches": pr["giro_m"], "giro_cobertura": giro_cob,
@@ -530,9 +647,53 @@ def build_pleno_resolution_message(win: bool, sig: dict) -> str:
     return f"{header} ({numbers_str}) | Centro {sig['center']} | Intento {sig['attempt']}"
 
 
+def _hace(ts: float) -> str:
+    if not ts:
+        return "nunca"
+    seg = int(time.time() - ts)
+    if seg < 90:
+        return f"hace {seg}s"
+    if seg < 5400:
+        return f"hace {seg // 60} min"
+    return f"hace {seg / 3600:.1f} h"
+
+
+def build_mlstatus_message(server_state, validaciones: dict = None) -> str:
+    validaciones = validaciones or {}
+    lines = ["🧠 ML DE PLENOS (RandomForest)"]
+    lines.append("scikit-learn: OK" if SKLEARN_OK else "⚠️ scikit-learn NO instalado: el centro usa frecuencias recientes (sin RF)")
+    lines.append(f"Parámetros: {PLENO_RF_TREES} árboles | ventana {PLENO_WINDOW_SIZE} giros | hoja mín. {PLENO_RF_MIN_LEAF} | "
+                 f"reentrena cada {PLENO_RETRAIN_EVERY} giros | usa hasta {PLENO_TRAIN_MAX_SPINS} giros")
+    for key, table in server_state.tables.items():
+        cp = table.center_predictor
+        lines.append(f"\n🎲 Mesa {key} ({TABLE_NAME})")
+        n = len(cp.numbers)
+        if cp.model is not None:
+            prox = max(0, PLENO_RETRAIN_EVERY - cp.spins_since_train)
+            lines.append(f"• Estado: ✅ entrenado con {cp.last_train_n} giros | último entrenamiento {_hace(cp.last_train_ts)} | "
+                         f"próximo en {prox} giros")
+        elif not SKLEARN_OK:
+            lines.append("• Estado: ⛔ sin scikit-learn")
+        else:
+            lines.append(f"• Estado: ⏳ sin entrenar | {n}/{PLENO_TRAIN_MIN_SPINS} giros (faltan {max(0, PLENO_TRAIN_MIN_SPINS - n)})")
+        lines.append(f"• Giros disponibles: {n} (guardados hasta {PLENO_HISTORY_MAX}) | en vivo esta sesión: {table.live_spins_seen}")
+        v = validaciones.get(key)
+        if v:
+            lines.append(f"• Validación (entrena con {v['n_train']}, prueba con los últimos {v['n_test']}): "
+                         f"acierto exacto {v['top1']*100:.1f}% (azar 2.7%) | número dentro de las "
+                         f"{pleno_window_size()} casillas del centro {v['cob']*100:.1f}% (azar {pleno_window_size()/37*100:.1f}%)")
+            lines.append(f"  (con {v['n_test']} pruebas el margen de error es de ±{100*1.96*(0.25/v['n_test'])**0.5:.0f} pts)")
+        elif cp.model is not None:
+            lines.append("• Validación: sin datos suficientes todavía")
+        r = table.pleno_results[-PLENO_STATS_WINDOW:]
+        if r:
+            w = sum(1 for x in r if x["win"])
+            lines.append(f"• Señales de plenos (últimas {len(r)}): {w}/{len(r)} = {w/len(r)*100:.1f}% | azar {pleno_baseline()*100:.1f}%")
+    return "\n".join(lines)
+
+
 def build_pleno_status_message(server_state) -> str:
     lines = ["🎯 PLENOS (centro ± vecinos en la rueda)"]
-    lines.append(f"Sentido de giro: {'antihorario' if GIRO_ANTIHORARIO else 'horario'} (fijo, sin cambio de dirección)")
     base = pleno_baseline()
     lines.append(f"Cobertura: {pleno_window_size()} números | {PLENO_MAX_ATTEMPTS} intentos | "
                  f"azar puro = {base*100:.1f}%")
@@ -549,6 +710,14 @@ def build_pleno_status_message(server_state) -> str:
         lines.append(f"• Giros en el predictor: {len(cp.numbers)} | {model_txt}")
         if table.zona_ultimas10:
             lines.append(f"• Últimas {len(table.zona_ultimas10)}: {'-'.join(str(n) for n in table.zona_ultimas10)}")
+        sentido = "antihorario" if table.giro_antihorario else "horario"
+        diag = table.giro_diag or {}
+        if diag.get("score") is not None:
+            lines.append(f"• Sentido de giro: {sentido} (ajustado a mano con /sentido) | "
+                         f"patrón de saltos: {diag['score']*100:.1f}% con {diag['n']} pruebas "
+                         f"(línea base ≈{(2*GIRO_TOL+1)/37*100:.0f}%)")
+        else:
+            lines.append(f"• Sentido de giro: {sentido} (ajustado a mano con /sentido)")
         if rate is None:
             lines.append("• Señales cerradas: 0")
         else:
@@ -580,6 +749,11 @@ class RouletteTable:
         self.pleno_results = []   # {"win","attempt","center","sent","trio","matches","cobertura","giro_matches","ts"}
         self.zona_ultimas10 = []  # últimas ZONA_ULTIMAS rondas (se persisten)
 
+        # ── SENTIDO DE GIRO: por defecto horario, se ajusta a mano con /sentido (no se puede
+        # detectar del historial: ver la nota junto a GIRO_ANTIHORARIO) ──
+        self.giro_antihorario = GIRO_ANTIHORARIO
+        self.giro_diag = {}   # {"score": float, "n": int} — diagnóstico, no detección de sentido
+
     # ── PLENOS ───────────────────────────────────────────────
     def _pleno_recent(self):
         r = self.pleno_results[-PLENO_STATS_WINDOW:]
@@ -597,10 +771,11 @@ class RouletteTable:
             await delete_msg(prev_id, CHANNEL_PLENOS)
 
     def _pleno_try_open(self, last_number):
-        """Abre una señal de plenos cuando las 3 últimas rondas cumplen el análisis de zona del cilindro."""
+        """Abre una señal de plenos cuando la secuencia de las 3 últimas rondas se confirma en el histórico."""
         if self.pleno_active is not None or not self.center_predictor.ready():
             return
-        sig, motivo = zona_evaluar(self.center_predictor.numbers, self.center_predictor, self.zona_ultimas10)
+        sig, motivo = zona_evaluar(self.center_predictor.numbers, self.center_predictor,
+                                    self.zona_ultimas10, self.giro_antihorario)
         if sig is None:
             log.debug(f"[Plenos] sin señal: {motivo}")
             return
@@ -609,7 +784,8 @@ class RouletteTable:
         n, w = self._pleno_recent()
         gc = sig["giro_cobertura"]
         giro_txt = f"{sig['giro_matches']} coinc" + ("" if gc is None else f", cobertura {gc*100:.0f}%")
-        log.info(f"🎯 PLENOS zona {'-'.join(str(x) for x in sig['trio'])} | 9 vecinos {sig['S']} | "
+        log.info(f"🎯 PLENOS secuencia {'-'.join(str(x) for x in sig['trio'])} | ventanas "
+                 f"{sig['ventanas']} | "
                  f"{sig['matches']} coincidencias, cobertura {sig['cobertura']*100:.0f}%, "
                  f"giro {giro_txt}, "
                  f"{sig['en_ultimas']}/{ZONA_ULTIMAS} en zona → centro {sig['center']} "
@@ -629,35 +805,59 @@ class RouletteTable:
                                        "sent": sig["sent"], "trio": sig["trio"], "matches": sig["matches"],
                                        "cobertura": round(sig["cobertura"], 3),
                                        "giro_matches": sig["giro_matches"], "ts": time.time()})
-            if len(self.pleno_results) > 200:
-                self.pleno_results = self.pleno_results[-200:]
+            # Se guardan TODAS las señales cerradas (sin recorte); las estadísticas usan una ventana
+            # reciente aparte (PLENO_STATS_WINDOW), no un límite de guardado.
             log.info(f"🎯 PLENOS cerrado: {'WIN' if hit else 'LOSS'} intento {sig['attempt']} | "
                      f"centro {sig['center']} | salió {number}")
             if sig["sent"]:
                 asyncio.create_task(send_msg(build_pleno_resolution_message(hit, sig), CHANNEL_PLENOS))
             self.pleno_active = None
             return
-        # Reintento: se recalcula el centro con el modelo actualizado (misma zona y mismo giro)
+        # Reintento tras perder el intento 1: se busca qué zona suele salir DESPUÉS de una pérdida
+        # (misma secuencia de 3 ventanas, pero mirando la ronda siguiente a las veces que esa
+        # secuencia falló). Si no hay datos suficientes de eso, se repite la misma zona del intento 1.
         sig["attempt"] += 1
-        pr = priors_plenos(self.center_predictor.numbers, set(sig["S"]))
-        pred = self.center_predictor.predict_center(pr["zona_q"], pr["giro_q"])
+        numbers = self.center_predictor.numbers
+        idxs = zona_matches(numbers, sig["ventanas"])          # se recalcula: los índices no se
+        window1 = set(sig["window"])                           # reutilizan de una ronda a la otra
+        nexts1 = [numbers[i + 1] for i in idxs]
+        nexts2 = [numbers[i + 2] for i in idxs
+                  if i + 2 < len(numbers) and numbers[i + 1] not in window1]
+        usar_post_perdida = len(nexts2) >= ZONA_MIN_MATCHES_RETRY
+        nexts = nexts2 if usar_post_perdida else nexts1
+        gq, gm, _ = giro_analisis(numbers, self.giro_antihorario)
+        pred = self.center_predictor.predict_center(zona_q(nexts), gq if gm >= GIRO_MIN_MATCHES else None)
         sig["center"], sig["window"] = pred["center"], pred["window"]
-        log.info(f"🎯 PLENOS intento {sig['attempt']}: nuevo centro {sig['center']}")
+        log.info(f"🎯 PLENOS intento {sig['attempt']}: nuevo centro {sig['center']} "
+                 f"({'zona post-pérdida' if usar_post_perdida else 'repite zona del intento 1'}, "
+                 f"{len(nexts)} coincidencias)")
         if sig["sent"]:
             asyncio.create_task(self._pleno_send_entry(sig, number, sig["attempt"]))
 
     def pleno_persist(self) -> dict:
-        return {"numbers": self.center_predictor.persist(), "results": self.pleno_results[-200:],
-                "ultimas10": self.zona_ultimas10[-ZONA_ULTIMAS:]}
+        return {"numbers": self.center_predictor.persist(), "results": self.pleno_results,
+                "ultimas10": self.zona_ultimas10[-ZONA_ULTIMAS:],
+                "giro_antihorario": self.giro_antihorario}
 
     def pleno_load(self, data):
         if not data:
             return
         self.center_predictor.load_numbers(data.get("numbers", []))
-        self.pleno_results = list(data.get("results", []))[-200:]
+        self.pleno_results = list(data.get("results", []))
         self.zona_ultimas10 = list(data.get("ultimas10") or self.center_predictor.numbers[-ZONA_ULTIMAS:])[-ZONA_ULTIMAS:]
+        self.giro_antihorario = data.get("giro_antihorario", GIRO_ANTIHORARIO)
         if self.center_predictor.ready():
             self.center_predictor.train()
+
+    def set_sentido(self, antihorario: bool):
+        self.giro_antihorario = antihorario
+
+    async def giro_diagnostico(self) -> dict:
+        """Se calcula bajo demanda (/sentido, /plenos): no hace falta correrlo en cada giro."""
+        numeros = list(self.center_predictor.numbers)
+        score, n = await asyncio.to_thread(giro_predictibilidad, numeros, self.giro_antihorario)
+        self.giro_diag = {"score": score, "n": n}
+        return self.giro_diag
 
     def update(self, number: int, real_color: str, timestamp: float = None, training: bool = False):
         if timestamp is None:
