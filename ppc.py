@@ -27,13 +27,13 @@
 ║     en cada intento se recalcula S1.                          ║
 ║   - HTTP: /ping, /health, /api/state/{mesa}, /api/all         ║
 ║   - Persistencia en model_<key>.json + self-ping (Render)     ║
-║   - ESTRATEGIA=masa (defecto): S1 ES la predicción. En cada   ║
-║     giro se calcula el CENTRO de S1 (ventana de 7 con más     ║
-║     caídas en las últimas 34), se arman S2..S6 en sentido     ║
-║     HORARIO y se reclasifican las 34 rondas en S1..S6.        ║
-║     La bola gira SIEMPRE en sentido horario, de S1 a S6.      ║
-║     ESTRATEGIA=zonas = método alternativo (zona relativa al   ║
-║     número anterior).                                         ║
+║   - ESTRATEGIA=desvio (defecto): en cada ronda se anota en qué║
+║     zona Sx cayó el número respecto de la S1 predicha (des-   ║
+║     viación). Con las últimas 34 desviaciones, árboles ML por ║
+║     crupier estiman la zona más probable y los 37 números se  ║
+║     prueban como centro de la nueva S1. Se recalcula en cada  ║
+║     intento. Giro SIEMPRE horario, de S1 a S6.                ║
+║   - ESTRATEGIA=masa / zonas: métodos anteriores (alternativos)║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -59,6 +59,13 @@ except ImportError:
     AsyncTeleBot = None
     BotCommand = None
     TELEBOT_OK = False
+
+try:   # árboles de decisión (ML) para la estrategia "desvio"; sin scikit-learn se usa el método por frecuencia
+    from sklearn.ensemble import RandomForestClassifier
+    SKLEARN_OK = True
+except ImportError:
+    RandomForestClassifier = None
+    SKLEARN_OK = False
 
 # ──────────────────────────────────────────────
 #  CONFIGURACIÓN
@@ -114,10 +121,10 @@ COBERTURAS           = (6, 8)   # 6 vecinos = 13 números | 8 vecinos = 17 núme
 COBERTURA_ENVIO      = int(os.environ.get("COBERTURA_VECINOS", "6"))   # la que se muestra/apuesta en la señal
 if COBERTURA_ENVIO not in COBERTURAS:
     COBERTURA_ENVIO = COBERTURAS[0]
-# Estrategia: "masa" (defecto: S1 = predicción, centro calculado sobre las últimas 34 rondas) o "zonas" (relativa al número anterior)
-ESTRATEGIA           = os.environ.get("ESTRATEGIA", "masa").strip().lower()
-if ESTRATEGIA not in ("zonas", "masa"):
-    ESTRATEGIA = "masa"
+# Estrategia: "desvio" (defecto: desviación respecto a la S1 predicha + árboles ML), "masa" (S1 = ventana más caliente de las últimas 34) o "zonas"
+ESTRATEGIA           = os.environ.get("ESTRATEGIA", "desvio").strip().lower()
+if ESTRATEGIA not in ("zonas", "masa", "desvio"):
+    ESTRATEGIA = "desvio"
 ZONA_VENTANA         = int(os.environ.get("ZONA_VENTANA", "34"))          # rondas recientes para hallar la zona que más sale (0 = toda la sesión)
 ZONA_MIN_CUENTA      = int(os.environ.get("ZONA_MIN_CUENTA", "3"))        # veces mínimas que debe haber salido la zona dominante
 ZONA_Z_MIN           = float(os.environ.get("ZONA_Z_MIN", "1.5"))         # cuánto debe superar al azar (en desviaciones) para dar señal
@@ -125,6 +132,26 @@ ZONA_HIST_MIN        = int(os.environ.get("ZONA_HIST_MIN", "30"))       # rondas
 SESGO_MIN_RONDAS     = int(os.environ.get("SESGO_MIN_RONDAS", "20"))   # mínimo de rondas en la sesión para evaluar
 SESGO_MIN_ACIERTOS_S1 = int(os.environ.get("SESGO_MIN_ACIERTOS_S1", "9"))  # aciertos mínimos de S1 (7 nº) en las últimas 34 (esperado al azar ≈ 6.4)
 SESGO_SIM_MIN        = float(os.environ.get("SESGO_SIM_MIN", "0.35"))  # similitud mínima vs sesiones pasadas del crupier
+# ── Estrategia "desvio": en cada ronda se anota en qué zona Sx (respecto de la S1 predicha) cayó el número; con las últimas
+#    34 desviaciones se predice la nueva S1. Los 37 números son candidatos a centro. Modelo: árboles de decisión por crupier.
+DESVIO_VENTANA        = RONDAS_ANALISIS
+DESVIO_MIN_HIST       = int(os.environ.get("DESVIO_MIN_HIST", "10"))          # desviaciones mínimas en la ventana para predecir
+DESVIO_MIN_TRAIN      = int(os.environ.get("DESVIO_MIN_TRAIN", "120"))        # filas mínimas del crupier para entrenar los árboles
+DESVIO_REENTRENAR_CADA = int(os.environ.get("DESVIO_REENTRENAR_CADA", "25"))  # giros entre reentrenamientos
+DESVIO_MIN_PROB       = float(os.environ.get("DESVIO_MIN_PROB", "0.40"))      # prob. mínima de que el próximo número caiga en la cobertura
+DESVIO_MARGEN_VAL     = float(os.environ.get("DESVIO_MARGEN_VAL", "0.03"))    # cuánto debe superar al azar la validación para "confirmar"
+DESVIO_MIN_VAL        = int(os.environ.get("DESVIO_MIN_VAL", "40"))           # giros mínimos de validación fuera de muestra
+# Filtros para DESCARTAR señales (se aplican al abrir y, con DESVIO_DESCARTAR_EN_INTENTOS, también en cada reintento)
+DESVIO_SOLO_CONFIRMADAS = os.environ.get("DESVIO_SOLO_CONFIRMADAS", "1").strip() != "0"   # descarta si la validación fuera de muestra del crupier no supera al azar
+DESVIO_REQUIERE_ARBOLES = os.environ.get("DESVIO_REQUIERE_ARBOLES", "1").strip() != "0"   # descarta si no hay modelo de árboles entrenado
+DESVIO_MIN_PROB_REINTENTO = float(os.environ.get("DESVIO_MIN_PROB_REINTENTO", "0.37"))    # en un reintento: prob. mínima para seguir (azar 13/37 = 0.351)
+DESVIO_DESCARTAR_EN_INTENTOS = os.environ.get("DESVIO_DESCARTAR_EN_INTENTOS", "1").strip() != "0"
+DESVIO_LIVE_N         = int(os.environ.get("DESVIO_LIVE_N", "20"))            # últimas señales cerradas del crupier para medir su rendimiento en vivo
+DESVIO_LIVE_MIN       = int(os.environ.get("DESVIO_LIVE_MIN", "10"))          # con al menos estas señales se activa el filtro de rendimiento en vivo
+DESVIO_SUAVIZADO      = 10.0
+DESVIO_SESIONES_ENTRENO = 6
+DESVIO_SPINS_X_SESION = 500
+DESVIO_MAX_FILAS      = 3000
 # Gestión Fibonacci: multiplicador de ficha por intento. Ganar 1 vez resetea la gestión.
 SESGO_FIB            = [1, 1, 2, 3, 5, 8, 13, 21]
 SESGO_MAX_INTENTOS   = int(os.environ.get("SESGO_MAX_INTENTOS", str(len(SESGO_FIB))))
@@ -148,6 +175,11 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     datefmt="%H:%M:%S", handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger(__name__)
+
+
+if ESTRATEGIA == "desvio" and not SKLEARN_OK:
+    log.warning("ESTRATEGIA=desvio sin scikit-learn: no habrá árboles y, con DESVIO_REQUIERE_ARBOLES=1, ninguna señal "
+                "pasará el filtro. Agregá 'scikit-learn' a requirements.txt (o DESVIO_REQUIERE_ARBOLES=0).")
 
 
 def color_of(n):
@@ -228,6 +260,18 @@ def build_status_message(server_state) -> str:
                               f"aciertos S1 {analisis['hits'][0]} (esperados {analisis['esperados'][0]:.1f}) | "
                               f"sectores {analisis['hits']}")
                 lineas.append(f"• Últimos números: {'-'.join(str(n) for n in mesa.sesion_actual[-10:])}")
+        if ESTRATEGIA == "desvio" and mesa.pred_desvio:
+            pd_ = mesa.pred_desvio
+            lineas.append(f"• Próxima S1 (desvío): base {pd_['base']} → centro {pd_['centro']} | desviación dominante "
+                          f"S{pd_['dom_zona']} ({pd_['dom_cuenta']}/{pd_['n']}) | prob. cobertura {pd_['prob_cov']*100:.0f}% "
+                          f"(azar {(2 * COBERTURA_ENVIO + 1) / 37 * 100:.0f}%) | {pd_['metodo']}")
+        if ESTRATEGIA == "desvio":
+            motivo = mesa._filtro_desvio(mesa.pred_desvio)
+            lineas.append("• Filtro de descarte (ahora): " + ("PASA ✅" if motivo is None else f"descartada 🚫 — {motivo}"))
+            if mesa.descartes:
+                top = sorted(mesa.descartes.items(), key=lambda kv: -kv[1])[:5]
+                lineas.append(f"• Candidatas descartadas: {sum(mesa.descartes.values())} (" +
+                              " · ".join(f"{k} {v}" for k, v in top) + ")")
         r = mesa.resultados_modo()[-SESGO_STATS_WINDOW:]
         if r:
             w = sum(1 for x in r if x["win"])
@@ -246,6 +290,10 @@ def build_status_message(server_state) -> str:
             for nombre in nombres[:10]:
                 actual = mesa.sesion_actual if nombre == mesa.crupier_actual else None
                 lineas.append(linea_analisis_crupier(nombre, conocidos.get(nombre, []), actual))
+                mod = mesa.modelos.get(nombre)
+                if ESTRATEGIA == "desvio" and mod:
+                    lineas.append(f"      Árboles ML: {mod['n']} filas | fuera de muestra {mod['val_hit']*100:.1f}% "
+                                  f"vs S1 base sin corrección {mod['val_base']*100:.1f}% en {mod['val_n']} giros")
                 sen = [x for x in mesa.resultados if x.get("crupier") == nombre and x.get("sent")]
                 if sen:
                     w = sum(1 for x in sen if x["win"])
@@ -380,6 +428,14 @@ def build_crupier_reply(mesa) -> str:
     if ESTRATEGIA == "masa":
         lineas.append("📊 Análisis de este crupier (S1 recalculado en cada giro):")
         lineas.append(linea_analisis_crupier(nombre, previas, mesa.sesion_actual if es_actual else None))
+        mod = mesa.modelos.get(nombre)
+        if ESTRATEGIA == "desvio" and mod:
+            lineas.append(f"  🤖 Árboles ML: {mod['n']} filas | fuera de muestra {mod['val_hit']*100:.1f}% "
+                          f"vs S1 base {mod['val_base']*100:.1f}% en {mod['val_n']} giros")
+        if ESTRATEGIA == "desvio" and es_actual and mesa.pred_desvio:
+            pd_ = mesa.pred_desvio
+            lineas.append(f"  🎯 Próxima S1: base {pd_['base']} → {pd_['centro']} (desviación dominante S{pd_['dom_zona']}, "
+                          f"prob. {pd_['prob_cov']*100:.0f}%)")
     # Señales de este crupier
     sen = [x for x in mesa.resultados if x.get("crupier") == nombre and x.get("sent")]
     if sen:
@@ -699,6 +755,142 @@ def linea_analisis_crupier(nombre: str, sesiones: list, sesion_actual: list = No
 
 
 # ══════════════════════════════════════════════
+#  ESTRATEGIA "desvio": desviación respecto de la S1 predicha + árboles de decisión
+# ══════════════════════════════════════════════
+# Idea: en cada ronda hay una S1 predicha (base = ventana más caliente de las 34 rondas previas). Cuando sale el número
+# se anota en qué zona Sx cayó respecto de esa S1 (esa es la "desviación"). Con las últimas 34 desviaciones se estima
+# qué zona suele salir más respecto de la predicha y se corre la predicción hacia allí. Los 37 números son candidatos a
+# centro de la nueva S1: gana el que más probabilidad acumula en su cobertura (centro ± vecinos).
+_COB = {v: [cobertura_numeros(c, v) for c in range(37)] for v in {S1_RADIO, *COBERTURAS}}
+_DIST = [[min(abs(WHEEL_POS[a] - WHEEL_POS[b]), L_RUEDA - abs(WHEEL_POS[a] - WHEEL_POS[b])) for b in range(37)]
+         for a in range(37)]
+
+
+def traza_vacia() -> dict:
+    return {"bases": [], "hits": [], "devs": []}
+
+
+def extender_traza(spins: list, traza: dict) -> dict:
+    """
+    Alinea la traza con la sesión: para cada giro i guarda la S1 base que se predijo ANTES de que saliera (con las 34
+    rondas previas), los aciertos de esa S1 y la desviación (zona 1..6 donde cayó el número respecto de esa S1).
+    """
+    b, h, d = traza["bases"], traza["hits"], traza["devs"]
+    if len(b) > len(spins):
+        b.clear(); h.clear(); d.clear()
+    for i in range(len(b), len(spins)):
+        a = analizar_sesgo(spins[max(0, i - RONDAS_ANALISIS):i]) if i >= SESGO_MIN_RONDAS else None
+        if a:
+            b.append(a["centro"]); h.append(a["hits"][0]); d.append(zona_de(a["centro"], spins[i]))
+        else:
+            b.append(None); h.append(None); d.append(None)
+    return traza
+
+
+def feats_desvio(devs_prev: list, base: int, ult1: int, ult2: Optional[int], hits_base: int) -> list:
+    """Variables para los árboles: reparto de desviaciones (34 y 10 rondas), últimas 5 desviaciones y posición de los
+    últimos números respecto de la S1 base."""
+    w34 = [x for x in devs_prev[-DESVIO_VENTANA:] if x]
+    w10 = [x for x in devs_prev[-10:] if x]
+    f = []
+    for w in (w34, w10):
+        n = len(w)
+        f += [(w.count(k) / n) if n else 0.0 for k in range(1, 7)]
+    ult = list(devs_prev[-5:])
+    f += [0] * (5 - len(ult)) + [(x or 0) for x in ult]
+    off = lambda n: ((WHEEL_POS[n] - WHEEL_POS[base]) * WHEEL_DIRECTION) % L_RUEDA if n is not None else -1
+    f += [len(w34), hits_base, zona_de(base, ult1), off(ult1), off(ult2), WHEEL_POS[base]]
+    return f
+
+
+def filas_desvio(spins: list, traza: dict):
+    """Filas de entrenamiento (X, y, meta) de una sesión. y = desviación real (1..6); meta = (S1 base, número que salió)."""
+    X, y, meta = [], [], []
+    b, h, d = traza["bases"], traza["hits"], traza["devs"]
+    for i in range(min(len(spins), len(b))):
+        if b[i] is None:
+            continue
+        prev = d[max(0, i - DESVIO_VENTANA):i]
+        if sum(1 for x in prev if x) < DESVIO_MIN_HIST:
+            continue
+        X.append(feats_desvio(prev, b[i], spins[i - 1], spins[i - 2] if i >= 2 else None, h[i]))
+        y.append(d[i])
+        meta.append((b[i], spins[i]))
+    return X, y, meta
+
+
+def probs_frecuencia(devs_prev: list) -> list:
+    """Método sin ML: reparto de las últimas 34 desviaciones, suavizado hacia lo esperado por azar."""
+    w = [x for x in devs_prev[-DESVIO_VENTANA:] if x]
+    n = len(w)
+    return [(w.count(k) + DESVIO_SUAVIZADO * tam_zona(k) / 37.0) / (n + DESVIO_SUAVIZADO) for k in range(1, 7)]
+
+
+def proba6(clf, X: list) -> list:
+    """Probabilidades de las 6 zonas (aunque el árbol no haya visto alguna) para cada fila de X."""
+    out = []
+    for fila in clf.predict_proba(X):
+        P = [1e-3] * 6
+        for cls, v in zip(clf.classes_, fila):
+            P[int(cls) - 1] = max(float(v), 1e-3)
+        t = sum(P)
+        out.append([x / t for x in P])
+    return out
+
+
+def elegir_centro(base: int, P: list, vecinos: int = None):
+    """
+    Con P = probabilidad de cada zona (medida desde la S1 base), reparte esa probabilidad entre los números de cada zona y
+    prueba LOS 37 NÚMEROS como centro de la nueva S1: gana el de mayor probabilidad en su cobertura (centro ± vecinos).
+    Devuelve (centro, probabilidad_de_cobertura, probabilidad_por_número).
+    """
+    v = COBERTURA_ENVIO if vecinos is None else vecinos
+    p = [0.0] * 37
+    for k, nums in enumerate(construir_sectores(base)):
+        for n in nums:
+            p[n] = P[k] / len(nums)
+    mejor, mejor_clave = None, None
+    for c in range(37):
+        cov = sum(p[n] for n in _COB[v][c])
+        s1 = sum(p[n] for n in _COB[S1_RADIO][c])
+        clave = (round(cov, 9), round(s1, 9), -_DIST[c][base])   # desempate: más masa en S1, luego el más cercano a la base
+        if mejor_clave is None or clave > mejor_clave:
+            mejor, mejor_clave = c, clave
+    return mejor, mejor_clave[0], p
+
+
+def entrenar_modelo_desvio(X: list, y: list, meta: list) -> Optional[dict]:
+    """
+    Árboles de decisión (bosque aleatorio) que aprenden, para UN crupier, en qué zona cae el siguiente número respecto de
+    la S1 base. Se valida fuera de muestra (último 25 % cronológico): % de veces que el número siguiente cae en la cobertura
+    del centro elegido, frente a usar solo la S1 base sin corrección.
+    """
+    n = len(y)
+    if not SKLEARN_OK or n < DESVIO_MIN_TRAIN:
+        return None
+
+    def nuevo():
+        return RandomForestClassifier(n_estimators=60, max_depth=4, min_samples_leaf=10, max_features="sqrt",
+                                      random_state=7, n_jobs=1)
+    try:
+        corte = int(n * 0.75)
+        m = nuevo().fit(X[:corte], y[:corte])
+        Xv, mv = X[corte:][-300:], meta[corte:][-300:]
+        cob = _COB[COBERTURA_ENVIO]
+        ok_ml = ok_base = 0
+        for P, (base, real) in zip(proba6(m, Xv), mv):
+            c, _, _ = elegir_centro(base, P)
+            ok_ml += real in cob[c]
+            ok_base += real in cob[base]
+        final = nuevo().fit(X, y)
+    except Exception as e:
+        log.warning(f"[Desvío] No se pudo entrenar el modelo: {e}")
+        return None
+    nv = max(1, len(mv))
+    return {"clf": final, "n": n, "val_n": len(mv), "val_hit": ok_ml / nv, "val_base": ok_base / nv}
+
+
+# ══════════════════════════════════════════════
 #  MENSAJES
 # ══════════════════════════════════════════════
 def build_entrada_message(sig: dict, ultimo_numero, intento: int) -> str:
@@ -716,11 +908,31 @@ def build_entrada_message(sig: dict, ultimo_numero, intento: int) -> str:
     extra_vecinos = ""
     extra_analisis = ""
     extra_fib = ""
+    extra_recalc = ""
+    cs = sig.get("centros") or []
+    if intento > 1 and len(cs) >= 2:
+        ant, nuevo = cs[-2], cs[-1]
+        extra_recalc = (f"🔁 S1 recalculado: centro {ant} → {nuevo}\n" if ant != nuevo
+                        else f"🔁 S1 recalculado: el centro se mantiene en {nuevo}\n")
     if SENAL_DETALLE:
         atras = " - ".join(str(n) for n in cobertura[:COBERTURA_ENVIO])       # lado contrario al avance de S1→S6
         adelante = " - ".join(str(n) for n in cobertura[COBERTURA_ENVIO + 1:])  # lado hacia donde avanzan S2..S6
         extra_vecinos = f"   ◀ {SENTIDO_OPUESTO_TXT}: {atras} | {centro} | {adelante} :{SENTIDO_TXT} ▶\n"
-        if sig.get("zona"):
+        if sig.get("modo") == "desvio":
+            d = sig.get("desvio") or {}
+            azar_c = (2 * COBERTURA_ENVIO + 1) / 37 * 100
+            if sig["confirmada"]:
+                conf = (f"\n✅ Validación fuera de muestra: {sig['sim']*100:.0f}% al 1er intento en {sig['sim_n']} giros "
+                        f"(azar {azar_c:.0f}%)")
+            else:
+                conf = "\n⚠️ SIN CONFIRMACIÓN (la validación fuera de muestra de este crupier no supera al azar)"
+            metodo = "árboles de decisión (ML)" if d.get("metodo") == "arboles" else "frecuencia de desviaciones"
+            extra_analisis = (f"\n🧭 Desviación dominante S{d.get('dom_zona', '?')} respecto a la S1 predicha "
+                              f"({d.get('dom_cuenta', '?')} de {d.get('n', '?')} rondas, esperado {d.get('dom_esp', 0):.1f})"
+                              f"\n🎯 S1 base {d.get('base', '?')} → nueva S1 {sig['centro']} | prob. de caer en los "
+                              f"{2 * COBERTURA_ENVIO + 1} números: {d.get('prob_cov', 0) * 100:.0f}% (azar {azar_c:.0f}%)"
+                              f"\n🤖 Método: {metodo}\n🔄 Giro: {GIRO_TXT}{conf}\n")
+        elif sig.get("zona"):
             k = sig["zona"]
             if sig["confirmada"]:
                 conf = (f"\n✅ Histórico: S{k} sale {sig['sim']*100:.0f}% en {sig['sim_n']} rondas previas "
@@ -744,6 +956,7 @@ def build_entrada_message(sig: dict, ultimo_numero, intento: int) -> str:
             f"👤 NAME CRUPIER: {crupier}\n"
             f"👉 INGRESAR DESPUÉS: {numero} ({numero_emoji})\n"
             f"🧨 CUBRIR {COBERTURA_ENVIO} VECINOS: {centro} ({centro_emoji})\n"
+            f"{extra_recalc}"
             f"{extra_vecinos}"
             f"{extra_analisis}\n"
             f"🇨🇴 VALOR DE FICHA: ${ficha:,} COP\n"
@@ -777,6 +990,14 @@ class RouletteTable:
         self.sesion_actual: list = []                 # giros de la sesión del crupier actual
         self.sesiones_por_crupier: dict = {}          # {nombre: [sesión1, sesión2, ...]}
 
+        # ── Estrategia "desvio" ──
+        self.traza: dict = traza_vacia()              # S1 base predicha + desviación de cada giro de la sesión actual
+        self.pred_desvio: Optional[dict] = None       # predicción vigente (se recalcula en cada giro)
+        self.modelos: dict = {}                       # {crupier: modelo de árboles entrenado}
+        self._ultimo_entreno: dict = {}               # {crupier: total_spins_seen del último entrenamiento}
+        self._cache_traza: dict = {}                  # trazas de sesiones archivadas
+        self.descartes: dict = {}                     # {motivo: veces} señales candidatas descartadas por el filtro
+
         # ── Señal ──
         self.senal_activa: Optional[dict] = None
         self.resultados: list = []   # {"win","intento","centro","sent","crupier","confirmada","sim","ts"}
@@ -789,6 +1010,8 @@ class RouletteTable:
         self._archivar_sesion_actual()
         self.crupier_actual = nombre
         self.sesion_actual = []
+        self.traza = traza_vacia()
+        self.pred_desvio = None
         # Anular señal activa: cambió el crupier, la sesión ya no aplica
         if (self.senal_activa is not None and self.senal_activa.get("sent")
                 and not self.senal_activa.get("envio_cerrado")):
@@ -833,6 +1056,158 @@ class RouletteTable:
         if not sig["confirmada"] and sig.get("msg_id"):
             self.last_sinconf_msg_id = sig["msg_id"]
 
+    # ── estrategia "desvio" ────────────────────────────────────
+    def _filas_entrenamiento(self, nombre: str):
+        """Filas (X, y, meta) del crupier: sesiones archivadas recientes + sesión en curso."""
+        X, y, meta = [], [], []
+        vivos = {}
+        for ses in self.sesiones_por_crupier.get(nombre, [])[-DESVIO_SESIONES_ENTRENO:]:
+            ent = self._cache_traza.get(id(ses))
+            if ent is None or ent[0] is not ses or ent[1] != len(ses):
+                corte = ses[-DESVIO_SPINS_X_SESION:]
+                ent = (ses, len(ses), corte, extender_traza(corte, traza_vacia()))
+            vivos[id(ses)] = ent
+            fx, fy, fm = filas_desvio(ent[2], ent[3])
+            X += fx; y += fy; meta += fm
+        self._cache_traza = vivos
+        if nombre == self.crupier_actual:
+            extender_traza(self.sesion_actual, self.traza)
+            fx, fy, fm = filas_desvio(self.sesion_actual, self.traza)
+            X += fx; y += fy; meta += fm
+        return X[-DESVIO_MAX_FILAS:], y[-DESVIO_MAX_FILAS:], meta[-DESVIO_MAX_FILAS:]
+
+    def _asegurar_modelo(self):
+        """Entrena (o reentrena cada DESVIO_REENTRENAR_CADA giros) los árboles del crupier actual."""
+        nombre = self.crupier_actual
+        if nombre is None or not SKLEARN_OK:
+            return
+        ult = self._ultimo_entreno.get(nombre)
+        if ult is not None and self.total_spins_seen - ult < DESVIO_REENTRENAR_CADA:
+            return
+        self._ultimo_entreno[nombre] = self.total_spins_seen
+        t0 = time.time()
+        X, y, meta = self._filas_entrenamiento(nombre)
+        mod = entrenar_modelo_desvio(X, y, meta)
+        if mod:
+            self.modelos[nombre] = mod
+            log.info(f"[Desvío] Árboles de {nombre}: {mod['n']} filas | validación fuera de muestra "
+                     f"{mod['val_hit']*100:.1f}% vs base {mod['val_base']*100:.1f}% en {mod['val_n']} giros "
+                     f"({time.time() - t0:.2f}s)")
+        else:
+            log.info(f"[Desvío] {nombre}: {len(y)} filas (< {DESVIO_MIN_TRAIN}), se usa el método por frecuencia")
+
+    def _calcular_desvio(self) -> Optional[dict]:
+        """Predice la nueva S1 con las últimas 34 desviaciones del crupier (se llama después de cada giro)."""
+        nombre = self.crupier_actual
+        spins = self.sesion_actual
+        if nombre is None or len(spins) < SESGO_MIN_RONDAS:
+            return None
+        extender_traza(spins, self.traza)            # incluye la desviación del giro que acaba de salir
+        a = analizar_sesgo(spins)
+        if a is None:
+            return None
+        base = a["centro"]                            # S1 predicha por la ventana caliente (referencia de las desviaciones)
+        self._asegurar_modelo()
+        prev = self.traza["devs"][-DESVIO_VENTANA:]
+        P, metodo = probs_frecuencia(prev), "frecuencia"
+        mod = self.modelos.get(nombre)
+        if mod is not None:
+            try:
+                x = feats_desvio(prev, base, spins[-1], spins[-2] if len(spins) >= 2 else None, a["hits"][0])
+                P, metodo = proba6(mod["clf"], [x])[0], "arboles"
+            except Exception as e:
+                log.warning(f"[Desvío] Falló la predicción con árboles ({e}); se usa frecuencia")
+        centro, prob_cov, _ = elegir_centro(base, P)
+        w = [x for x in prev if x]
+        cnt = [w.count(k) for k in range(1, 7)]
+        esp = [len(w) * tam_zona(k) / 37.0 for k in range(1, 7)]
+        kd = max(range(6), key=lambda i: cnt[i] - esp[i])
+        return {"centro": centro, "base": base, "P": P, "prob_cov": prob_cov, "metodo": metodo, "n": len(w),
+                "dom_zona": kd + 1, "dom_cuenta": cnt[kd], "dom_esp": esp[kd], "hits_base": a["hits"][0]}
+
+    def _val_desvio(self):
+        """(confirmada, val_hit, val_n): ¿la validación fuera de muestra de los árboles de este crupier supera al azar?"""
+        mod = self.modelos.get(self.crupier_actual) or {}
+        azar = (2 * COBERTURA_ENVIO + 1) / 37.0
+        val_hit, val_n = mod.get("val_hit"), mod.get("val_n", 0)
+        ok = bool(val_hit is not None and val_n >= DESVIO_MIN_VAL and val_hit >= azar + DESVIO_MARGEN_VAL)
+        return ok, val_hit, val_n
+
+    def _rendimiento_vivo(self):
+        """(aciertos al 1er intento, señales) de las últimas señales cerradas de este crupier con la estrategia desvío."""
+        r = [x for x in self.resultados if x.get("modo") == "desvio" and x.get("crupier") == self.crupier_actual]
+        r = r[-DESVIO_LIVE_N:]
+        return sum(1 for x in r if x.get(f"i{COBERTURA_ENVIO}") == 1), len(r)
+
+    def _filtro_desvio(self, p, reintento: bool = False) -> Optional[str]:
+        """
+        FILTRO DE DESCARTE. Devuelve None si la señal pasa, o el motivo por el que se descarta:
+          - pocos datos            : menos de DESVIO_MIN_HIST desviaciones en la ventana de 34
+          - sin modelo de árboles  : el crupier aún no tiene árboles entrenados (DESVIO_REQUIERE_ARBOLES)
+          - probabilidad baja      : prob. de cubrir el próximo número < DESVIO_MIN_PROB (al abrir) / DESVIO_MIN_PROB_REINTENTO (reintento)
+          - validación no supera al azar : la validación fuera de muestra del crupier no supera al azar (DESVIO_SOLO_CONFIRMADAS)
+          - rendimiento en vivo bajo     : sus últimas señales aciertan al 1er intento menos que el azar (solo al abrir)
+        """
+        if p is None:
+            return "sin predicción"
+        if p["n"] < DESVIO_MIN_HIST:
+            return "pocos datos"
+        if DESVIO_REQUIERE_ARBOLES and p["metodo"] != "arboles":
+            return "sin modelo de árboles"
+        if p["prob_cov"] < (DESVIO_MIN_PROB_REINTENTO if reintento else DESVIO_MIN_PROB):
+            return "probabilidad baja"
+        if DESVIO_SOLO_CONFIRMADAS and not self._val_desvio()[0]:
+            return "validación no supera al azar"
+        if not reintento:
+            ok, n = self._rendimiento_vivo()
+            if n >= DESVIO_LIVE_MIN and ok / n < (2 * COBERTURA_ENVIO + 1) / 37.0:
+                return "rendimiento en vivo bajo"
+        return None
+
+    def _contar_descarte(self, motivo: str):
+        self.descartes[motivo] = self.descartes.get(motivo, 0) + 1
+
+    def _descartar_senal(self, sig: dict, motivo: str):
+        """Descarta una señal ya abierta (en un reintento): se deja de apostar y se archiva como pérdida de esa cadena."""
+        fallidos = sig["intento"] - 1
+        self._contar_descarte(f"en reintento: {motivo}")
+        if sig["sent"] and not sig["envio_cerrado"]:
+            asyncio.create_task(send_msg(
+                f"🚫 SEÑAL DESCARTADA tras {fallidos} intento(s): {motivo}.\n"
+                f"No apuestes más y reseteá la gestión. Crupier {esc(sig['crupier'])}", CANAL_SENALES))
+        reg = {"win": False, "intento": None, "centro": sig["centro"], "sent": sig["sent"], "crupier": sig["crupier"],
+               "confirmada": sig["confirmada"], "sim": sig["sim"], "ts": time.time(), "cob_envio": COBERTURA_ENVIO,
+               "modo": "desvio", "zona": None, "descartada": motivo}
+        for v in COBERTURAS:
+            reg[f"i{v}"] = sig["hit"][v]
+        self.resultados.append(reg)
+        log.info(f"🚫 Señal descartada tras {fallidos} intento(s): {motivo} | centro {sig['centro']} | crupier {sig['crupier']}")
+        self.senal_activa = None
+
+    def _abrir_desvio(self, ultimo_numero):
+        p = self.pred_desvio
+        motivo = self._filtro_desvio(p)
+        if motivo:
+            self._contar_descarte(motivo)
+            log.debug(f"[Desvío] Candidata descartada: {motivo}")
+            return
+        confirmada, val_hit, val_n = self._val_desvio()
+        sig = {
+            "modo": "desvio", "crupier": self.crupier_actual, "sesion_num": self._num_sesion(),
+            "centro": p["centro"], "centros": [p["centro"]], "sectores": construir_sectores(p["centro"]),
+            "hits": None, "esperados": None, "rondas": p["n"], "confirmada": confirmada,
+            "sim": val_hit, "sim_n": val_n, "desvio": p,
+            "intento": 1, "numeros": [], "msg_id": None, "msg_id_anterior": None,
+            "sent": self._gate_ok(),
+            "hit": {v: None for v in COBERTURAS}, "envio_cerrado": False, "intento_envio": None,
+        }
+        self.senal_activa = sig
+        log.info(f"🎯 SEÑAL DESVÍO: base {p['base']} → S1 {p['centro']} | desviación dominante S{p['dom_zona']} "
+                 f"({p['dom_cuenta']}/{p['n']}) | prob. cobertura {p['prob_cov']*100:.0f}% | {p['metodo']} | "
+                 f"crupier {sig['crupier']} | confirmada={confirmada} | {'ENVIADA' if sig['sent'] else 'sombra'}")
+        if sig["sent"]:
+            asyncio.create_task(self._enviar_entrada(sig, ultimo_numero, 1))
+
     def _abrir_zonas(self, ultimo_numero):
         """S1 adaptativo: se toma la zona que MÁS SALE (cada ronda medida contra el número anterior) y se predice esa
         misma zona respecto del último número; se cubre su centro con 6 u 8 vecinos. Solo hay señal si la zona
@@ -850,7 +1225,7 @@ class RouletteTable:
         confirmada = n_hist >= ZONA_HIST_MIN and share >= tam_zona(k) / 37.0
         sig = {
             "crupier": self.crupier_actual, "sesion_num": self._num_sesion(),
-            "centro": centro, "sectores": construir_sectores(ref),
+            "centro": centro, "centros": [centro], "sectores": construir_sectores(ref),
             "hits": None, "esperados": None, "rondas": dom["n"], "confirmada": confirmada,
             "sim": share, "sim_n": n_hist, "zona": k, "ref": ref, "dom": dom,
             "intento": 1, "numeros": [], "sent": self._gate_ok(), "msg_id": None, "msg_id_anterior": None,
@@ -867,6 +1242,8 @@ class RouletteTable:
     def _intentar_abrir(self, ultimo_numero):
         if self.senal_activa is not None or self.crupier_actual is None:
             return
+        if ESTRATEGIA == "desvio":
+            return self._abrir_desvio(ultimo_numero)
         if ESTRATEGIA == "zonas":
             return self._abrir_zonas(ultimo_numero)
         if len(self.sesion_actual) < SESGO_MIN_RONDAS:
@@ -889,7 +1266,7 @@ class RouletteTable:
             confirmada = False   # primeras sesiones del crupier: nada que las confirme
         sig = {
             "crupier": self.crupier_actual, "sesion_num": self._num_sesion(),
-            "centro": analisis["centro"], "sectores": analisis["sectores"],
+            "centro": analisis["centro"], "centros": [analisis["centro"]], "sectores": analisis["sectores"],
             "hits": analisis["hits"], "esperados": analisis["esperados"],
             "rondas": analisis["rondas"], "confirmada": confirmada,
             "sim": sim, "sim_n": sim_n,
@@ -935,7 +1312,7 @@ class RouletteTable:
                    "sent": sig["sent"], "crupier": sig["crupier"],
                    "confirmada": sig["confirmada"], "sim": sig["sim"], "ts": time.time(),
                    "cob_envio": COBERTURA_ENVIO,
-                   "modo": "zonas" if sig.get("zona") else "masa", "zona": sig.get("zona")}
+                   "modo": sig.get("modo") or ("zonas" if sig.get("zona") else "masa"), "zona": sig.get("zona")}
             for v in COBERTURAS:
                 reg[f"i{v}"] = sig["hit"][v]      # intento del acierto, o None si falló en todos
             self.resultados.append(reg)
@@ -947,21 +1324,41 @@ class RouletteTable:
         # Siguiente intento: se recalcula S1 con la sesión actualizada
         sig["intento"] += 1
         sig["msg_id_anterior"] = sig.get("msg_id")
-        if sig.get("zona"):
+        if sig.get("modo") == "desvio":
+            # Se recalculan las desviaciones de las últimas 34 rondas (ya incluyen el giro que acaba de salir) y la nueva S1
+            centro_previo = sig["centro"]
+            p = self.pred_desvio
+            if p is not None:
+                sig["centro"], sig["desvio"], sig["rondas"] = p["centro"], p, p["n"]
+                sig["sectores"] = construir_sectores(p["centro"])
+            sig.setdefault("centros", [centro_previo]).append(sig["centro"])
+            if DESVIO_DESCARTAR_EN_INTENTOS and not sig["envio_cerrado"]:
+                motivo = self._filtro_desvio(p, reintento=True)
+                if motivo:
+                    self._descartar_senal(sig, motivo)
+                    return
+            log.info(f"🎯 Intento {sig['intento']}: desviación dominante S{(p or {}).get('dom_zona', '?')} → nueva S1 "
+                     f"{centro_previo} → {sig['centro']}" + (" (sin cambio)" if sig["centro"] == centro_previo else " (se movió)"))
+        elif sig.get("zona"):
             # S1 adaptativo: se recalcula la zona dominante (con la ronda nueva) y se mide desde el número que acaba de salir
             dom = zona_dominante(zonas_de_giros(self.sesion_actual))
             if dom is not None:
                 sig["zona"], sig["dom"] = dom["zona"], dom
             sig["ref"] = number
             sig["centro"] = centro_de_zona(number, sig["zona"])
+            sig.setdefault("centros", []).append(sig["centro"])
             sig["sectores"] = construir_sectores(number)
             log.info(f"🎯 Intento {sig['intento']}: zona dominante S{sig['zona']} desde {number} → centro {sig['centro']}")
         else:
-            analisis = analizar_sesgo(self.sesion_actual)
+            centro_previo = sig["centro"]
+            analisis = analizar_sesgo(self.sesion_actual)   # incluye el giro que acaba de salir
             if analisis:
                 sig["centro"], sig["sectores"] = analisis["centro"], analisis["sectores"]
                 sig["hits"], sig["esperados"], sig["rondas"] = analisis["hits"], analisis["esperados"], analisis["rondas"]
-            log.info(f"🎯 Intento {sig['intento']}: S1 recalculado → centro {sig['centro']}")
+            sig.setdefault("centros", [centro_previo]).append(sig["centro"])
+            log.info(f"🎯 Intento {sig['intento']}: S1 recalculado → centro {centro_previo} → {sig['centro']}"
+                     + (" (sin cambio)" if sig["centro"] == centro_previo else " (se movió)")
+                     + (f" | S1 {sig['hits'][0]} aciertos/{sig['rondas']}" if sig.get("hits") else ""))
         if sig["sent"] and not sig["envio_cerrado"]:
             asyncio.create_task(self._enviar_entrada(sig, number, sig["intento"]))
 
@@ -974,6 +1371,7 @@ class RouletteTable:
             "sesiones_por_crupier": self.sesiones_por_crupier,
             "resultados": self.resultados,
             "ultima_ronda": self.ultima_ronda,
+            "descartes": self.descartes,
         }
 
     def load(self, data):
@@ -986,6 +1384,7 @@ class RouletteTable:
                                      for k, v in (data.get("sesiones_por_crupier") or {}).items()}
         self.resultados = list(data.get("resultados", []))
         self.ultima_ronda = data.get("ultima_ronda")
+        self.descartes = dict(data.get("descartes") or {})
 
     def agregar_seed(self, spins: list):
         """El histórico sin crupier queda como sesión de referencia de un pseudo-crupier."""
@@ -1011,9 +1410,18 @@ class RouletteTable:
                              "sesion_num": self._num_sesion(), "ts": timestamp,
                              "zona": zona, "ref": prev}
         if len(self.sesion_actual) > MAX_SPINS_SESION_MEMORIA:
-            del self.sesion_actual[:len(self.sesion_actual) - MAX_SPINS_SESION_MEMORIA]
+            exceso = len(self.sesion_actual) - MAX_SPINS_SESION_MEMORIA
+            del self.sesion_actual[:exceso]
+            for lista in self.traza.values():
+                del lista[:exceso]
         if training:
             return
+        if ESTRATEGIA == "desvio":
+            try:
+                self.pred_desvio = self._calcular_desvio()   # antes de resolver: cada intento usa la S1 recalculada
+            except Exception as e:
+                log.warning(f"[Desvío] Error calculando la predicción: {e}")
+                self.pred_desvio = None
         self._resolver(number)
         self._intentar_abrir(number)
         crupier_txt = self.crupier_actual or "?"
@@ -1040,6 +1448,8 @@ class RouletteTable:
                 "esperados": analisis["esperados"], "rondas": analisis["rondas"],
                 "sectores": analisis["sectores"],
             },
+            "desvio": None if self.pred_desvio is None else {
+                k: self.pred_desvio[k] for k in ("base", "centro", "prob_cov", "metodo", "dom_zona", "n")},
             "senal": {
                 "activa": None if a is None else {
                     "crupier": a["crupier"], "centro": a["centro"], "sectores": a["sectores"],
