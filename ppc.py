@@ -10,8 +10,8 @@
 ║   - En cada giro se analizan las últimas RONDAS_ANALISIS (34) ║
 ║     rondas de la sesión ACTUAL del crupier.                   ║
 ║   - La rueda se divide en 6 sectores adaptativos:             ║
-║       S1 = 7 números (centro = predicción, 3 izq + 3 der)     ║
-║       S2..S6 = 6 números cada uno, en sentido HORARIO de S1   ║
+║       S1 = 7 números (centro = predicción, 3 por cada lado)   ║
+║       S2..S6 = 6 números cada uno, en sentido HORARIO desde S1║
 ║     S1 se recalcula en CADA giro (el centro es el número cuya ║
 ║     ventana de 7 acumula más caídas en las últimas 34).       ║
 ║   - COBERTURA al apostar: centro ± 6 (13 nº) o ± 8 (17 nº).   ║
@@ -27,6 +27,13 @@
 ║     en cada intento se recalcula S1.                          ║
 ║   - HTTP: /ping, /health, /api/state/{mesa}, /api/all         ║
 ║   - Persistencia en model_<key>.json + self-ping (Render)     ║
+║   - ESTRATEGIA=masa (defecto): S1 ES la predicción. En cada   ║
+║     giro se calcula el CENTRO de S1 (ventana de 7 con más     ║
+║     caídas en las últimas 34), se arman S2..S6 en sentido     ║
+║     HORARIO y se reclasifican las 34 rondas en S1..S6.        ║
+║     La bola gira SIEMPRE en sentido horario, de S1 a S6.      ║
+║     ESTRATEGIA=zonas = método alternativo (zona relativa al   ║
+║     número anterior).                                         ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -99,7 +106,7 @@ HISTORY_SEED_TABLE = os.environ.get("HISTORY_SEED_TABLE", "roulette_1")
 
 # ── Estrategia: sesgo por crupier + sectores S1..S6 ──
 RONDAS_ANALISIS      = 34     # rondas que miramos hacia atrás en la sesión del crupier
-S1_RADIO             = 3      # S1 = centro ± 3 (7 números: 3 izq + centro + 3 der)
+S1_RADIO             = 3      # S1 = centro ± 3 (7 números: 3 por cada lado + centro)
 SECTORES_EXTRA       = 5      # S2..S6
 SECTOR_EXTRA_TAM     = 6      # 6 números cada uno (7 + 5*6 = 37)
 # Cobertura al apostar la señal: centro ± N vecinos. Se miden AMBAS en cada señal.
@@ -107,6 +114,14 @@ COBERTURAS           = (6, 8)   # 6 vecinos = 13 números | 8 vecinos = 17 núme
 COBERTURA_ENVIO      = int(os.environ.get("COBERTURA_VECINOS", "6"))   # la que se muestra/apuesta en la señal
 if COBERTURA_ENVIO not in COBERTURAS:
     COBERTURA_ENVIO = COBERTURAS[0]
+# Estrategia: "masa" (defecto: S1 = predicción, centro calculado sobre las últimas 34 rondas) o "zonas" (relativa al número anterior)
+ESTRATEGIA           = os.environ.get("ESTRATEGIA", "masa").strip().lower()
+if ESTRATEGIA not in ("zonas", "masa"):
+    ESTRATEGIA = "masa"
+ZONA_VENTANA         = int(os.environ.get("ZONA_VENTANA", "34"))          # rondas recientes para hallar la zona que más sale (0 = toda la sesión)
+ZONA_MIN_CUENTA      = int(os.environ.get("ZONA_MIN_CUENTA", "3"))        # veces mínimas que debe haber salido la zona dominante
+ZONA_Z_MIN           = float(os.environ.get("ZONA_Z_MIN", "1.5"))         # cuánto debe superar al azar (en desviaciones) para dar señal
+ZONA_HIST_MIN        = int(os.environ.get("ZONA_HIST_MIN", "30"))       # rondas históricas del crupier para confirmar
 SESGO_MIN_RONDAS     = int(os.environ.get("SESGO_MIN_RONDAS", "20"))   # mínimo de rondas en la sesión para evaluar
 SESGO_MIN_ACIERTOS_S1 = int(os.environ.get("SESGO_MIN_ACIERTOS_S1", "9"))  # aciertos mínimos de S1 (7 nº) en las últimas 34 (esperado al azar ≈ 6.4)
 SESGO_SIM_MIN        = float(os.environ.get("SESGO_SIM_MIN", "0.35"))  # similitud mínima vs sesiones pasadas del crupier
@@ -213,7 +228,7 @@ def build_status_message(server_state) -> str:
                               f"aciertos S1 {analisis['hits'][0]} (esperados {analisis['esperados'][0]:.1f}) | "
                               f"sectores {analisis['hits']}")
                 lineas.append(f"• Últimos números: {'-'.join(str(n) for n in mesa.sesion_actual[-10:])}")
-        r = mesa.resultados[-SESGO_STATS_WINDOW:]
+        r = mesa.resultados_modo()[-SESGO_STATS_WINDOW:]
         if r:
             w = sum(1 for x in r if x["win"])
             lineas.append(f"• Señales (últimas {len(r)}): {w}/{len(r)} = {w/len(r)*100:.1f}% | "
@@ -221,15 +236,20 @@ def build_status_message(server_state) -> str:
         if a:
             lineas.append(f"• Señal activa: centro {a['centro']} intento {a['intento']}/{SESGO_MAX_INTENTOS} "
                           f"({'enviada' if a['sent'] else 'sombra'})")
-        # Registro por crupier
+        # Análisis por crupier (sesiones archivadas + la sesión en curso del crupier actual)
         conocidos = mesa.sesiones_por_crupier
-        if conocidos:
-            lineas.append("• Crupiers registrados:")
-            for nombre, sesiones in list(conocidos.items())[:12]:
-                resumen = resumen_crupier(sesiones)
-                lineas.append(f"  - {esc(nombre)}: {len(sesiones)} sesión(es) | sesgo medio S1 "
-                              f"{resumen['media_s1_hits']:.1f} aciertos/34 | última discrepancia "
-                              f"{resumen['ultima_sim'] if resumen['ultima_sim'] is not None else '—'}")
+        nombres = list(conocidos.keys())
+        if mesa.crupier_actual and mesa.crupier_actual not in nombres:
+            nombres.append(mesa.crupier_actual)
+        if nombres:
+            lineas.append("• Análisis por crupier (S1 recalculado en cada giro, sectores S1..S6 en sentido horario):")
+            for nombre in nombres[:10]:
+                actual = mesa.sesion_actual if nombre == mesa.crupier_actual else None
+                lineas.append(linea_analisis_crupier(nombre, conocidos.get(nombre, []), actual))
+                sen = [x for x in mesa.resultados if x.get("crupier") == nombre and x.get("sent")]
+                if sen:
+                    w = sum(1 for x in sen if x["win"])
+                    lineas.append(f"      Señales enviadas: {w}/{len(sen)} ganadas ({w / len(sen) * 100:.0f}%)")
         gate = "ABIERTO ✅" if mesa._gate_ok() else "cerrado ⛔"
         lineas.append(f"• Envío a Telegram: {gate} (mín {SESGO_SEND_MIN_WIN_RATE*100:.0f}% con "
                       f"≥{SESGO_SEND_MIN_SAMPLES} señales)")
@@ -238,7 +258,7 @@ def build_status_message(server_state) -> str:
 
 def calcular_stats_cobertura(resultados: list) -> dict:
     """Aciertos por cobertura (6 y 8 vecinos). Solo cuentan señales que traen el dato de ambas coberturas."""
-    validos = [x for x in resultados if all(f"i{v}" in x for v in COBERTURAS)]
+    validos = [x for x in resultados if x.get("modo", "masa") == ESTRATEGIA and all(f"i{v}" in x for v in COBERTURAS)]
     out = {"total": len(validos), "antiguos": len(resultados) - len(validos)}
 
     def por_cob(lista):
@@ -265,7 +285,7 @@ def build_estadisticas_message(server_state) -> str:
     todos.sort(key=lambda x: x.get("ts", 0))
     st = calcular_stats_cobertura(todos)
     if st["total"] == 0:
-        extra = f"\n({st['antiguos']} señales antiguas no traen dato de 6/8 vecinos)" if st["antiguos"] else ""
+        extra = f"\n({st['antiguos']} señales de la estrategia anterior o sin dato de 6/8 vecinos)" if st["antiguos"] else ""
         return ("📊 <b>ESTADÍSTICAS</b>\nTodavía no hay señales cerradas con dato de 6 y 8 vecinos. "
                 f"Se van acumulando a medida que se cierran señales (incluye las de sombra).{extra}")
 
@@ -273,7 +293,7 @@ def build_estadisticas_message(server_state) -> str:
         return f"{w / n * 100:.1f}%" if n else "—"
 
     g = st["global"]
-    lineas = ["📊 <b>ESTADÍSTICAS GLOBALES — 6 vs 8 vecinos</b>",
+    lineas = [f"📊 <b>ESTADÍSTICAS GLOBALES — 6 vs 8 vecinos</b>\nEstrategia: {ESTRATEGIA}",
               f"Señales cerradas: {st['total']} (enviadas: {st['enviadas'][COBERTURAS[0]]['n']} | "
               f"sombra: {st['total'] - st['enviadas'][COBERTURAS[0]]['n']}) — hasta {SESGO_MAX_INTENTOS} intentos c/u"]
     for v in COBERTURAS:
@@ -282,6 +302,8 @@ def build_estadisticas_message(server_state) -> str:
         lineas.append(f"\n🧨 <b>{v} VECINOS</b> ({2 * v + 1} números){marca}")
         lineas.append(f"• Aciertos: {d['wins']}/{d['n']} = {pct(d['wins'], d['n'])} | "
                       f"fallos: {d['n'] - d['wins']} | azar: {azar_s1(SESGO_MAX_INTENTOS, v) * 100:.1f}%")
+        lineas.append(f"• 1er intento: {d['dist'][1]}/{d['n']} = {pct(d['dist'][1], d['n'])} | "
+                      f"azar: {(2 * v + 1) / 37 * 100:.1f}%")
         dist = " · ".join(f"I{k}: {c}" for k, c in d["dist"].items() if c) or "—"
         prom = f"{d['prom']:.2f}" if d["prom"] is not None else "—"
         lineas.append(f"• Acierto por intento: {dist} | intento medio: {prom}")
@@ -295,7 +317,7 @@ def build_estadisticas_message(server_state) -> str:
         lineas.append(f"\n📌 {b} vecinos acierta {dif:+.1f} pts vs {a} vecinos "
                       f"(apuesta {2 * b + 1} números en vez de {2 * a + 1}).")
     if st["antiguos"]:
-        lineas.append(f"({st['antiguos']} señales antiguas sin dato de cobertura no se cuentan)")
+        lineas.append(f"({st['antiguos']} señales de la estrategia anterior o sin dato de cobertura no se cuentan)")
     return "\n".join(lineas)
 
 
@@ -321,13 +343,25 @@ def build_crupier_reply(mesa) -> str:
     previas = mesa.sesiones_por_crupier.get(nombre, [])
     lineas = [f"🎲 Mesa {mesa.key} ({esc(TABLE_NAME)})",
               f"👤 CRUPIER DE LA ÚLTIMA RONDA: {esc(nombre)}",
-              f"🔁 Última ronda: {ur['numero']} ({emoji} {ur.get('color', '')}) — {_hace(ur['ts'])}"]
+              f"🔁 Última ronda: {ur['numero']} ({emoji} {ur.get('color', '')}) — {_hace(ur['ts'])}"
+              + (f" | zona S{ur['zona']} respecto a {ur['ref']}" if (ur.get("zona") and ESTRATEGIA == "zonas") else "")]
     if es_actual:
         lineas.append(f"📋 Sesión #{ur['sesion_num']} | giros en la sesión: {len(mesa.sesion_actual)}")
         if mesa.sesion_actual:
             lineas.append(f"🔢 Últimos números: {'-'.join(str(n) for n in mesa.sesion_actual[-10:])}")
+            zs = zonas_de_giros(mesa.sesion_actual)
+            rz = resumen_zonas(contar_zonas([mesa.sesion_actual]), zs[-10:])
+            if rz and ESTRATEGIA == "zonas":
+                lineas.append(f"🧭 Zonas S1..S6 de la sesión ({rz['n']} rondas): {rz['partes']}")
+                lineas.append(f"↪️ Últimas zonas: {rz['secuencia']} (azar: S1 {tam_zona(1)/37*100:.0f}% · resto {tam_zona(2)/37*100:.0f}%)")
+                dom = zona_dominante(zs)
+                if dom:
+                    lineas.append(f"⭐ Zona que más sale (últimas {dom['n']}): S{dom['zona']} — {dom['cuenta']} veces "
+                                  f"(esperado {dom['esperado']:.1f}, {dom['z']:+.1f}σ) → cae "
+                                  f"{txt_desplazamiento(dom['zona'])}")
+                    lineas.append(f"🔄 Sentido del giro: {GIRO_TXT}")
             a = analizar_sesgo(mesa.sesion_actual)
-            if a:
+            if a and ESTRATEGIA == "masa":
                 lineas.append(f"🎯 Sesgo (últimas {a['rondas']}): S1 centro {a['centro']} | aciertos S1 "
                               f"{a['hits'][0]} (esperados {a['esperados'][0]:.1f})")
     else:
@@ -338,8 +372,14 @@ def build_crupier_reply(mesa) -> str:
         sim = r["ultima_sim"] if r["ultima_sim"] is not None else "—"
         lineas.append(f"📚 Sesiones archivadas: {len(previas)} | sesgo medio S1 {r['media_s1_hits']:.1f} aciertos/34 "
                       f"| última similitud {sim}")
+        rh = resumen_zonas(contar_zonas(previas))
+        if rh and ESTRATEGIA == "zonas":
+            lineas.append(f"🧭 Zonas históricas del crupier ({rh['n']} rondas): {rh['partes']}")
     else:
         lineas.append("📚 Sesiones archivadas: 0 (primera sesión de este crupier)")
+    if ESTRATEGIA == "masa":
+        lineas.append("📊 Análisis de este crupier (S1 recalculado en cada giro):")
+        lineas.append(linea_analisis_crupier(nombre, previas, mesa.sesion_actual if es_actual else None))
     # Señales de este crupier
     sen = [x for x in mesa.resultados if x.get("crupier") == nombre and x.get("sent")]
     if sen:
@@ -412,9 +452,14 @@ WHEEL_ORDER = (0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23
                24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26)
 WHEEL_POS = {n: i for i, n in enumerate(WHEEL_ORDER)}
 L_RUEDA = len(WHEEL_ORDER)
-# Sentido físico de giro de la rueda: +1 = horario (clockwise) sobre WHEEL_ORDER.
-# Los vecinos "izquierda" de S1 quedan en -d y los de "derecha" en +d; S2..S5 avanzan horario.
-WHEEL_DIRECTION = 1
+# La bola gira SIEMPRE en sentido horario (agujas del reloj) y las zonas se arman en ese mismo orden: S1 = 3 números por
+# cada lado; S2 arranca en el 4º número horario desde el centro, y S2..S6 siguen en sentido horario hasta que S6 termina
+# en el 4º antihorario. WHEEL_ORDER (0-32-15-19-4-21…) está listada en sentido horario, así que WHEEL_DIRECTION=+1 (defecto)
+# = horario. -1 = antihorario (solo por si hiciera falta, vía variable de entorno).
+WHEEL_DIRECTION = -1 if os.environ.get("WHEEL_DIRECTION", "1").strip() == "-1" else 1
+SENTIDO_TXT = "horario" if WHEEL_DIRECTION == 1 else "antihorario"
+SENTIDO_OPUESTO_TXT = "antihorario" if WHEEL_DIRECTION == 1 else "horario"
+GIRO_TXT = f"sentido {SENTIDO_TXT} (agujas del reloj), de S1 a S6" if WHEEL_DIRECTION == 1 else f"sentido {SENTIDO_TXT}, de S1 a S6"
 
 
 def azar_s1(intentos: int = None, vecinos: int = None) -> float:
@@ -429,6 +474,80 @@ def cobertura_numeros(centro: int, vecinos: int) -> list:
     """Números a apostar: centro ± vecinos sobre la rueda física (2*vecinos + 1 números, en orden de rueda)."""
     i = WHEEL_POS[centro]
     return [WHEEL_ORDER[(i + WHEEL_DIRECTION * d) % L_RUEDA] for d in range(-vecinos, vecinos + 1)]
+
+
+def zona_de(ref: int, x: int) -> int:
+    """Zona (1..6) donde cae x con S1 centrado en ref. S1 = ref ± 3; S2..S6 = 6 números c/u en sentido horario (ver WHEEL_DIRECTION)."""
+    d = ((WHEEL_POS[x] - WHEEL_POS[ref]) * WHEEL_DIRECTION) % L_RUEDA
+    if d <= S1_RADIO or d >= L_RUEDA - S1_RADIO:
+        return 1
+    return 2 + (d - (S1_RADIO + 1)) // SECTOR_EXTRA_TAM
+
+
+def tam_zona(k: int) -> int:
+    return (2 * S1_RADIO + 1) if k == 1 else SECTOR_EXTRA_TAM
+
+
+def centro_de_zona(ref: int, zona: int) -> int:
+    """Número central de la zona 'zona' medida desde ref (S1 -> el propio ref; zonas de 6 -> el 3er número)."""
+    if zona == 1:
+        return ref
+    d = S1_RADIO + 1 + (zona - 2) * SECTOR_EXTRA_TAM + (SECTOR_EXTRA_TAM // 2 - 1)
+    return WHEEL_ORDER[(WHEEL_POS[ref] + WHEEL_DIRECTION * d) % L_RUEDA]
+
+
+def zonas_de_giros(numeros: list) -> list:
+    """Zona de cada ronda respecto del número anterior de la sesión (la 1ª ronda no tiene referencia)."""
+    return [zona_de(numeros[i - 1], numeros[i]) for i in range(1, len(numeros))]
+
+
+def zona_dominante(zonas: list) -> Optional[dict]:
+    """Zona que MÁS SALE en las últimas ZONA_VENTANA rondas (desempate: la más reciente) y cuánto supera al azar."""
+    z = zonas[-ZONA_VENTANA:] if ZONA_VENTANA > 0 else list(zonas)
+    n = len(z)
+    if n == 0:
+        return None
+    cont = {k: z.count(k) for k in range(1, SECTORES_EXTRA + 2)}
+    ultima = {k: (max(i for i, v in enumerate(z) if v == k) if cont[k] else -1) for k in cont}
+    k = max(cont, key=lambda kk: (cont[kk], ultima[kk]))
+    p = tam_zona(k) / 37.0
+    esperado = n * p
+    sd = math.sqrt(n * p * (1 - p))
+    zs = (cont[k] - esperado) / sd if sd > 0 else 0.0
+    return {"zona": k, "cuenta": cont[k], "n": n, "esperado": esperado, "z": zs, "cont": cont}
+
+
+def desplazamiento_zona(k: int) -> int:
+    """Casillas (hacia el lado de S2..S6 respecto del número anterior) hasta el centro de la zona k. S1 = 0."""
+    return 0 if k == 1 else S1_RADIO + 1 + (k - 2) * SECTOR_EXTRA_TAM + (SECTOR_EXTRA_TAM // 2 - 1)
+
+
+def txt_desplazamiento(k: int) -> str:
+    d = desplazamiento_zona(k)
+    return "en el mismo sector del número anterior" if d == 0 else f"a {d} casillas en sentido {SENTIDO_TXT} del número anterior"
+
+
+def contar_zonas(sesiones: list) -> dict:
+    cont = {z: 0 for z in range(1, SECTORES_EXTRA + 2)}
+    for ses in sesiones:
+        for z in zonas_de_giros(list(ses)):
+            cont[z] += 1
+    return cont
+
+
+def share_zona(sesiones: list, k: int):
+    cont = contar_zonas(sesiones)
+    n = sum(cont.values())
+    return (cont[k] / n if n else 0.0), n
+
+
+def resumen_zonas(cont: dict, ultimas: list = None) -> Optional[dict]:
+    n = sum(cont.values())
+    if not n:
+        return None
+    partes = " · ".join(f"S{k}: {c} ({c / n * 100:.0f}%)" for k, c in cont.items())
+    return {"n": n, "partes": partes,
+            "secuencia": "-".join(f"S{k}" for k in ultimas) if ultimas else ""}
 
 
 def construir_sectores(centro: int) -> list:
@@ -446,7 +565,7 @@ def construir_sectores(centro: int) -> list:
 def analizar_sesgo(numeros: list) -> Optional[dict]:
     """
     Análisis de las últimas RONDAS_ANALISIS rondas: recalcula S1 (centro = número cuya ventana de
-    13 acumula más caídas), arma S2..S5 en sentido horario y cuenta aciertos por sector.
+    7 acumula más caídas; desempate: centro con más caídas, luego la caída más reciente), arma S2..S6 en sentido horario y cuenta aciertos por sector.
     Devuelve None si no hay datos suficientes.
     """
     if len(numeros) < 4:
@@ -456,12 +575,17 @@ def analizar_sesgo(numeros: list) -> Optional[dict]:
     conteo = [0] * 37
     for n in ventana:
         conteo[n] += 1
-    # centro: posición de rueda cuya ventana de ±3 acumula más caídas
-    mejor_masa, mejor_idx = -1, 0
+    # centro: posición de rueda cuya ventana de ±3 acumula más caídas.
+    # Desempate (muy frecuente con 34 rondas): 1) más caídas en el propio centro, 2) caída más reciente dentro de la ventana.
+    ultima = [-1] * 37
+    for j, n in enumerate(ventana):
+        ultima[n] = j
+    mejor_clave, mejor_idx = None, 0
     for i in range(L_RUEDA):
-        masa = sum(conteo[WHEEL_ORDER[(i + d) % L_RUEDA]] for d in range(-S1_RADIO, S1_RADIO + 1))
-        if masa > mejor_masa:
-            mejor_masa, mejor_idx = masa, i
+        nums = [WHEEL_ORDER[(i + d) % L_RUEDA] for d in range(-S1_RADIO, S1_RADIO + 1)]
+        clave = (sum(conteo[n] for n in nums), conteo[WHEEL_ORDER[i]], max(ultima[n] for n in nums))
+        if mejor_clave is None or clave > mejor_clave:
+            mejor_clave, mejor_idx = clave, i
     centro = WHEEL_ORDER[mejor_idx]
     sectores = construir_sectores(centro)
     hits = [sum(conteo[n] for n in s) for s in sectores]
@@ -527,6 +651,53 @@ def resumen_crupier(sesiones: list) -> dict:
             "ultima_sim": (round(sims[-1], 3) if sims else None)}
 
 
+def analisis_crupier(sesiones: list, max_sesiones: int = 8, max_rondas: int = 400) -> Optional[dict]:
+    """
+    Análisis del sesgo de UN crupier sobre todas sus sesiones (archivadas + la actual si se la pasa).
+    Repite lo que hace el bot en vivo: en cada giro (con al menos SESGO_MIN_RONDAS previos) calcula el centro de S1
+    con las 34 rondas anteriores, arma S2..S6 en sentido horario y mide dónde cae el giro SIGUIENTE:
+      - reparto por sector S1..S6 (azar: S1 19% · S2..S6 16% c/u)
+      - acierto al 1er intento con centro ± 6 y ± 8 vecinos (azar 35% / 46%)
+    """
+    sector = [0] * (SECTORES_EXTRA + 1)
+    hit = {v: 0 for v in COBERTURAS}
+    n = 0
+    for ses in sesiones[-max_sesiones:]:
+        ses = list(ses)[-max_rondas:]
+        for t in range(SESGO_MIN_RONDAS, len(ses)):
+            a = analizar_sesgo(ses[max(0, t - RONDAS_ANALISIS):t])
+            if a is None:
+                continue
+            x = ses[t]
+            n += 1
+            for i, sec in enumerate(a["sectores"]):
+                if x in sec:
+                    sector[i] += 1
+                    break
+            for v in COBERTURAS:
+                if x in cobertura_numeros(a["centro"], v):
+                    hit[v] += 1
+    if n == 0:
+        return None
+    return {"n": n, "sector": sector, "hit": hit}
+
+
+def linea_analisis_crupier(nombre: str, sesiones: list, sesion_actual: list = None) -> str:
+    """Una línea de texto con el análisis S1..S6 de un crupier (sesiones archivadas + sesión en curso)."""
+    todas = [list(x) for x in sesiones]
+    if sesion_actual:
+        todas.append(list(sesion_actual))
+    total_rondas = sum(len(x) for x in todas)
+    an = analisis_crupier(todas)
+    base = f"  - {esc(nombre)}: {len(sesiones)} sesión(es) archivada(s), {total_rondas} rondas"
+    if an is None:
+        return base + " | análisis: pocos datos todavía"
+    reparto = " · ".join(f"S{i + 1} {c / an['n'] * 100:.0f}%" for i, c in enumerate(an["sector"]))
+    aciertos = " · ".join(f"{v}v {an['hit'][v] / an['n'] * 100:.1f}% (azar {(2 * v + 1) / 37 * 100:.0f}%)"
+                          for v in COBERTURAS)
+    return f"{base}\n      {reparto}\n      1er intento: {aciertos} sobre {an['n']} giros"
+
+
 # ══════════════════════════════════════════════
 #  MENSAJES
 # ══════════════════════════════════════════════
@@ -546,15 +717,27 @@ def build_entrada_message(sig: dict, ultimo_numero, intento: int) -> str:
     extra_analisis = ""
     extra_fib = ""
     if SENAL_DETALLE:
-        izq = " - ".join(str(n) for n in cobertura[:COBERTURA_ENVIO])
-        der = " - ".join(str(n) for n in cobertura[COBERTURA_ENVIO + 1:])
-        extra_vecinos = f"   {izq} | {centro} | {der}\n"
-        if not sig["confirmada"]:
-            conf = "\n⚠️ SIN CONFIRMACIÓN (la sesión actual discrepa de las sesiones pasadas de este crupier)"
+        atras = " - ".join(str(n) for n in cobertura[:COBERTURA_ENVIO])       # lado contrario al avance de S1→S6
+        adelante = " - ".join(str(n) for n in cobertura[COBERTURA_ENVIO + 1:])  # lado hacia donde avanzan S2..S6
+        extra_vecinos = f"   ◀ {SENTIDO_OPUESTO_TXT}: {atras} | {centro} | {adelante} :{SENTIDO_TXT} ▶\n"
+        if sig.get("zona"):
+            k = sig["zona"]
+            if sig["confirmada"]:
+                conf = (f"\n✅ Histórico: S{k} sale {sig['sim']*100:.0f}% en {sig['sim_n']} rondas previas "
+                        f"del crupier (azar {tam_zona(k)/37*100:.0f}%)")
+            else:
+                conf = "\n⚠️ SIN CONFIRMACIÓN (el histórico de este crupier no respalda esa zona)"
+            dom = sig.get("dom") or {}
+            extra_analisis = (f"\n📍 Zona dominante S{k} ({dom.get('cuenta', '?')} de {dom.get('n', '?')} rondas, "
+                              f"esperado {dom.get('esperado', 0):.1f}) → {txt_desplazamiento(k)} ({sig['ref']})"
+                              f"\n🔄 Giro: {GIRO_TXT}{conf}\n")
         else:
-            conf = f"\n✅ Confirmación histórica: {sig['sim']*100:.0f}% ({sig['sim_n']} sesión(es) previa(s))"
-        extra_analisis = (f"\n📊 Aciertos S1 últimas {sig['rondas']}: {sig['hits'][0]} "
-                          f"(esperados {sig['esperados'][0]:.1f}){conf}\n")
+            if not sig["confirmada"]:
+                conf = "\n⚠️ SIN CONFIRMACIÓN (la sesión actual discrepa de las sesiones pasadas de este crupier)"
+            else:
+                conf = f"\n✅ Confirmación histórica: {sig['sim']*100:.0f}% ({sig['sim_n']} sesión(es) previa(s))"
+            extra_analisis = (f"\n📊 Aciertos S1 últimas {sig['rondas']}: {sig['hits'][0]} "
+                              f"(esperados {sig['esperados'][0]:.1f}){conf}\n")
         extra_fib = "📈 Gestión FIBONACCI (1·1·2·3·5·8·13·21): ganá 1 vez y reseteá la gestión\n"
 
     return (f"🚨🚨 ENTRADA INTENTO {intento} 🚨🚨\n\n"
@@ -620,6 +803,10 @@ class RouletteTable:
             self.sesiones_por_crupier[self.crupier_actual] = \
                 self.sesiones_por_crupier[self.crupier_actual][-MAX_SESIONES_X_CRUPIER:]
 
+    def resultados_modo(self) -> list:
+        """Resultados de la estrategia activa (no se mezclan con los de otra estrategia)."""
+        return [x for x in self.resultados if x.get("modo", "masa") == ESTRATEGIA]
+
     def _num_sesion(self) -> int:
         if not self.crupier_actual:
             return 1
@@ -627,7 +814,7 @@ class RouletteTable:
 
     # ── gate de envío ──────────────────────────────────────────
     def _gate_ok(self) -> bool:
-        r = self.resultados[-SESGO_STATS_WINDOW:]
+        r = self.resultados_modo()[-SESGO_STATS_WINDOW:]
         if len(r) < max(1, SESGO_SEND_MIN_SAMPLES):
             return False
         w = sum(1 for x in r if x["win"])
@@ -646,9 +833,42 @@ class RouletteTable:
         if not sig["confirmada"] and sig.get("msg_id"):
             self.last_sinconf_msg_id = sig["msg_id"]
 
+    def _abrir_zonas(self, ultimo_numero):
+        """S1 adaptativo: se toma la zona que MÁS SALE (cada ronda medida contra el número anterior) y se predice esa
+        misma zona respecto del último número; se cubre su centro con 6 u 8 vecinos. Solo hay señal si la zona
+        dominante supera claramente al azar (ZONA_MIN_CUENTA y ZONA_Z_MIN)."""
+        zonas = zonas_de_giros(self.sesion_actual)
+        dom = zona_dominante(zonas)
+        if dom is None or dom["cuenta"] < ZONA_MIN_CUENTA or dom["z"] < ZONA_Z_MIN:
+            return
+        k = dom["zona"]
+        ref = self.sesion_actual[-1]
+        centro = centro_de_zona(ref, k)
+        # Confirmación: en las sesiones pasadas del crupier, ¿la zona k sale más de lo esperado por azar?
+        pasadas = self.sesiones_por_crupier.get(self.crupier_actual, [])
+        share, n_hist = share_zona(pasadas, k)
+        confirmada = n_hist >= ZONA_HIST_MIN and share >= tam_zona(k) / 37.0
+        sig = {
+            "crupier": self.crupier_actual, "sesion_num": self._num_sesion(),
+            "centro": centro, "sectores": construir_sectores(ref),
+            "hits": None, "esperados": None, "rondas": dom["n"], "confirmada": confirmada,
+            "sim": share, "sim_n": n_hist, "zona": k, "ref": ref, "dom": dom,
+            "intento": 1, "numeros": [], "sent": self._gate_ok(), "msg_id": None, "msg_id_anterior": None,
+            "hit": {v: None for v in COBERTURAS}, "envio_cerrado": False, "intento_envio": None,
+        }
+        self.senal_activa = sig
+        log.info(f"🎯 SEÑAL ZONA DOMINANTE S{k} ({dom['cuenta']}/{dom['n']}, esperado {dom['esperado']:.1f}, z={dom['z']:.1f}) "
+                 f"desde {ref} → centro {centro} | crupier {sig['crupier']} sesión #{sig['sesion_num']} | "
+                 f"confirmada={confirmada} (hist S{k} {share*100:.0f}% en {n_hist} rondas) | "
+                 f"{'ENVIADA' if sig['sent'] else 'sombra'}")
+        if sig["sent"]:
+            asyncio.create_task(self._enviar_entrada(sig, ultimo_numero, 1))
+
     def _intentar_abrir(self, ultimo_numero):
         if self.senal_activa is not None or self.crupier_actual is None:
             return
+        if ESTRATEGIA == "zonas":
+            return self._abrir_zonas(ultimo_numero)
         if len(self.sesion_actual) < SESGO_MIN_RONDAS:
             return
         analisis = analizar_sesgo(self.sesion_actual)
@@ -714,7 +934,8 @@ class RouletteTable:
             reg = {"win": win_envio, "intento": sig["intento_envio"], "centro": sig["centro"],
                    "sent": sig["sent"], "crupier": sig["crupier"],
                    "confirmada": sig["confirmada"], "sim": sig["sim"], "ts": time.time(),
-                   "cob_envio": COBERTURA_ENVIO}
+                   "cob_envio": COBERTURA_ENVIO,
+                   "modo": "zonas" if sig.get("zona") else "masa", "zona": sig.get("zona")}
             for v in COBERTURAS:
                 reg[f"i{v}"] = sig["hit"][v]      # intento del acierto, o None si falló en todos
             self.resultados.append(reg)
@@ -726,11 +947,21 @@ class RouletteTable:
         # Siguiente intento: se recalcula S1 con la sesión actualizada
         sig["intento"] += 1
         sig["msg_id_anterior"] = sig.get("msg_id")
-        analisis = analizar_sesgo(self.sesion_actual)
-        if analisis:
-            sig["centro"], sig["sectores"] = analisis["centro"], analisis["sectores"]
-            sig["hits"], sig["esperados"], sig["rondas"] = analisis["hits"], analisis["esperados"], analisis["rondas"]
-        log.info(f"🎯 Intento {sig['intento']}: S1 recalculado → centro {sig['centro']}")
+        if sig.get("zona"):
+            # S1 adaptativo: se recalcula la zona dominante (con la ronda nueva) y se mide desde el número que acaba de salir
+            dom = zona_dominante(zonas_de_giros(self.sesion_actual))
+            if dom is not None:
+                sig["zona"], sig["dom"] = dom["zona"], dom
+            sig["ref"] = number
+            sig["centro"] = centro_de_zona(number, sig["zona"])
+            sig["sectores"] = construir_sectores(number)
+            log.info(f"🎯 Intento {sig['intento']}: zona dominante S{sig['zona']} desde {number} → centro {sig['centro']}")
+        else:
+            analisis = analizar_sesgo(self.sesion_actual)
+            if analisis:
+                sig["centro"], sig["sectores"] = analisis["centro"], analisis["sectores"]
+                sig["hits"], sig["esperados"], sig["rondas"] = analisis["hits"], analisis["esperados"], analisis["rondas"]
+            log.info(f"🎯 Intento {sig['intento']}: S1 recalculado → centro {sig['centro']}")
         if sig["sent"] and not sig["envio_cerrado"]:
             asyncio.create_task(self._enviar_entrada(sig, number, sig["intento"]))
 
@@ -766,8 +997,10 @@ class RouletteTable:
     def update(self, number: int, real_color: str, timestamp: float = None, training: bool = False):
         if timestamp is None:
             timestamp = time.time()
+        prev = self.sesion_actual[-1] if self.sesion_actual else None
+        zona = zona_de(prev, number) if prev is not None else None   # zona de esta ronda respecto del nº anterior
         self.spin_history.append({"number": number, "color": real_color, "timestamp": timestamp,
-                                  "crupier": self.crupier_actual})
+                                  "crupier": self.crupier_actual, "zona": zona})
         if len(self.spin_history) > 200:
             self.spin_history.pop(0)
         self.total_spins_seen += 1
@@ -775,7 +1008,8 @@ class RouletteTable:
             self.live_spins_seen += 1
         self.sesion_actual.append(number)
         self.ultima_ronda = {"numero": number, "color": real_color, "crupier": self.crupier_actual,
-                             "sesion_num": self._num_sesion(), "ts": timestamp}
+                             "sesion_num": self._num_sesion(), "ts": timestamp,
+                             "zona": zona, "ref": prev}
         if len(self.sesion_actual) > MAX_SPINS_SESION_MEMORIA:
             del self.sesion_actual[:len(self.sesion_actual) - MAX_SPINS_SESION_MEMORIA]
         if training:
@@ -788,7 +1022,7 @@ class RouletteTable:
                  f"Señal: {'activa (centro %s, intento %s)' % (self.senal_activa['centro'], self.senal_activa['intento']) if self.senal_activa else 'sin señal'}")
 
     def get_state(self, limit: int = 40):
-        r = self.resultados[-SESGO_STATS_WINDOW:]
+        r = self.resultados_modo()[-SESGO_STATS_WINDOW:]
         a = self.senal_activa
         analisis = analizar_sesgo(self.sesion_actual)
         return {
@@ -817,6 +1051,7 @@ class RouletteTable:
                 "win_rate": (sum(1 for x in r if x["win"]) / len(r)) if r else None,
                 "azar": azar_s1(),
                 "cobertura_envio": COBERTURA_ENVIO,
+                "estrategia": ESTRATEGIA,
                 "envio_abierto": self._gate_ok(),
             },
         }
