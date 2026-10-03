@@ -1,17 +1,20 @@
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   BOT DE SEÑALES — COLUMNAS Y DOCENAS · Roulette 1 (227)      ║
 ║                                                               ║
-║   Dos agentes INDEPENDIENTES (cada uno con su propia señal,   ║
-║   su prealerta y su gestión Fibonacci):                       ║
-║     · Agente_Col : columnas  (a, b, b, c, a)                  ║
-║     · Agente_Doc : docenas   (a, b, b, c, a)                  ║
-║   Cada letra es una columna/docena distinta; el orden es el   ║
-║   de las últimas 5 rondas (la más antigua primero).           ║
+║   Cuatro agentes INDEPENDIENTES (cada uno con su propia       ║
+║   señal, su prealerta y su gestión Fibonacci):                ║
+║     · Agente_Col  : columnas (a, b, b, c, a)  → busca b       ║
+║     · Agente_Doc  : docenas  (a, b, b, c, a)  → busca b       ║
+║     · Agente_Col2 : columnas (a, a, b, a, a)  → busca b       ║
+║     · Agente_Doc2 : docenas  (a, a, b, a, a)  → busca b       ║
+║   Cada letra es una columna/docena; el orden es el de las     ║
+║   últimas 5 rondas (la más antigua primero).                  ║
 ║                                                               ║
 ║   Flujo:                                                      ║
-║   1. Si las últimas 4 rondas son (a, b, b, c) → PREALERTA:    ║
-║      "debe salir a" para completar el patrón.                 ║
+║   1. Si las últimas 4 rondas son el inicio del patrón         ║
+║      (a,b,b,c) o (a,a,b,a) → PREALERTA: "debe salir a".      ║
 ║   2. Sale a → se borra la prealerta y se envía la SEÑAL a b.  ║
 ║      No sale a → se borra la prealerta.                       ║
 ║   3. Fibonacci (1,1,2,3,5,8…) sobre ficha de 50 COP hasta que ║
@@ -19,6 +22,9 @@
 ║      el nuevo con la ficha actualizada.                       ║
 ║   4. Pago 2:1 (una sola casilla). Ganancia neta =             ║
 ║      2 × ficha del intento ganador − fichas perdidas antes.   ║
+║   Historial: se toma todo lo que manda el servidor (sin       ║
+║   distinguir crupier); al conectar se evalúa si ya hay un     ║
+║   patrón en curso.                                            ║
 ║   El 0 no pertenece a ninguna columna/docena: rompe patrones  ║
 ║   y cuenta como pérdida si hay una señal activa.              ║
 ║                                                               ║
@@ -116,6 +122,24 @@ def es_patron(c: list) -> bool:
     return len(c) == 5 and es_prealerta(c[:4]) and c[4] == c[0]
 
 
+def es_prealerta_aabaa(c: list) -> bool:
+    """c = últimas 4 categorías (antigua → reciente). Patrón (a, a, b, a) con a ≠ b."""
+    if len(c) != 4 or any(x is None for x in c):
+        return False
+    return c[0] == c[1] == c[3] and c[2] != c[0]
+
+
+def es_patron_aabaa(c: list) -> bool:
+    """c = últimas 5 categorías. Patrón completo (a, a, b, a, a)."""
+    return len(c) == 5 and es_prealerta_aabaa(c[:4]) and c[4] == c[0]
+
+
+# Cada patrón: prealerta (últimas 4), patrón completo (últimas 5) y posición de b dentro de las últimas 5.
+# En ambos, la categoría que debe salir para completar el patrón es "a" (la primera de las últimas 4).
+PATRON_ABBCA = {"txt": "(a, b, b, c, a)", "pre": es_prealerta,       "full": es_patron,       "b_idx": 1}
+PATRON_AABAA = {"txt": "(a, a, b, a, a)", "pre": es_prealerta_aabaa, "full": es_patron_aabaa, "b_idx": 2}
+
+
 # ══════════════════════════════════════════════
 #  TELEGRAM
 # ══════════════════════════════════════════════
@@ -189,10 +213,12 @@ def msg_perdida(palabra: str, b: int, intento: int, perdido: int) -> str:
 class Agente:
     """Un agente = una categoría (COLUMNA o DOCENA). Totalmente independiente del otro."""
 
-    def __init__(self, nombre: str, palabra: str, clasificar: Callable[[int], Optional[int]]):
+    def __init__(self, nombre: str, palabra: str, clasificar: Callable[[int], Optional[int]],
+                 patron: dict = PATRON_ABBCA):
         self.nombre = nombre            # Agente_Col / Agente_Doc
         self.palabra = palabra          # COLUMNA / DOCENA
         self.clasificar = clasificar
+        self.patron = patron
         self.pre_msg: Optional[int] = None      # id del mensaje de prealerta vigente
         self.sig: Optional[dict] = None         # señal activa
         self.stats = {"senales": 0, "ganadas": 0, "perdidas": 0, "neto": 0, "por_intento": {}, "max_intento": 0}
@@ -255,17 +281,25 @@ class Agente:
             await delete_msg(self.pre_msg)
             self.pre_msg = None
 
+        await self._buscar_patron(historial)
+
+    async def _buscar_patron(self, historial: list):
         cats = [self.clasificar(n) for n in historial[-5:]]
 
         # 3) patrón completo → señal confirmada a b
-        if es_patron(cats):
-            await self._abrir_senal(cats[1])
+        if self.patron["full"](cats):
+            await self._abrir_senal(cats[self.patron["b_idx"]])
             return
 
         # 4) últimas 4 = (a, b, b, c) → prealerta: debe salir a
-        if es_prealerta(cats[-4:]):
+        if self.patron["pre"](cats[-4:]):
             self.pre_msg = await send_msg(msg_prealerta(self.palabra, cats[-4]))
-            log.info(f"[{self.nombre}] Prealerta: debe salir {self.palabra} {cats[-4]} (b = {cats[-3]})")
+            log.info(f"[{self.nombre}] Prealerta {self.patron['txt']}: debe salir {self.palabra} {cats[-4]}")
+
+    async def sincronizar(self, historial: list):
+        """Evalúa el historial recién cargado del servidor (sin resolver nada): si el patrón ya está en curso, avisa."""
+        if self.sig is None and self.pre_msg is None:
+            await self._buscar_patron(historial)
 
     def estado(self) -> dict:
         s = self.sig
@@ -287,8 +321,10 @@ class RouletteTable:
         self.total_spins = 0
         self.live_spins = 0
         self.agentes = [
-            Agente("Agente_Col", "COLUMNA", columna_de),
-            Agente("Agente_Doc", "DOCENA", docena_de),
+            Agente("Agente_Col", "COLUMNA", columna_de, PATRON_ABBCA),
+            Agente("Agente_Doc", "DOCENA", docena_de, PATRON_ABBCA),
+            Agente("Agente_Col2", "COLUMNA", columna_de, PATRON_AABAA),
+            Agente("Agente_Doc2", "DOCENA", docena_de, PATRON_AABAA),
         ]
 
     async def update(self, number: int, training: bool = False):
@@ -307,6 +343,15 @@ class RouletteTable:
         log.info(f"🎰 Mesa {self.key} | Giro #{self.total_spins}: {number} | "
                  f"Col {columna_de(number)} · Doc {docena_de(number)} | "
                  + " | ".join(f"{a.nombre}: " + (f"intento {a.sig['intento']}" if a.sig else "libre") for a in self.agentes))
+
+    async def sincronizar(self):
+        """Se llama una vez, cuando termina de cargarse el historial que manda el servidor."""
+        log.info(f"📥 Historial del servidor cargado: {len(self.historial)} giros → {self.historial[-10:]}")
+        for ag in self.agentes:
+            try:
+                await ag.sincronizar(self.historial)
+            except Exception as e:
+                log.exception(f"[{ag.nombre}] Error sincronizando el historial: {e}")
 
     def get_state(self, limit: int = 40) -> dict:
         return {
@@ -330,7 +375,7 @@ def build_estado_message(server_state) -> str:
             activa = f"intento {a.sig['intento']} (ficha ${a.sig['ficha']})" if a.sig else "sin señal activa"
             por = ", ".join(f"INT {k}: {v}" for k, v in sorted(st["por_intento"].items(), key=lambda x: int(x[0]))) or "—"
             lineas.append(
-                f"\n<b>{a.nombre}</b> ({a.palabra})\n"
+                f"\n<b>{a.nombre}</b> ({a.palabra} {a.patron['txt']})\n"
                 f"• Señales: {st['senales']} · Ganadas: {st['ganadas']} · Perdidas: {st['perdidas']} ({pct:.0f}%)\n"
                 f"• Aciertos por intento: {por}\n"
                 f"• Intento máx.: {st['max_intento']}\n"
@@ -354,7 +399,7 @@ if bot is not None:
         if BotCommand is None:
             return
         try:
-            await bot.set_my_commands([BotCommand("estado", "Estadísticas de Agente_Col y Agente_Doc")])
+            await bot.set_my_commands([BotCommand("estado", "Estadísticas de los 4 agentes (columnas y docenas)")])
         except Exception as e:
             log.warning(f"[Telegram] No se pudo registrar el menú de comandos: {e}")
 else:
@@ -423,9 +468,11 @@ def _gid_num(gid) -> Optional[int]:
 
 
 class PragmaticWebSocketHandler:
-    def __init__(self, key: int, on_spin_callback: Callable[..., Awaitable[None]]):
+    def __init__(self, key: int, on_spin_callback: Callable[..., Awaitable[None]],
+                 on_sync_callback: Optional[Callable[[], Awaitable[None]]] = None):
         self.key = key
         self.on_spin_callback = on_spin_callback
+        self.on_sync_callback = on_sync_callback
         self.seen = set()
         self.inicializado = False          # True cuando ya llegó la primera tanda last20Results
         self.t_inicio = time.time()
@@ -465,8 +512,10 @@ class PragmaticWebSocketHandler:
                         emit = self.inicializado or (time.time() - self.t_inicio > CALENTAMIENTO)
                         for r in self._ordenar(lista, single):
                             await self._feed(r.get("gameId"), r.get("result"), emit=emit)
-                        if isinstance(results, list):
+                        if isinstance(results, list) and not self.inicializado:
                             self.inicializado = True
+                            if self.on_sync_callback:
+                                await self.on_sync_callback()
             except Exception as e:
                 log.warning(f"🔌 WS key={self.key}: {e}. Reconectando en {delay}s…")
             await asyncio.sleep(delay)
@@ -501,6 +550,11 @@ class ServerState:
         mesa = self.tables.get(key)
         if mesa is not None:
             await mesa.update(number, training=training)
+
+    async def sync_mesa(self, key: int):
+        mesa = self.tables.get(key)
+        if mesa is not None:
+            await mesa.sincronizar()
 
 
 # ══════════════════════════════════════════════
@@ -570,7 +624,11 @@ async def main():
 
     tasks = []
     for key in ROULETTE_KEYS.values():
-        handler = PragmaticWebSocketHandler(key, lambda num, training=False, k=key: on_spin(k, num, training))
+        handler = PragmaticWebSocketHandler(
+            key,
+            lambda num, training=False, k=key: on_spin(k, num, training),
+            on_sync_callback=lambda k=key: server_state.sync_mesa(k),
+        )
         tasks.append(asyncio.create_task(handler.run()))
 
     tasks.append(asyncio.create_task(self_ping_loop()))
